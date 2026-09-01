@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# snc: the Scala Native Compiler CLI. No JVM required -- dotc-native and
+# linkdriver-native are both standalone binaries.
+#
+# Usage: snc build <Main.scala> [<More.scala> ...] -o <output>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST="$ROOT/dist"
+
+for f in "$DIST/dotc-native" "$DIST/linkdriver-native" "$DIST/java.base.jar" \
+         "$DIST/compiler.cp" "$DIST/nativelibs.cp" "$DIST/nscplugin.jar.txt"; do
+  [[ -e "$f" ]] || { echo "snc: missing $f -- run build/all.sh first" >&2; exit 1; }
+done
+
+cmd="${1:-}"
+[[ "$cmd" == "build" ]] || { echo "usage: snc build <Main.scala> [more.scala...] -o <output>" >&2; exit 1; }
+shift
+
+sources=()
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) sources+=("$1"); shift ;;
+  esac
+done
+[[ -n "$out" ]] || { echo "snc: -o <output> is required" >&2; exit 1; }
+[[ ${#sources[@]} -gt 0 ]] || { echo "snc: no source files given" >&2; exit 1; }
+
+# The entry-point object name doubles as the mainClass scala-native links.
+# Assumes a single top-level `object Foo` with a `def main` -- same
+# convention plain scalac/dotc use for "the main class of this program".
+main_class="$(basename "${sources[0]}" .scala)"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+compile_cp="$(cat "$DIST/compiler.cp"):$(cat "$DIST/nativelibs.cp")"
+plugin_jar="$(cat "$DIST/nscplugin.jar.txt")"
+
+mkdir -p "$work/classes"
+"$DIST/dotc-native" \
+  -javabootclasspath "$DIST/java.base.jar" \
+  -classpath "$compile_cp" \
+  -Xplugin:"$plugin_jar" -Xplugin-require:scalanative \
+  -d "$work/classes" \
+  "${sources[@]}"
+
+link_cp="$work/classes:$(cat "$DIST/nativelibs.cp")"
+"$DIST/linkdriver-native" "$link_cp" "$work/link" "$main_class" \
+  "$(command -v clang)" "$(command -v clang++)"
+
+cp "$work/link/$main_class" "$out" 2>/dev/null || cp "$work/link/$(echo "$main_class" | tr '[:upper:]' '[:lower:]')" "$out"
+chmod +x "$out"
+echo "snc: wrote $out"

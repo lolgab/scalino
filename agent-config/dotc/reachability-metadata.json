@@ -1,0 +1,1467 @@
+{
+  "reflection": [
+    {
+      "type": "dotty.tools.backend.jvm.BCodeIdiomatic$JCodeMethodN",
+      "fields": [
+        {
+          "name": "genStringBuilderEndDesc$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.BCodeSkelBuilder$PlainSkelBuilder",
+      "fields": [
+        {
+          "name": "AndroidCreatorClass$lzy1"
+        },
+        {
+          "name": "AndroidParcelableInterface$lzy1"
+        },
+        {
+          "name": "bc$lzy1"
+        },
+        {
+          "name": "locals$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.BTypes",
+      "fields": [
+        {
+          "name": "BOOL$lzy1"
+        },
+        {
+          "name": "BYTE$lzy1"
+        },
+        {
+          "name": "CHAR$lzy1"
+        },
+        {
+          "name": "ClassBType$lzy1"
+        },
+        {
+          "name": "DOUBLE$lzy1"
+        },
+        {
+          "name": "FLOAT$lzy1"
+        },
+        {
+          "name": "INT$lzy1"
+        },
+        {
+          "name": "LONG$lzy1"
+        },
+        {
+          "name": "SHORT$lzy1"
+        },
+        {
+          "name": "UNIT$lzy1"
+        },
+        {
+          "name": "classBTypeFromInternalNameMap$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.BTypes$BType[]"
+    },
+    {
+      "type": "dotty.tools.backend.jvm.BTypesFromSymbols",
+      "fields": [
+        {
+          "name": "TransientAttr$lzy1"
+        },
+        {
+          "name": "VolatileAttr$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.BackendUtils",
+      "fields": [
+        {
+          "name": "classfileVersion$lzy1"
+        },
+        {
+          "name": "extraProc$lzy1"
+        },
+        {
+          "name": "serializedLamdaObjDesc$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.BackendUtils$",
+      "fields": [
+        {
+          "name": "classfileVersionMap$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.ClassfileWriters",
+      "fields": [
+        {
+          "name": "ClassfileWriter$lzy1"
+        },
+        {
+          "name": "FileWriter$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.CodeGen",
+      "fields": [
+        {
+          "name": "Impl$lzy1"
+        },
+        {
+          "name": "mirrorCodeGen$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.CodeGen$Impl$",
+      "fields": [
+        {
+          "name": "BTypesStack$lzy1"
+        },
+        {
+          "name": "JCodeMethodN$lzy1"
+        },
+        {
+          "name": "JavaStringBuilderClassName$lzy1"
+        },
+        {
+          "name": "LoadDestination$lzy1"
+        },
+        {
+          "name": "NativeAttr$lzy1"
+        },
+        {
+          "name": "backendUtils$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.CollectSuperCalls"
+    },
+    {
+      "type": "dotty.tools.backend.jvm.CoreBTypesFromSymbols",
+      "fields": [
+        {
+          "name": "_ObjectRef$lzy1"
+        },
+        {
+          "name": "_StringRef$lzy1"
+        },
+        {
+          "name": "_boxResultType$lzy1"
+        },
+        {
+          "name": "_boxedClassOfPrimitive$lzy1"
+        },
+        {
+          "name": "_jiSerializableRef$lzy1"
+        },
+        {
+          "name": "_jlCharSequenceRef$lzy1"
+        },
+        {
+          "name": "_jlClassCastExceptionRef$lzy1"
+        },
+        {
+          "name": "_jlClassRef$lzy1"
+        },
+        {
+          "name": "_jlCloneableRef$lzy1"
+        },
+        {
+          "name": "_jlIllegalArgExceptionRef$lzy1"
+        },
+        {
+          "name": "_jlStringBufferRef$lzy1"
+        },
+        {
+          "name": "_jlStringBuilderRef$lzy1"
+        },
+        {
+          "name": "_jlThrowableRef$lzy1"
+        },
+        {
+          "name": "_jliCallSiteRef$lzy1"
+        },
+        {
+          "name": "_jliLambdaDeserializeBootstrapHandle$lzy1"
+        },
+        {
+          "name": "_jliLambdaMetaFactoryAltMetafactoryHandle$lzy1"
+        },
+        {
+          "name": "_jliLambdaMetaFactoryMetafactoryHandle$lzy1"
+        },
+        {
+          "name": "_jliLambdaMetafactoryRef$lzy1"
+        },
+        {
+          "name": "_jliMethodHandleRef$lzy1"
+        },
+        {
+          "name": "_jliMethodHandlesLookupRef$lzy1"
+        },
+        {
+          "name": "_jliMethodTypeRef$lzy1"
+        },
+        {
+          "name": "_jliSerializedLambdaRef$lzy1"
+        },
+        {
+          "name": "_jliStringConcatFactoryMakeConcatWithConstantsHandle$lzy1"
+        },
+        {
+          "name": "_jliStringConcatFactoryRef$lzy1"
+        },
+        {
+          "name": "_primitiveTypeMap$lzy1"
+        },
+        {
+          "name": "_srBoxesRuntimeRef$lzy1"
+        },
+        {
+          "name": "_srLambdaDeserialize$lzy1"
+        },
+        {
+          "name": "_srNothingRef$lzy1"
+        },
+        {
+          "name": "_srNullRef$lzy1"
+        },
+        {
+          "name": "_unboxResultType$lzy1"
+        },
+        {
+          "name": "asmBoxTo$lzy1"
+        },
+        {
+          "name": "asmUnboxTo$lzy1"
+        },
+        {
+          "name": "boxedClasses$lzy1"
+        },
+        {
+          "name": "typeOfArrayOp$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.DottyBackendInterface",
+      "fields": [
+        {
+          "name": "ArrayValue$lzy1"
+        },
+        {
+          "name": "DesugaredSelect$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.backend.jvm.PostProcessorFrontendAccess$Impl",
+      "fields": [
+        {
+          "name": "_compilerSettings$lzy1"
+        },
+        {
+          "name": "directBackendReporting$lzy1"
+        },
+        {
+          "name": "localReporter$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.Run",
+      "fields": [
+        {
+          "name": "NoPrintedTree$lzy1"
+        },
+        {
+          "name": "suppressions$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.ast.Trees$Instance",
+      "fields": [
+        {
+          "name": "TypeDefs$lzy1"
+        },
+        {
+          "name": "ValDefs$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.ast.tpd$",
+      "fields": [
+        {
+          "name": "AssertNotNull$lzy1"
+        },
+        {
+          "name": "ConstantValue$lzy1"
+        },
+        {
+          "name": "QuotedTypeOf$lzy1"
+        },
+        {
+          "name": "SplicedType$lzy1"
+        },
+        {
+          "name": "WitnessNamesAnnot$lzy1"
+        },
+        {
+          "name": "blockEndingInClosure$lzy1"
+        },
+        {
+          "name": "closure$lzy1"
+        },
+        {
+          "name": "closureDef$lzy1"
+        },
+        {
+          "name": "possiblyTypedClosureDef$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.ast.untpd$",
+      "fields": [
+        {
+          "name": "IdPattern$lzy1"
+        },
+        {
+          "name": "ImpureByNameTypeTree$lzy1"
+        },
+        {
+          "name": "WitnessNamesAnnot$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.cc.CCState",
+      "fields": [
+        {
+          "name": "ClosedUnrecorded$lzy1"
+        },
+        {
+          "name": "HardSeparate$lzy1"
+        },
+        {
+          "name": "Separate$lzy1"
+        },
+        {
+          "name": "Unrecorded$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.CompilerCommand",
+      "fields": [
+        {
+          "name": "Columnator$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.PathResolver",
+      "fields": [
+        {
+          "name": "Calculated$lzy1"
+        },
+        {
+          "name": "result$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.PathResolver$Calculated$",
+      "fields": [
+        {
+          "name": "containers$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.Properties$",
+      "fields": [
+        {
+          "name": "scalaProps$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.ScalaSettings",
+      "fields": [
+        {
+          "name": "Whas$lzy1"
+        },
+        {
+          "name": "WshadowHas$lzy1"
+        },
+        {
+          "name": "WunusedHas$lzy1"
+        },
+        {
+          "name": "mixinForwarderChoices$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.ScalaSettingsProperties$",
+      "fields": [
+        {
+          "name": "maxTargetVersion$lzy1"
+        },
+        {
+          "name": "minTargetVersion$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.config.SourceVersion[]"
+    },
+    {
+      "type": "dotty.tools.dotc.config.WrappedProperties$AccessControl$",
+      "fields": [
+        {
+          "name": "scalaProps$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Comments$Comment",
+      "fields": [
+        {
+          "name": "expandedBody$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Contexts$ContextBase",
+      "fields": [
+        {
+          "name": "SomePhase$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Definitions",
+      "fields": [
+        {
+          "name": "ArrayOf$lzy1"
+        },
+        {
+          "name": "ByNameFunction$lzy1"
+        },
+        {
+          "name": "ContextFunctionType$lzy1"
+        },
+        {
+          "name": "FunctionNOf$lzy1"
+        },
+        {
+          "name": "FunctionOf$lzy1"
+        },
+        {
+          "name": "FunctionTypeOfMethod$lzy1"
+        },
+        {
+          "name": "MatchCase$lzy1"
+        },
+        {
+          "name": "MultiArrayOf$lzy1"
+        },
+        {
+          "name": "NamedTuple$lzy1"
+        },
+        {
+          "name": "NamedTupleDirect$lzy1"
+        },
+        {
+          "name": "NonEmptyTuple_tail$lzy1"
+        },
+        {
+          "name": "PartialFunctionOf$lzy1"
+        },
+        {
+          "name": "PolyFunctionClass$lzy1"
+        },
+        {
+          "name": "PolyFunctionOf$lzy1"
+        },
+        {
+          "name": "RefinedFunctionOf$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.NameOps$compactify$",
+      "fields": [
+        {
+          "name": "md5$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Names$Name$",
+      "fields": [
+        {
+          "name": "derived$CanEqual$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Phases$Phase[]"
+    },
+    {
+      "type": "dotty.tools.dotc.core.StdNames$ScalaNames",
+      "fields": [
+        {
+          "name": "raw$lzy1"
+        },
+        {
+          "name": "specializedTypeNames$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.StdNames$ScalaTermNames",
+      "fields": [
+        {
+          "name": "primitive$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Symbols$Symbol[]"
+    },
+    {
+      "type": "dotty.tools.dotc.core.Types$Type[]"
+    },
+    {
+      "type": "dotty.tools.dotc.core.classfile.ClassfileParser",
+      "fields": [
+        {
+          "name": "innerClasses$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.tasty.AttributeUnpickler",
+      "fields": [
+        {
+          "name": "attributes$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.tasty.CommentUnpickler",
+      "fields": [
+        {
+          "name": "comments$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.unpickleScala2.Scala2Unpickler",
+      "fields": [
+        {
+          "name": "localMemberUnpickler$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.parsing.Parsers$Parser",
+      "fields": [
+        {
+          "name": "symbXMLBuilder$lzy1"
+        },
+        {
+          "name": "xmlp$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.parsing.Scanners$IndentWidth$Run[]"
+    },
+    {
+      "type": "dotty.tools.dotc.printing.Formatting$ShownDef$Show$",
+      "fields": [
+        {
+          "name": "given_Show_AbstractFile$lzy1"
+        },
+        {
+          "name": "given_Show_Boolean$lzy1"
+        },
+        {
+          "name": "given_Show_Char$lzy1"
+        },
+        {
+          "name": "given_Show_Class$lzy1"
+        },
+        {
+          "name": "given_Show_CompilationUnit$lzy1"
+        },
+        {
+          "name": "given_Show_Int$lzy1"
+        },
+        {
+          "name": "given_Show_Integer$lzy1"
+        },
+        {
+          "name": "given_Show_Long$lzy1"
+        },
+        {
+          "name": "given_Show_OwnerTree$lzy1"
+        },
+        {
+          "name": "given_Show_Phase$lzy1"
+        },
+        {
+          "name": "given_Show_ScalaVersion$lzy1"
+        },
+        {
+          "name": "given_Show_Scanner$lzy1"
+        },
+        {
+          "name": "given_Show_Showable$lzy1"
+        },
+        {
+          "name": "given_Show_Shown$lzy1"
+        },
+        {
+          "name": "given_Show_SourceFile$lzy1"
+        },
+        {
+          "name": "given_Show_Span$lzy1"
+        },
+        {
+          "name": "given_Show_String$lzy1"
+        },
+        {
+          "name": "given_Show_StringBuffer$lzy1"
+        },
+        {
+          "name": "given_Show_Throwable$lzy1"
+        },
+        {
+          "name": "given_Show_TyperState$lzy1"
+        },
+        {
+          "name": "given_Show_Unit$lzy1"
+        },
+        {
+          "name": "given_Show_Value$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.printing.Formatting$ShownDef$ShowImplicits1",
+      "fields": [
+        {
+          "name": "given_Show_Designator$lzy1"
+        },
+        {
+          "name": "given_Show_ImplicitRef$lzy1"
+        },
+        {
+          "name": "given_Show_SrcPos$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.printing.Formatting$ShownDef$ShowImplicits2",
+      "fields": [
+        {
+          "name": "given_Show_ParamInfo$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.printing.Formatting$ShownDef$ShowImplicits3",
+      "fields": [
+        {
+          "name": "given_Show_Product$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ArrayApply",
+      "fields": [
+        {
+          "name": "SeqApplyArgs$lzy1"
+        },
+        {
+          "name": "StripAscription$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ArrayConstructors"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.BetaReduce"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Bridges",
+      "fields": [
+        {
+          "name": "elimErasedCtx$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CapturedVars"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CheckLoopingImplicits"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CheckNoSuperThis"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CheckReentrant"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CheckStatic"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CollectEntryPoints"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CollectNullableFields",
+      "fields": [
+        {
+          "name": "NotNullable$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CompleteJavaEnums"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Constructors"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CookComments"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CountOuterAccesses"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.CrossVersionChecks"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.DropBreaks",
+      "fields": [
+        {
+          "name": "Break$lzy1"
+        },
+        {
+          "name": "BreakBoundary$lzy1"
+        },
+        {
+          "name": "LabelTry$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.DropOuterAccessors"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.DropParentRefinements"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimByName"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimErasedValueType"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimOpaque"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimOuterSelect"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimPackagePrefixes"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimPolyFunction"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimRepeated"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ElimStaticThis"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.EtaReduce"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ExpandPrivate"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ExpandSAMs"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ExplicitOuter"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ExplicitSelf"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ExtensionMethods"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.FirstTransform",
+      "fields": [
+        {
+          "name": "collectBinders$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Flatten"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ForwardDepChecks"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.FunctionXXLForwarders"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Getters"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.HoistSuperArgs"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.InlinePatterns",
+      "fields": [
+        {
+          "name": "App$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.InlineVals"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.InterceptedMethods"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.LambdaLift"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.LazyVals"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.LetOverApply"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.MegaPhase",
+      "fields": [
+        {
+          "name": "shortPhaseName$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.MegaPhase$MiniPhase[]"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Memoize"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Mixin"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.MixinOps",
+      "fields": [
+        {
+          "name": "JUnit4Annotations$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.MoveStatics"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.NonLocalReturns"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ParamForwarding"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.PatternMatcher"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Pickler",
+      "fields": [
+        {
+          "name": "serialized$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.PostInlining",
+      "fields": [
+        {
+          "name": "synthMbr$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.PostTyper$PostTyperTransformer",
+      "fields": [
+        {
+          "name": "dropInlines$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ProtectedAccessors"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.PruneErasedDefs"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.PureStats"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.RepeatableAnnotations"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.ResolveSuper"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.RestoreScopes"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.SelectStatic"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.SeqLiterals"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.SpecializeApplyMethods"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.SpecializeFunctions"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.SpecializeTuples"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.Splicing",
+      "fields": [
+        {
+          "name": "Level0QuoteTransformer$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.TailRec"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.TransformWildcards"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.TryCatchPatterns"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.TupleOptimizations"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.UncacheGivenAliases"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.UninitializedDefs"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.VCElideAllocations"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.VCInlineMethods"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.localopt.DropForMap",
+      "fields": [
+        {
+          "name": "Lambda$lzy1"
+        },
+        {
+          "name": "MapCall$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.transform.localopt.StringInterpolatorOpt",
+      "fields": [
+        {
+          "name": "InvalidEscapePosition$lzy1"
+        },
+        {
+          "name": "Literals$lzy1"
+        },
+        {
+          "name": "SOrRawInterpolator$lzy1"
+        },
+        {
+          "name": "StringContextApply$lzy1"
+        },
+        {
+          "name": "StringContextIntrinsic$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.typer.Namer",
+      "fields": [
+        {
+          "name": "nestedTyper$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.typer.Namer$ClassCompleter",
+      "fields": [
+        {
+          "name": "completerCtx$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.typer.RefChecks"
+    },
+    {
+      "type": "dotty.tools.dotc.typer.Typer",
+      "fields": [
+        {
+          "name": "ArgMatch$lzy1"
+        },
+        {
+          "name": "CompareScheme$lzy1"
+        },
+        {
+          "name": "hasSkolem$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.typer.VarianceChecker",
+      "fields": [
+        {
+          "name": "Traverser$lzy1"
+        },
+        {
+          "name": "Validator$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.io.FileZipArchive",
+      "fields": [
+        {
+          "name": "$1$$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.io.Jar",
+      "fields": [
+        {
+          "name": "jarFile$lzy1"
+        },
+        {
+          "name": "manifest$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "java.lang.Boolean",
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "getBoolean",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "java.lang.ClassValue"
+    },
+    {
+      "type": "java.lang.Runtime",
+      "methods": [
+        {
+          "name": "version",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "java.lang.Runtime$Version",
+      "methods": [
+        {
+          "name": "major",
+          "parameterTypes": []
+        },
+        {
+          "name": "parse",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "java.lang.String[]"
+    },
+    {
+      "type": "java.lang.String[][]"
+    },
+    {
+      "type": "java.lang.invoke.VarHandle",
+      "methods": [
+        {
+          "name": "releaseFence",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "java.net.URL[]"
+    },
+    {
+      "type": "java.nio.file.attribute.FileAttribute[]"
+    },
+    {
+      "type": "java.util.jar.JarFile",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.io.File",
+            "boolean",
+            "int",
+            "java.lang.Runtime$Version"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "jdk.internal.jrtfs.JrtFileSystemProvider"
+    },
+    {
+      "type": "scala.collection.concurrent.CNodeBase"
+    },
+    {
+      "type": "scala.collection.concurrent.INodeBase"
+    },
+    {
+      "type": "scala.collection.concurrent.MainNode"
+    },
+    {
+      "type": "scala.collection.concurrent.TrieMap"
+    },
+    {
+      "type": "scala.scalanative.nir.ControlFlow$Block",
+      "fields": [
+        {
+          "name": "splitCount$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.ControlFlow$Edge[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Defn$Define",
+      "fields": [
+        {
+          "name": "hasUnwind$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Defn$Define$DebugInfo",
+      "fields": [
+        {
+          "name": "lexicalScopeOf$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Defn[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Inst[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Op",
+      "fields": [
+        {
+          "name": "hashCode$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Sig",
+      "fields": [
+        {
+          "name": "hashCode$lzy1"
+        },
+        {
+          "name": "privateIn$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.SourceFile$Relative",
+      "fields": [
+        {
+          "name": "path$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.serialization.BinarySerializer",
+      "fields": [
+        {
+          "name": "Defns$lzy1"
+        },
+        {
+          "name": "Globals$lzy1"
+        },
+        {
+          "name": "Header$lzy1"
+        },
+        {
+          "name": "Insts$lzy1"
+        },
+        {
+          "name": "Offsets$lzy1"
+        },
+        {
+          "name": "Positions$lzy1"
+        },
+        {
+          "name": "Strings$lzy1"
+        },
+        {
+          "name": "Types$lzy1"
+        },
+        {
+          "name": "Vals$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.AdaptLazyVals",
+      "fields": [
+        {
+          "name": "LazyValsDefns$lzy1"
+        },
+        {
+          "name": "LazyValsNames$lzy1"
+        },
+        {
+          "name": "currentScalaVersion$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.GenReflectiveInstantisation$ReflectiveInstantiationBuffer[]"
+    },
+    {
+      "type": "scala.scalanative.nscplugin.NirCodeGen",
+      "fields": [
+        {
+          "name": "ContTree$lzy1"
+        },
+        {
+          "name": "DesugaredSelect$lzy1"
+        },
+        {
+          "name": "ExportedSymbol$lzy1"
+        },
+        {
+          "name": "LinktimeProperty$lzy1"
+        },
+        {
+          "name": "MirrorClass$lzy1"
+        },
+        {
+          "name": "ValTree$lzy1"
+        },
+        {
+          "name": "jlStringBuilderAppendForSymbol$lzy1"
+        },
+        {
+          "name": "scala$scalanative$nscplugin$NirGenName$$ObjectTypeSyms$lzy1"
+        },
+        {
+          "name": "scala$scalanative$nscplugin$NirGenStat$$ApplyExtern$lzy1"
+        },
+        {
+          "name": "scala$scalanative$nscplugin$NirGenType$$BoxTypesForPrimitive$lzy1"
+        },
+        {
+          "name": "scala$scalanative$nscplugin$NirGenType$$PrimitiveSymbolToNirTypes$lzy1"
+        },
+        {
+          "name": "scala$scalanative$nscplugin$NirGenType$$UnsignedTypes$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.NirDefinitions",
+      "fields": [
+        {
+          "name": "CFuncPtrNNames$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.NirGenExpr$ExprBuffer",
+      "fields": [
+        {
+          "name": "SafeZoneInstance$lzy1"
+        },
+        {
+          "name": "WrapArray$lzy1"
+        },
+        {
+          "name": "jlStringBuilderCtor$lzy1"
+        },
+        {
+          "name": "jlStringBuilderCtorSig$lzy1"
+        },
+        {
+          "name": "jlStringBuilderRef$lzy1"
+        },
+        {
+          "name": "jlStringBuilderToString$lzy1"
+        },
+        {
+          "name": "jlStringBuilderToStringSig$lzy1"
+        },
+        {
+          "name": "optimizedFunctions$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.NirPositions",
+      "fields": [
+        {
+          "name": "conversionCache$lzy1"
+        },
+        {
+          "name": "fromSourcePosition$lzy1"
+        },
+        {
+          "name": "fromSpan$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.NirPrimitives",
+      "fields": [
+        {
+          "name": "nirPrimitives$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.PostInlineNativeInterop"
+    },
+    {
+      "type": "scala.scalanative.nscplugin.PrepNativeInterop",
+      "fields": [
+        {
+          "name": "EnumerationsContext$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.PrepNativeInterop$EnumerationsContext",
+      "fields": [
+        {
+          "name": "ScalaEnumVal$lzy1"
+        },
+        {
+          "name": "ScalaEnumValue$lzy1"
+        },
+        {
+          "name": "defnNative$lzy1"
+        },
+        {
+          "name": "nmeNative$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.PrepNativeInterop$EnumerationsContext$ScalaEnumFctExtractors",
+      "fields": [
+        {
+          "name": "NoName$lzy1"
+        },
+        {
+          "name": "NullName$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nscplugin.ScalaNativePlugin",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "scala.tools.asm.Handle[]"
+    },
+    {
+      "type": "scala.tools.asm.Label[]"
+    },
+    {
+      "type": "sun.misc.Unsafe",
+      "fields": [
+        {
+          "name": "theUnsafe"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "glob": "META-INF/services/java.nio.file.spi.FileSystemProvider"
+    },
+    {
+      "glob": "compiler.properties"
+    },
+    {
+      "glob": "library.properties"
+    },
+    {
+      "glob": "wrapped.properties"
+    }
+  ]
+}

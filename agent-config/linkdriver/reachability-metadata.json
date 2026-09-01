@@ -1,0 +1,418 @@
+{
+  "reflection": [
+    {
+      "type": "java.lang.Boolean",
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "getBoolean",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "java.lang.ClassValue"
+    },
+    {
+      "type": "java.lang.Object[]"
+    },
+    {
+      "type": "java.lang.Object[][]"
+    },
+    {
+      "type": "java.lang.String[]"
+    },
+    {
+      "type": "java.lang.invoke.VarHandle",
+      "methods": [
+        {
+          "name": "releaseFence",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "jdk.internal.jrtfs.JrtFileSystemProvider"
+    },
+    {
+      "type": "scala.collection.concurrent.CNodeBase"
+    },
+    {
+      "type": "scala.collection.concurrent.INodeBase"
+    },
+    {
+      "type": "scala.collection.concurrent.MainNode"
+    },
+    {
+      "type": "scala.collection.concurrent.TrieMap"
+    },
+    {
+      "type": "scala.scalanative.build.Config$Impl",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.build.Discover$",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.build.LLVM$",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.build.NativeConfig$Impl",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.build.Platform$",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.checker.Check$Error[]"
+    },
+    {
+      "type": "scala.scalanative.codegen.CommonMemoryLayouts",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.FieldLayout",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.Lower$",
+      "fields": [
+        {
+          "name": "0bitmap$2"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.Lower$Impl",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.MemoryLayout$PositionedType[]"
+    },
+    {
+      "type": "scala.scalanative.codegen.RuntimeTypeInformation",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.SourceCodeCache",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.llvm.AbstractCodeGen",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.llvm.MetadataCodeGen$DefnScopes",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.llvm.MetadataCodeGen$Writer$",
+      "fields": [
+        {
+          "name": "0bitmap$2"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.codegen.llvm.compat.os.OsCompat",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.interflow.Interflow",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.interflow.MergeBlock",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.interflow.MergeBlock[]"
+    },
+    {
+      "type": "scala.scalanative.interflow.MergePhi[]"
+    },
+    {
+      "type": "scala.scalanative.interflow.MergeProcessor",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.interflow.UseDef$Def[]"
+    },
+    {
+      "type": "scala.scalanative.linker.Class",
+      "fields": [
+        {
+          "name": "0bitmap$2"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ClassLoader$FromDisk",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ClassLoader$FromMemory",
+      "fields": [
+        {
+          "name": "0bitmap$2"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ClassPath$Impl",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.Class[]"
+    },
+    {
+      "type": "scala.scalanative.linker.Field",
+      "fields": [
+        {
+          "name": "0bitmap$3"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.Field[]"
+    },
+    {
+      "type": "scala.scalanative.linker.MemberInfo[]"
+    },
+    {
+      "type": "scala.scalanative.linker.Reach",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ReachabilityAnalysis$Result",
+      "fields": [
+        {
+          "name": "0bitmap$4"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ReachabilityAnalysis$Result$references$",
+      "fields": [
+        {
+          "name": "0bitmap$5"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ScopeInfo",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.linker.ScopeInfo[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Attr[]"
+    },
+    {
+      "type": "scala.scalanative.nir.ControlFlow$Block",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.ControlFlow$Edge[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Defn$Define",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Defn$Define$DebugInfo",
+      "fields": [
+        {
+          "name": "0bitmap$2"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Defn$Define$DebugInfo$LexicalScope[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Defn$Define[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Defn[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Global[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Inst[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Local[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Next[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Op",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Sig",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Sig[]"
+    },
+    {
+      "type": "scala.scalanative.nir.SourceFile$Relative",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.scalanative.nir.Type[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Val$Local[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Val$StructValue[]"
+    },
+    {
+      "type": "scala.scalanative.nir.Val[]"
+    },
+    {
+      "type": "scala.scalanative.nir.serialization.BinaryDeserializer",
+      "fields": [
+        {
+          "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "sun.misc.Unsafe",
+      "fields": [
+        {
+          "name": "theUnsafe"
+        }
+      ]
+    },
+    {
+      "type": "sun.security.provider.SHA",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "glob": "META-INF/services/java.nio.file.spi.FileSystemProvider"
+    },
+    {
+      "glob": "META-INF/services/java.time.zone.ZoneRulesProvider"
+    }
+  ]
+}
