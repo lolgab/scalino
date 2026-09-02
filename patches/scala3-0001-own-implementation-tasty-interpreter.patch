@@ -2190,7 +2190,7 @@ index e34d3506..9cc8ffda 100644
    /** Exception that stops interpretation if some issue is found */
    class StopInterpretation(val msg: Message, val pos: SrcPos) extends Exception
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index b5386d5b..919ba02f 100644
+index b5386d5b..91ecf36a 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 @@ -257,7 +257,16 @@ object Splicer {
@@ -2211,7 +2211,7 @@ index b5386d5b..919ba02f 100644
  
        // Interpret level -1 `Type.of[T]`
        case Apply(TypeApply(fn, quoted :: Nil), _) if fn.symbol == defn.QuotedTypeModule_of =>
-@@ -266,5 +275,33 @@ object Splicer {
+@@ -266,5 +275,38 @@ object Splicer {
        case _ =>
          super.interpretTree(tree)
      }
@@ -2228,17 +2228,22 @@ index b5386d5b..919ba02f 100644
 +      val resolver = new tpd.TreeMap {
 +        override def transform(t: Tree)(using Context): Tree = t match
 +          case Splice(expr) =>
-+            val exprImpl = interpretTree(expr) match
++            // `expr` is typically a single `Quotes ?=> Expr[X]` closure, but
++            // a splice built from further-nested splices/quotes (e.g. a
++            // curried callback: `Quotes ?=> Expr[A] => Quotes ?=> Expr[B]`,
++            // itself invoked with a real value argument by the *rest* of the
++            // interpreted tree before this Splice node is even reached) can
++            // still bottom out several context-function layers deep -- keep
++            // feeding a fresh `QuotesImpl` while the result is still an
++            // unapplied function, rather than assuming exactly one layer.
++            @annotation.tailrec
++            def resolve(v: Object, fuel: Int): ExprImpl = v match
 +              case e: ExprImpl => e
-+              case f: (AnyRef => Object) @unchecked =>
-+                f(QuotesImpl()) match
-+                  case e: ExprImpl => e
-+                  case other =>
-+                    throw new StopInterpretation(
-+                      em"Unexpected result interpreting a nested splice: ${other.toString}", t.srcPos)
++              case f: (AnyRef => Object) @unchecked if fuel > 0 => resolve(f(QuotesImpl()), fuel - 1)
 +              case other =>
 +                throw new StopInterpretation(
 +                  em"Unexpected result interpreting a nested splice: ${other.toString}", t.srcPos)
++            val exprImpl = resolve(interpretTree(expr), 8)
 +            transform(exprImpl.tree)
 +          case _ => super.transform(t)
 +      }
