@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..55ae30d8 100644
+index e34d3506..fbd12140 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -264,7 +264,7 @@ index e34d3506..55ae30d8 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +328,1606 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +328,1609 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -1692,6 +1692,10 @@ index e34d3506..55ae30d8 100644
 +      case (s: scala.collection.Seq[Object] @unchecked, "forall", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(Boolean.box(s.forall(f(_).asInstanceOf[Boolean])))
 +      case (s: scala.collection.Seq[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
++      // Immutable `Set` (e.g. a `Set("a", "b")` literal built via the
++      // `Set.apply` collection factory above) -- `Seq`'s own `contains`
++      // case above doesn't cover it (Set isn't a Seq).
++      case (s: collection.Set[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
 +      case (s: scala.collection.Seq[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(s(i))
 +      case (s: scala.collection.Seq[Object] @unchecked, "zip", (o: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(s.zip(o))
 +      case (s: scala.collection.Seq[Object] @unchecked, "zipWithIndex", Nil) => Some(s.zipWithIndex.map((v, i) => (v, Int.box(i))))
@@ -1799,7 +1803,6 @@ index e34d3506..55ae30d8 100644
 +      case (it: Iterator[Object] @unchecked, "foreach", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        it.foreach(f); Some(().asInstanceOf[Object])
 +      case (s: mutable.Set[Object] @unchecked, "add" | "addOne" | "+=", (v: Object) :: Nil) => s += v; Some(Boolean.box(true))
-+      case (s: mutable.Set[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
 +      case (s: mutable.Set[Object] @unchecked, "remove" | "-=", (v: Object) :: Nil) => s -= v; Some(Boolean.box(true))
 +      case (b: mutable.Builder[Object, Object] @unchecked, "addOne" | "+=", (v: Object) :: Nil) => b += v; Some(b)
 +      case (b: mutable.Builder[Object, Object] @unchecked, "result", Nil) => Some(b.result())
