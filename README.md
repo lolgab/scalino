@@ -1,6 +1,6 @@
 # scala-native-compiler
 
-[![CI](https://github.com/lolgab/scala-native-compiler/actions/workflows/ci.yml/badge.svg)](https://github.com/lolgab/scala-native-compiler/actions/workflows/ci.yml)
+[![CI](https://github.com/lolgab/snc/actions/workflows/ci.yml/badge.svg)](https://github.com/lolgab/snc/actions/workflows/ci.yml)
 
 A self-contained Scala Native compiler toolchain: no JVM required to run it
 (a JVM is only needed once, at build time, to run GraalVM's native-image).
@@ -8,7 +8,7 @@ Scala 3 only.
 
 ## Prebuilt binaries
 
-Each [release](https://github.com/lolgab/scala-native-compiler/releases) ships
+Each [release](https://github.com/lolgab/snc/releases) ships
 a self-contained `dist/` tarball (compiler + linker + `scli`, no JVM needed to
 run any of it) for Linux, macOS, and Windows, on both x86_64 and arm64.
 Windows support is experimental/best-effort -- see
