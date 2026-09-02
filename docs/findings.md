@@ -184,17 +184,31 @@ built by `build/07-build-scli.sh` -- itself compiled by
 compiler is itself a product of that same compiler.
 
 What it does:
-- Parses `//> using dep "org::name:version"` (cross-versioned, `::` gets
-  `_3` appended) and `//> using dep "org:name:version"` (exact artifact) --
-  one per line, anywhere in any given source file. `//> using scala "x"`
-  is parsed and produces a warning (not an error) if it disagrees with the
-  toolchain's pinned version -- there's no multi-version support, this
-  binary only ever targets the Scala/scala-native version it was built for.
+- Parses `//> using dep "..."` in all three scala-cli coordinate formats
+  (one per line, anywhere in any given source file):
+  - `org:name:version` (sbt `%`, exact artifact) — unchanged
+  - `org::name:version` (sbt `%%`, Scala-version cross) — `org:name_3:version`
+  - `org::name::version` (sbt `%%%`, platform+Scala cross) —
+    `org:name_native<binVer>_3:version` (`<binVer>` = scala-native's
+    major.minor, e.g. `0.5`, baked into `BuildInfo` from `versions.env`)
+
+  `//> using scala "x"` is parsed and produces a warning (not an error) if
+  it disagrees with the toolchain's pinned version -- there's no
+  multi-version support, this binary only ever targets the Scala/scala-native
+  version it was built for.
 - Resolves dependencies via a native `cs fetch --classpath` subprocess,
   cached on disk (`.scli-build/deps-cache/`) keyed by the sorted dependency
   list, so repeat runs skip the resolution step (and its network
   round-trip) entirely, not just the artifact download `cs` already caches
-  itself.
+  itself. Excludes scala-native's own runtime artifacts
+  (`nativelib_native<v>_3`, `javalib_native<v>_3`, etc., see
+  `excludedArtifacts`) and plain `scala3-library_3`/`scala-library` from
+  that resolution: a `::name::version` dependency's own published build was
+  cross-compiled against *some* scala-native release (rarely the exact same
+  patch version as ours), and without excluding them its transitively-pulled
+  copies collide with the ones we always supply ourselves
+  (`dist/nativelibs.cp`) -- hundreds of `clang` duplicate-symbol errors at
+  link time otherwise (two copies of the GC, of libc shims, ...).
 - Detects the entry point via a **heuristic text scan** (`@main def`,
   `object X extends App`, or a `def main(args: Array[String])` inside an
   `object` block, tracked via naive brace-depth counting) -- not
@@ -213,17 +227,23 @@ What it does:
 Verified against `examples/Hello.scala` (plain), `examples/macro-hello/`
 (real macro, **and** confirmed order-independent -- `Foo.scala Test.scala`
 and `Test.scala Foo.scala` both correctly detect `Test` as the entry point),
-a real `//> using dep "org.typelevel::cats-core:2.10.0"` resolution (cached
-correctly on rerun), and the ambiguous/missing-entry-point error paths.
+the ambiguous/missing-entry-point error paths, and all three dependency
+formats together in one resolution (`scala3-interfaces` exact,
+`com.lihaoyi::pprint` cross-Scala, `com.lihaoyi::os-lib::0.11.7`
+cross-platform). The last one is the strongest proof: not just resolved but
+**actually linked and called into** --
+`println(os.pwd)` (real POSIX `getcwd` underneath, via a real third-party
+scala-native library) compiled, linked, and printed the correct working
+directory end to end.
 
 **Known limitation, inherent to scala-native itself, not this tool**: a
 resolved dependency jar typechecks fine but only *links* if it's actually
-cross-published for scala-native (a `_native0.5_3`-suffixed artifact or
-equivalent). The cats-core test above only proves resolution/plumbing --
-`cats-core_3` itself is an ordinary JVM jar with no `.nir` bodies, so code
-that actually *called into* it would fail at the link step with unreachable
-symbols, same as it would under real scala-cli targeting `--native` with a
-JVM-only dependency.
+cross-published for scala-native (an `org::name::version`-resolvable
+artifact). A plain `org::name:version` JVM-only dependency (e.g.
+`org.typelevel::cats-core`) resolves and typechecks but has no `.nir`
+bodies, so code that actually *called into* it would fail at the link step
+with unreachable symbols, same as it would under real scala-cli targeting
+`--native` with a JVM-only dependency.
 
 Not implemented: watch mode, incremental Scala compilation (every `scli`
 build fully recompiles every given source file -- only the native-library

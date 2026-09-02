@@ -19,10 +19,15 @@ mkdir -p "$SRC_DIR"
 # Baked-in paths: scli isn't relocatable any more than dist/*.cp already
 # are (see docs/findings.md "Packaging/relocatability") -- it's built for,
 # and hardcodes, THIS checkout.
+# scala-native's own artifact-naming convention uses just major.minor (see
+# e.g. nativelib_native0.5_3) -- not the full patch version.
+NATIVE_BINARY_VERSION="$(echo "$SCALA_NATIVE_VERSION" | cut -d. -f1,2)"
+
 cat > "$SRC_DIR/BuildInfo.scala" <<EOF
 object BuildInfo:
   val root: String = "$ROOT"
   val scalaVersion: String = "$SCALA_VERSION"
+  val nativeBinaryVersion: String = "$NATIVE_BINARY_VERSION"
 EOF
 
 CLASSES_DIR="$WORK/scli-classes"

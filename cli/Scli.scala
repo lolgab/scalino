@@ -86,19 +86,51 @@ object Scli:
       scalaRe.findFirstMatchIn(line).foreach(m => scalaVersion = Some(m.group(1)))
     Directives(deps.distinct, scalaVersion)
 
-  /** `org::name:version` (cross-versioned -- scala-cli/mill/sbt %% syntax)
-   *  becomes `org:name_3:version`; `org:name:version` (exact artifact,
-   *  scala-cli/sbt %) is passed through unchanged. */
+  /** scala-cli's three dependency formats:
+   *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
+   *   - `org::name:version`  Scala-version cross (sbt `%%`)        -> `org:name_3:version`
+   *   - `org::name::version` platform+Scala cross (sbt `%%%`)      -> `org:name_native<binVer>_3:version`
+   *  (there is no `org:name::version` form -- scala-cli doesn't have a
+   *  "platform-only, not Scala-version" cross suffix, so a lone `::` before
+   *  the version with a single-colon name prefix is treated as malformed
+   *  and passed through unchanged rather than guessed at.)
+   */
   def toCoursierCoord(dep: String): String =
-    dep.split("::", 2) match
-      case Array(org, rest) =>
-        val i = rest.indexOf(':')
+    dep.split("::") match
+      case Array(_) => dep // no "::" at all: org:name:version, unchanged
+      case Array(org, nameAndVersion) =>
+        val i = nameAndVersion.indexOf(':')
         if i < 0 then dep
-        else s"$org:${rest.substring(0, i)}_3:${rest.substring(i + 1)}"
+        else s"$org:${nameAndVersion.substring(0, i)}_3:${nameAndVersion.substring(i + 1)}"
+      case Array(org, name, version) =>
+        s"$org:${name}_native${BuildInfo.nativeBinaryVersion}_3:$version"
       case _ => dep
 
   def sanitizeKey(s: String): String =
     s.map(c => if c.isLetterOrDigit then c else '_')
+
+  /** A `::name::version` (scala-native cross) dependency's own published
+   *  build pulls its OWN version of scala-native's runtime jars transitively
+   *  (whatever scala-native release it happened to be built against) --
+   *  almost never the exact same patch version as ours. Left alone, both
+   *  end up on the link classpath and clang fails with hundreds of
+   *  duplicate-symbol errors (two copies of the GC, two copies of libc
+   *  shims, ...). We always supply these ourselves (dist/nativelibs.cp), so
+   *  they're excluded here rather than resolved a second time. */
+  private def excludedArtifacts: List[String] =
+    val v = BuildInfo.nativeBinaryVersion
+    List(
+      s"org.scala-native:nativelib_native${v}_3",
+      s"org.scala-native:javalib_native${v}_3",
+      s"org.scala-native:auxlib_native${v}_3",
+      s"org.scala-native:posixlib_native${v}_3",
+      s"org.scala-native:clib_native${v}_3",
+      s"org.scala-native:windowslib_native${v}_3",
+      s"org.scala-native:scala3lib_native${v}_3",
+      s"org.scala-native:scalalib_native${v}_2.13",
+      "org.scala-lang:scala3-library_3",
+      "org.scala-lang:scala-library"
+    )
 
   /** Resolves `deps` to a classpath via native `cs fetch --classpath`,
    *  cached on disk keyed by the sorted dependency list -- `cs` itself does
@@ -115,8 +147,9 @@ object Scli:
       else
         val cs = findOnPath("cs")
         val coords = deps.map(toCoursierCoord)
+        val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
         System.err.println(s"scli: resolving ${deps.mkString(", ")}")
-        val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: List("--classpath"))
+        val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: List("--classpath"))
         if code != 0 then die(s"dependency resolution failed for: ${deps.mkString(", ")}")
         Files.write(cacheFile, cp.getBytes("UTF-8"))
         cp
