@@ -22,15 +22,19 @@ import scala.jdk.CollectionConverters.*
 
 object Scli:
 
-  // Resolved from the running binary's own path (not baked in at build time)
-  // so a copied/relocated dist/ directory still works -- see
-  // docs/findings.md "Packaging/relocatability". selfexe.SelfExe is one of
-  // three OS-specific implementations (cli/selfexe/*.scala); build/07-build-
-  // scli.sh picks the right one for the host OS at compile time.
-  val root: String =
+  // `dist` is wherever this binary itself lives, resolved from its own path
+  // (not baked in at build time) so a copied/relocated/extracted-from-a-
+  // release-tarball dist/ still works -- see docs/findings.md "Packaging/
+  // relocatability". Deliberately NOT "two levels up from the binary,
+  // then + /dist": that hardcoded a directory literally named `dist`,
+  // which release.yml's tarball layout (scli sitting directly next to
+  // lib/, compiler.cp, etc., with no `dist/` wrapper) doesn't have.
+  // selfexe.SelfExe is one of three OS-specific implementations
+  // (cli/selfexe/*.scala); build/07-build-scli.sh picks the right one for
+  // the host OS at compile time.
+  val dist: String =
     val exe = selfexe.SelfExe.path()
-    Paths.get(exe).toRealPath().getParent.getParent.toString
-  val dist: String = s"$root/dist"
+    Paths.get(exe).toRealPath().getParent.toString
 
   def die(msg: String): Nothing =
     System.err.println(s"scli: $msg")

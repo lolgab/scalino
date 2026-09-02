@@ -30,7 +30,17 @@ mkdir -p "$DIST" "$WORK"
 CLANG="$(command -v clang)"
 CLANGPP="$(command -v clang++)"
 
-require() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }; }
+# For a bare name, PATH-search via `command -v`. For a full path (as
+# resolve_tool above returns), check existence directly instead -- under
+# git-bash on Windows, `command -v` doesn't recognize a .cmd script given
+# as a literal path as executable, even though it runs fine when invoked.
+require() {
+  if [[ "$1" == */* ]]; then
+    [[ -e "$1" ]] || { echo "missing required tool: $1" >&2; exit 1; }
+  else
+    command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }
+  fi
+}
 require cs
 require "$JAVA"
 require "$NATIVE_IMAGE"
