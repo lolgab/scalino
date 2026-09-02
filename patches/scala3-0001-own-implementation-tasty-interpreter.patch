@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..62f2ab45 100644
+index e34d3506..a2ca4188 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -84,7 +84,7 @@ index e34d3506..62f2ab45 100644
    type Env = Map[Symbol, Object]
    def emptyEnv: Env = Map.empty
    inline def env(using e: Env): e.type = e
-@@ -61,43 +125,164 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -61,43 +125,173 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
    /** Returns the result of interpreting the code in the tree.
     *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
     */
@@ -142,6 +142,13 @@ index e34d3506..62f2ab45 100644
 +    case Try(expr, cases, finalizer) =>
 +      try
 +        try interpretTree(expr)
++        // A `throw` interpreted below always throws `InterpretedThrow`
++        // (its own interpreted value, e.g. an `InterpretedInstance`, isn't
++        // a real `Throwable` `throw` could raise directly) -- match cases
++        // against the *unwrapped* value, same as a real `catch` would see
++        // the real exception object, not some wrapper around it.
++        catch case InterpretedThrow(value) =>
++          interpretCases(cases, value).getOrElse(throw InterpretedThrow(value))
 +        catch case NonFatalInterpretedException(ex) =>
 +          interpretCases(cases, ex).getOrElse(throw ex)
 +      finally
@@ -192,6 +199,8 @@ index e34d3506..62f2ab45 100644
 +        Boolean.box(true) // best effort: we don't retain the type argument through the `Call` extractor
 +      else if isPrimitiveOp(fn.symbol, fn.qualifier.tpe) && args.nonEmpty then
 +        interpretPrimitiveOp(fn.symbol.name.toString, interpretTree(fn.qualifier), evalNonErased(rawArgs))
++      else if fn.symbol == defn.throwMethod then
++        throw InterpretedThrow(interpretTree(rawArgs.head))
 +      else if (fn.symbol.isConstructor)
 +        interpretNew(fn.symbol, rawArgs)
        else if (fn.symbol.is(Module))
@@ -257,7 +266,7 @@ index e34d3506..62f2ab45 100644
      // Interpret `foo(j = x, i = y)` which it is expanded to
      // `val j$1 = x; val i$1 = y; foo(i = i$1, j = j$1)`
      case Block(stats, expr) => interpretBlock(stats, expr)
-@@ -115,6 +300,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -115,6 +309,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        unexpectedTree(tree)
    }
  
@@ -266,7 +275,7 @@ index e34d3506..62f2ab45 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,2137 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +339,2154 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -739,9 +748,7 @@ index e34d3506..62f2ab45 100644
 +  // this very binary) or a recursive interpretation of the callee's own
 +  // retained tree.
 +  // ---------------------------------------------------------------------
- 
--  private def interpretModuleAccess(fn: Symbol): Object =
--    loadModule(fn.moduleClass)
++
 +  /** Some formal parameter slots (erased evidence, given markers the typer
 +   *  already resolved away) show up in the actual argument trees as literal
 +   *  `EmptyTree`, not merely absent. Interpreting `EmptyTree` always fails, so
@@ -758,17 +765,17 @@ index e34d3506..62f2ab45 100644
 +      // but fall back to positional truncation rather than crash outright.
 +      params.zip(rawArgs.filterNot(_.isEmpty)).map((p, t) => (p, interpretTree(t)))
  
+-  private def interpretModuleAccess(fn: Symbol): Object =
+-    loadModule(fn.moduleClass)
++  private def evalNonErased(rawArgs: List[Tree])(using Env): List[Object] =
++    rawArgs.filterNot(_.isEmpty).map(interpretTree)
+ 
 -  private def interpretNew(fn: Symbol, args: List[Object]): Object = {
 -    val className = fn.owner.fullName.mangledString.replaceAll("\\$\\.", "\\$")
 -    val clazz = loadClass(className)
 -    val constr = clazz.getConstructor(paramsSig(fn)*)
 -    constr.newInstance(args*).asInstanceOf[Object]
 -  }
-+  private def evalNonErased(rawArgs: List[Tree])(using Env): List[Object] =
-+    rawArgs.filterNot(_.isEmpty).map(interpretTree)
- 
--  private def unexpectedTree(tree: Tree): Object =
--    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}", tree.srcPos)
 +  private def interpretStaticCall(moduleClass: Symbol, fn: Symbol, rawArgs: List[Tree])(using Env): Object =
 +    lazy val args = evalNonErased(rawArgs)
 +    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
@@ -781,11 +788,8 @@ index e34d3506..62f2ab45 100644
 +        case _ => notInterpretable(fn)
 +    }
  
--  private def loadModule(sym: Symbol): Object =
--    if (sym.owner.is(Package)) {
--      // is top level object
--      val moduleClass = loadClass(sym.fullName.toString)
--      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
+-  private def unexpectedTree(tree: Tree): Object =
+-    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}", tree.srcPos)
 +  /** `Vector(...)`/`Set(...)`/`Seq(...)`/etc: `fn.owner` is useless here
 +   *  (always the abstract `IterableFactory`/`SeqFactory` trait, since the
 +   *  call site's static type is that trait, not the concrete companion) --
@@ -834,7 +838,12 @@ index e34d3506..62f2ab45 100644
 +      // placeholder is fine here.
 +      case "List" | "Vector" | "Map" | "Set" | "Seq" | "Array" => Some(ModuleValue(fn))
 +      case _ => None
-+
+ 
+-  private def loadModule(sym: Symbol): Object =
+-    if (sym.owner.is(Package)) {
+-      // is top level object
+-      val moduleClass = loadClass(sym.fullName.toString)
+-      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
 +  /** `Int.box`/`Int.unbox` and friends: compiler-generated calls with no
 +   *  retained source at all (they're synthesized, not really library code).
 +   *  Our values are already boxed `Object`s uniformly, so these are no-ops.
@@ -888,7 +897,13 @@ index e34d3506..62f2ab45 100644
 +    // `orElse(fn)` covers the (common) case where `fn` already *is* the
 +    // most-derived declaration, where `overridingSymbol` correctly finds
 +    // nothing.
-+    val dispatchFn = if concreteCls.exists then fn.overridingSymbol(concreteCls.asClass).orElse(fn) else fn
++    // `concreteCls.exists` alone isn't enough -- `receiverConcreteClass`'s
++    // `ModuleValue(moduleClass) => moduleClass` case can hand back a
++    // non-class symbol in the wild (e.g. `interpretModuleAccess`'s
++    // `ModuleValue(fn.owner)`, whenever `fn`'s owner isn't itself a
++    // module/class), and `.asClass` throws a `ClassCastException` on
++    // anything that isn't (crashed a real run of examples/macro-hello).
++    val dispatchFn = if concreteCls.exists && concreteCls.isClass then fn.overridingSymbol(concreteCls.asClass).orElse(fn) else fn
 +    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).getOrElse {
 +      resolveExternalDefTree(dispatchFn) match
 +        case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
@@ -946,7 +961,7 @@ index e34d3506..62f2ab45 100644
 +              // actually runs -- look up the real implementation by name on
 +              // the concrete class and use *its* defTree instead (ordinary
 +              // virtual dispatch, which `Symbol.defTree` alone doesn't do).
-+              if concreteCls.exists then
++              if concreteCls.exists && concreteCls.isClass then
 +                superAccessorTarget(fn, concreteCls) match
 +                  case Some(target) =>
 +                    resolveExternalDefTree(target) match
@@ -2548,6 +2563,17 @@ index e34d3506..62f2ab45 100644
 + *  it targets -- how dotc lowers matches (among other things) internally.
 + */
 +final case class LabeledReturn(label: Symbol, value: Object) extends Exception(null, null, false, false)
++
++/** `throw expr`: dotc desugars it to `Apply(Ident(defn.throwMethod), List(expr))`
++ *  (`<special-ops>.throw`, a synthetic method with no retained/interpretable
++ *  body of its own -- see `Definitions#throwMethod`), not a dedicated tree
++ *  node. `expr`'s own interpreted value (e.g. an `InterpretedInstance` for
++ *  a macro-defined exception class) is never a real `java.lang.Throwable`
++ *  a JVM `throw` could raise directly, so wrap it to actually unwind the
++ *  interpreter's own call stack; `Try`'s own `case InterpretedThrow(value)`
++ *  unwraps it back before matching catch cases against it.
++ */
++final case class InterpretedThrow(value: Object) extends Exception(null, null, false, false)
 +
 +object NonFatalInterpretedException:
 +  def unapply(ex: Throwable): Option[Throwable] = scala.util.control.NonFatal.unapply(ex)
