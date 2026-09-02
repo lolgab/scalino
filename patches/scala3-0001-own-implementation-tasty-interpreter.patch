@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..670ec186 100644
+index e34d3506..62f2ab45 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..670ec186 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,2127 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,2137 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -2532,7 +2532,17 @@ index e34d3506..670ec186 100644
 + *  within the same block) can be interpreted instead of just returned as a
 + *  value the way a local `val` reference would be.
 + */
-+final case class LocalDef(ddef: tpd.DefDef, var closureEnv: Map[Symbol, Object])
++final case class LocalDef(ddef: tpd.DefDef, var closureEnv: Map[Symbol, Object]):
++  // A self-recursive local `def`'s own `closureEnv` is mutated (see the
++  // call site binding it) to map its own symbol back to *this* `LocalDef`,
++  // a deliberate cycle so the def can call itself. The case class's
++  // auto-generated `toString` walks `closureEnv` (a plain `Map#toString`),
++  // which walks back into this `LocalDef`, forever -- a real
++  // `StackOverflowError` seen via any incidental `.toString`/`.show` of an
++  // environment containing one (an error message, `mkString`, a debug
++  // print). Print just the def's name; nothing here needs the full
++  // (cyclic) closure printed anyway.
++  override def toString: String = s"LocalDef(${ddef.name})"
 +
 +/** Interprets `return[label] value` / the enclosing `Labeled(label, ...)` block
 + *  it targets -- how dotc lowers matches (among other things) internally.

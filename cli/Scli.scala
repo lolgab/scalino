@@ -324,8 +324,20 @@ object Scli:
     // scala-native-blessed artifacts, untouched.
     val scalalibRetained = s"$dist/lib/scalalib-retained.jar"
 
+    // `compilerCp`/`nativelibsCp` each carry their own plain, scalac-compiled
+    // scala-library jar (2.13.16 and 2.13.18 respectively) -- having *both*
+    // that jar and scalalibRetained's recompiled one on the same classpath
+    // is genuinely ambiguous, not just redundant: which one dotc's classpath
+    // scanning resolves scala.Option/scala.Some/etc to (and so whether
+    // resolveExternalDefTree finds a real body at all) turned out to depend
+    // on timing/caching, not just declaration order -- non-deterministic
+    // between otherwise-identical runs. Drop the plain jar entirely from the
+    // compile classpath so scalalibRetained is the only one providing it.
+    def dropPlainScalaLibrary(cp: String): String =
+      cp.split(":").filterNot(_.matches(""".*/scala-library-[0-9.]+\.jar""")).mkString(":")
+
     val compileCp =
-      List(scalalibRetained, compilerCp, nativelibsCp, extraClasspath, extraCompileOnlyClasspath)
+      List(scalalibRetained, dropPlainScalaLibrary(compilerCp), dropPlainScalaLibrary(nativelibsCp), extraClasspath, extraCompileOnlyClasspath)
         .filter(_.nonEmpty).mkString(":")
 
     val compileCmd = List(
