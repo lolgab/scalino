@@ -173,8 +173,63 @@ JVM-free piece already available (coursier ships `cs` itself as a prebuilt
 GraalVM native-image launcher, so shelling out to it for dependency
 resolution costs no JVM despite coursier being JVM Scala under the hood),
 and hand-roll the rest (directives, an incremental-compile cache, watch mode)
-purpose-built rather than porting zinc/BSP. Not started — this section is a
-placeholder for when that work begins.
+purpose-built rather than porting zinc/BSP.
+
+### `scli`: implemented, self-hosted
+
+`cli/Scli.scala` is a mini scala-cli-style CLI (`scli run`/`scli compile`),
+built by `build/07-build-scli.sh` -- itself compiled by
+`dist/dotc-native`+`dist/linkdriver-native` (bootstrapped once those exist),
+**not** by any JVM. This closes the loop: the build tool driving the
+compiler is itself a product of that same compiler.
+
+What it does:
+- Parses `//> using dep "org::name:version"` (cross-versioned, `::` gets
+  `_3` appended) and `//> using dep "org:name:version"` (exact artifact) --
+  one per line, anywhere in any given source file. `//> using scala "x"`
+  is parsed and produces a warning (not an error) if it disagrees with the
+  toolchain's pinned version -- there's no multi-version support, this
+  binary only ever targets the Scala/scala-native version it was built for.
+- Resolves dependencies via a native `cs fetch --classpath` subprocess,
+  cached on disk (`.scli-build/deps-cache/`) keyed by the sorted dependency
+  list, so repeat runs skip the resolution step (and its network
+  round-trip) entirely, not just the artifact download `cs` already caches
+  itself.
+- Detects the entry point via a **heuristic text scan** (`@main def`,
+  `object X extends App`, or a `def main(args: Array[String])` inside an
+  `object` block, tracked via naive brace-depth counting) -- not
+  compiler-driven, since this binary has no reflection/introspection
+  machinery to ask the compiler "what did you just produce." Works for
+  normal formatting; can misfire on deliberately adversarial code (e.g. a
+  `{`/`}` inside a string or comment throws off the depth counter). Ambiguous
+  or missing entry points are a clear error asking for `--main-class`, not a
+  guess. This also fixes `bin/snc`'s documented "first file's basename"
+  limitation -- source file order no longer matters.
+- Drives `dotc-native`/`linkdriver-native` directly (reading the same
+  `dist/*.cp` manifests `bin/snc` uses), with the resolved dependency
+  classpath folded in, into the same persistent `.scli-build/<mainClass>/`
+  caching layout `bin/snc` uses (see the C-object-cache fix above).
+
+Verified against `examples/Hello.scala` (plain), `examples/macro-hello/`
+(real macro, **and** confirmed order-independent -- `Foo.scala Test.scala`
+and `Test.scala Foo.scala` both correctly detect `Test` as the entry point),
+a real `//> using dep "org.typelevel::cats-core:2.10.0"` resolution (cached
+correctly on rerun), and the ambiguous/missing-entry-point error paths.
+
+**Known limitation, inherent to scala-native itself, not this tool**: a
+resolved dependency jar typechecks fine but only *links* if it's actually
+cross-published for scala-native (a `_native0.5_3`-suffixed artifact or
+equivalent). The cats-core test above only proves resolution/plumbing --
+`cats-core_3` itself is an ordinary JVM jar with no `.nir` bodies, so code
+that actually *called into* it would fail at the link step with unreachable
+symbols, same as it would under real scala-cli targeting `--native` with a
+JVM-only dependency.
+
+Not implemented: watch mode, incremental Scala compilation (every `scli`
+build fully recompiles every given source file -- only the native-library
+object cache and the dependency-resolution cache are incremental),
+multi-module projects, and anything past the one directive kind above
+(no `//> using options`, `//> using resourceDir`, toolkit shortcuts, etc.).
 
 ### `bin/snc` created a fresh tmp dir every build — first real bug found
 
@@ -241,14 +296,17 @@ causes, one in each layer:
    but isn't yet a distributable, self-contained tarball. Follow-up: vendor
    the referenced jars into `dist/lib/` and rewrite the manifests to relative
    paths.
-4. **A real JVM-free build-tool experience.** See "Toward a build-tool
-   experience without a JVM" above — dependency resolution via native `cs`,
-   `//> using` directives, watch mode. Not started.
+4. **`scli` follow-ups.** See "Toward a build-tool experience without a JVM"
+   above for what's implemented. Missing: watch mode, incremental Scala
+   compilation (see item 7), multi-module projects, more `//> using`
+   directive kinds, and a real (not heuristic-text-scan) entry-point
+   detector.
 5. Only tested on macOS/arm64. Linux/other-arch is unverified.
 6. `bin/snc`'s "first source file's basename is the main class" convention is
-   naive — for multi-file macro examples the entry-point file must be listed
-   first (see `examples/macro-hello/` usage in the README). A real CLI would
-   detect the actual `@main`/`extends App` entry point instead.
+   still naive (unlike `scli`, which auto-detects) — for multi-file macro
+   examples via `bin/snc` directly, the entry-point file must be listed
+   first (see `examples/macro-hello/` usage in the README).
 7. Only compiling Scala source is incremental-cache-free right now — `dotc`
    always fully recompiles every given source file. The native-library object
-   cache fixed above only covers scala-native's own vendored runtime sources.
+   cache fixed above, and `scli`'s dependency-resolution cache, are the only
+   incremental pieces so far.

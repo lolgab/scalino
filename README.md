@@ -13,23 +13,43 @@ Requires: GraalVM JDK 21+ (with `native-image`), `clang`, `coursier` (`cs`),
 ./build/all.sh
 ```
 
-This clones `scala/scala3` into `vendor/scala3` (pinned tag, see
-`versions.env`), applies our patches from `patches/`, and produces
-`dist/dotc-native` (standalone compiler + scala-native plugin, our patched
-macro interpreter baked in) and `dist/linkdriver-native` (standalone
-NIR→native linker), plus the classpath manifests `bin/snc` needs.
+This clones `scala/scala3` and `scala-native/scala-native` into `vendor/`
+(pinned versions, see `versions.env`), applies our patches from `patches/`,
+and produces `dist/dotc-native` (standalone compiler + scala-native plugin,
+our patched macro interpreter baked in), `dist/linkdriver-native` (standalone
+NIR→native linker), and `dist/scli` (see below) -- plus the classpath
+manifests `bin/snc`/`scli` need.
 
 ## Use
+
+The easy way — `scli`, a mini scala-cli-style build tool (see
+`cli/Scli.scala`), itself compiled by this toolchain, not by a JVM:
+
+```
+./dist/scli run examples/Hello.scala
+./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala   # a real macro
+./dist/scli compile examples/Hello.scala -o hello && ./hello
+```
+
+It auto-detects the entry point (`@main`, `extends App`, or `def main`), so
+source file order doesn't matter, and understands `//> using dep
+"org::name:version"` / `//> using scala "x"` directives — dependency
+resolution shells out to `cs` (coursier's own launcher is itself a prebuilt
+GraalVM native-image binary, so this costs no JVM either), and both the
+resolved classpath and the compiled/linked output are cached in
+`.scli-build/`. Only libraries actually cross-published for scala-native
+will *link* successfully (JVM-only jars resolve and typecheck fine, but have
+no native code to call into) — see `docs/findings.md`.
+
+The lower-level way — `bin/snc`, a plain bash wrapper (what `scli` itself
+was bootstrapped from, and what `scli`'s own build script still uses):
 
 ```
 ./bin/snc build examples/Hello.scala -o hello
 ./hello
-
-./bin/snc build examples/macro-hello/Test.scala examples/macro-hello/Foo.scala -o macro-hello
-./macro-hello   # a real inline/quote macro, expanded with no JVM involved
 ```
 
-Neither `dotc-native`, `linkdriver-native`, nor `snc` invoke a JVM.
+Neither `dotc-native`, `linkdriver-native`, `scli`, nor `snc` invoke a JVM.
 
 ## Status
 
