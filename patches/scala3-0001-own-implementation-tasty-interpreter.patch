@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..bf51c086 100644
+index e34d3506..382d3a42 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -264,7 +264,7 @@ index e34d3506..bf51c086 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +328,1560 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +328,1596 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -331,6 +331,24 @@ index e34d3506..bf51c086 100644
 +      if matchesRuntimeType(scrutinee, tpt.tpe) then Some(env) else None
 +    case Typed(inner, _) => matchPattern(inner, scrutinee)
 +    case Alternative(pats) => pats.iterator.map(p => matchPattern(p, scrutinee)).find(_.isDefined).flatten
++    case QuotePattern(bindings, body, _) =>
++      // `case '[ft] =>`/`case '[type ft; ft] =>` (matching a `Type[?]`
++      // scrutinee, pre-`QuotePatterns`-phase raw shape -- that phase
++      // normally lowers this into a `TypeMatch.unapply` call, but
++      // `-Yretain-trees` captures the tree before it runs). Only the
++      // "bare type variable, no real structural shape" case is handled: a
++      // single binding whose own symbol *is* the whole pattern body always
++      // matches, binding it directly to the scrutinee type (our `Type[T]`/
++      // `TypeRepr` values are the same raw dotc `Type` either way). A real
++      // structural shape (e.g. `case '[List[t]] =>`) would need genuine
++      // type-shape unification against `body`, not attempted here.
++      bindings match
++        case (b: Bind) :: Nil if body.symbol == b.symbol =>
++          Some(env.updated(b.symbol, scrutinee))
++        case _ =>
++          throw new StopInterpretation(
++            em"Interpreter (own implementation) does not support structural quote-type patterns yet (only a bare type-variable pattern like `case '[t] =>`): ${pat.show}",
++            pat.srcPos)
 +    case (_: Ident | _: Select) if pat.symbol.exists && !pat.symbol.is(Method) =>
 +      // A stable-identifier pattern (e.g. `case scala.reflect.ClassTag.ObjectTYPE => ...`,
 +      // matching a `val` by equality, not deconstructing anything) --
@@ -389,7 +407,7 @@ index e34d3506..bf51c086 100644
 +              // matches iff the real `List`'s length equals the pattern
 +              // count (`patterns` is captured from the enclosing `UnApply`).
 +              Some {
-+                case s: Seq[Object @unchecked] => if s.size == patterns.size then Some(s.toList) else None
++                case s: scala.collection.Seq[Object @unchecked] => if s.size == patterns.size then Some(s.toList) else None
 +                case _ => None
 +              }
 +            case name =>
@@ -523,7 +541,7 @@ index e34d3506..bf51c086 100644
 +   *  from `interpretTree0`'s Call dispatch but otherwise unused here).
 +   */
 +  private def interpretCollectionFactory(moduleClass: Symbol, fn: Symbol, args: => List[Object]): Option[Object] =
-+    def elems: Seq[Object] = args match { case (s: Seq[Object] @unchecked) :: Nil => s; case other => other }
++    def elems: scala.collection.Seq[Object] = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
 +    (moduleClass.name.toString.stripSuffix("$"), fn.name.toString) match
 +      case ("List", "apply") => Some(elems.toList)
 +      case ("List", "empty") => Some(Nil)
@@ -586,6 +604,10 @@ index e34d3506..bf51c086 100644
 +    if fn.name.toString == "newInstance" && fn.owner.showFullName == "java.lang.reflect.Array" then
 +      args match
 +        case _ :: (len: Integer) :: Nil => Some(new Array[Object](len))
++        case _ => None
++    else if fn.name.toString == "copyOf" && fn.owner.showFullName == "java.util.Arrays" then
++      args match
++        case (a: Array[Object] @unchecked) :: (len: Integer) :: Nil => Some(java.util.Arrays.copyOf(a, len))
 +        case _ => None
 +    else None
  
@@ -1461,14 +1483,14 @@ index e34d3506..bf51c086 100644
 +      // body) `apply` method (`.s(...)` is an instance call, handled in
 +      // `interpretStdlibIntrinsic` instead).
 +      case "apply" if fn.owner.name.toString.stripSuffix("$") == "StringContext" =>
-+        val parts = args match { case (s: Seq[Object] @unchecked) :: Nil => s; case other => other }
-+        Some(scala.StringContext(parts.map(_.toString)*))
++        val parts = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
++        Some(scala.StringContext(parts.map(_.toString).toSeq*))
 +      case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "Set" =>
 +        Some(scala.collection.immutable.Set.newBuilder[Object])
 +      case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "List" =>
 +        Some(List.newBuilder[Object])
 +      case "apply" if fn.owner.name.toString.stripSuffix("$") == "List" =>
-+        val elems = args match { case (s: Seq[Object] @unchecked) :: Nil => s; case other => other }
++        val elems = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
 +        Some(elems.toList)
 +      case "empty" if fn.owner.name.toString.stripSuffix("$") == "List" =>
 +        Some(Nil)
@@ -1635,63 +1657,63 @@ index e34d3506..bf51c086 100644
 +      // from the type's own symbol instead of any real reflection.
 +      case (t: dotty.tools.dotc.core.Types.Type @unchecked, "isPrimitive", Nil) =>
 +        Some(Boolean.box(t.typeSymbol.isPrimitiveValueClass))
-+      case (s: Seq[Object] @unchecked, "sum", _) => Some(s.reduceOption(numericPlus).getOrElse(0.asInstanceOf[Object])) // ignores the `Numeric[T]` evidence arg
-+      case (s: Seq[Object] @unchecked, "map", (f: Function1[Object, Object] @unchecked) :: Nil) => Some(s.map(f))
-+      case (s: Seq[Object] @unchecked, "mkString", Nil) => Some(s.mkString)
-+      case (s: Seq[Object] @unchecked, "mkString", (sep: String) :: Nil) => Some(s.mkString(sep))
-+      case (s: Seq[Object] @unchecked, "head", Nil) => Some(s.head)
-+      case (s: Seq[Object] @unchecked, "headOption", Nil) => Some(s.headOption)
-+      case (s: Seq[Object] @unchecked, "last", Nil) => Some(s.last)
-+      case (s: Seq[Object] @unchecked, "tail", Nil) => Some(s.tail)
-+      case (s: Seq[Object] @unchecked, "isEmpty", Nil) => Some(Boolean.box(s.isEmpty))
-+      case (s: Seq[Object] @unchecked, "nonEmpty", Nil) => Some(Boolean.box(s.nonEmpty))
-+      case (s: Seq[Object] @unchecked, "size" | "length", Nil) => Some(Int.box(s.size))
-+      case (s: Seq[Object] @unchecked, "reverse", Nil) => Some(s.reverse)
-+      case (s: Seq[Object] @unchecked, "grouped", (n: Integer) :: Nil) => Some(s.grouped(n))
-+      case (s: Seq[Object] @unchecked, "sliding", (n: Integer) :: Nil) => Some(s.sliding(n))
-+      case (s: Seq[Object] @unchecked, "take", (n: Integer) :: Nil) => Some(s.take(n))
-+      case (s: Seq[Object] @unchecked, "drop", (n: Integer) :: Nil) => Some(s.drop(n))
-+      case (s: Seq[Object] @unchecked, "splitAt", (n: Integer) :: Nil) => Some(s.splitAt(n))
-+      case (s: Seq[Object] @unchecked, "distinct", Nil) => Some(s.distinct)
-+      case (s: Seq[Object] @unchecked, "filter", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "sum", _) => Some(s.reduceOption(numericPlus).getOrElse(0.asInstanceOf[Object])) // ignores the `Numeric[T]` evidence arg
++      case (s: scala.collection.Seq[Object] @unchecked, "map", (f: Function1[Object, Object] @unchecked) :: Nil) => Some(s.map(f))
++      case (s: scala.collection.Seq[Object] @unchecked, "mkString", Nil) => Some(s.mkString)
++      case (s: scala.collection.Seq[Object] @unchecked, "mkString", (sep: String) :: Nil) => Some(s.mkString(sep))
++      case (s: scala.collection.Seq[Object] @unchecked, "head", Nil) => Some(s.head)
++      case (s: scala.collection.Seq[Object] @unchecked, "headOption", Nil) => Some(s.headOption)
++      case (s: scala.collection.Seq[Object] @unchecked, "last", Nil) => Some(s.last)
++      case (s: scala.collection.Seq[Object] @unchecked, "tail", Nil) => Some(s.tail)
++      case (s: scala.collection.Seq[Object] @unchecked, "isEmpty", Nil) => Some(Boolean.box(s.isEmpty))
++      case (s: scala.collection.Seq[Object] @unchecked, "nonEmpty", Nil) => Some(Boolean.box(s.nonEmpty))
++      case (s: scala.collection.Seq[Object] @unchecked, "size" | "length", Nil) => Some(Int.box(s.size))
++      case (s: scala.collection.Seq[Object] @unchecked, "reverse", Nil) => Some(s.reverse)
++      case (s: scala.collection.Seq[Object] @unchecked, "grouped", (n: Integer) :: Nil) => Some(s.grouped(n))
++      case (s: scala.collection.Seq[Object] @unchecked, "sliding", (n: Integer) :: Nil) => Some(s.sliding(n))
++      case (s: scala.collection.Seq[Object] @unchecked, "take", (n: Integer) :: Nil) => Some(s.take(n))
++      case (s: scala.collection.Seq[Object] @unchecked, "drop", (n: Integer) :: Nil) => Some(s.drop(n))
++      case (s: scala.collection.Seq[Object] @unchecked, "splitAt", (n: Integer) :: Nil) => Some(s.splitAt(n))
++      case (s: scala.collection.Seq[Object] @unchecked, "distinct", Nil) => Some(s.distinct)
++      case (s: scala.collection.Seq[Object] @unchecked, "filter", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(s.filter(f(_).asInstanceOf[Boolean]))
-+      case (s: Seq[Object] @unchecked, "exists", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "exists", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(Boolean.box(s.exists(f(_).asInstanceOf[Boolean])))
-+      case (s: Seq[Object] @unchecked, "forall", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "forall", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(Boolean.box(s.forall(f(_).asInstanceOf[Boolean])))
-+      case (s: Seq[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
-+      case (s: Seq[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(s(i))
-+      case (s: Seq[Object] @unchecked, "zip", (o: Seq[Object] @unchecked) :: Nil) => Some(s.zip(o))
-+      case (s: Seq[Object] @unchecked, "zipWithIndex", Nil) => Some(s.zipWithIndex.map((v, i) => (v, Int.box(i))))
-+      case (s: Seq[Object] @unchecked, "toList", Nil) => Some(s.toList)
-+      case (s: Seq[Object] @unchecked, "toSet", Nil) => Some(s.toSet)
-+      case (s: Seq[Object] @unchecked, "toVector", Nil) => Some(s.toVector)
-+      case (s: Seq[Object] @unchecked, "indexOf", (v: Object) :: Nil) => Some(Int.box(s.indexOf(v)))
-+      case (s: Seq[Object] @unchecked, "foldLeft", (z: Object) :: (f: Function2[Object, Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
++      case (s: scala.collection.Seq[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(s(i))
++      case (s: scala.collection.Seq[Object] @unchecked, "zip", (o: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(s.zip(o))
++      case (s: scala.collection.Seq[Object] @unchecked, "zipWithIndex", Nil) => Some(s.zipWithIndex.map((v, i) => (v, Int.box(i))))
++      case (s: scala.collection.Seq[Object] @unchecked, "toList", Nil) => Some(s.toList)
++      case (s: scala.collection.Seq[Object] @unchecked, "toSet", Nil) => Some(s.toSet)
++      case (s: scala.collection.Seq[Object] @unchecked, "toVector", Nil) => Some(s.toVector)
++      case (s: scala.collection.Seq[Object] @unchecked, "indexOf", (v: Object) :: Nil) => Some(Int.box(s.indexOf(v)))
++      case (s: scala.collection.Seq[Object] @unchecked, "foldLeft", (z: Object) :: (f: Function2[Object, Object, Object] @unchecked) :: Nil) =>
 +        Some(s.foldLeft(z)(f))
-+      case (s: Seq[Object] @unchecked, "foldRight", (z: Object) :: (f: Function2[Object, Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "foldRight", (z: Object) :: (f: Function2[Object, Object, Object] @unchecked) :: Nil) =>
 +        Some(s.foldRight(z)(f))
-+      case (s: Seq[Object] @unchecked, "reduce" | "reduceLeft", (f: Function2[Object, Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "reduce" | "reduceLeft", (f: Function2[Object, Object, Object] @unchecked) :: Nil) =>
 +        Some(s.reduceLeft(f))
-+      case (s: Seq[Object] @unchecked, "count", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "count", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(Int.box(s.count(f(_).asInstanceOf[Boolean])))
-+      case (s: Seq[Object] @unchecked, "find", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "find", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(s.find(f(_).asInstanceOf[Boolean]))
-+      case (s: Seq[Object] @unchecked, "flatMap", (f: Function1[Object, Seq[Object] @unchecked] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "flatMap", (f: Function1[Object, scala.collection.Seq[Object] @unchecked] @unchecked) :: Nil) =>
 +        Some(s.flatMap(f))
-+      case (s: Seq[Seq[Object] @unchecked] @unchecked, "flatten", Nil) => Some(s.flatten)
-+      case (s: Seq[Object] @unchecked, "flatten", (asIterable: Function1[Object, IterableOnce[Object] @unchecked] @unchecked) :: Nil) =>
++      case (s: Seq[scala.collection.Seq[Object] @unchecked] @unchecked, "flatten", Nil) => Some(s.flatten)
++      case (s: scala.collection.Seq[Object] @unchecked, "flatten", (asIterable: Function1[Object, IterableOnce[Object] @unchecked] @unchecked) :: Nil) =>
 +        // Real `flatten` takes an implicit `A => IterableOnce[B]` evidence
 +        // arg (already interpreted, e.g. via the `$conforms` identity
 +        // fallback above) -- use it as the flatMap function.
 +        Some(s.flatMap(asIterable))
-+      case (s: Seq[Object] @unchecked, "foreach", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "foreach", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        s.foreach(f); Some(().asInstanceOf[Object])
-+      case (s: Seq[Object] @unchecked, "sortBy", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++      case (s: scala.collection.Seq[Object] @unchecked, "sortBy", (f: Function1[Object, Object] @unchecked) :: Nil) =>
 +        Some(s.sortBy(f(_).toString))
-+      case (s: Seq[Object] @unchecked, "::" | "+:", (v: Object) :: Nil) => Some(v +: s)
-+      case (s: Seq[Object] @unchecked, ":+", (v: Object) :: Nil) => Some(s :+ v)
-+      case (a: Seq[Object] @unchecked, "++" | ":::", (b: Seq[Object] @unchecked) :: Nil) => Some(a ++ b)
++      case (s: scala.collection.Seq[Object] @unchecked, "::" | "+:", (v: Object) :: Nil) => Some(v +: s)
++      case (s: scala.collection.Seq[Object] @unchecked, ":+", (v: Object) :: Nil) => Some(s :+ v)
++      case (a: scala.collection.Seq[Object] @unchecked, "++" | ":::", (b: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(a ++ b)
 +      case (s: String, "length", Nil) => Some(Int.box(s.length))
 +      case (s: String, "+", (o: Object) :: Nil) => Some(s + String.valueOf(o))
 +      case (s: String, "isEmpty", Nil) => Some(Boolean.box(s.isEmpty))
@@ -1725,6 +1747,15 @@ index e34d3506..bf51c086 100644
 +      // in the first place) -- likewise no retained defTree for these, but
 +      // common enough in derivation-macro memoization state to be worth a
 +      // direct intrinsic rather than failing.
++      // A real host `Array[Object]` (e.g. from the `java.lang.reflect.Array`
++      // stand-in above): `.apply`/`.update`/`.length` on arrays are special,
++      // compiler-synthesized ops in real Scala (no real method body ever
++      // exists for them, `<special-ops>` in error messages), so they need a
++      // direct case here rather than falling through to `resolveExternalDefTree`.
++      case (a: Array[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(a(i))
++      case (a: Array[Object] @unchecked, "update", (i: Integer) :: (v: Object) :: Nil) =>
++        a(i) = v; Some(().asInstanceOf[Object])
++      case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
 +      case (m: mutable.Map[Object, Object] @unchecked, "put", (k: Object) :: (v: Object) :: Nil) => Some(m.put(k, v))
 +      case (m: mutable.Map[Object, Object] @unchecked, "get", (k: Object) :: Nil) => Some(m.get(k))
 +      case (m: mutable.Map[Object, Object] @unchecked, "getOrElseUpdate", (k: Object) :: (default: Object) :: Nil) =>
@@ -1818,7 +1849,7 @@ index e34d3506..bf51c086 100644
 +        // already-interpreted `Seq` (see `interpretVarargs`/`SeqLiteral`),
 +        // not as separate positional args -- unwrap that one level before
 +        // spreading.
-+        val flatArgs = rawArgs match { case (s: Seq[Object] @unchecked) :: Nil => s; case other => other }
++        val flatArgs = (rawArgs match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }).toSeq
 +        Some(if fn.name.toString == "s" then sc.s(flatArgs*) else sc.raw(flatArgs*))
 +      // `._1`/`._2`/... on any real `Product` (any Tuple, or any real
 +      // case-class-shaped host value) -- no retained body for these on the
@@ -1829,7 +1860,12 @@ index e34d3506..bf51c086 100644
 +      case (i: Integer, "until", (end: Integer) :: Nil) => Some(scala.Range(i, end))
 +      case (i: Integer, "to", (end: Integer) :: Nil) => Some(scala.Range.inclusive(i, end))
 +      case (r, "toString", Nil) => Some(r.toString)
-+      case _ => None
++      // A `ModuleValue`-qualified static call (e.g. `java.util.Arrays.copyOf`)
++      // reaches this dispatcher too (not just `interpretStaticCall`), since
++      // `Call`'s qualifier-based static branch now runs it through
++      // `interpretInstanceCall` for `this`-binding reasons -- reuse the
++      // same JDK-native-leaf cases either path can hit.
++      case _ => interpretJavaReflectionIntrinsic(fn, args)
 +
 +  private def numericPlus(a: Object, b: Object): Object = interpretPrimitiveOp("+", a, List(b))
 +
