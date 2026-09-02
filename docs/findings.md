@@ -366,7 +366,26 @@ causes, one in each layer:
    commands -- none of those have an obvious JVM-free equivalent yet (no
    vendored test framework, no scalafmt, no bloop), so they currently just
    print "not implemented" rather than being faked.
-5. Only tested on macOS/arm64. Linux/other-arch is unverified.
+5. Now covered by CI (`.github/workflows/ci.yml`) on Linux and macOS,
+   x86_64 and arm64 -- all four build, link, and run the plain-program and
+   real-macro smoke tests, plus a relocatability check that mirrors the
+   release tarball's flat layout. Windows (x86_64 and arm64) is still
+   experimental: CI found and fixed three real bugs so far (GraalVM tool
+   paths need `.exe`/`.cmd` resolved explicitly for a literal path, `git
+   apply` needs `-c core.autocrlf=false` on the vendor clone plus
+   `.gitattributes` pinning `patches/*.patch` to LF, and `require()` needs a
+   plain existence check rather than `command -v` for literal paths -- see
+   the "resolve GraalVM tool paths"/"force LF for vendor clone" commits) and
+   is now getting as far as `02-build-java-base.sh` before failing silently
+   in `03a-patch-compiler.sh` with no error output. Prime suspect: `cs
+   fetch --classpath`'s output separator. Every build script (`01-fetch-
+   deps.sh` onward) joins/splits classpaths on a hardcoded `:`, matching
+   Unix's `java.io.File.pathSeparator` -- Windows' is `;`, and even if that
+   weren't a factor, naively splitting a Windows path with a drive letter
+   (`C:\...`) on `:` would mis-parse it regardless of the real separator.
+   Confirming and fixing this needs actually reading a failed Windows run's
+   intermediate `.build-work/*.cp` files (not currently uploaded anywhere),
+   or a real Windows box -- deliberately not guessed at blind here.
 6. `bin/snc`'s "first source file's basename is the main class" convention is
    still naive (unlike `scli`, which auto-detects) — for multi-file macro
    examples via `bin/snc` directly, the entry-point file must be listed
