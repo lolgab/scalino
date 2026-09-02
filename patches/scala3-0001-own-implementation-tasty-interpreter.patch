@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..23e714ba 100644
+index e34d3506..3a85864f 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..23e714ba 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1675 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1705 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -597,7 +597,12 @@ index e34d3506..23e714ba 100644
 +      case ("Set", "empty") => Some(Set.empty[Object])
 +      case ("Array", "apply") => Some(elems.toArray)
 +      case _ => None
-+
+ 
+-  private def loadModule(sym: Symbol): Object =
+-    if (sym.owner.is(Package)) {
+-      // is top level object
+-      val moduleClass = loadClass(sym.fullName.toString)
+-      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
 +  /** `Nil`/`None`: in the `scala` package, referenced as plain vals (not
 +   *  `Module`-flagged symbols, so the generic `fn.symbol.is(Module)` case in
 +   *  `interpretTree0` doesn't catch them) whose forwarder body lives in
@@ -635,12 +640,7 @@ index e34d3506..23e714ba 100644
 +    val isBoxCompanion = Set("Int", "Boolean", "Long", "Double", "Float", "Byte", "Short", "Char", "Unit").contains(ownerName)
 +    if isBoxCompanion && (fn.name.toString.startsWith("box") || fn.name.toString.startsWith("unbox")) then args.headOption
 +    else None
- 
--  private def loadModule(sym: Symbol): Object =
--    if (sym.owner.is(Package)) {
--      // is top level object
--      val moduleClass = loadClass(sym.fullName.toString)
--      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
++
 +  /** `java.lang.reflect.Array.newInstance(componentType, len)`: real
 +   *  JDK-native reflection, no Scala source -- and it wouldn't work for real
 +   *  even if we called it directly, since `componentType` here is our own
@@ -716,22 +716,28 @@ index e34d3506..23e714ba 100644
 +                case ModuleValue(moduleClass) => moduleClass
 +                case _ => NoSymbol
 +              if concreteCls.exists then
-+                // `overridingSymbol` (not a raw `.member(name)` lookup):
-+                // that alone throws on an overloaded name (e.g.
-+                // `sizeCompare(Int)` vs `sizeCompare(Iterable[?])` --
-+                // `.symbol` on a multi-alternative denotation is ambiguous)
-+                // and a plain signature-equality check is *also* wrong for
-+                // a covariant-return override (e.g. `ClassValueCompat`'s
-+                // abstract `computeValue(cls): T` erases `T` to `Object`,
-+                // but a concrete `cache$` extending
-+                // `ClassValueCompat[WeakReference[...]]` overrides it with
-+                // a real, narrower, DIFFERENT-signature return type) --
-+                // `overridingSymbol` is dotc's own override-matching
-+                // logic, handling both correctly.
-+                val concrete = fn.overridingSymbol(concreteCls.asClass)
-+                resolveExternalDefTree(concrete) match
-+                  case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
-+                  case _ => notInterpretable(fn)
++                superAccessorTarget(fn, concreteCls) match
++                  case Some(target) =>
++                    resolveExternalDefTree(target) match
++                      case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
++                      case _ => notInterpretable(fn)
++                  case None =>
++                    // `overridingSymbol` (not a raw `.member(name)` lookup):
++                    // that alone throws on an overloaded name (e.g.
++                    // `sizeCompare(Int)` vs `sizeCompare(Iterable[?])` --
++                    // `.symbol` on a multi-alternative denotation is ambiguous)
++                    // and a plain signature-equality check is *also* wrong for
++                    // a covariant-return override (e.g. `ClassValueCompat`'s
++                    // abstract `computeValue(cls): T` erases `T` to `Object`,
++                    // but a concrete `cache$` extending
++                    // `ClassValueCompat[WeakReference[...]]` overrides it with
++                    // a real, narrower, DIFFERENT-signature return type) --
++                    // `overridingSymbol` is dotc's own override-matching
++                    // logic, handling both correctly.
++                    val concrete = fn.overridingSymbol(concreteCls.asClass)
++                    resolveExternalDefTree(concrete) match
++                      case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
++                      case _ => notInterpretable(fn)
 +              else notInterpretable(fn)
      }
 -    else {
@@ -950,6 +956,30 @@ index e34d3506..23e714ba 100644
 +      case AppliedType(tycon, (arg: Type) :: Nil) if tycon.typeSymbol == defn.QuotedTypeClass =>
 +        env.get(arg.typeSymbol)
 +      case _ => None
++
++  /** `Trait$$super$method` (e.g. `scala$collection$SeqOps$$super$sizeCompare`):
++   *  the JVM-level accessor Scala's own compiler generates for a qualified
++   *  `super[Trait].method(...)` call, since trait super-calls need explicit
++   *  disambiguation at the bytecode level. It's compiler-synthesized (no
++   *  retained source, ever) but always means the same thing: whatever
++   *  `method` implementation the class linearization would reach by
++   *  looking *past* `Trait` -- exactly `SymDenotation#superSymbolIn`.
++   *  Using ordinary virtual dispatch (`overridingSymbol`) here instead
++   *  would find the *same* override the super-call exists to skip past,
++   *  causing infinite recursion the first time such an override calls its
++   *  own super-accessor.
++   */
++  private def superAccessorTarget(fn: Symbol, concreteCls: Symbol)(using Context): Option[Symbol] =
++    val marker = "$$super$"
++    val nameStr = fn.name.toString
++    if !nameStr.contains(marker) then None
++    else
++      val realName = nameStr.substring(nameStr.lastIndexOf(marker) + marker.length).toTermName
++      val ownerMember = fn.owner.info.member(realName).suchThat(m => m.is(Method) && m.signature == fn.signature).symbol
++      if !ownerMember.exists then None
++      else
++        val target = ownerMember.superSymbolIn(concreteCls.asClass)
++        if target.exists then Some(target) else None
 +
 +  private def resolveExternalDefTree(sym: Symbol)(using Context): Tree =
 +    if !sym.defTree.isEmpty then sym.defTree
