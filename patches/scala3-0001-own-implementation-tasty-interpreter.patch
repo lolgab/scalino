@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..3a85864f 100644
+index e34d3506..addae30e 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..3a85864f 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1705 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1723 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -734,7 +734,25 @@ index e34d3506..3a85864f 100644
 +                    // a real, narrower, DIFFERENT-signature return type) --
 +                    // `overridingSymbol` is dotc's own override-matching
 +                    // logic, handling both correctly.
-+                    val concrete = fn.overridingSymbol(concreteCls.asClass)
++                    val overriding = fn.overridingSymbol(concreteCls.asClass)
++                    // `overridingSymbol` only finds a symbol that actually
++                    // *overrides* `fn` -- if nothing overrides it (the
++                    // inherited default, e.g. `LinearSeqOps#iterator`'s own
++                    // concrete body, already *is* the most-derived
++                    // implementation, with no further override anywhere in
++                    // `concreteCls`'s hierarchy), it returns `NoSymbol`
++                    // even though a perfectly good real implementation
++                    // exists. Fall back to scanning every same-name,
++                    // same-signature alternative visible from
++                    // `concreteCls` and using whichever one actually has a
++                    // retained/unpicklable body.
++                    val concrete =
++                      if overriding.exists then overriding
++                      else concreteCls.info.member(fn.name).alternatives
++                        .map(_.symbol)
++                        .filter(s => s.is(Method) && s.signature == fn.signature)
++                        .find(s => !resolveExternalDefTree(s).isEmpty)
++                        .getOrElse(NoSymbol)
 +                    resolveExternalDefTree(concrete) match
 +                      case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
 +                      case _ => notInterpretable(fn)
