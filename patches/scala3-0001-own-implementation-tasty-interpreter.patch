@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..4d45a9a8 100644
+index e34d3506..670ec186 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..4d45a9a8 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,2113 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,2127 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -1608,7 +1608,14 @@ index e34d3506..4d45a9a8 100644
 +          lit <- literalConstant(value)
 +        yield
 +          given Context = summonCtx(q)
-+          new ExprImpl(TpdLiteral(lit), SpliceScope.getCurrent)
++          // `pos` (this whole macro expansion's call site): a literal built
++          // here has no source of its own, but a spliced-in tree needs
++          // *some* real span, not `NoSpan` -- otherwise a later assertion
++          // (`position not set for ...`) fails once this literal ends up
++          // nested inside a larger result (e.g. a folded `Expr[String]`
++          // built up across several `Expr(...)` calls, observed via
++          // porcupine's `sql"..."` macro).
++          new ExprImpl(TpdLiteral(lit).withSpan(pos.span), SpliceScope.getCurrent)
 +
 +      case "valueOrAbort" | "value" if fn.owner.derivesFrom(defn.QuotedExprClass) || fn.owner == defn.QuotesClass =>
 +        // Desugars to a call ON the Quotes instance, with the actual Expr[T]
@@ -1848,7 +1855,13 @@ index e34d3506..4d45a9a8 100644
 +          case _ => None
 +      case "apply" if fn.owner.name.toString == "LiteralModule" =>
 +        args match
-+          case (const: Constant) :: Nil => Some(tpd.Literal(const))
++          // A bare `tpd.Literal` has no children to derive a span from
++          // (unlike `Apply`/`If`/etc, whose smart constructors union their
++          // sub-trees' spans) -- `NoSpan` by default, which later fails a
++          // "position not set" assertion once this literal ends up spliced
++          // somewhere inside the macro's final result (`pos`, this whole
++          // expansion's call site, is the best span available here).
++          case (const: Constant) :: Nil => Some(tpd.Literal(const).withSpan(pos.span))
 +          case _ => None
 +      case "apply" if fn.owner.name.toString == "IfModule" =>
 +        args match
@@ -1873,11 +1886,12 @@ index e34d3506..4d45a9a8 100644
 +          case (lhs: Tree) :: (rhs: Tree) :: Nil => Some(tpd.Assign(lhs, rhs))
 +          case _ => None
 +      case "apply" if fn.owner.name.toString == "InferredModule" =>
++        // Another childless leaf (see `LiteralModule` above).
 +        args match
-+          case (tpe: Type) :: Nil => Some(tpd.TypeTree(tpe))
++          case (tpe: Type) :: Nil => Some(tpd.TypeTree(tpe).withSpan(pos.span))
 +          case _ => None
 +      case "apply" if fn.owner.name.toString == "WildcardModule" =>
-+        Some(dotty.tools.dotc.ast.untpd.Ident(nme.WILDCARD).withType(defn.AnyType))
++        Some(dotty.tools.dotc.ast.untpd.Ident(nme.WILDCARD).withType(defn.AnyType).withSpan(pos.span))
 +      case "apply" if fn.owner.name.toString == "IntConstantModule" =>
 +        args match { case (v: Integer) :: Nil => Some(Constant(v.intValue)); case _ => None }
 +      case "apply" if fn.owner.name.toString == "BooleanConstantModule" =>
@@ -2532,10 +2546,41 @@ index e34d3506..4d45a9a8 100644
    /** Exception that stops interpretation if some issue is found */
    class StopInterpretation(val msg: Message, val pos: SrcPos) extends Exception
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index b5386d5b..91ecf36a 100644
+index b5386d5b..656597ad 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-@@ -257,7 +257,16 @@ object Splicer {
+@@ -59,7 +59,29 @@ object Splicer {
+ 
+             // Some parts of the macro are evaluated during the unpickling performed in quotedExprToTree
+             val interpretedExpr = interpreter.interpret[Quotes => scala.quoted.Expr[Any]](tree)
+-            val interpretedTree = interpretedExpr.fold(tree)(macroClosure => PickledQuotes.quotedExprToTree(macroClosure(QuotesImpl())))
++            val rawInterpretedTree = interpretedExpr.fold(tree)(macroClosure => PickledQuotes.quotedExprToTree(macroClosure(QuotesImpl())))
++            // A literal constant reached through cross-module TASTy
++            // unpickling (`resolveExternalDefTree`'s `rootTreeContaining`,
++            // for a symbol/tree that lives in a *dependency* jar rather
++            // than this run's own in-memory typer output) can come back
++            // with `NoSpan` -- unlike `-Yretain-trees`, which just keeps
++            // the original, already-positioned in-memory tree object for
++            // this run's own symbols, position info surviving a real
++            // pickle/unpickle round-trip for an arbitrary dependency's TASTy
++            // isn't guaranteed for every leaf (observed via porcupine's
++            // `sql"..."` macro: a bare `""` literal it builds as its fold's
++            // starting accumulator). Typer's own `position not set for
++            // $tree` assertion fires on *any* spliced-in tree missing a
++            // span, so backfill every such node with the macro call site's
++            // own span (the best position available -- there's no better
++            // synthetic answer for a tree with no real source of its own).
++            val interpretedTree = new tpd.TreeMap {
++              override def transform(t: Tree)(using Context): Tree =
++                val t1 = super.transform(t)
++                // `EmptyTree`/`EmptyValDef` are shared immutable singletons
++                // (no span to sensibly set, and `withSpan` on them asserts).
++                if t1.span.exists || t1.isEmpty then t1 else t1.withSpan(splicePos.span)
++            }.transform(rawInterpretedTree)
+ 
+             checkEscapedVariables(interpretedTree, macroOwner)
+           } finally {
+@@ -257,7 +279,16 @@ object Splicer {
            case tree: Inlined if tree.inlinedFromOuterScope => tree.expansion
            case _ => body
          }
@@ -2553,7 +2598,7 @@ index b5386d5b..91ecf36a 100644
  
        // Interpret level -1 `Type.of[T]`
        case Apply(TypeApply(fn, quoted :: Nil), _) if fn.symbol == defn.QuotedTypeModule_of =>
-@@ -266,5 +275,38 @@ object Splicer {
+@@ -266,5 +297,38 @@ object Splicer {
        case _ =>
          super.interpretTree(tree)
      }
