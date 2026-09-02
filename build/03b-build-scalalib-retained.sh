@@ -78,5 +78,30 @@ echo "compiling with dist/dotc-native (the real compiler scli itself runs)..."
   -d "$CLASSES_DIR" \
   $(find "$SRC_DIR" -name '*.scala')
 
+echo "merging in the plain jar's Java-sourced classes (scala.runtime.* etc, never compiled above)..."
+# The scala-library *sources* jar we compiled from only has .scala files
+# (`find ... -name '*.scala'` above) -- but real scala-library also has a
+# handful of .java sources (scala.runtime.Statics, BoxesRunTime, etc,
+# runtime-support classes with no .scala equivalent at all). Skipping them
+# isn't an oversight to fix by finding more sources to feed dotc (dotc
+# can't compile .java here anyway) -- merge the plain jar's own compiled
+# classes for anything CLASSES_DIR doesn't already provide, so
+# scalalib-retained.jar is a complete, self-contained replacement and
+# never needs the plain jar alongside it on the same classpath (see
+# cli/Scli.scala's dropPlainScalaLibrary -- two jars both providing
+# scala.Option/etc turned out to make dotc's classpath resolution
+# non-deterministic, not just redundant).
+PLAIN_DIR="$WORK/scalalib-plain-classes"
+rm -rf "$PLAIN_DIR"
+mkdir -p "$PLAIN_DIR"
+(cd "$PLAIN_DIR" && "$JAR" xf "$STDLIB_JAR")
+(cd "$PLAIN_DIR" && find . -type f -print0) |
+  while IFS= read -r -d '' relpath; do
+    [[ -f "$CLASSES_DIR/$relpath" ]] || {
+      mkdir -p "$CLASSES_DIR/$(dirname "$relpath")"
+      cp -f "$PLAIN_DIR/$relpath" "$CLASSES_DIR/$relpath"
+    }
+  done
+
 (cd "$CLASSES_DIR" && "$JAR" cf "$DIST/lib/scalalib-retained.jar" .)
 echo "OK: $DIST/lib/scalalib-retained.jar"
