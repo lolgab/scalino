@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..f793ba9b 100644
+index e34d3506..ea5dbca1 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..f793ba9b 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1748 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1764 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -840,6 +840,22 @@ index e34d3506..f793ba9b 100644
 +    if fn.owner == defn.SomeClass then
 +      rawArgs.filterNot(_.isEmpty) match
 +        case v :: Nil => Some(Some(interpretTree(v)))
++        case _ => None
++    // `head :: tail` (`new ::(head, tail)` at the tree level): without this,
++    // every list built via cons syntax (as opposed to `List(...)`, which
++    // already goes through `interpretCollectionFactory`) becomes an
++    // `InterpretedInstance` instead of a real `scala.collection.immutable.::`
++    // -- silently breaking any code (ours or interpreted library code) that
++    // pattern-matches `case xs: List[_] => ...` or similar against it. Real
++    // `Nil` is already a real value (`wellKnownSingleton`), so building
++    // *this* case as real too keeps every list uniformly real bottom-up.
++    else if fn.owner == defn.ConsClass then
++      rawArgs.filterNot(_.isEmpty) match
++        case headT :: tailT :: Nil =>
++          val tail = interpretTree(tailT) match
++            case s: scala.collection.Seq[Object @unchecked] => s.toList
++            case other => other.asInstanceOf[List[Object]]
++          Some(interpretTree(headT) :: tail)
 +        case _ => None
 +    // `java.lang.ref.WeakReference`: a real JDK-native class (no Scala
 +    // source, no TASTy, ever) -- but its actual runtime semantics (a real
