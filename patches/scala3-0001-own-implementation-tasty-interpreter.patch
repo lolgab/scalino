@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..addae30e 100644
+index e34d3506..f284c8ac 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..addae30e 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1723 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1733 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -746,11 +746,21 @@ index e34d3506..addae30e 100644
 +                    // same-signature alternative visible from
 +                    // `concreteCls` and using whichever one actually has a
 +                    // retained/unpicklable body.
++                    // Walk `concreteCls`'s own linearization (already
++                    // most-derived-first) instead of an unordered
++                    // `.member(name).alternatives` scan: picking a
++                    // same-signature same-name symbol from the *wrong*
++                    // spot in the hierarchy risks landing back on (or
++                    // past) `fn` itself, whose own body calls right back
++                    // into this same virtual dispatch -- infinite
++                    // recursion. Only each base class's *own* declarations
++                    // (`.decls`, not `.member`, which would re-include
++                    // inherited ones) are considered at each step.
 +                    val concrete =
 +                      if overriding.exists then overriding
-+                      else concreteCls.info.member(fn.name).alternatives
-+                        .map(_.symbol)
-+                        .filter(s => s.is(Method) && s.signature == fn.signature)
++                      else concreteCls.asClass.baseClasses.iterator
++                        .flatMap(_.info.decls.toList)
++                        .filter(s => s.is(Method) && s.name == fn.name && s.signature == fn.signature)
 +                        .find(s => !resolveExternalDefTree(s).isEmpty)
 +                        .getOrElse(NoSymbol)
 +                    resolveExternalDefTree(concrete) match
