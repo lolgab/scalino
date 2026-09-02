@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..382d3a42 100644
+index e34d3506..55ae30d8 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -264,7 +264,7 @@ index e34d3506..382d3a42 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +328,1596 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +328,1606 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -353,7 +353,17 @@ index e34d3506..382d3a42 100644
 +      // A stable-identifier pattern (e.g. `case scala.reflect.ClassTag.ObjectTYPE => ...`,
 +      // matching a `val` by equality, not deconstructing anything) --
 +      // just evaluate the referenced value and compare.
-+      if interpretTree(pat) == scrutinee then Some(env) else None
++      val patValue = interpretTree(pat)
++      val matches = (patValue, scrutinee) match
++        // Two dotc `Type`s (e.g. `classOf[T]` stand-ins, primitive `TYPE`
++        // constants): plain `==` is unreliable -- structurally-equivalent
++        // types built via different prefix paths (e.g. root-relative
++        // `ThisType` vs a symbol-based `TermRef` for the same `scala`
++        // package) aren't always `==`, but dotc's own `=:=` (real "is this
++        // the same type") handles that correctly.
++        case (t1: dotty.tools.dotc.core.Types.Type @unchecked, t2: dotty.tools.dotc.core.Types.Type @unchecked) => t1 =:= t2
++        case _ => patValue == scrutinee
++      if matches then Some(env) else None
 +    case UnApply(fun, _, patterns) =>
 +      if sys.env.contains("SNC_INTERP_DEBUG") then
 +        Console.err.println(s"[matchPattern UnApply] fun.getClass=${fun.getClass.getSimpleName} fun.symbol=${fun.symbol} fun.symbol.owner=${fun.symbol.owner} fun=${fun.show}")
