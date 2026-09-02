@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..746b175b 100644
+index e34d3506..ecf00218 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..746b175b 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1867 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1874 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -496,6 +496,12 @@ index e34d3506..746b175b 100644
 +                case sl: SeqLiteral @unchecked => Some(List(sl.elems, sl.elemtpt))
 +                case _ => None
 +              }
++            case "Typed" =>
++              // `quotes.reflect.Typed` -- a real `tpd.Typed`: `expr: Term`, `tpt: TypeTree`.
++              Some {
++                case t: Typed @unchecked => Some(List(t.expr, t.tpt))
++                case _ => None
++              }
 +            case name =>
 +              // Generic `TypeTest[TypeRepr, SomeDotcTypeSubclass]` shape:
 +              // matches iff the scrutinee's real runtime type (dotc's own
@@ -590,6 +596,7 @@ index e34d3506..746b175b 100644
 +    // `Expr`) -- `Repeated` is a type alias for `tpd.SeqLiteral` in the
 +    // real `QuotesImpl`.
 +    case "RepeatedTypeTest" => Some(classOf[SeqLiteral])
++    case "TypedTypeTest" => Some(classOf[Typed])
 +    case _ => None
 +
 +  private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
@@ -672,12 +679,7 @@ index e34d3506..746b175b 100644
 +        case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(ModuleValue(moduleClass)), ddef, args)
 +        case _ => notInterpretable(fn)
 +    }
- 
--  private def loadModule(sym: Symbol): Object =
--    if (sym.owner.is(Package)) {
--      // is top level object
--      val moduleClass = loadClass(sym.fullName.toString)
--      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
++
 +  /** `Vector(...)`/`Set(...)`/`Seq(...)`/etc: `fn.owner` is useless here
 +   *  (always the abstract `IterableFactory`/`SeqFactory` trait, since the
 +   *  call site's static type is that trait, not the concrete companion) --
@@ -760,7 +762,12 @@ index e34d3506..746b175b 100644
 +    else if fn.name.toString == "releaseFence" && fn.owner.showFullName == "scala.runtime.Statics" then
 +      Some(().asInstanceOf[Object])
 +    else None
-+
+ 
+-  private def loadModule(sym: Symbol): Object =
+-    if (sym.owner.is(Package)) {
+-      // is top level object
+-      val moduleClass = loadClass(sym.fullName.toString)
+-      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
 +  private def interpretInstanceCall(receiver: Object, fn: Symbol, rawArgs: List[Tree], srcPos: SrcPos)(using Env): Object =
 +    lazy val args = evalNonErased(rawArgs)
 +    val collectionFactory = receiver match
