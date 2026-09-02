@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..c46a0a46 100644
+index e34d3506..c55c5006 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..c46a0a46 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1881 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1959 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -508,6 +508,69 @@ index e34d3506..c46a0a46 100644
 +                case b: Block @unchecked => Some(List(b.stats, b.expr))
 +                case _ => None
 +              }
++            case "Inlined" =>
++              // `quotes.reflect.Inlined` -- a real `tpd.Inlined`: `call: Tree`,
++              // `bindings: List[Definition]`, `body: Term` (named `expansion` on the real tree).
++              Some {
++                case i: Inlined @unchecked => Some(List(i.call, i.bindings, i.expansion))
++                case _ => None
++              }
++            // The rest of the common `quotes.reflect` tree-destructuring
++            // extractors -- same story as `Repeated`/`Typed`/`Block`/`Inlined`
++            // above (real dotc case classes, `matchConcreteUnapply` just
++            // needs to know each one's field order to match the API name).
++            case "Apply" => Some {
++              case a: Apply @unchecked => Some(List(a.fun, a.args))
++              case _ => None
++            }
++            case "TypeApply" => Some {
++              case a: TypeApply @unchecked => Some(List(a.fun, a.args))
++              case _ => None
++            }
++            case "Select" => Some {
++              case s: Select @unchecked => Some(List(s.qualifier, s.name.toString))
++              case _ => None
++            }
++            case "Ident" => Some {
++              case i: Ident @unchecked => Some(List(i.name.toString))
++              case _ => None
++            }
++            case "Literal" => Some {
++              case l: Literal @unchecked => Some(List(l.const))
++              case _ => None
++            }
++            case "Constant" => Some {
++              case c: dotty.tools.dotc.core.Constants.Constant => Some(List(c.value.asInstanceOf[Object]))
++              case _ => None
++            }
++            case "New" => Some {
++              case n: New @unchecked => Some(List(n.tpt))
++              case _ => None
++            }
++            case "NamedArg" => Some {
++              case n: NamedArg @unchecked => Some(List(n.name.toString, n.arg))
++              case _ => None
++            }
++            case "Assign" => Some {
++              case a: Assign @unchecked => Some(List(a.lhs, a.rhs))
++              case _ => None
++            }
++            case "If" => Some {
++              case i: If @unchecked => Some(List(i.cond, i.thenp, i.elsep))
++              case _ => None
++            }
++            case "Match" => Some {
++              case m: Match @unchecked => Some(List(m.selector, m.cases))
++              case _ => None
++            }
++            case "CaseDef" => Some {
++              case c: CaseDef @unchecked => Some(List(c.pat, if c.guard.isEmpty then None else Some(c.guard), c.body))
++              case _ => None
++            }
++            case "Bind" => Some {
++              case b: Bind @unchecked => Some(List(b.name.toString, b.body))
++              case _ => None
++            }
 +            case name =>
 +              // Generic `TypeTest[TypeRepr, SomeDotcTypeSubclass]` shape:
 +              // matches iff the scrutinee's real runtime type (dotc's own
@@ -604,6 +667,21 @@ index e34d3506..c46a0a46 100644
 +    case "RepeatedTypeTest" => Some(classOf[SeqLiteral])
 +    case "TypedTypeTest" => Some(classOf[Typed])
 +    case "BlockTypeTest" => Some(classOf[Block])
++    case "InlinedTypeTest" => Some(classOf[Inlined])
++    case "ApplyTypeTest" => Some(classOf[Apply])
++    case "TypeApplyTypeTest" => Some(classOf[TypeApply])
++    case "SelectTypeTest" => Some(classOf[Select])
++    case "IdentTypeTest" => Some(classOf[Ident])
++    case "LiteralTypeTest" => Some(classOf[Literal])
++    case "ThisTypeTest" => Some(classOf[This])
++    case "NewTypeTest" => Some(classOf[New])
++    case "NamedArgTypeTest" => Some(classOf[NamedArg])
++    case "SuperTypeTest" => Some(classOf[Super])
++    case "AssignTypeTest" => Some(classOf[Assign])
++    case "IfTypeTest" => Some(classOf[If])
++    case "MatchTypeTest" => Some(classOf[Match])
++    case "CaseDefTypeTest" => Some(classOf[CaseDef])
++    case "BindTypeTest" => Some(classOf[Bind])
 +    case _ => None
 +
 +  private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
@@ -686,7 +764,12 @@ index e34d3506..c46a0a46 100644
 +        case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(ModuleValue(moduleClass)), ddef, args)
 +        case _ => notInterpretable(fn)
 +    }
-+
+ 
+-  private def loadModule(sym: Symbol): Object =
+-    if (sym.owner.is(Package)) {
+-      // is top level object
+-      val moduleClass = loadClass(sym.fullName.toString)
+-      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
 +  /** `Vector(...)`/`Set(...)`/`Seq(...)`/etc: `fn.owner` is useless here
 +   *  (always the abstract `IterableFactory`/`SeqFactory` trait, since the
 +   *  call site's static type is that trait, not the concrete companion) --
@@ -769,12 +852,7 @@ index e34d3506..c46a0a46 100644
 +    else if fn.name.toString == "releaseFence" && fn.owner.showFullName == "scala.runtime.Statics" then
 +      Some(().asInstanceOf[Object])
 +    else None
- 
--  private def loadModule(sym: Symbol): Object =
--    if (sym.owner.is(Package)) {
--      // is top level object
--      val moduleClass = loadClass(sym.fullName.toString)
--      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
++
 +  private def interpretInstanceCall(receiver: Object, fn: Symbol, rawArgs: List[Tree], srcPos: SrcPos)(using Env): Object =
 +    lazy val args = evalNonErased(rawArgs)
 +    val collectionFactory = receiver match
