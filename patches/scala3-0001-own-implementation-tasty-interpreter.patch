@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..31a8154b 100644
+index e34d3506..793d1c34 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..31a8154b 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1663 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1669 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -716,7 +716,13 @@ index e34d3506..31a8154b 100644
 +                case ModuleValue(moduleClass) => moduleClass
 +                case _ => NoSymbol
 +              if concreteCls.exists then
-+                val concrete = concreteCls.info.member(fn.name).suchThat(_.is(Method)).symbol
++                // `.suchThat(_.is(Method))` alone throws if the name is
++                // overloaded (e.g. `sizeCompare(Int)` vs
++                // `sizeCompare(Iterable[?])`) -- `.symbol` on a multi-
++                // alternative denotation is ambiguous. Match by real
++                // signature (arity + erased param/result shape) too, since
++                // that's what actually distinguishes overloads.
++                val concrete = concreteCls.info.member(fn.name).suchThat(m => m.is(Method) && m.signature == fn.signature).symbol
 +                resolveExternalDefTree(concrete) match
 +                  case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
 +                  case _ => notInterpretable(fn)
