@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..f742506b 100644
+index e34d3506..31a8154b 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..f742506b 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1649 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1663 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -298,6 +298,16 @@ index e34d3506..f742506b 100644
 +        accEnv.updated(stat.symbol, LocalDef(stat, accEnv))
 +      case _: Import =>
 +        accEnv // purely a typer-time construct; no runtime effect
++      case _: TypeDef =>
++        // A local class/anon-class definition (e.g. `List`'s own iterator:
++        // `{ final class $anon extends AbstractIterator[A] { ... }; new
++        // $anon() }`) -- nothing to *do* here, it's a declaration, not a
++        // value. Its symbol's own `defTree` is already retained regardless
++        // of `-Yretain-trees` (a local symbol's `owner.isTerm`, one of
++        // `retainsDefTree`'s conditions), so the later `New(anonSym)` in
++        // this same block finds its constructor/methods normally through
++        // the usual `resolveExternalDefTree`/`interpretNewFromTree` path.
++        accEnv
        case stat =>
 -        if (unexpected.isEmpty)
 -          unexpected = Some(unexpectedTree(stat))
@@ -525,9 +535,7 @@ index e34d3506..f742506b 100644
 +  // this very binary) or a recursive interpretation of the callee's own
 +  // retained tree.
 +  // ---------------------------------------------------------------------
- 
--  private def interpretModuleAccess(fn: Symbol): Object =
--    loadModule(fn.moduleClass)
++
 +  /** Some formal parameter slots (erased evidence, given markers the typer
 +   *  already resolved away) show up in the actual argument trees as literal
 +   *  `EmptyTree`, not merely absent. Interpreting `EmptyTree` always fails, so
@@ -544,17 +552,17 @@ index e34d3506..f742506b 100644
 +      // but fall back to positional truncation rather than crash outright.
 +      params.zip(rawArgs.filterNot(_.isEmpty)).map((p, t) => (p, interpretTree(t)))
  
+-  private def interpretModuleAccess(fn: Symbol): Object =
+-    loadModule(fn.moduleClass)
++  private def evalNonErased(rawArgs: List[Tree])(using Env): List[Object] =
++    rawArgs.filterNot(_.isEmpty).map(interpretTree)
+ 
 -  private def interpretNew(fn: Symbol, args: List[Object]): Object = {
 -    val className = fn.owner.fullName.mangledString.replaceAll("\\$\\.", "\\$")
 -    val clazz = loadClass(className)
 -    val constr = clazz.getConstructor(paramsSig(fn)*)
 -    constr.newInstance(args*).asInstanceOf[Object]
 -  }
-+  private def evalNonErased(rawArgs: List[Tree])(using Env): List[Object] =
-+    rawArgs.filterNot(_.isEmpty).map(interpretTree)
- 
--  private def unexpectedTree(tree: Tree): Object =
--    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}", tree.srcPos)
 +  private def interpretStaticCall(moduleClass: Symbol, fn: Symbol, rawArgs: List[Tree])(using Env): Object =
 +    lazy val args = evalNonErased(rawArgs)
 +    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
@@ -566,7 +574,9 @@ index e34d3506..f742506b 100644
 +        case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(ModuleValue(moduleClass)), ddef, args)
 +        case _ => notInterpretable(fn)
 +    }
-+
+ 
+-  private def unexpectedTree(tree: Tree): Object =
+-    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}", tree.srcPos)
 +  /** `Vector(...)`/`Set(...)`/`Seq(...)`/etc: `fn.owner` is useless here
 +   *  (always the abstract `IterableFactory`/`SeqFactory` trait, since the
 +   *  call site's static type is that trait, not the concrete companion) --
@@ -794,8 +804,12 @@ index e34d3506..f742506b 100644
 +        Some(mutable.HashMap.empty[Object, Object])
 +      case "scala.collection.mutable.ArrayBuffer" | "scala.collection.mutable.Buffer" =>
 +        Some(mutable.ArrayBuffer.empty[Object])
-+      case "scala.collection.mutable.ListBuffer" =>
-+        Some(mutable.ListBuffer.empty[Object])
++      // NOT `ListBuffer` (removed): its own real methods mutate private
++      // fields (`first`/`last0`/`len`) directly via `this.field = ...`,
++      // which only works on an `InterpretedInstance` (our own field store),
++      // not a real host object -- building it via ordinary
++      // `interpretNewFromTree` instead lets that assignment (see `Assign`'s
++      // `InterpretedInstance` case) actually work.
 +      case "scala.collection.mutable.HashSet" | "scala.collection.mutable.Set" =>
 +        Some(mutable.HashSet.empty[Object])
 +      case _ => None
