@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..d7c2bbbb 100644
+index e34d3506..f793ba9b 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..d7c2bbbb 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1743 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1748 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -658,6 +658,11 @@ index e34d3506..d7c2bbbb 100644
 +      args match
 +        case (a: Array[Object] @unchecked) :: (len: Integer) :: Nil => Some(java.util.Arrays.copyOf(a, len))
 +        case _ => None
++    // `scala.runtime.Statics.releaseFence()`: a real JVM memory-fence
++    // intrinsic (safe publication for concurrent readers) -- meaningless,
++    // and a no-op, for this single-threaded, compile-time interpreter.
++    else if fn.name.toString == "releaseFence" && fn.owner.showFullName == "scala.runtime.Statics" then
++      Some(().asInstanceOf[Object])
 +    else None
 +
 +  private def interpretInstanceCall(receiver: Object, fn: Symbol, rawArgs: List[Tree], srcPos: SrcPos)(using Env): Object =
