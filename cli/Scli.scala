@@ -313,9 +313,19 @@ object Scli:
     val compilerCp = resolveCp(readListFile("compiler.cp"))
     val nativelibsCp = resolveCp(readListFile("nativelibs.cp"))
     val pluginJar = s"$dist/" + readListFile("nscplugin.jar.txt")
+    // dist/lib/scalalib-retained.jar (build/03b-build-scalalib-retained.sh):
+    // the same scala-library source nativelibsCp's plain jar has, recompiled
+    // with dotc instead of scalac -- real TASTy, so our own-implementation
+    // macro interpreter can run List/Option/Seq/etc's *actual* bodies
+    // (Interpreter.scala's resolveExternalDefTree) instead of needing a
+    // hand-written intrinsic for every stdlib method a macro's own code
+    // happens to call. Compile-only (ahead of the plain one on this
+    // classpath, but never on linkCp below) -- linking still uses the real
+    // scala-native-blessed artifacts, untouched.
+    val scalalibRetained = s"$dist/lib/scalalib-retained.jar"
 
     val compileCp =
-      List(compilerCp, nativelibsCp, extraClasspath, extraCompileOnlyClasspath)
+      List(scalalibRetained, compilerCp, nativelibsCp, extraClasspath, extraCompileOnlyClasspath)
         .filter(_.nonEmpty).mkString(":")
 
     val compileCmd = List(

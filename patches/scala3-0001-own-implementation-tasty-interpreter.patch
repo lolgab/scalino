@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..aa19344b 100644
+index e34d3506..4d45a9a8 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..aa19344b 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,2006 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,2113 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -874,8 +874,23 @@ index e34d3506..aa19344b 100644
 +    val collectionFactory = receiver match
 +      case ModuleValue(cls) => interpretCollectionFactory(cls, fn, args)
 +      case _ => None
++    val concreteCls = receiverConcreteClass(receiver)
++    // `fn` is whatever symbol the call site's *static* type resolved to
++    // (e.g. `SeqOps#isEmpty`, a concrete trait default) -- not necessarily
++    // the receiver's own most-derived override (e.g. `View.ZipAll` overrides
++    // `isEmpty` concretely with `sc1.isEmpty && sc2.isEmpty`, never calling
++    // into `SeqOps`'s generic `lengthCompare`-based default at all).
++    // `resolveExternalDefTree(fn)` alone has no notion of the runtime
++    // receiver, so without this it always runs `fn`'s own body -- silently
++    // wrong (not just unsupported) whenever a more-derived class overrides
++    // it. Real virtual dispatch: prefer whatever overrides `fn` in the
++    // receiver's real concrete class, same as ordinary JVM method dispatch;
++    // `orElse(fn)` covers the (common) case where `fn` already *is* the
++    // most-derived declaration, where `overridingSymbol` correctly finds
++    // nothing.
++    val dispatchFn = if concreteCls.exists then fn.overridingSymbol(concreteCls.asClass).orElse(fn) else fn
 +    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).getOrElse {
-+      resolveExternalDefTree(fn) match
++      resolveExternalDefTree(dispatchFn) match
 +        case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
 +        case vdef: ValDef =>
 +          // A class-body `val`/`var` (private mutable-state fields
@@ -899,6 +914,17 @@ index e34d3506..aa19344b 100644
 +          receiver match
 +            case inst: InterpretedInstance =>
 +              inst.fields.getOrElseUpdate(fn.name.toString, if uninitialized then null else interpretTree(vdef.rhs)(using bindThis(env, fn.owner, inst)))
++            // A value class's (`extends AnyVal`) own primary-constructor
++            // param accessor (e.g. `RichInt#self`): such an instance is
++            // never wrapped in an `InterpretedInstance` (it's represented
++            // directly as its erased underlying value, same as the real
++            // JVM does), so "reading the field" is just the receiver
++            // itself -- not `null`, which the general uninitialized-var
++            // fallback below would otherwise wrongly return (there's no
++            // real initializer tree here either way, so nothing
++            // distinguishes the two cases except this check).
++            case _ if uninitialized && fn.is(ParamAccessor) && fn.owner.derivesFrom(defn.AnyValClass) =>
++              receiver
 +            case _ =>
 +              // No `.fields` to memoize into (e.g. a `ModuleValue` receiver)
 +              // -- re-runs the initializer per access, which is wasteful but
@@ -920,10 +946,6 @@ index e34d3506..aa19344b 100644
 +              // actually runs -- look up the real implementation by name on
 +              // the concrete class and use *its* defTree instead (ordinary
 +              // virtual dispatch, which `Symbol.defTree` alone doesn't do).
-+              val concreteCls = receiver match
-+                case inst: InterpretedInstance => inst.cls
-+                case ModuleValue(moduleClass) => moduleClass
-+                case _ => NoSymbol
 +              if concreteCls.exists then
 +                superAccessorTarget(fn, concreteCls) match
 +                  case Some(target) =>
@@ -967,11 +989,33 @@ index e34d3506..aa19344b 100644
 +                    // inherited ones) are considered at each step.
 +                    val concrete =
 +                      if overriding.exists then overriding
-+                      else concreteCls.asClass.baseClasses.iterator
-+                        .flatMap(_.info.decls.toList)
-+                        .filter(s => s.is(Method) && s.name == fn.name && s.signature == fn.signature)
-+                        .find(s => !resolveExternalDefTree(s).isEmpty)
-+                        .getOrElse(NoSymbol)
++                      else
++                        // Only classes strictly more derived than `fn.owner`
++                        // (i.e. before it in `concreteCls`'s already
++                        // most-derived-first linearization) -- landing on
++                        // `fn.owner` itself or anything past it would just
++                        // re-find `fn` (or something whose own body calls
++                        // back into it), the infinite-recursion risk noted
++                        // above.
++                        val moreDerived = concreteCls.asClass.baseClasses.takeWhile(_ != fn.owner)
++                        def scan(matchSignature: Boolean) = moreDerived.iterator
++                          .flatMap(_.info.decls.toList)
++                          .filter(s => s.is(Method) && s.name == fn.name && (!matchSignature || s.signature == fn.signature))
++                          .find(s => !resolveExternalDefTree(s).isEmpty)
++                        // Exact signature match first; a same-name-only
++                        // fallback second (last resort) -- an F-bounded
++                        // generic method (e.g. `IterableOps#fromSpecific`,
++                        // parameterized over `CC[_] <: IterableOps[...]`)
++                        // can have a genuinely-overriding concrete
++                        // implementation (`IterableFactoryDefaults#
++                        // fromSpecific`) whose `Signature` doesn't compare
++                        // `==` to the abstract declaration's outside a full
++                        // compilation pass (mixin type-parameter
++                        // instantiation isn't being resolved the same way
++                        // here), even though `overridingSymbol` and a
++                        // same-signature scan both correctly handle the
++                        // *simpler* covariant-return case above.
++                        scan(matchSignature = true).orElse(scan(matchSignature = false)).getOrElse(NoSymbol)
 +                    resolveExternalDefTree(concrete) match
 +                      case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
 +                      case _ => notInterpretable(fn)
@@ -1002,7 +1046,14 @@ index e34d3506..aa19344b 100644
 +    val withThis = receiver match
 +      case Some(r) if ddef.symbol.owner.exists => bindThis(withParams, ddef.symbol.owner, r)
 +      case _ => withParams
-+    interpretTree(ddef.rhs)(using withThis)
++    // A bare `return expr` directly inside this method's own body (not
++    // nested in a local lambda) targets `ddef.symbol` itself -- unlike a
++    // `while`/labeled-block early exit, there's no explicit `Labeled` tree
++    // node wrapping the body to catch it (that wrapping is a later-phase
++    // lowering detail, not present in this pre-lowering retained tree), so
++    // the method's own call frame has to be the catch point.
++    try interpretTree(ddef.rhs)(using withThis)
++    catch case LabeledReturn(label, value) if label == ddef.symbol => value
 +
 +  /** Binds `this` for `owner`'s body -- and, if `value` is one of our own
 +   *  `InterpretedInstance`s, for every base class/trait of its concrete
@@ -1020,9 +1071,27 @@ index e34d3506..aa19344b 100644
 +      case inst: InterpretedInstance => inst.cls
 +      case ModuleValue(moduleClass) => moduleClass
 +      case _ => NoSymbol
++    val withOwner = env.updated(owner, value)
 +    if cls.exists && cls.isClass then
-+      cls.asClass.baseClasses.foldLeft(env.updated(owner, value))((e, base) => e.updated(base, value))
-+    else env.updated(owner, value)
++      // Fill in gaps only -- never clobber a base-class key `env` already
++      // carries (from `callUserDefDef`'s `inst.outerEnv` base). A self-type
++      // alias (`self =>`) inside some trait `T`'s own method is recorded as
++      // an ordinary `This(T)` reference; a closure built *inside* that
++      // method (e.g. `Iterator#zipAll`'s `new AbstractIterator{...}`) can
++      // itself extend the very same `T` (`AbstractIterator extends
++      // Iterator`), so `T` ends up in *both* the anon class's own
++      // `baseClasses` *and* its captured `outerEnv` (holding the ORIGINAL
++      // `self` receiver, e.g. the iterator `zipAll` was called on) -- both
++      // legitimately keyed by the exact same `Symbol`, since it's the same
++      // trait referenced via two different lexical paths, not two symbols.
++      // Blindly overwriting here silently redirects `self.hasNext` back
++      // onto the anon instance itself, an infinite `hasNext`-calls-itself
++      // loop (a real crash observed via `View.ZipAll`'s `iterator`).
++      // `outerEnv`'s capture reflects the actually-intended lexical target,
++      // so it wins; this class's own identity only fills keys nothing
++      // outer already claimed.
++      cls.asClass.baseClasses.foldLeft(withOwner)((e, base) => if e.contains(base) then e else e.updated(base, value))
++    else withOwner
 +
 +  /** A handful of mutable stdlib collection classes constructed directly as
 +   *  real host objects instead of via `interpretNew`'s tree-walking (their
@@ -1156,11 +1225,19 @@ index e34d3506..aa19344b 100644
 +  /** A parent that's a constructor call, possibly `Block`-wrapped (when its
 +   *  args need helper locals computed first, e.g. an implicit conversion
 +   *  applied to one of them -- jsoniter-scala's `CodecMakerConfig` default
-+   *  instance has exactly this shape).
++   *  instance has exactly this shape). Excludes a bare `java.lang.Object`
++   *  super call: essentially *every* class's `parents.head` is one (the
++   *  implicit default superclass whenever nothing else is extended, e.g.
++   *  `object View extends IterableFactory[View]`, whose only *class* parent
++   *  is `Object`), and it carries no data worth special-casing -- if it were
++   *  matched here, `moduleSuperCtorCall` would interpret it as the module's
++   *  own value, discarding the module's real identity for a bare `new
++   *  Object()` (observed: broke `View.from(...)` dispatch, since the
++   *  receiver silently became an empty `Object` instead of `ModuleValue(View)`).
 +   */
 +  private def constructorCallParent(t: Tree)(using Context): Boolean = t match
 +    case Block(_, expr) => constructorCallParent(expr)
-+    case Call(fn, _) => fn.symbol.isConstructor
++    case Call(fn, _) => fn.symbol.isConstructor && fn.symbol.owner != defn.ObjectClass
 +    case _ => false
 +
 +  private def moduleSuperCtorCall(moduleClass: Symbol)(using Context): Option[Tree] =
@@ -1214,6 +1291,27 @@ index e34d3506..aa19344b 100644
 +   *  causing infinite recursion the first time such an override calls its
 +   *  own super-accessor.
 +   */
++  /** The receiver's real dotc class symbol, for virtual dispatch (choosing
++   *  the most-derived override of a statically-resolved `fn`) -- covers our
++   *  own `InterpretedInstance`/`ModuleValue` wrappers directly, and a fixed,
++   *  small set of real stdlib collection types a macro's interpreted code
++   *  may build directly as real host objects (via `interpretCollectionFactory`
++   *  or a real library method like `SeqOps#zipAll` returning a real
++   *  `View.ZipAll`). `isInstanceOf` against this fixed set is a compile-time
++   *  type test against classes this file already statically depends on --
++   *  not reflection (no `getClass`, no name-based lookup).
++   */
++  private def receiverConcreteClass(receiver: Object)(using Context): Symbol = receiver match
++    case inst: InterpretedInstance => inst.cls
++    case ModuleValue(moduleClass) => moduleClass
++    case _: List[Object @unchecked] => defn.ListClass
++    case _: Vector[Object @unchecked] => requiredClass("scala.collection.immutable.Vector")
++    case _: mutable.ArrayBuffer[Object @unchecked] => requiredClass("scala.collection.mutable.ArrayBuffer")
++    case _: mutable.HashSet[Object @unchecked] => requiredClass("scala.collection.mutable.HashSet")
++    case _: scala.collection.immutable.Set[Object @unchecked] => requiredClass("scala.collection.immutable.Set")
++    case _: scala.collection.immutable.Seq[Object @unchecked] => defn.SeqClass
++    case _ => NoSymbol
++
 +  private def superAccessorTarget(fn: Symbol, concreteCls: Symbol)(using Context): Option[Symbol] =
 +    val marker = "$$super$"
 +    val nameStr = fn.name.toString
@@ -1221,7 +1319,14 @@ index e34d3506..aa19344b 100644
 +    else
 +      val realName = nameStr.substring(nameStr.lastIndexOf(marker) + marker.length).toTermName
 +      val ownerMember = fn.owner.info.member(realName).suchThat(m => m.is(Method) && m.signature == fn.signature).symbol
-+      if !ownerMember.exists then None
++      // `superSymbolIn`'s own precondition ("`this.owner` is in the base
++      // class sequence of `base`") isn't always true here -- when it isn't,
++      // its `dropWhile(owner != _)` silently consumes the *whole* list
++      // instead of finding it, and the following `.tail` throws on the
++      // empty result. Check it explicitly and fall back (to the ordinary
++      // `overridingSymbol`/linearization-scan path in the caller) instead
++      // of crashing.
++      if !ownerMember.exists || !concreteCls.asClass.baseClasses.contains(ownerMember.owner) then None
 +      else
 +        val target = ownerMember.superSymbolIn(concreteCls.asClass)
 +        if target.exists then Some(target) else None
@@ -1725,14 +1830,10 @@ index e34d3506..aa19344b 100644
 +      // body, but a `TupleN` is just its N fields, constructible directly.
 +      case "apply" if fn.owner.name.toString.stripSuffix("$").matches("Tuple\\d+") =>
 +        Some(Tuple.fromArray(args.toArray))
-+      // `Some.apply(x)` (the companion's own synthesized apply, distinct
-+      // from `new Some(x)` which `newStdlibCollection` already handles) --
-+      // same real class, so the same symbol-identity check (`showFullName`
-+      // is unreliable for root types, see `newStdlibCollection`).
-+      case "apply" if fn.owner == defn.SomeClass.companionModule.moduleClass =>
-+        args match
-+          case v :: Nil => Some(Some(v))
-+          case _ => None
++      // NOT `Some.apply(x)` (deliberately not special-cased): with
++      // dist/lib/scalalib-retained.jar on the classpath, `Option.scala`'s
++      // own compiler-generated `Some.apply` has a real retained body
++      // `resolveExternalDefTree` can run directly.
 +      case "apply" if fn.owner.name.toString == "ApplyModule" =>
 +        args match
 +          case (fun: Tree) :: as :: Nil => Some(tpd.Apply(fun, asObjectList(as).asInstanceOf[List[Tree]]))
@@ -2021,24 +2122,6 @@ index e34d3506..aa19344b 100644
 +        interpretTree(ddef.rhs)(using withParams)
 +      case _ => throw new StopInterpretation(em"Interpreter (own implementation): cannot call $methodName directly on ${inst.toString}", pos)
 +
-+  /** `f.lift`, generalized over the three partial-function shapes this
-+   *  interpreter hands out (real `PartialFunction`, an `InterpretedInstance`
-+   *  anon-class override, or a plain closure relying on `MatchError` --
-+   *  see the `"lift"` cases below) -- used directly by `Seq#collect`,
-+   *  which needs the same "try it, None if not defined" logic but can't
-+   *  delegate to a real host `.collect` since the function value itself
-+   *  usually isn't a real `scala.PartialFunction`.
-+   */
-+  private def pfLift(f: Object)(using Env): Object => Option[Object] = f match
-+    case pf: PartialFunction[Object, Object] @unchecked => pf.lift
-+    case inst: InterpretedInstance =>
-+      (x: Object) =>
-+        if callInstanceMethodDirect(inst, "isDefinedAt", List(x)).asInstanceOf[Boolean]
-+        then Some(callInstanceMethodDirect(inst, "apply", List(x)))
-+        else None
-+    case fn1: Function1[Object, Object] @unchecked =>
-+      (x: Object) => try Some(fn1(x)) catch case _: MatchError => None
-+
 +  private def interpretStdlibIntrinsic(receiver: Object, fn: Symbol, args: List[Object])(using Env): Option[Object] =
 +    if sys.env.contains("SNC_INTERP_DEBUG") then
 +      Console.err.println(s"[interpretStdlibIntrinsic] receiver.getClass=${if receiver == null then "null" else receiver.getClass} fn.name=${fn.name} args=${args.map(a => if a == null then "null" else a.getClass)}")
@@ -2092,12 +2175,36 @@ index e34d3506..aa19344b 100644
 +      case (s: collection.Set[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
 +      case (s: scala.collection.Seq[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(s(i))
 +      case (s: scala.collection.Seq[Object] @unchecked, "zip", (o: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(s.zip(o))
-+      case (s: scala.collection.Seq[Object] @unchecked, "zipAll", (o: scala.collection.Seq[Object] @unchecked) :: (thisElem: Object) :: (thatElem: Object) :: Nil) =>
-+        Some(s.zipAll(o, thisElem, thatElem))
-+      case (s: scala.collection.Seq[Object] @unchecked, "collect", (f: Object) :: Nil) =>
-+        val lift = pfLift(f)
-+        Some(s.iterator.flatMap(lift).toList)
++      // NOT `zipAll`/`collect` (deliberately not special-cased): with
++      // dist/lib/scalalib-retained.jar on the classpath, `IterableOps`'s
++      // own real bodies for these run directly via `resolveExternalDefTree`
++      // (`collect`'s own body dispatches to the existing
++      // `"isDefinedAt"/"apply"/"lift"` cases below for its partial-function
++      // argument). Interpreting the real generic implementation instead of
++      // a hand-written shortcut also fixed a real bug: our shortcut's
++      // differently-shaped output tree was missing a source position
++      // `Splicer`'s downstream processing needed.
 +      case (s: scala.collection.Seq[Object] @unchecked, "zipWithIndex", Nil) => Some(s.zipWithIndex.map((v, i) => (v, Int.box(i))))
++      // `IterableOps#iterableFactory`/`SeqOps#iterableFactory`: genuinely
++      // abstract (each concrete collection overrides it to return its own
++      // companion), so a real host receiver (as opposed to one of our own
++      // `InterpretedInstance`s, which the virtual-dispatch fallback already
++      // handles) needs its concrete family identified some other way.
++      // `isInstanceOf` against a fixed, small set of real stdlib collection
++      // types is a compile-time type test against classes this file already
++      // statically depends on (same as `interpretCollectionFactory` above)
++      // -- not reflection (no `getClass`, no loading a class unknown at
++      // build time from a runtime-computed name).
++      case (receiver, "iterableFactory", Nil) =>
++        val moduleClass = receiver match
++          case _: List[Object @unchecked] => defn.ListModule.moduleClass
++          case _: Vector[Object @unchecked] => requiredModule("scala.collection.immutable.Vector").moduleClass
++          case _: mutable.ArrayBuffer[Object @unchecked] => requiredModule("scala.collection.mutable.ArrayBuffer").moduleClass
++          case _: mutable.HashSet[Object @unchecked] => requiredModule("scala.collection.mutable.HashSet").moduleClass
++          case _: scala.collection.immutable.Set[Object @unchecked] => requiredModule("scala.collection.immutable.Set").moduleClass
++          case _: scala.collection.immutable.Seq[Object @unchecked] => defn.SeqClass.companionModule.moduleClass
++          case _ => NoSymbol
++        if moduleClass.exists then Some(ModuleValue(moduleClass)) else None
 +      case (s: scala.collection.Seq[Object] @unchecked, "toList", Nil) => Some(s.toList)
 +      case (s: scala.collection.Seq[Object] @unchecked, "toSet", Nil) => Some(s.toSet)
 +      case (s: scala.collection.Seq[Object] @unchecked, "toVector", Nil) => Some(s.toVector)
