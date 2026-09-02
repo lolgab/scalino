@@ -33,24 +33,40 @@ manifests `bin/snc`/`scli` need.
 
 ## Use
 
-The easy way — `scli`, a mini scala-cli-style build tool (see
-`cli/Scli.scala`), itself compiled by this toolchain, not by a JVM:
+The easy way — `scli`, a mini scala-cli, self-hosted (see `cli/Scli.scala`),
+itself compiled by this toolchain, not by a JVM. Its CLI is deliberately
+shaped like [scala-cli](https://scala-cli.virtuslab.org/)'s:
 
 ```
-./dist/scli run examples/Hello.scala
-./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala   # a real macro
+./dist/scli examples/Hello.scala                                                # `run` is the default command
+./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala  # a real macro
+./dist/scli run examples/ --main-class Hello                                    # a directory: every .scala file under it
+./dist/scli run examples/Hello.scala -w                                         # watch mode: rebuild+rerun on change
 ./dist/scli compile examples/Hello.scala -o hello && ./hello
 ```
 
 It auto-detects the entry point (`@main`, `extends App`, or `def main`), so
-source file order doesn't matter, and understands `//> using dep
-"org::name:version"` / `//> using scala "x"` directives — dependency
-resolution shells out to `cs` (coursier's own launcher is itself a prebuilt
-GraalVM native-image binary, so this costs no JVM either), and both the
-resolved classpath and the compiled/linked output are cached in
-`.scli-build/`. Only libraries actually cross-published for scala-native
-will *link* successfully (JVM-only jars resolve and typecheck fine, but have
-no native code to call into) — see `docs/findings.md`.
+source file order doesn't matter, and understands the common
+`//> using <key> "value"` directives: `dep`/`deps` (dependency coordinates,
+in any of scala-cli's `org:name:version` / `org::name:version` /
+`org::name::version` forms), `scala` (declares a Scala version — must match
+this toolchain's, see below), `mainClass`, and `options`/`option` (extra
+compiler flags). The same things are available as flags: `-d/--dep`,
+`-S/--scala`, `-O/--scalac-option`, `--main-class`, `-w/--watch`,
+`-o/--output`, and `-- <args...>` for the program's own arguments. Run
+`scli --help` for the full list. Dependency resolution shells out to `cs`
+(coursier's own launcher is itself a prebuilt GraalVM native-image binary,
+so this costs no JVM either), and both the resolved classpath and the
+compiled/linked output are cached in `.scli-build/`. Only libraries actually
+cross-published for scala-native will *link* successfully (JVM-only jars
+resolve and typecheck fine, but have no native code to call into) — see
+`docs/findings.md`.
+
+Unlike scala-cli, this toolchain only ever targets the one pinned
+Scala/scala-native version it was built for (no per-project version
+switching, no JVM/Scala.js platforms), and doesn't implement scala-cli's
+`test`/`fmt`/`repl`/`package`/`publish`/`bsp`/`export` commands — running
+any of those prints a clear "not implemented" instead of guessing.
 
 The lower-level way — `bin/snc`, a plain bash wrapper (what `scli` itself
 was bootstrapped from, and what `scli`'s own build script still uses):

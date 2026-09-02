@@ -36,6 +36,15 @@ object Scli:
     System.err.println(s"scli: $msg")
     sys.exit(1)
 
+  /** Raised by anything in the compile/link/resolve pipeline that can fail
+   *  and recover on the next rebuild (as opposed to a bad CLI invocation,
+   *  which is a `die` -- always fatal, checked once before the pipeline
+   *  ever runs). In watch mode (`-w`) a BuildFailed is caught and reported
+   *  per-iteration instead of killing the watch loop; outside watch mode
+   *  it's caught once at the top and turned into the same `die` exit. */
+  case class BuildFailed(msg: String) extends RuntimeException(msg)
+  def fail(msg: String): Nothing = throw BuildFailed(msg)
+
   def readFile(p: Path): String =
     new String(Files.readAllBytes(p), "UTF-8")
 
@@ -71,27 +80,45 @@ object Scli:
 
   def findOnPath(name: String): String =
     val (code, out) = runCaptureStdout(List("sh", "-c", s"command -v $name"))
-    if code != 0 || out.isEmpty then die(s"'$name' not found on PATH")
+    if code != 0 || out.isEmpty then fail(s"'$name' not found on PATH")
     out
 
   // ---------------------------------------------------------------------
-  // Directives: `//> using dep "org::name:version"` / `//> using scala "x"`.
-  // One per line, anywhere in the file -- not a real directive parser (no
-  // multi-line, no other directive kinds), but covers the common case.
+  // Directives: `//> using <key> "value"[, "value2"...]`, one per line,
+  // anywhere in the file. Not a real directive parser (no multi-line `//>
+  // using` blocks, no `-`/`.`-namespaced keys beyond what's listed below),
+  // but covers scala-cli's common single-line quoted-value form, including
+  // its plural aliases (`dep`/`deps`, `option`/`options`).
   // ---------------------------------------------------------------------
 
-  case class Directives(deps: List[String], scalaVersion: Option[String])
+  case class Directives(
+    deps: List[String],
+    scalaVersion: Option[String],
+    mainClass: Option[String],
+    options: List[String]
+  )
 
-  private val depRe = """//>\s*using\s+dep\s+"([^"]+)"""".r
-  private val scalaRe = """//>\s*using\s+scala\s+"([^"]+)"""".r
+  private val quotedRe = """"([^"]*)"""".r
+  private def usingRe(key: String) = s"""//>\\s*using\\s+$key\\b(.*)$$""".r
+
+  /** All quoted values on a `//> using <key> ...` line, trying each of
+   *  `keys` in turn (so callers can accept e.g. both `dep` and `deps`). */
+  private def directiveValues(line: String, keys: String*): Option[List[String]] =
+    keys.iterator.flatMap { k =>
+      usingRe(k).findFirstMatchIn(line).map(m => quotedRe.findAllMatchIn(m.group(1)).map(_.group(1)).toList)
+    }.nextOption()
 
   def parseDirectives(sources: List[Path]): Directives =
     var deps = List.empty[String]
     var scalaVersion = Option.empty[String]
+    var mainClass = Option.empty[String]
+    var options = List.empty[String]
     for src <- sources; line <- readFile(src).linesIterator do
-      depRe.findFirstMatchIn(line).foreach(m => deps = deps :+ m.group(1))
-      scalaRe.findFirstMatchIn(line).foreach(m => scalaVersion = Some(m.group(1)))
-    Directives(deps.distinct, scalaVersion)
+      directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
+      directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
+      directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
+      directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
+    Directives(deps.distinct, scalaVersion, mainClass, options)
 
   /** scala-cli's three dependency formats:
    *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
@@ -157,7 +184,7 @@ object Scli:
         val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
         System.err.println(s"scli: resolving ${deps.mkString(", ")}")
         val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: List("--classpath"))
-        if code != 0 then die(s"dependency resolution failed for: ${deps.mkString(", ")}")
+        if code != 0 then fail(s"dependency resolution failed for: ${deps.mkString(", ")}")
         Files.write(cacheFile, cp.getBytes("UTF-8"))
         cp
 
@@ -193,9 +220,31 @@ object Scli:
       val candidates = sources.flatMap(s => scanMainCandidates(readFile(s))).distinct
       candidates match
         case List(one) => one
-        case Nil => die("no entry point found (looked for `@main def`, `extends App`, or `def main(args: Array[String])`) -- pass --main-class")
-        case many => die(s"multiple possible entry points found (${many.mkString(", ")}) -- pass --main-class to pick one")
+        case Nil => fail("no entry point found (looked for `@main def`, `extends App`, or `def main(args: Array[String])`) -- pass --main-class")
+        case many => fail(s"multiple possible entry points found (${many.mkString(", ")}) -- pass --main-class to pick one")
     }
+
+  // ---------------------------------------------------------------------
+  // Source expansion: a directory argument (e.g. `scli run .`) means "every
+  // .scala file under here", scala-cli-style -- skipping hidden dirs and
+  // this tool's own build-output dirs.
+  // ---------------------------------------------------------------------
+
+  private val skipDirNames = Set(".scli-build", "target", "out")
+
+  def collectScalaFiles(dir: Path): List[Path] =
+    val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
+    entries.flatMap { f =>
+      val name = f.getName
+      if f.isDirectory then
+        if name.startsWith(".") || skipDirNames(name) then Nil
+        else collectScalaFiles(f.toPath)
+      else if name.endsWith(".scala") then List(f.toPath)
+      else Nil
+    }
+
+  def expandSources(paths: List[Path]): List[Path] =
+    paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p))
 
   // ---------------------------------------------------------------------
   // Compile + link, mirroring bin/snc but with directive-resolved deps
@@ -209,7 +258,13 @@ object Scli:
   // (e.g. "lib/foo.jar") so dist/ stays relocatable -- resolve to absolute.
   def resolveCp(raw: String): String = raw.split(":").map(e => s"$dist/$e").mkString(":")
 
-  def buildBinary(sources: List[Path], mainClass: String, extraClasspath: String, out: Path): Unit =
+  def buildBinary(
+    sources: List[Path],
+    mainClass: String,
+    extraClasspath: String,
+    out: Path,
+    extraOptions: List[String] = Nil
+  ): Unit =
     val cacheRoot = Paths.get(".scli-build").resolve(mainClass)
     val classesDir = cacheRoot.resolve("classes")
     val linkDir = cacheRoot.resolve("link")
@@ -229,12 +284,13 @@ object Scli:
       "-javabootclasspath", javaBase,
       "-classpath", compileCp,
       "-Xplugin:" + pluginJar, "-Xplugin-require:scalanative",
-      "-Yretain-trees",
+      "-Yretain-trees"
+    ) ++ extraOptions ++ List(
       "-d", classesDir.toString
     ) ++ sources.map(_.toString)
 
     val compileExit = runInherited(compileCmd)
-    if compileExit != 0 then die("compilation failed")
+    if compileExit != 0 then fail("compilation failed")
 
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir:$nativelibsCp"
@@ -245,64 +301,172 @@ object Scli:
     val linkExit = runInherited(
       List(s"$dist/linkdriver-native", linkCp, linkDir.toString, mainClass, clang, clangpp)
     )
-    if linkExit != 0 then die("linking failed")
+    if linkExit != 0 then fail("linking failed")
 
     val produced = linkDir.resolve(mainClass)
     val producedLower = linkDir.resolve(mainClass.toLowerCase)
     val actual = if Files.exists(produced) then produced else producedLower
-    if !Files.exists(actual) then die(s"expected linked binary at $actual, not found")
+    if !Files.exists(actual) then fail(s"expected linked binary at $actual, not found")
+    Files.createDirectories(Option(out.getParent).getOrElse(Paths.get(".")))
     Files.copy(actual, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     out.toFile.setExecutable(true)
 
   // ---------------------------------------------------------------------
-  // CLI surface: `scli run <sources...> [--main-class X] [-- args...]`
-  //              `scli compile <sources...> [--main-class X] -o <out>`
+  // CLI surface, scala-cli-shaped:
+  //   scli <sources...>                       run (default command, like
+  //                                            `scala-cli Foo.scala`)
+  //   scli run <sources...> [options]
+  //   scli compile <sources...> -o <out> [options]
+  //   scli version / scli --help
+  // options: --main-class X | -d/--dep coord | -S/--scala ver |
+  //          -O/--scalac-option opt | -w/--watch | -o/--output path |
+  //          -- <program args...>
   // ---------------------------------------------------------------------
 
-  def main(args: Array[String]): Unit =
-    if args.isEmpty then die("usage: scli run|compile <sources...> [--main-class X] [-o out] [-- args...]")
+  private val unsupportedCommands = Set(
+    "test", "fmt", "repl", "package", "publish", "publish-local", "clean",
+    "bsp", "export", "doctor", "setup-ide", "install-completions",
+    "dependency-update", "shebang"
+  )
 
-    val cmd = args(0)
-    var sources = List.empty[Path]
-    var mainClassOpt = Option.empty[String]
-    var out = Option.empty[String]
-    var progArgs = List.empty[String]
+  def printVersion(): Unit =
+    println(s"scli (scala-native-compiler) -- Scala ${BuildInfo.scalaVersion}, scala-native ${BuildInfo.nativeBinaryVersion}.x")
 
-    var i = 1
+  def printUsage(out: java.io.PrintStream): Unit =
+    out.print(
+      s"""scli: a mini scala-cli, self-hosted on scala-native-compiler (no JVM anywhere)
+         |
+         |usage:
+         |  scli <sources...>                   run (default command)
+         |  scli run <sources...> [options]     compile and run
+         |  scli compile <sources...> [options] -o <out>   compile to a native binary
+         |  scli version                        print version info
+         |  scli --help                         this message
+         |
+         |a source argument may be a directory: every .scala file under it is
+         |included (skipping hidden and build-output directories).
+         |
+         |options:
+         |  --main-class <name>        explicit entry point (skips auto-detection)
+         |  -d, --dep <coord>          add a dependency (repeatable)
+         |  -S, --scala <version>      declare a Scala version (must match ${BuildInfo.scalaVersion})
+         |  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
+         |  -w, --watch                rebuild (and, for `run`, rerun) on source changes
+         |  -o, --output <path>        output path (compile only)
+         |  -- <args...>               arguments passed to the program (run only)
+         |
+         |directives (in source files), one per line:
+         |  //> using dep "org::name:version"
+         |  //> using scala "3.x"
+         |  //> using mainClass "Foo"
+         |  //> using options "-flag1", "-flag2"
+         |
+         |not implemented (this is a minimal scala-cli-alike): ${unsupportedCommands.toList.sorted.mkString(", ")}.
+         |""".stripMargin
+    )
+
+  case class RunOpts(
+    sources: List[Path] = Nil,
+    mainClassOpt: Option[String] = None,
+    out: Option[String] = None,
+    watch: Boolean = false,
+    cliDeps: List[String] = Nil,
+    cliScala: Option[String] = None,
+    cliOptions: List[String] = Nil,
+    progArgs: List[String] = Nil
+  )
+
+  def parseRunOpts(args: Array[String]): RunOpts =
+    var o = RunOpts()
+    var i = 0
     var inProgArgs = false
     while i < args.length do
-      if inProgArgs then progArgs = progArgs :+ args(i)
+      if inProgArgs then o = o.copy(progArgs = o.progArgs :+ args(i))
       else args(i) match
         case "--" => inProgArgs = true
-        case "--main-class" => mainClassOpt = Some(args(i + 1)); i += 1
-        case "-o" => out = Some(args(i + 1)); i += 1
-        case f => sources = sources :+ Paths.get(f)
+        case "--main-class" => o = o.copy(mainClassOpt = Some(args(i + 1))); i += 1
+        case "-o" | "--output" => o = o.copy(out = Some(args(i + 1))); i += 1
+        case "-w" | "--watch" => o = o.copy(watch = true)
+        case "-d" | "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
+        case "-S" | "--scala" | "--scala-version" => o = o.copy(cliScala = Some(args(i + 1))); i += 1
+        case "-O" | "--scalac-option" | "--scalac-opt" => o = o.copy(cliOptions = o.cliOptions :+ args(i + 1)); i += 1
+        case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
+    o
 
-    if sources.isEmpty then die("no source files given")
-    sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
-
-    val directives = parseDirectives(sources)
-    directives.scalaVersion.foreach { v =>
+  /** Re-run for every rebuild: re-parses directives (they may have changed
+   *  under `-w`), resolves deps, detects the entry point, compiles+links,
+   *  and for `run` also executes the result. Throws BuildFailed on any
+   *  recoverable failure -- never calls `die`/`sys.exit` directly, so a
+   *  watch-mode caller can catch it and keep watching. */
+  def buildAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts): Int =
+    val directives = parseDirectives(expanded)
+    directives.scalaVersion.orElse(o.cliScala).foreach { v =>
       if !BuildInfo.scalaVersion.startsWith(v) then
         System.err.println(
-          s"scli: warning: //> using scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
+          s"scli: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
         )
     }
-    val extraClasspath = resolveDeps(directives.deps, Paths.get(".scli-build").resolve("deps-cache"))
-    val mainClass = detectMainClass(sources, mainClassOpt)
+    val allDeps = (directives.deps ++ o.cliDeps).distinct
+    val extraClasspath = resolveDeps(allDeps, Paths.get(".scli-build").resolve("deps-cache"))
+    val mainClass = detectMainClass(expanded, o.mainClassOpt.orElse(directives.mainClass))
+    val options = directives.options ++ o.cliOptions
 
-    cmd match
+    mode match
       case "run" =>
         val binPath = Paths.get(".scli-build").resolve(mainClass).resolve("bin")
-        buildBinary(sources, mainClass, extraClasspath, binPath)
-        val exit = runInherited(binPath.toString :: progArgs)
-        sys.exit(exit)
-
+        buildBinary(expanded, mainClass, extraClasspath, binPath, options)
+        runInherited(binPath.toString :: o.progArgs)
       case "compile" =>
-        val outPath = Paths.get(out.getOrElse(die("-o <output> is required for `scli compile`")))
-        buildBinary(sources, mainClass, extraClasspath, outPath)
+        val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `scli compile`")))
+        buildBinary(expanded, mainClass, extraClasspath, outPath, options)
         println(s"scli: wrote $outPath")
+        0
 
+  /** Polls source mtimes every 500ms and reruns `attempt` on change --
+   *  simple and portable (no reliance on java.nio.file.WatchService, whose
+   *  support in this toolchain's javalib port is unverified). Runs once
+   *  immediately, same as scala-cli's `-w`. */
+  def watchLoop(sources: List[Path])(attempt: () => Unit): Unit =
+    def mtimes(): Map[Path, Long] =
+      sources.filter(Files.exists(_)).map(p => p -> Files.getLastModifiedTime(p).toMillis).toMap
+    attempt()
+    System.err.println("scli: watching for changes (Ctrl+C to stop)...")
+    var last = mtimes()
+    while true do
+      Thread.sleep(500)
+      val cur = mtimes()
+      if cur != last then
+        last = cur
+        System.err.println("scli: change detected, rebuilding...")
+        attempt()
+
+  def handleRunOrCompile(mode: String, args: Array[String]): Unit =
+    val o = parseRunOpts(args)
+    if o.sources.isEmpty then die("no source files given")
+    o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
+    val expanded = expandSources(o.sources)
+    if expanded.isEmpty then die("no .scala files found")
+
+    if o.watch then
+      watchLoop(expanded) { () =>
+        try buildAndMaybeRun(mode, expanded, o)
+        catch case BuildFailed(msg) => System.err.println(s"scli: $msg")
+      }
+    else
+      try sys.exit(buildAndMaybeRun(mode, expanded, o))
+      catch case BuildFailed(msg) => die(msg)
+
+  def main(args: Array[String]): Unit =
+    if args.isEmpty then { printUsage(System.err); sys.exit(1) }
+    args(0) match
+      case "-h" | "--help" => printUsage(System.out)
+      case "--version" | "version" => printVersion()
+      case "run" => handleRunOrCompile("run", args.drop(1))
+      case "compile" => handleRunOrCompile("compile", args.drop(1))
+      case cmd if unsupportedCommands(cmd) =>
+        die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, version")
+      case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
+        handleRunOrCompile("run", args) // implicit `run`, e.g. `scli Foo.scala`
       case other =>
-        die(s"unknown command '$other' -- expected 'run' or 'compile'")
+        die(s"unknown command or file '$other' -- run 'scli --help'")

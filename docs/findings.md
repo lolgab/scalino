@@ -236,6 +236,46 @@ cross-platform). The last one is the strongest proof: not just resolved but
 scala-native library) compiled, linked, and printed the correct working
 directory end to end.
 
+### `scli`: closing the gap with scala-cli's CLI surface
+
+Follow-up pass specifically aimed at making the command line itself feel
+like scala-cli's, not just the directive parsing underneath:
+
+- `scli <sources...>` with no subcommand now means `run` (scala-cli's
+  signature `scala-cli Foo.scala` UX); `scli run`/`scli compile` still work
+  explicitly.
+- A source argument may be a directory (`scli run .`): every `.scala` file
+  under it is collected recursively, skipping hidden and build-output
+  (`.scli-build`/`target`/`out`) directories.
+- New directives: `mainClass` (explicit entry point, alternative to
+  `--main-class`) and `options`/`option` (extra `dotc-native` flags, e.g.
+  `//> using options "-explain"`).
+- New flags mirroring scala-cli's: `-d`/`--dep`/`--dependency` (dependency,
+  repeatable, same as the directive), `-S`/`--scala`/`--scala-version`
+  (same warn-if-mismatched behavior as the directive), `-O`/
+  `--scalac-option` (extra compiler flag, repeatable).
+- `-w`/`--watch`: rebuilds (and, for `run`, reruns) on source change. Polls
+  file mtimes every 500ms rather than using `java.nio.file.WatchService` --
+  simpler and doesn't depend on that API's support in this toolchain's
+  javalib port, which is unverified. Build/link/resolve failures during a
+  watch iteration are caught and reported without killing the loop (see
+  `BuildFailed` in `Scli.scala`); a genuinely bad CLI invocation still exits
+  immediately, before the loop ever starts.
+- `scli version` and `scli --help`/`-h`.
+- Typing an unimplemented scala-cli command (`test`, `fmt`, `repl`,
+  `package`, `publish`, `publish-local`, `clean`, `bsp`, `export`,
+  `doctor`, `setup-ide`, `install-completions`, `dependency-update`,
+  `shebang`) now gets a clear "not implemented" message naming what *is*
+  supported, instead of being misparsed as a source file.
+
+Verified: implicit-run, `run` on a directory (correctly aggregates every
+`.scala` file found and still applies entry-point detection/disambiguation
+across all of them), `-O` flag passthrough to `dotc-native`, the
+`mainClass` directive, the `-d` flag (resolution failure surfaces the same
+clean error as a directive-declared dependency), and a full watch-mode
+cycle (initial build/run, edit, detected, rebuild, rerun, all without
+restarting the process).
+
 **Known limitation, inherent to scala-native itself, not this tool**: a
 resolved dependency jar typechecks fine but only *links* if it's actually
 cross-published for scala-native (an `org::name::version`-resolvable
@@ -318,10 +358,14 @@ causes, one in each layer:
    platform) instead of a build-time-baked-in absolute path. `dist/` is now a
    self-contained, copyable/tarball-able distribution.
 4. **`scli` follow-ups.** See "Toward a build-tool experience without a JVM"
-   above for what's implemented. Missing: watch mode, incremental Scala
-   compilation (see item 7), multi-module projects, more `//> using`
-   directive kinds, and a real (not heuristic-text-scan) entry-point
-   detector.
+   above for what's implemented (including watch mode and directory/CLI-flag
+   parity with scala-cli as of the "closing the gap" pass). Still missing:
+   incremental Scala compilation (see item 7), multi-module/multi-target
+   projects, a real (not heuristic-text-scan) entry-point detector, and
+   scala-cli's `test`/`fmt`/`repl`/`package`/`publish`/`bsp`/`export`
+   commands -- none of those have an obvious JVM-free equivalent yet (no
+   vendored test framework, no scalafmt, no bloop), so they currently just
+   print "not implemented" rather than being faked.
 5. Only tested on macOS/arm64. Linux/other-arch is unverified.
 6. `bin/snc`'s "first source file's basename is the main class" convention is
    still naive (unlike `scli`, which auto-detects) — for multi-file macro
