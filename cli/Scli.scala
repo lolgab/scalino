@@ -97,32 +97,45 @@ object Scli:
 
   case class Directives(
     deps: List[String],
+    compileOnlyDeps: List[String],
     scalaVersion: Option[String],
     mainClass: Option[String],
     options: List[String]
   )
 
   private val quotedRe = """"([^"]*)"""".r
-  private def usingRe(key: String) = s"""//>\\s*using\\s+$key\\b(.*)$$""".r
+  private def usingRe(key: String) = s"""//>\\s*using\\s+${java.util.regex.Pattern.quote(key)}\\b(.*)$$""".r
 
-  /** All quoted values on a `//> using <key> ...` line, trying each of
-   *  `keys` in turn (so callers can accept e.g. both `dep` and `deps`). */
+  /** All values on a `//> using <key> ...` line, trying each of `keys` in
+   *  turn (so callers can accept e.g. both `dep` and `deps`). Values are
+   *  normally quoted (scala-cli's `"org::name:version"` form), but a lone
+   *  unquoted token (`//> using dep org::name:version`, no quotes) is also
+   *  accepted as a single bare value, matching real scala-cli. */
   private def directiveValues(line: String, keys: String*): Option[List[String]] =
     keys.iterator.flatMap { k =>
-      usingRe(k).findFirstMatchIn(line).map(m => quotedRe.findAllMatchIn(m.group(1)).map(_.group(1)).toList)
+      usingRe(k).findFirstMatchIn(line).map { m =>
+        val rest = m.group(1)
+        val quoted = quotedRe.findAllMatchIn(rest).map(_.group(1)).toList
+        if quoted.nonEmpty then quoted
+        else rest.trim match
+          case "" => Nil
+          case bare => List(bare)
+      }
     }.nextOption()
 
   def parseDirectives(sources: List[Path]): Directives =
     var deps = List.empty[String]
+    var compileOnlyDeps = List.empty[String]
     var scalaVersion = Option.empty[String]
     var mainClass = Option.empty[String]
     var options = List.empty[String]
     for src <- sources; line <- readFile(src).linesIterator do
       directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
+      directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
       directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
       directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
       directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
-    Directives(deps.distinct, scalaVersion, mainClass, options)
+    Directives(deps.distinct, compileOnlyDeps.distinct, scalaVersion, mainClass, options)
 
   /** scala-cli's three dependency formats:
    *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
@@ -267,7 +280,8 @@ object Scli:
     mainClass: String,
     extraClasspath: String,
     out: Path,
-    extraOptions: List[String] = Nil
+    extraOptions: List[String] = Nil,
+    extraCompileOnlyClasspath: String = ""
   ): Unit =
     val cacheRoot = Paths.get(".scli-build").resolve(mainClass)
     val classesDir = cacheRoot.resolve("classes")
@@ -280,8 +294,8 @@ object Scli:
     val pluginJar = s"$dist/" + readListFile("nscplugin.jar.txt")
 
     val compileCp =
-      if extraClasspath.isEmpty then s"$compilerCp:$nativelibsCp"
-      else s"$compilerCp:$nativelibsCp:$extraClasspath"
+      List(compilerCp, nativelibsCp, extraClasspath, extraCompileOnlyClasspath)
+        .filter(_.nonEmpty).mkString(":")
 
     val compileCmd = List(
       s"$dist/dotc-native",
@@ -361,6 +375,7 @@ object Scli:
          |
          |directives (in source files), one per line:
          |  //> using dep "org::name:version"
+         |  //> using compileOnly.dep "org::name:version"
          |  //> using scala "3.x"
          |  //> using mainClass "Foo"
          |  //> using options "-flag1", "-flag2"
@@ -412,18 +427,20 @@ object Scli:
         )
     }
     val allDeps = (directives.deps ++ o.cliDeps).distinct
-    val extraClasspath = resolveDeps(allDeps, Paths.get(".scli-build").resolve("deps-cache"))
+    val depsCache = Paths.get(".scli-build").resolve("deps-cache")
+    val extraClasspath = resolveDeps(allDeps, depsCache)
+    val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
     val mainClass = detectMainClass(expanded, o.mainClassOpt.orElse(directives.mainClass))
     val options = directives.options ++ o.cliOptions
 
     mode match
       case "run" =>
         val binPath = Paths.get(".scli-build").resolve(mainClass).resolve("bin")
-        buildBinary(expanded, mainClass, extraClasspath, binPath, options)
+        buildBinary(expanded, mainClass, extraClasspath, binPath, options, extraCompileOnlyClasspath)
         runInherited(binPath.toString :: o.progArgs)
       case "compile" =>
         val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `scli compile`")))
-        buildBinary(expanded, mainClass, extraClasspath, outPath, options)
+        buildBinary(expanded, mainClass, extraClasspath, outPath, options, extraCompileOnlyClasspath)
         println(s"scli: wrote $outPath")
         0
 

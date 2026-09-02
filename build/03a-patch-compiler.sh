@@ -2,18 +2,20 @@
 # Applies our patch to the vendored scala3 source and produces a "patched"
 # scala3-compiler jar: the published scala3-compiler_3 jar with
 # dotty/tools/dotc/quoted/{Interpreter,ModuleValue,InterpretedInstance,
-# InterpretedVar,LocalDef,LabeledReturn,NonFatalInterpretedException}* classes
-# overlaid by our own-implementation, JVM-free rewrite (see
-# vendor/scala3/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala and
-# docs/findings.md "Macro execution").
+# InterpretedVar,LocalDef,LabeledReturn,NonFatalInterpretedException}* and
+# dotty/tools/dotc/transform/Splicer* classes overlaid by our own-implementation,
+# JVM-free rewrite (see vendor/scala3/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala,
+# .../transform/Splicer.scala, and docs/findings.md "Macro execution").
 #
 # This is a source-level patch (`git diff` against the vendored scala3 clone
 # is the actual patch), but NOT a full dotty sbt rebuild -- we only recompile
-# the one changed file against the published, unmodified scala3-compiler_3
-# jar and splice the result in. This works because the change is confined to
-# a single file with no changes to anything it isn't already a normal
-# dependent of. A change spanning multiple compiler files would need the full
-# sbt bootstrap build instead; see docs/findings.md "Remaining work".
+# the two changed files (together, so Splicer.scala's `SpliceInterpreter
+# extends Interpreter` sees our patched Interpreter from source rather than
+# the original class on the classpath) against the published, unmodified
+# scala3-compiler_3 jar and splice the result in. This works because the
+# change is confined to files with no other dependents that also need
+# patching. A change spanning further compiler files would need the full sbt
+# bootstrap build instead; see docs/findings.md "Remaining work".
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -36,7 +38,8 @@ mkdir -p "$PATCHED_DIR"
 "$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
   -classpath "$(cat "$WORK/compiler.cp")" \
   -d "$PATCHED_DIR" \
-  "$VENDOR/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala"
+  "$VENDOR/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala" \
+  "$VENDOR/compiler/src/dotty/tools/dotc/transform/Splicer.scala"
 
 cp "$ORIG_JAR" "$PATCHED_JAR"
 (cd "$PATCHED_DIR" && "$JAR" uf "$PATCHED_JAR" $(find dotty -type f))
