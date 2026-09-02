@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..9cc8ffda 100644
+index e34d3506..303c9d5c 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..9cc8ffda 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1771 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1854 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -343,7 +343,7 @@ index e34d3506..9cc8ffda 100644
 +      if matchesRuntimeType(scrutinee, tpt.tpe) then Some(env) else None
 +    case Typed(inner, _) => matchPattern(inner, scrutinee)
 +    case Alternative(pats) => pats.iterator.map(p => matchPattern(p, scrutinee)).find(_.isDefined).flatten
-+    case QuotePattern(bindings, body, _) =>
++    case QuotePattern(bindings, body, _) if body.isType =>
 +      // `case '[ft] =>`/`case '[type ft; ft] =>` (matching a `Type[?]`
 +      // scrutinee, pre-`QuotePatterns`-phase raw shape -- that phase
 +      // normally lowers this into a `TypeMatch.unapply` call, but
@@ -361,6 +361,16 @@ index e34d3506..9cc8ffda 100644
 +          throw new StopInterpretation(
 +            em"Interpreter (own implementation) does not support structural quote-type patterns yet (only a bare type-variable pattern like `case '[t] =>`): ${pat.show}",
 +            pat.srcPos)
++    case QuotePattern(_, body, _) =>
++      // `case '{ ... } =>` (matching an `Expr[?]` scrutinee structurally --
++      // e.g. every custom string-interpolator macro's own
++      // `case '{ StringContext(${Varargs(Exprs(parts))}: _*) } => ...`).
++      // `body` is the pre-`QuotePatterns`-phase shape tree, already
++      // containing real nested `UnApply`s (`Varargs.unapply`/`Exprs.unapply`/
++      // etc, from `${pattern}` splice-patterns inside it) -- walk `body`
++      // and the scrutinee's real tree in parallel, handing off to the
++      // ordinary `matchPattern`/`UnApply` machinery at each `SplicePattern`.
++      matchQuoteBody(body, scrutinee)
 +    case (_: Ident | _: Select) if pat.symbol.exists && !pat.symbol.is(Method) =>
 +      // A stable-identifier pattern (e.g. `case scala.reflect.ClassTag.ObjectTYPE => ...`,
 +      // matching a `val` by equality, not deconstructing anything) --
@@ -432,6 +442,31 @@ index e34d3506..9cc8ffda 100644
 +                case s: scala.collection.Seq[Object @unchecked] => if s.size == patterns.size then Some(s.toList) else None
 +                case _ => None
 +              }
++            // `scala.quoted.Varargs.unapply`/`Exprs.unapply`: the two
++            // extractors every custom string-interpolator macro's own
++            // `case '{ StringContext(${Varargs(Exprs(parts))}: _*) } => ...`
++            // is built from (see `matchQuoteBody` below, which supplies the
++            // `Expr`/`Seq[Expr]` scrutinees these expect).
++            case "Varargs" => Some {
++              case e: scala.quoted.runtime.impl.ExprImpl =>
++                stripInlined(e.tree) match
++                  case SeqLiteral(elems, _) => Some(List(elems.map(t => new scala.quoted.runtime.impl.ExprImpl(t, e.scope))))
++                  case Typed(SeqLiteral(elems, _), _) => Some(List(elems.map(t => new scala.quoted.runtime.impl.ExprImpl(t, e.scope))))
++                  case _ => None
++              case _ => None
++            }
++            case "Exprs" => Some {
++              case exprs: scala.collection.Seq[Object @unchecked] =>
++                val values = exprs.map {
++                  case e: scala.quoted.runtime.impl.ExprImpl =>
++                    stripInlined(e.tree) match
++                      case Literal(Constant(v)) => Some(v.asInstanceOf[Object])
++                      case _ => None
++                  case _ => None
++                }
++                if values.forall(_.isDefined) then Some(List(values.map(_.get).toList)) else None
++              case _ => None
++            }
 +            // `quotes.reflect.{AppliedType,OrType,AndType,TypeBounds}`'s own
 +            // companion `unapply` (structural deconstruction, not a
 +            // `TypeTest`): the scrutinee already *is* a real dotc
@@ -480,6 +515,54 @@ index e34d3506..9cc8ffda 100644
 +    case _ =>
 +      throw new StopInterpretation(
 +        em"Interpreter (own implementation) does not support this pattern shape yet: ${pat.show}", pat.srcPos)
++
++  /** Strips the `Inlined(EmptyTree, Nil, realTree)` wrapper every `ExprImpl`
++   *  we construct puts around its tree (see the `Quote`-handling in
++   *  `Splicer.scala`), to compare/match the real underlying tree.
++   */
++  private def stripInlined(t: Tree): Tree = t match
++    case Inlined(_, Nil, expr) => stripInlined(expr)
++    case _ => t
++
++  /** Matches a term-level quote pattern's `body` (e.g. `StringContext(${Varargs(Exprs(parts))}: _*)`)
++   *  against an `Expr[?]` scrutinee structurally. `body` is the
++   *  pre-`QuotePatterns`-phase shape tree: ordinary term structure
++   *  (`Apply`/`Select`/`Ident`/`Typed`) with real `SplicePattern` nodes
++   *  wherever the source wrote `${pattern}` -- walk both trees in
++   *  parallel, and at each `SplicePattern` hand off to the ordinary
++   *  `matchPattern`/`UnApply` machinery (which already knows how to
++   *  destructure `Varargs`/`Exprs`/etc, added above) using the
++   *  corresponding scrutinee sub-tree (wrapped as a fresh `Expr`) as its
++   *  scrutinee.
++   */
++  private def matchQuoteBody(pat: Tree, scrutinee: Object)(using env: Env): Option[Env] =
++    scrutinee match
++      case e: scala.quoted.runtime.impl.ExprImpl => matchQuoteBodyTree(pat, stripInlined(e.tree), e.scope)
++      case _ => None
++
++  private def matchQuoteBodyTree(pat: Tree, scrutTree: Tree, scope: scala.quoted.runtime.impl.Scope)(using env: Env): Option[Env] = pat match
++    case SplicePattern(subPat, _, _) =>
++      matchPattern(subPat, new scala.quoted.runtime.impl.ExprImpl(scrutTree, scope))
++    case Typed(patExpr, _) =>
++      val scrutExpr = scrutTree match { case Typed(e, _) => e; case _ => scrutTree }
++      matchQuoteBodyTree(patExpr, scrutExpr, scope)
++    case Apply(patFn, patArgs) =>
++      scrutTree match
++        case Apply(scrutFn, scrutArgs) if patArgs.size == scrutArgs.size =>
++          matchQuoteBodyTree(patFn, scrutFn, scope).flatMap { e1 =>
++            patArgs.zip(scrutArgs).foldLeft(Option(e1)) { (eOpt, pv) =>
++              eOpt.flatMap(e => matchQuoteBodyTree(pv._1, pv._2, scope)(using e))
++            }
++          }
++        case _ => None
++    case Select(patQual, patName) =>
++      scrutTree match
++        case Select(scrutQual, scrutName) if patName == scrutName => matchQuoteBodyTree(patQual, scrutQual, scope)
++        case _ => None
++    case _ =>
++      // A leaf reference (e.g. `StringContext`'s own `Ident`/module select):
++      // match by symbol identity, not structurally.
++      if pat.symbol.exists && pat.symbol == scrutTree.symbol then Some(env) else None
 +
 +  private def typeTestClass(name: String): Option[Class[?]] = name match
 +    case "ConstantTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.ConstantType])
