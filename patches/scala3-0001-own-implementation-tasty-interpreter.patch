@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..ecf00218 100644
+index e34d3506..c46a0a46 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..ecf00218 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1874 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1881 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -502,6 +502,12 @@ index e34d3506..ecf00218 100644
 +                case t: Typed @unchecked => Some(List(t.expr, t.tpt))
 +                case _ => None
 +              }
++            case "Block" =>
++              // `quotes.reflect.Block` -- a real `tpd.Block`: `stats: List[Statement]`, `expr: Term`.
++              Some {
++                case b: Block @unchecked => Some(List(b.stats, b.expr))
++                case _ => None
++              }
 +            case name =>
 +              // Generic `TypeTest[TypeRepr, SomeDotcTypeSubclass]` shape:
 +              // matches iff the scrutinee's real runtime type (dotc's own
@@ -597,6 +603,7 @@ index e34d3506..ecf00218 100644
 +    // real `QuotesImpl`.
 +    case "RepeatedTypeTest" => Some(classOf[SeqLiteral])
 +    case "TypedTypeTest" => Some(classOf[Typed])
++    case "BlockTypeTest" => Some(classOf[Block])
 +    case _ => None
 +
 +  private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
