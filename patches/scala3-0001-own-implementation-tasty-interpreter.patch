@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..c55c5006 100644
+index e34d3506..aa19344b 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..c55c5006 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1959 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,2006 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -292,10 +292,16 @@ index e34d3506..c55c5006 100644
 +        accEnv.updated(stat.symbol, if stat.symbol.is(Mutable) then InterpretedVar(v) else v)
 +      case stat: DefDef =>
 +        // Local def: recorded so calls to it later in the block invoke it
-+        // (see the `LocalDef` case in interpretTree's Call branch). Captures
-+        // `accEnv` as of this point -- sufficient for non-mutually-recursive
-+        // local defs, which is what match/closure desugarings generate.
-+        accEnv.updated(stat.symbol, LocalDef(stat, accEnv))
++        // (see the `LocalDef` case in interpretTree's Call branch). A
++        // self-recursive local def (e.g. a macro's own `def rec(tree) =
++        // tree match { case ... => rec(sub) }`) needs its OWN binding
++        // inside its captured env -- `closureEnv` is mutated in place
++        // (after the symbol is already bound) so it includes itself,
++        // rather than only the env as of just before this def.
++        val ld = LocalDef(stat, accEnv)
++        val newEnv = accEnv.updated(stat.symbol, ld)
++        ld.closureEnv = newEnv
++        newEnv
 +      case _: Import =>
 +        accEnv // purely a typer-time construct; no runtime effect
 +      case _: TypeDef =>
@@ -432,6 +438,16 @@ index e34d3506..c55c5006 100644
 +              // `case Some(x) =>` on a real `Option` -- same story as `::`.
 +              Some {
 +                case Some(v: Object @unchecked) => Some(List(v))
++                case _ => None
++              }
++            case name2 if name2.matches("Tuple\\d+") =>
++              // `case (a, b, ...) =>`/`case TupleN(a, b, ...) =>` -- the
++              // compiler-generated `TupleN.unapply`. A real `TupleN` (e.g.
++              // from `Tuple.fromArray` in the `apply` case below, or
++              // built directly by user code) is a `Product`; extract its
++              // fields positionally, generic over arity.
++              Some {
++                case p: Product => Some((0 until patterns.size).map(i => p.productElement(i).asInstanceOf[Object]).toList)
 +                case _ => None
 +              }
 +            case "List" =>
@@ -1709,6 +1725,14 @@ index e34d3506..c55c5006 100644
 +      // body, but a `TupleN` is just its N fields, constructible directly.
 +      case "apply" if fn.owner.name.toString.stripSuffix("$").matches("Tuple\\d+") =>
 +        Some(Tuple.fromArray(args.toArray))
++      // `Some.apply(x)` (the companion's own synthesized apply, distinct
++      // from `new Some(x)` which `newStdlibCollection` already handles) --
++      // same real class, so the same symbol-identity check (`showFullName`
++      // is unreliable for root types, see `newStdlibCollection`).
++      case "apply" if fn.owner == defn.SomeClass.companionModule.moduleClass =>
++        args match
++          case v :: Nil => Some(Some(v))
++          case _ => None
 +      case "apply" if fn.owner.name.toString == "ApplyModule" =>
 +        args match
 +          case (fun: Tree) :: as :: Nil => Some(tpd.Apply(fun, asObjectList(as).asInstanceOf[List[Tree]]))
@@ -1997,6 +2021,24 @@ index e34d3506..c55c5006 100644
 +        interpretTree(ddef.rhs)(using withParams)
 +      case _ => throw new StopInterpretation(em"Interpreter (own implementation): cannot call $methodName directly on ${inst.toString}", pos)
 +
++  /** `f.lift`, generalized over the three partial-function shapes this
++   *  interpreter hands out (real `PartialFunction`, an `InterpretedInstance`
++   *  anon-class override, or a plain closure relying on `MatchError` --
++   *  see the `"lift"` cases below) -- used directly by `Seq#collect`,
++   *  which needs the same "try it, None if not defined" logic but can't
++   *  delegate to a real host `.collect` since the function value itself
++   *  usually isn't a real `scala.PartialFunction`.
++   */
++  private def pfLift(f: Object)(using Env): Object => Option[Object] = f match
++    case pf: PartialFunction[Object, Object] @unchecked => pf.lift
++    case inst: InterpretedInstance =>
++      (x: Object) =>
++        if callInstanceMethodDirect(inst, "isDefinedAt", List(x)).asInstanceOf[Boolean]
++        then Some(callInstanceMethodDirect(inst, "apply", List(x)))
++        else None
++    case fn1: Function1[Object, Object] @unchecked =>
++      (x: Object) => try Some(fn1(x)) catch case _: MatchError => None
++
 +  private def interpretStdlibIntrinsic(receiver: Object, fn: Symbol, args: List[Object])(using Env): Option[Object] =
 +    if sys.env.contains("SNC_INTERP_DEBUG") then
 +      Console.err.println(s"[interpretStdlibIntrinsic] receiver.getClass=${if receiver == null then "null" else receiver.getClass} fn.name=${fn.name} args=${args.map(a => if a == null then "null" else a.getClass)}")
@@ -2050,6 +2092,11 @@ index e34d3506..c55c5006 100644
 +      case (s: collection.Set[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(s.contains(v)))
 +      case (s: scala.collection.Seq[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(s(i))
 +      case (s: scala.collection.Seq[Object] @unchecked, "zip", (o: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(s.zip(o))
++      case (s: scala.collection.Seq[Object] @unchecked, "zipAll", (o: scala.collection.Seq[Object] @unchecked) :: (thisElem: Object) :: (thatElem: Object) :: Nil) =>
++        Some(s.zipAll(o, thisElem, thatElem))
++      case (s: scala.collection.Seq[Object] @unchecked, "collect", (f: Object) :: Nil) =>
++        val lift = pfLift(f)
++        Some(s.iterator.flatMap(lift).toList)
 +      case (s: scala.collection.Seq[Object] @unchecked, "zipWithIndex", Nil) => Some(s.zipWithIndex.map((v, i) => (v, Int.box(i))))
 +      case (s: scala.collection.Seq[Object] @unchecked, "toList", Nil) => Some(s.toList)
 +      case (s: scala.collection.Seq[Object] @unchecked, "toSet", Nil) => Some(s.toSet)
@@ -2364,7 +2411,7 @@ index e34d3506..c55c5006 100644
 + *  within the same block) can be interpreted instead of just returned as a
 + *  value the way a local `val` reference would be.
 + */
-+final case class LocalDef(ddef: tpd.DefDef, closureEnv: Map[Symbol, Object])
++final case class LocalDef(ddef: tpd.DefDef, var closureEnv: Map[Symbol, Object])
 +
 +/** Interprets `return[label] value` / the enclosing `Labeled(label, ...)` block
 + *  it targets -- how dotc lowers matches (among other things) internally.
