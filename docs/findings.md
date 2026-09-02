@@ -163,6 +163,68 @@ dependent of. A patch spanning multiple compiler files, or one needing an
 API not exposed by the published jar's public surface, would need the full
 sbt build instead (see "Remaining work").
 
+## Toward a build-tool experience without a JVM
+
+Asked whether `snc` could grow scala-cli-like ergonomics (single command,
+dependency resolution, caching, watch mode) without reintroducing a JVM.
+Conclusion: don't reuse scala-cli itself — it's deeply JVM-coupled
+(coursier-as-library, bloop, zinc). Instead reuse only the one genuinely
+JVM-free piece already available (coursier ships `cs` itself as a prebuilt
+GraalVM native-image launcher, so shelling out to it for dependency
+resolution costs no JVM despite coursier being JVM Scala under the hood),
+and hand-roll the rest (directives, an incremental-compile cache, watch mode)
+purpose-built rather than porting zinc/BSP. Not started — this section is a
+placeholder for when that work begins.
+
+### `bin/snc` created a fresh tmp dir every build — first real bug found
+
+First thing noticed trying to actually use `snc` repeatedly: every dependency
+`.c` file (scala-native's own vendored runtime, ~160 files) recompiled from
+scratch on every single build, even with no source changes. Two distinct
+causes, one in each layer:
+
+1. **Our bug**: `bin/snc` used `work="$(mktemp -d)"` + `trap 'rm -rf "$work"'
+   EXIT` — a fresh, deleted-on-exit directory every invocation. scala-native's
+   own `Build.buildCachedAwait` (used by `LinkDriver.scala`) keeps its
+   per-file `.o` cache *inside* that workDir, so deleting it every time threw
+   the cache away regardless of whether it worked. Fixed: `bin/snc` now uses
+   a persistent, project-local `.snc-build/<mainClass>/` (scala-cli's own
+   `.scala-build` convention), never deleted.
+
+2. **scala-native's bug** (0.5.12): even with a persistent workDir, dependency
+   `.c` files still recompiled every time. Root cause, traced into
+   `vendor/scala-native`: `LLVM.compile`'s freshness check
+   (`needsCompiling`, `LLVM.scala`) is `mtime(.c) > mtime(.o) ||
+   Build.userConfigHasChanged(config)` — a real per-file cache. But for
+   vendored dependency libraries, `NativeLib.compileNativeLibrary` calls this
+   with a **per-library** `projConfig` (`configureNativeLibrary` appends
+   reachability-analysis-derived preprocessor flags per library), while the
+   hash file it's compared against is written once, at the very end of the
+   whole build, from the **top-level, un-augmented** config
+   (`Build.scala:159`, `dumpUserConfigHash`). Comparing two structurally
+   different `NativeConfig`s meant `userConfigHasChanged` was true almost
+   unconditionally for every dependency file — the mtime check never even
+   got a chance to matter. Our own generated LLVM IR (compiled with the
+   *unmodified* top-level config) was never affected — only the ~160 vendored
+   runtime C/S files were.
+
+   **Fix** (`patches/scala-native-0001-fix-native-lib-object-cache.patch`,
+   `build/04a-patch-tools.sh`, same splice-not-full-rebuild approach as the
+   dotc patch): made the hash-file path an explicit parameter through
+   `LLVM.compile`/`needsCompiling`/`Build.userConfigHasChanged`/
+   `dumpUserConfigHash`, and gave `compileNativeLibrary` its own hash file
+   scoped to that library's `destPath`, computed from and compared against
+   its own `projConfig`. Every other call site keeps the original top-level
+   file (`Build.defaultUserConfigHashPath`), so this is strictly additive —
+   it can only make the cache *more* accurate (skip when a library's
+   effective config really is unchanged), never less safe, since the
+   pre-patch behavior was "almost always recompile" (safe, just wasteful),
+   not "sometimes wrongly skip." Verified: cache invalidates correctly when
+   source actually changes (rebuilt `examples/Hello.scala` after editing it
+   mid-`.snc-build`, got the new output), and a warm rebuild of
+   `examples/Hello.scala` went from 162 dependency recompiles / ~4.6s to 0
+   recompiles / ~1.7s.
+
 ## Remaining work
 
 1. **General quote-pattern matching.** The biggest real gap — see
@@ -171,18 +233,22 @@ sbt build instead (see "Remaining work").
 2. **Full sbt source build.** Current patching approach (recompile one file,
    splice into the published jar) only works for single-file, dependency-only
    patches. Anything touching multiple compiler files, or needing non-public
-   API, needs the real dotty sbt bootstrap build wired up instead.
+   API, needs the real dotty/scala-native sbt bootstrap build wired up
+   instead.
 3. **Packaging/relocatability.** `dist/*.cp` manifests (used by `bin/snc`)
    currently hold absolute paths into the local coursier cache
    (`~/Library/Caches/Coursier/...`). This works on the machine that built it
    but isn't yet a distributable, self-contained tarball. Follow-up: vendor
    the referenced jars into `dist/lib/` and rewrite the manifests to relative
    paths.
-4. **`scala-native/scala-native` patching.** Only `scala/scala3` has needed a
-   patch so far; scala-native's published artifacts have worked as-is. The
-   `vendor`/`patches` mechanism generalizes to it if that changes.
+4. **A real JVM-free build-tool experience.** See "Toward a build-tool
+   experience without a JVM" above — dependency resolution via native `cs`,
+   `//> using` directives, watch mode. Not started.
 5. Only tested on macOS/arm64. Linux/other-arch is unverified.
 6. `bin/snc`'s "first source file's basename is the main class" convention is
    naive — for multi-file macro examples the entry-point file must be listed
    first (see `examples/macro-hello/` usage in the README). A real CLI would
    detect the actual `@main`/`extends App` entry point instead.
+7. Only compiling Scala source is incremental-cache-free right now — `dotc`
+   always fully recompiles every given source file. The native-library object
+   cache fixed above only covers scala-native's own vendored runtime sources.

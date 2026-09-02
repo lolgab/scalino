@@ -4,6 +4,7 @@
 /.patch-work/
 /.scala-build/
 /.bsp/
+.snc-build/
 *.class
 *.tasty
 *.nir

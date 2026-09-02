@@ -1,0 +1,172 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/Build.scala b/tools/src/main/scala/scala/scalanative/build/Build.scala
+index 8eb17b0..9a2963a 100644
+--- a/tools/src/main/scala/scala/scalanative/build/Build.scala
++++ b/tools/src/main/scala/scala/scalanative/build/Build.scala
+@@ -156,7 +156,7 @@ object Build {
+             .map(objects => link(config, linkerResult, objects))
+             .map(artifact => postProcess(config, artifact))
+         }
+-        .andThen { case Success(_) => dumpUserConfigHash(config) }
++        .andThen { case Success(_) => dumpUserConfigHash(config, defaultUserConfigHashPath(config)) }
+     }
+   }
+ 
+@@ -172,7 +172,7 @@ object Build {
+         .sequence {
+           irGenerators.map(irGenerator =>
+             irGenerator.flatMap(generatedIR =>
+-              LLVM.compile(config, analysis, generatedIR)
++              LLVM.compile(config, analysis, generatedIR, defaultUserConfigHashPath(config))
+             )
+           )
+         }
+@@ -318,13 +318,40 @@ object Build {
+ 
+   private[scalanative] final val userConfigHashFile = "userConfigHash"
+ 
+-  private[scalanative] def userConfigHasChanged(config: Config): Boolean =
+-    IO.readFully(config.workDir.resolve(userConfigHashFile))
++  /** The original workDir-relative location, for call sites checking/dumping
++   *  the top-level config's own hash (as opposed to a per-library one, see
++   *  below). */
++  private[scalanative] def defaultUserConfigHashPath(config: Config): Path =
++    config.workDir.resolve(userConfigHashFile)
++
++  // own-implementation fix: hashPath is now an explicit, required parameter
++  // (was implicitly always config.workDir.resolve(userConfigHashFile); every
++  // pre-existing call site now passes defaultUserConfigHashPath(config) to
++  // keep identical behavior). NativeLib.compileNativeLibrary passes a
++  // *per-library* hashPath instead: it compiles each dependency with a
++  // per-library `projConfig` (configureNativeLibrary appends reachability-
++  // analysis-derived preprocessor flags per library, see NativeLib.scala),
++  // but before this fix every such check compared that per-library config's
++  // hash against the ONE shared file this module's dumpUserConfigHash writes
++  // from the top-level, un-augmented config -- a structural mismatch, so
++  // userConfigHasChanged effectively always returned true for every
++  // vendored C/S dependency file, defeating LLVM.needsCompiling's mtime
++  // check and forcing a full recompile of scala-native's own runtime
++  // sources on every single build regardless of whether anything changed.
++  // See docs/findings.md "Native-library object-file caching was inert".
++  private[scalanative] def userConfigHasChanged(
++      config: Config,
++      hashPath: Path
++  ): Boolean =
++    IO.readFully(hashPath)
+       .forall(_.trim() != config.compilerConfig.##.toString())
+ 
+-  private[scalanative] def dumpUserConfigHash(config: Config): Unit =
++  private[scalanative] def dumpUserConfigHash(
++      config: Config,
++      hashPath: Path
++  ): Unit =
+     IO.write(
+-      path = config.workDir.resolve(userConfigHashFile),
++      path = hashPath,
+       content = config.compilerConfig.##.toString()
+     )
+ 
+diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+index 0ae5846..00729a1 100644
+--- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
++++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+@@ -49,7 +49,13 @@ private[scalanative] object LLVM {
+   def compile(
+       config: Config,
+       analysis: ReachabilityAnalysis.Result,
+-      path: Path
++      path: Path,
++      // own-implementation fix: explicit, required hash-file path for the
++      // userConfigHasChanged check (was implicitly always
++      // config.workDir.resolve(Build.userConfigHashFile) -- pass
++      // Build.defaultUserConfigHashPath(config) for identical behavior). See
++      // the comment on Build.userConfigHasChanged for why this exists.
++      hashPath: Path
+   )(implicit
+       ec: ExecutionContext
+   ): Future[Path] = {
+@@ -60,7 +66,7 @@ private[scalanative] object LLVM {
+     val outpath = inpath + oExt
+     val objPath = Paths.get(outpath)
+     // compile if out of date or no object file
+-    if (needsCompiling(path, objPath)) compileFile(path, objPath)
++    if (needsCompiling(path, objPath, hashPath)) compileFile(path, objPath)
+     else Future.successful(objPath)
+   }
+ 
+@@ -397,11 +403,11 @@ private[scalanative] object LLVM {
+    *  @return
+    *    true if it needs compiling false otherwise.
+    */
+-  @inline private def needsCompiling(in: Path, out: Path)(implicit
+-      config: Config
++  @inline private def needsCompiling(in: Path, out: Path, hashPath: Path)(
++      implicit config: Config
+   ): Boolean = {
+     in.toFile().lastModified() > out.toFile().lastModified() ||
+-    Build.userConfigHasChanged(config)
++    Build.userConfigHasChanged(config, hashPath)
+   }
+ 
+   /** Looks at all the object files to see if one is newer than the output
+diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+index d49c90f..885fdcc 100644
+--- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
++++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+@@ -44,9 +44,19 @@ private[scalanative] object NativeLib {
+     val destPath = unpackNativeCode(nativeLib)
+     val paths = findNativePaths(destPath)
+     val projConfig = configureNativeLibrary(config, analysis, destPath)
+-    Future.sequence {
+-      paths.map(LLVM.compile(projConfig, analysis, _))
+-    }
++    // own-implementation fix: a hash file scoped to THIS library's own
++    // dest dir/projConfig, instead of the shared top-level workDir one --
++    // see the comment on Build.userConfigHasChanged for why the shared file
++    // made this per-library cache check always report "changed". destPath
++    // already survives across runs (unpackNativeCode/unpackNativeJar only
++    // wipe it when the source jar itself actually changed), so this file
++    // does too.
++    val hashPath = destPath.resolve(Build.userConfigHashFile)
++    Future
++      .sequence {
++        paths.map(LLVM.compile(projConfig, analysis, _, hashPath))
++      }
++      .andThen { case Success(_) => Build.dumpUserConfigHash(projConfig, hashPath) }
+   }
+ 
+   /** Update the project configuration if a project `Descriptor` is present.
+@@ -194,7 +204,7 @@ private[scalanative] object NativeLib {
+     val workDir = config.workDir
+     val classpath = config.classPath
+     val nativeCodeDir = workDir.resolve("dependencies")
+-    if (Build.userConfigHasChanged(config))
++    if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
+       IO.deleteRecursive(nativeCodeDir)
+ 
+     val nativeLibPaths = classpath.flatMap { path =>
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala b/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
+index 35a1110..fdf6775 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
+@@ -18,7 +18,7 @@ private[codegen] class IncrementalCodeGenContext(config: build.Config) {
+   private val dumpPackage2hash: Path = config.workDir.resolve("package2hash")
+ 
+   def collectFromPreviousState(): Unit = {
+-    if (Build.userConfigHasChanged(config))
++    if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
+       Files.deleteIfExists(dumpPackage2hash)
+     else if (Files.exists(dumpPackage2hash)) {
+       Source
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
+index a477edf..325c5ec 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
+@@ -71,7 +71,7 @@ object CodeGen {
+     Scope { implicit in =>
+       val env = assembly.map(defn => defn.name -> defn).toMap
+       val outputDirPath = config.workDir.resolve("generated")
+-      if (Build.userConfigHasChanged(config))
++      if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
+         IO.deleteRecursive(outputDirPath)
+       Files.createDirectories(outputDirPath)
+       val outputDir = VirtualDirectory.real(outputDirPath)

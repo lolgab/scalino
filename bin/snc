@@ -33,8 +33,16 @@ done
 # convention plain scalac/dotc use for "the main class of this program".
 main_class="$(basename "${sources[0]}" .scala)"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# A persistent, project-local cache dir (scala-cli calls its equivalent
+# .scala-build) -- NOT a throwaway mktemp dir. scala-native's own
+# Build.buildCachedAwait (see src/LinkDriver.scala) already skips recompiling
+# a dependency .c file when its .o is still valid; that cache lives under
+# $work/link/native/dependencies/. A fresh tmpdir every invocation, deleted
+# on exit, was silently discarding it -- forcing every single build to
+# recompile scala-native's C runtime sources from scratch. Persisting this
+# directory is what makes that existing cache actually take effect.
+work="$PWD/.snc-build/$main_class"
+mkdir -p "$work"
 
 compile_cp="$(cat "$DIST/compiler.cp"):$(cat "$DIST/nativelibs.cp")"
 plugin_jar="$(cat "$DIST/nscplugin.jar.txt")"
