@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..a2ca4188 100644
+index e34d3506..233aea33 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -275,7 +275,7 @@ index e34d3506..a2ca4188 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +339,2154 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +339,2169 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -1165,7 +1165,22 @@ index e34d3506..a2ca4188 100644
 +    if sys.env.contains("SNC_INTERP_DEBUG") then
 +      val dt = fn.owner.primaryConstructor.defTree
 +      Console.err.println(s"[interpretNew] cls=${fn.owner} ctorDefTreeEmpty=${dt.isEmpty} ctorDefTreeClass=${dt.getClass.getSimpleName} rawArgs=${rawArgs.map(t => s"${t.getClass.getSimpleName}(isEmpty=${t.isEmpty})")}")
-+    newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs))
++    // `new Array[T](len)`: `Array` is compiler-magic (erasure/the backend
++    // turns it into a real JVM `newarray`/`anewarray` instruction, never
++    // real bytecode with an actual constructor), so it has no retained
++    // constructor body for `interpretNewFromTree`'s generic path to find --
++    // which built an inert `InterpretedInstance` instead (observed via
++    // jsoniter-scala's own `Array#map`-built `reqMasks`, whose later
++    // `.update`/`.apply` calls on that fake "array" silently misbehaved
++    // instead of storing/reading real elements). Every element here is
++    // already a boxed `Object` uniformly, so a real `Array[Object]`
++    // (default-initialized to `null`, same as any reference-typed array)
++    // is the right runtime representation regardless of `T`.
++    if fn.owner == defn.ArrayClass then
++      rawArgs.filterNot(_.isEmpty) match
++        case len :: Nil => new Array[Object](interpretTree(len).asInstanceOf[Integer])
++        case _ => newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs))
++    else newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs))
 +
 +  private def interpretNewFromTree(fn: Symbol, rawArgs: List[Tree])(using Env): Object =
 +    resolveExternalDefTree(fn.owner.primaryConstructor) match
