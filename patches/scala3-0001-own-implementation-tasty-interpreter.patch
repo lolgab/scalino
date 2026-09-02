@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index e34d3506..303c9d5c 100644
+index e34d3506..746b175b 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -30,7 +30,68 @@ import dotty.tools.dotc.reporting.Message
@@ -266,7 +266,7 @@ index e34d3506..303c9d5c 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -143,186 +330,1854 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -143,186 +330,1867 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -489,6 +489,13 @@ index e34d3506..303c9d5c 100644
 +              case t: dotty.tools.dotc.core.Types.TypeBounds => Some(List(t.lo, t.hi))
 +              case _ => None
 +            }
++            case "Repeated" =>
++              // `Repeated = tpd.SeqLiteral` in `QuotesImpl` -- `elems: List[Term]`,
++              // `elemtpt: TypeTree`.
++              Some {
++                case sl: SeqLiteral @unchecked => Some(List(sl.elems, sl.elemtpt))
++                case _ => None
++              }
 +            case name =>
 +              // Generic `TypeTest[TypeRepr, SomeDotcTypeSubclass]` shape:
 +              // matches iff the scrutinee's real runtime type (dotc's own
@@ -577,6 +584,12 @@ index e34d3506..303c9d5c 100644
 +    case "MethodTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.MethodType])
 +    case "PolyTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.PolyType])
 +    case "TypeLambdaTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.HKTypeLambda])
++    // `quotes.reflect.Repeated` (a repeated/varargs argument's own tree
++    // shape, e.g. `case Repeated(elems, _) =>` when a macro inspects a
++    // `Term` directly rather than going through `Varargs`/`Exprs` on an
++    // `Expr`) -- `Repeated` is a type alias for `tpd.SeqLiteral` in the
++    // real `QuotesImpl`.
++    case "RepeatedTypeTest" => Some(classOf[SeqLiteral])
 +    case _ => None
 +
 +  private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
