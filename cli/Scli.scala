@@ -98,6 +98,7 @@ object Scli:
   case class Directives(
     deps: List[String],
     compileOnlyDeps: List[String],
+    testDeps: List[String],
     scalaVersion: Option[String],
     mainClass: Option[String],
     options: List[String]
@@ -126,16 +127,18 @@ object Scli:
   def parseDirectives(sources: List[Path]): Directives =
     var deps = List.empty[String]
     var compileOnlyDeps = List.empty[String]
+    var testDeps = List.empty[String]
     var scalaVersion = Option.empty[String]
     var mainClass = Option.empty[String]
     var options = List.empty[String]
     for src <- sources; line <- readFile(src).linesIterator do
       directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
       directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
+      directiveValues(line, "test.dep", "test.deps").foreach(vs => testDeps = testDeps ++ vs)
       directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
       directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
       directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
-    Directives(deps.distinct, compileOnlyDeps.distinct, scalaVersion, mainClass, options)
+    Directives(deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options)
 
   /** scala-cli's three dependency formats:
    *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
@@ -264,6 +267,24 @@ object Scli:
     paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p))
 
   // ---------------------------------------------------------------------
+  // Compilation scopes, scala-cli-style: every source is "main" scope
+  // except one that has a path segment literally named "test" -- covers
+  // both a flat top-level `test/` folder and the sbt-style nested
+  // `src/test/scala/...` layout. `run`/`compile` only build the main
+  // scope (test sources typically reference a test framework like munit
+  // that's declared via `//> using test.dep`, not a plain `dep`, and so
+  // isn't even on the main scope's classpath -- compiling them in would
+  // just fail). There's no `scli test` yet (still in unsupportedCommands)
+  // to actually execute the test scope.
+  // ---------------------------------------------------------------------
+
+  def isTestSource(p: Path): Boolean =
+    p.iterator().asScala.exists(_.toString == "test")
+
+  def partitionSources(sources: List[Path]): (List[Path], List[Path]) =
+    sources.partition(s => !isTestSource(s))
+
+  // ---------------------------------------------------------------------
   // Compile + link, mirroring bin/snc but with directive-resolved deps
   // folded into the classpath, and driven straight from this process
   // instead of shelling out to a shell script.
@@ -362,7 +383,9 @@ object Scli:
          |  scli --help                         this message
          |
          |a source argument may be a directory: every .scala file under it is
-         |included (skipping hidden and build-output directories).
+         |included (skipping hidden and build-output directories). files under
+         |a `test/` directory (or sbt-style `src/test/scala/`) are test scope
+         |and excluded from `run`/`compile` -- scala-cli's convention.
          |
          |options:
          |  --main-class <name>        explicit entry point (skips auto-detection)
@@ -376,6 +399,7 @@ object Scli:
          |directives (in source files), one per line:
          |  //> using dep "org::name:version"
          |  //> using compileOnly.dep "org::name:version"
+         |  //> using test.dep "org::name:version"    (test scope only; parsed, not yet run)
          |  //> using scala "3.x"
          |  //> using mainClass "Foo"
          |  //> using options "-flag1", "-flag2"
@@ -466,8 +490,12 @@ object Scli:
     val o = parseRunOpts(args)
     if o.sources.isEmpty then die("no source files given")
     o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
-    val expanded = expandSources(o.sources)
-    if expanded.isEmpty then die("no .scala files found")
+    val allExpanded = expandSources(o.sources)
+    if allExpanded.isEmpty then die("no .scala files found")
+    val (expanded, testSources) = partitionSources(allExpanded)
+    if testSources.nonEmpty then
+      System.err.println(s"scli: excluding ${testSources.length} test source(s) under test/ from `$mode` (test scope isn't run yet)")
+    if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
 
     if o.watch then
       watchLoop(expanded) { () =>
