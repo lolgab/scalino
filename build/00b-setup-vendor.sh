@@ -17,7 +17,11 @@ setup_one() {
   local vendor="$ROOT/vendor/$name"
 
   if [[ ! -d "$vendor/.git" ]]; then
-    git clone --depth 1 --branch "$ref" "$url" "$vendor"
+    # -c core.autocrlf=false: our patches/*.patch files have LF line endings
+    # (as committed); on Windows, git's default CRLF checkout conversion
+    # would make the vendored source not match them byte-for-byte and
+    # `git apply` fails with "patch does not apply".
+    git -c core.autocrlf=false clone --depth 1 --branch "$ref" "$url" "$vendor"
   fi
 
   cd "$vendor"

@@ -1,0 +1,6 @@
+# These are real `git diff` patches applied via `git apply` against a
+# freshly-cloned vendor checkout (see build/00b-setup-vendor.sh). They must
+# stay byte-for-byte LF, regardless of the checkout platform's core.autocrlf
+# -- a CRLF-converted patch on Windows won't apply against LF vendor source
+# (which build/00b-setup-vendor.sh clones with core.autocrlf=false to match).
+patches/*.patch -text eol=lf
