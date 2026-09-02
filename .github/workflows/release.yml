@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build+release (defaults to the triggering tag)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # A release should ship whatever platforms actually build, not be
+    # all-or-nothing -- a single broken/experimental target must not block
+    # publishing the others. The publish job below reports what's missing.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: macos-x86_64
+            os: macos-15-intel
+          - target: macos-arm64
+            os: macos-14
+          # Windows support is untested/experimental -- see docs/findings.md.
+          - target: windows-x86_64
+            os: windows-latest
+          - target: windows-arm64
+            os: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - name: Build toolchain
+        shell: bash
+        run: ./build/all.sh
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./dist/scli run examples/Hello.scala
+          ./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
+
+      - name: Package
+        shell: bash
+        run: |
+          version="${{ inputs.tag || github.ref_name }}"
+          pkg="scala-native-compiler-${version}-${{ matrix.target }}"
+          mkdir -p "out/$pkg"
+          cp -a dist/. "out/$pkg/"
+          cp README.md LICENSE "out/$pkg/"
+          mkdir -p assets
+          tar czf "assets/$pkg.tar.gz" -C out "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: assets/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: assets
+          merge-multiple: true
+
+      - name: List assets that actually built
+        run: ls -la assets || echo "no assets produced -- every platform failed"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: assets/*.tar.gz

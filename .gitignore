@@ -2,9 +2,11 @@
 /.build-work/
 /vendor/
 /.patch-work/
-/.scala-build/
-/.bsp/
+.scala-build/
+.bsp/
+.metals/
 .snc-build/
+.scli-build/
 *.class
 *.tasty
 *.nir

@@ -310,12 +310,13 @@ causes, one in each layer:
    patches. Anything touching multiple compiler files, or needing non-public
    API, needs the real dotty/scala-native sbt bootstrap build wired up
    instead.
-3. **Packaging/relocatability.** `dist/*.cp` manifests (used by `bin/snc`)
-   currently hold absolute paths into the local coursier cache
-   (`~/Library/Caches/Coursier/...`). This works on the machine that built it
-   but isn't yet a distributable, self-contained tarball. Follow-up: vendor
-   the referenced jars into `dist/lib/` and rewrite the manifests to relative
-   paths.
+3. ~~**Packaging/relocatability.**~~ Fixed: `build/06-package.sh` now vendors
+   every jar into `dist/lib/` and rewrites `dist/*.cp` manifests to
+   dist-relative paths; `bin/snc` and `scli` resolve them against their own
+   dist root at runtime, and `scli` locates that root via its own executable
+   path (`cli/selfexe/*.scala`, one small OS-specific native binding per
+   platform) instead of a build-time-baked-in absolute path. `dist/` is now a
+   self-contained, copyable/tarball-able distribution.
 4. **`scli` follow-ups.** See "Toward a build-tool experience without a JVM"
    above for what's implemented. Missing: watch mode, incremental Scala
    compilation (see item 7), multi-module projects, more `//> using`

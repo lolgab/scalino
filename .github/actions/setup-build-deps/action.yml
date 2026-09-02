@@ -1,0 +1,46 @@
+name: Setup build dependencies
+description: >
+  Installs everything build/*.sh needs (GraalVM + native-image, coursier,
+  clang) and exports GRAAL_HOME, on Linux/macOS/Windows alike.
+
+runs:
+  using: composite
+  steps:
+    - name: Set up GraalVM
+      uses: graalvm/setup-graalvm@v1
+      with:
+        java-version: '25'
+        distribution: 'graalvm'
+        components: 'native-image'
+        set-java-home: true
+        github-token: ${{ github.token }}
+
+    - name: Export GRAAL_HOME
+      shell: bash
+      run: echo "GRAAL_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+
+    - name: Set up coursier
+      uses: coursier/setup-action@v1
+      with:
+        apps: cs
+
+    - name: Install clang (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y clang
+
+    # macOS runners ship Xcode command line tools (clang/clang++) already.
+
+    - name: Locate clang (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        # windows-latest/windows-11-arm images ship LLVM under this prefix;
+        # scala-native's C toolchain on Windows is experimental/best-effort
+        # (see docs/findings.md) -- this step just makes sure clang/clang++
+        # resolve, it doesn't guarantee scala-native links successfully.
+        if ! command -v clang >/dev/null 2>&1; then
+          echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+        fi

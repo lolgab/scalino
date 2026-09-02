@@ -44,8 +44,12 @@ main_class="$(basename "${sources[0]}" .scala)"
 work="$PWD/.snc-build/$main_class"
 mkdir -p "$work"
 
-compile_cp="$(cat "$DIST/compiler.cp"):$(cat "$DIST/nativelibs.cp")"
-plugin_jar="$(cat "$DIST/nscplugin.jar.txt")"
+# compiler.cp/nativelibs.cp/nscplugin.jar.txt hold dist-relative paths
+# (see build/06-package.sh) so dist/ stays relocatable -- resolve to absolute.
+resolve_cp() { echo "$DIST/${1//:/:$DIST/}"; }
+
+compile_cp="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIST/nativelibs.cp")")"
+plugin_jar="$DIST/$(cat "$DIST/nscplugin.jar.txt")"
 
 mkdir -p "$work/classes"
 "$DIST/dotc-native" \
@@ -56,7 +60,7 @@ mkdir -p "$work/classes"
   -d "$work/classes" \
   "${sources[@]}"
 
-link_cp="$work/classes:$(cat "$DIST/nativelibs.cp")"
+link_cp="$work/classes:$(resolve_cp "$(cat "$DIST/nativelibs.cp")")"
 "$DIST/linkdriver-native" "$link_cp" "$work/link" "$main_class" \
   "$(command -v clang)" "$(command -v clang++)"
 

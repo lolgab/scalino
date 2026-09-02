@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: macos-x86_64
+            os: macos-15-intel
+          - target: macos-arm64
+            os: macos-14
+          # Windows support is untested/experimental (see docs/findings.md) --
+          # scala-native's C toolchain story there is the main unknown, so
+          # these are best-effort and don't fail the required CI signal.
+          - target: windows-x86_64
+            os: windows-latest
+            experimental: true
+          - target: windows-arm64
+            os: windows-11-arm
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - name: Build toolchain
+        shell: bash
+        run: ./build/all.sh
+
+      - name: Smoke test -- plain program
+        shell: bash
+        run: |
+          out="$(./dist/scli run examples/Hello.scala)"
+          echo "$out"
+          [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
+
+      - name: Smoke test -- real macro
+        shell: bash
+        run: ./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
+
+      - name: Smoke test -- dist/ is relocatable
+        shell: bash
+        run: |
+          cp -a dist /tmp/dist-relocated
+          cp examples/Hello.scala /tmp/Hello.scala
+          cd /tmp && rm -rf .scli-build && ./dist-relocated/scli run Hello.scala

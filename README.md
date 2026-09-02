@@ -1,10 +1,21 @@
 # scala-native-compiler
 
+[![CI](https://github.com/lolgab/scala-native-compiler/actions/workflows/ci.yml/badge.svg)](https://github.com/lolgab/scala-native-compiler/actions/workflows/ci.yml)
+
 A self-contained Scala Native compiler toolchain: no JVM required to run it
 (a JVM is only needed once, at build time, to run GraalVM's native-image).
 Scala 3 only.
 
-## Build
+## Prebuilt binaries
+
+Each [release](https://github.com/lolgab/scala-native-compiler/releases) ships
+a self-contained `dist/` tarball (compiler + linker + `scli`, no JVM needed to
+run any of it) for Linux, macOS, and Windows, on both x86_64 and arm64.
+Windows support is experimental/best-effort -- see
+[`docs/findings.md`](docs/findings.md). Download the tarball for your
+platform, extract it, and use `dist/scli` as described below.
+
+## Build from source
 
 Requires: GraalVM JDK 21+ (with `native-image`), `clang`, `coursier` (`cs`),
 `git`.
@@ -63,3 +74,15 @@ own test suite (`interpreter/test-fixtures/`, sourced from
 supported yet — general quote-pattern matching (`case '{ ... } => `) is the
 main known gap. See [`docs/findings.md`](docs/findings.md) for the full
 verified/blocked/remaining breakdown.
+
+## Releasing
+
+Maintainers: push a `vX.Y.Z` tag and the [release workflow](.github/workflows/release.yml)
+builds `dist/` on every supported platform/arch and publishes a GitHub Release
+with one tarball per target. A platform that fails to build doesn't block the
+others — check the workflow run for which targets actually shipped.
+
+```
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```

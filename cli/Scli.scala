@@ -22,7 +22,14 @@ import scala.jdk.CollectionConverters.*
 
 object Scli:
 
-  val root: String = BuildInfo.root
+  // Resolved from the running binary's own path (not baked in at build time)
+  // so a copied/relocated dist/ directory still works -- see
+  // docs/findings.md "Packaging/relocatability". selfexe.SelfExe is one of
+  // three OS-specific implementations (cli/selfexe/*.scala); build/07-build-
+  // scli.sh picks the right one for the host OS at compile time.
+  val root: String =
+    val exe = selfexe.SelfExe.path()
+    Paths.get(exe).toRealPath().getParent.getParent.toString
   val dist: String = s"$root/dist"
 
   def die(msg: String): Nothing =
@@ -198,6 +205,10 @@ object Scli:
 
   def readListFile(name: String): String = readFile(Paths.get(s"$dist/$name")).trim
 
+  // compiler.cp/nativelibs.cp/nscplugin.jar.txt store dist-relative paths
+  // (e.g. "lib/foo.jar") so dist/ stays relocatable -- resolve to absolute.
+  def resolveCp(raw: String): String = raw.split(":").map(e => s"$dist/$e").mkString(":")
+
   def buildBinary(sources: List[Path], mainClass: String, extraClasspath: String, out: Path): Unit =
     val cacheRoot = Paths.get(".scli-build").resolve(mainClass)
     val classesDir = cacheRoot.resolve("classes")
@@ -205,9 +216,9 @@ object Scli:
     Files.createDirectories(classesDir)
 
     val javaBase = s"$dist/java.base.jar"
-    val compilerCp = readListFile("compiler.cp")
-    val nativelibsCp = readListFile("nativelibs.cp")
-    val pluginJar = readListFile("nscplugin.jar.txt")
+    val compilerCp = resolveCp(readListFile("compiler.cp"))
+    val nativelibsCp = resolveCp(readListFile("nativelibs.cp"))
+    val pluginJar = s"$dist/" + readListFile("nscplugin.jar.txt")
 
     val compileCp =
       if extraClasspath.isEmpty then s"$compilerCp:$nativelibsCp"
