@@ -8,13 +8,18 @@
 # that wasn't reachable at build time. So we bake nscplugin's classes into
 # the same image as dotc, and just point -Xplugin at its jar at runtime to
 # activate it (the classes are already resident).
+#
+# Also bakes in our patched dotty.tools.dotc.quoted.Interpreter (see
+# 03a-patch-compiler.sh / vendor/scala3's Interpreter.scala): the
+# JVM-reflection-free macro-execution path. compiler-patched.cp is identical
+# to compiler.cp except scala3-compiler_3's jar is swapped for the patched one.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
 
-[[ -f "$WORK/compiler.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
+[[ -f "$WORK/compiler-patched.cp" ]] || { echo "run 03a-patch-compiler.sh first" >&2; exit 1; }
 
-BUILD_CP="$(cat "$WORK/compiler.cp"):$(cat "$WORK/nativelibs.cp"):$(cat "$WORK/nscplugin.cp")"
+BUILD_CP="$(cat "$WORK/compiler-patched.cp"):$(cat "$WORK/nativelibs.cp"):$(cat "$WORK/nscplugin.cp")"
 
 "$NATIVE_IMAGE" \
   -cp "$BUILD_CP" \

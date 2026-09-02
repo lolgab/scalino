@@ -1,5 +1,9 @@
 /dist/
 /.build-work/
+/vendor/
+/.patch-work/
+/.scala-build/
+/.bsp/
 *.class
 *.tasty
 *.nir

@@ -44,6 +44,7 @@ mkdir -p "$work/classes"
   -javabootclasspath "$DIST/java.base.jar" \
   -classpath "$compile_cp" \
   -Xplugin:"$plugin_jar" -Xplugin-require:scalanative \
+  -Yretain-trees \
   -d "$work/classes" \
   "${sources[@]}"
 

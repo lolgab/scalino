@@ -6,21 +6,27 @@ Scala 3 only.
 
 ## Build
 
-Requires: GraalVM JDK 21+ (with `native-image`), `clang`, `coursier` (`cs`).
+Requires: GraalVM JDK 21+ (with `native-image`), `clang`, `coursier` (`cs`),
+`git`.
 
 ```
 ./build/all.sh
 ```
 
-Produces `dist/dotc-native` (standalone compiler + scala-native plugin) and
-`dist/linkdriver-native` (standalone NIR→native linker), plus the classpath
-manifests `bin/snc` needs.
+This clones `scala/scala3` into `vendor/scala3` (pinned tag, see
+`versions.env`), applies our patches from `patches/`, and produces
+`dist/dotc-native` (standalone compiler + scala-native plugin, our patched
+macro interpreter baked in) and `dist/linkdriver-native` (standalone
+NIR→native linker), plus the classpath manifests `bin/snc` needs.
 
 ## Use
 
 ```
 ./bin/snc build examples/Hello.scala -o hello
 ./hello
+
+./bin/snc build examples/macro-hello/Test.scala examples/macro-hello/Foo.scala -o macro-hello
+./macro-hello   # a real inline/quote macro, expanded with no JVM involved
 ```
 
 Neither `dotc-native`, `linkdriver-native`, nor `snc` invoke a JVM.
@@ -28,8 +34,12 @@ Neither `dotc-native`, `linkdriver-native`, nor `snc` invoke a JVM.
 ## Status
 
 Core toolchain (compile Scala 3 → NIR → native executable, fully JVM-free) is
-proven working end to end for macro-free programs. Macro execution via
-tasty-interpreter (replacing the JVM-bytecode execution real dotc uses for
-compile-time macro expansion) is not yet implemented. See
-[`docs/findings.md`](docs/findings.md) for what's been verified, the
-blockers hit and how they were fixed, and what's left.
+proven working end to end, **including real inline/quote macros**: macro
+expansion runs through our own from-scratch TASTy-tree interpreter (patched
+into dotc, see `patches/`) instead of dotc's normal JVM-bytecode-execution
+path, and it's exercised against real macro tests harvested from upstream's
+own test suite (`interpreter/test-fixtures/`, sourced from
+`vendor/scala3/tests/{run-macros,pos-macros}`). Not every macro shape is
+supported yet — general quote-pattern matching (`case '{ ... } => `) is the
+main known gap. See [`docs/findings.md`](docs/findings.md) for the full
+verified/blocked/remaining breakdown.

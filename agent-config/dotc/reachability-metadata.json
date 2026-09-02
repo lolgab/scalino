@@ -581,6 +581,30 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.inlines.InlineReducer",
+      "fields": [
+        {
+          "name": "NewInstance$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.inlines.Inliner",
+      "fields": [
+        {
+          "name": "InlineableArg$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.inlines.Inliner$InlineableArg$",
+      "fields": [
+        {
+          "name": "paramProxies$lzy1"
+        }
+      ]
+    },
+    {
       "type": "dotty.tools.dotc.parsing.Parsers$Parser",
       "fields": [
         {
@@ -692,6 +716,25 @@
       "fields": [
         {
           "name": "given_Show_Product$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.staging.CrossStageSafety",
+      "fields": [
+        {
+          "name": "CancelledQuote$lzy1"
+        },
+        {
+          "name": "CancelledSplice$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.staging.HealType",
+      "fields": [
+        {
+          "name": "NonSpliceAlias$lzy1"
         }
       ]
     },
@@ -1043,6 +1086,17 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.typer.OpenSearch",
+      "fields": [
+        {
+          "name": "coveringSet$lzy1"
+        },
+        {
+          "name": "typeSize$lzy1"
+        }
+      ]
+    },
+    {
       "type": "dotty.tools.dotc.typer.RefChecks"
     },
     {
@@ -1177,6 +1231,20 @@
     },
     {
       "type": "scala.collection.concurrent.TrieMap"
+    },
+    {
+      "type": "scala.quoted.runtime.impl.QuotesImpl",
+      "fields": [
+        {
+          "name": "ExprMatch$lzy1"
+        },
+        {
+          "name": "TypeMatch$lzy1"
+        },
+        {
+          "name": "reflect$lzy1"
+        }
+      ]
     },
     {
       "type": "scala.scalanative.nir.ControlFlow$Block",
