@@ -389,19 +389,14 @@ object Scli:
    *  to compile into. Only linking (whose C-object cache genuinely benefits
    *  from a stable, persistent path) is keyed by the resolved mainClass.
    *  Returns the resolved mainClass. */
-  def buildBinary(
-    sources: List[Path],
-    explicitMainClass: Option[String],
-    extraClasspath: String,
-    outFor: String => Path,
-    extraOptions: List[String] = Nil,
-    extraCompileOnlyClasspath: String = "",
-    logLevel: String = "info"
-  ): String =
-    val classesDir = Paths.get(".scli-build", "_scratch", "classes")
-    deleteRecursively(classesDir)
-    Files.createDirectories(classesDir)
+  /** javaBase/pluginJar/compileCp for a dotc-native invocation -- shared by
+   *  `buildBinary` (compile/run) and `handleSetupIde` (`setup-ide`) so the
+   *  IDE server type-checks against the exact same classpath/flags a real
+   *  build would use. `nativelibsCp` is returned undropped (see below) since
+   *  `buildBinary` also needs it, unmodified, for linking. */
+  case class CompileClasspath(javaBase: String, pluginJar: String, compileCp: String, nativelibsCp: String)
 
+  def computeCompileClasspath(extraClasspath: String, extraCompileOnlyClasspath: String = ""): CompileClasspath =
     val javaBase = s"$dist/java.base.jar"
     val compilerCp = resolveCp(readListFile("compiler.cp"))
     val nativelibsCp = resolveCp(readListFile("nativelibs.cp"))
@@ -442,11 +437,28 @@ object Scli:
       List(scalalibRetained, dropPlainScalaLibrary(compilerCp), dropPlainScalaLibrary(nativelibsCp), extraClasspath, extraCompileOnlyClasspath)
         .filter(_.nonEmpty).mkString(":")
 
+    CompileClasspath(javaBase, pluginJar, compileCp, nativelibsCp)
+
+  def buildBinary(
+    sources: List[Path],
+    explicitMainClass: Option[String],
+    extraClasspath: String,
+    outFor: String => Path,
+    extraOptions: List[String] = Nil,
+    extraCompileOnlyClasspath: String = "",
+    logLevel: String = "info"
+  ): String =
+    val classesDir = Paths.get(".scli-build", "_scratch", "classes")
+    deleteRecursively(classesDir)
+    Files.createDirectories(classesDir)
+
+    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+
     val compileCmd = List(
       s"$dist/dotc-native",
-      "-javabootclasspath", javaBase,
-      "-classpath", compileCp,
-      "-Xplugin:" + pluginJar, "-Xplugin-require:scalanative",
+      "-javabootclasspath", cc.javaBase,
+      "-classpath", cc.compileCp,
+      "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
       "-Yretain-trees"
     ) ++ extraOptions ++ List(
       "-d", classesDir.toString
@@ -459,8 +471,8 @@ object Scli:
     val linkDir = Paths.get(".scli-build").resolve(mainClass).resolve("link")
 
     val linkCp =
-      if extraClasspath.isEmpty then s"$classesDir:$nativelibsCp"
-      else s"$classesDir:$nativelibsCp:$extraClasspath"
+      if extraClasspath.isEmpty then s"$classesDir:${cc.nativelibsCp}"
+      else s"$classesDir:${cc.nativelibsCp}:$extraClasspath"
     val clang = findOnPath("clang")
     val clangpp = findOnPath("clang++")
 
@@ -493,7 +505,7 @@ object Scli:
 
   private val unsupportedCommands = Set(
     "test", "fmt", "repl", "package", "publish", "publish-local", "clean",
-    "bsp", "export", "doctor", "setup-ide", "install-completions",
+    "bsp", "export", "doctor", "install-completions",
     "dependency-update", "shebang"
   )
 
@@ -508,6 +520,7 @@ object Scli:
          |  scli <sources...>                   run (default command)
          |  scli run <sources...> [options]     compile and run
          |  scli compile <sources...> [options] -o <out>   compile to a native binary
+         |  scli setup-ide <sources...> [options]   write .dotty-ide.json for editor LSP support
          |  scli version                        print version info
          |  scli --help                         this message
          |
@@ -534,6 +547,13 @@ object Scli:
          |  //> using scala "3.x"
          |  //> using mainClass "Foo"
          |  //> using options "-flag1", "-flag2"
+         |
+         |`setup-ide` writes `.dotty-ide.json` at the project root -- dotty's
+         |own pre-Metals IDE config format (compilerArguments/
+         |sourceDirectories/dependencyClasspath/classDirectory), read by
+         |dist/dotty-lsp-native on startup. Same command name as scala-cli's
+         |`setup-ide`, but a different output file: this toolchain's LSP
+         |speaks that format directly, no BSP layer needed.
          |
          |not implemented (this is a minimal scala-cli-alike): ${unsupportedCommands.toList.sorted.mkString(", ")}.
          |""".stripMargin
@@ -646,6 +666,67 @@ object Scli:
       try sys.exit(buildAndMaybeRun(mode, expanded, o))
       catch case BuildFailed(msg) => die(msg)
 
+  /** JSON string/array literals for `.dotty-ide.json` -- hand-rolled rather
+   *  than pulling in a JSON library: the shape is fixed (see ProjectConfig
+   *  below) and every value here is either a plain path string or a flag
+   *  list, so escaping quotes/backslashes is all that's needed. */
+  def jsonStr(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+  def jsonArr(xs: List[String]): String = xs.map(jsonStr).mkString("[", ", ", "]")
+
+  /** `scli setup-ide` -- same command name as scala-cli's own `setup-ide`,
+   *  but writes `.dotty-ide.json` (dotty's pre-Metals IDE config format --
+   *  `ProjectConfig.java`, read by dist/dotty-lsp-native on `initialize`,
+   *  see DottyLanguageServer.IDE_CONFIG_FILE) instead of scala-cli's BSP
+   *  connection file: this toolchain's LSP speaks that format directly, no
+   *  BSP layer in between. Mirrors buildBinary's own compile flags/
+   *  classpath exactly (via computeCompileClasspath), so the IDE
+   *  type-checks against the same inputs a real build would use. */
+  def handleSetupIde(args: Array[String]): Unit =
+    val o = parseRunOpts(args)
+    if o.sources.isEmpty then die("no source files given")
+    o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
+    val allExpanded = expandSources(o.sources)
+    if allExpanded.isEmpty then die("no .scala files found")
+    val (expanded, testSources) = partitionSources(allExpanded)
+    if testSources.nonEmpty then
+      System.err.println(s"scli: excluding ${testSources.length} test source(s) under test/ from IDE config (test scope isn't run yet)")
+    if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
+
+    val directives = parseDirectives(expanded)
+    val allDeps = (directives.deps ++ o.cliDeps).distinct
+    val depsCache = Paths.get(".scli-build").resolve("deps-cache")
+    val extraClasspath = resolveDeps(allDeps, depsCache)
+    val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
+    val options = directives.options ++ o.cliOptions
+
+    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+    val compilerArguments =
+      List("-javabootclasspath", cc.javaBase, "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative", "-Yretain-trees") ++ options
+
+    val sourceDirectories = expanded.map(_.toAbsolutePath.getParent.toString).distinct.sorted
+    val dependencyClasspath = cc.compileCp.split(":").filter(_.nonEmpty).toList
+    val classDirectory = Paths.get(".scli-build", ".dotty-ide-classes").toAbsolutePath
+    Files.createDirectories(classDirectory)
+    val projectId = Option(Paths.get(".").toAbsolutePath.normalize.getFileName).map(_.toString).getOrElse("root")
+
+    val json =
+      s"""[
+         |  {
+         |    "id": ${jsonStr(projectId)},
+         |    "compilerVersion": ${jsonStr(BuildInfo.scalaVersion)},
+         |    "compilerArguments": ${jsonArr(compilerArguments)},
+         |    "sourceDirectories": ${jsonArr(sourceDirectories)},
+         |    "dependencyClasspath": ${jsonArr(dependencyClasspath)},
+         |    "classDirectory": ${jsonStr(classDirectory.toString)},
+         |    "projectDependencies": []
+         |  }
+         |]
+         |""".stripMargin
+
+    val configPath = Paths.get(".dotty-ide.json")
+    Files.write(configPath, json.getBytes("UTF-8"))
+    println(s"scli: wrote ${configPath.toAbsolutePath} -- point dist/dotty-lsp-native (or an editor's LSP binary override) at this project")
+
   def main(args: Array[String]): Unit =
     if args.isEmpty then { printUsage(System.err); sys.exit(1) }
     args(0) match
@@ -653,6 +734,7 @@ object Scli:
       case "--version" | "version" => printVersion()
       case "run" => handleRunOrCompile("run", args.drop(1))
       case "compile" => handleRunOrCompile("compile", args.drop(1))
+      case "setup-ide" => handleSetupIde(args.drop(1))
       case cmd if unsupportedCommands(cmd) =>
         die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, version")
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
