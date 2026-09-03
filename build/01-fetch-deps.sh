@@ -33,4 +33,18 @@ echo "== scala-native JVM-side build/link tool (tools_3, NOT tools_native0.5_3) 
 # it uses link-time intrinsics that throw UndefinedBehaviorError on a plain JVM.
 cs fetch "org.scala-native:tools_3:$SCALA_NATIVE_VERSION" --classpath > "$WORK/tools.cp"
 
+echo "== LSP server deps (Jackson version matches vendor/scala3's own language-server module) =="
+# lsp4j itself is NOT pinned to the 0.6.0 vendor/scala3's Build.scala uses:
+# that release has a real bug (both the current initialized(InitializedParams)
+# and the @Deprecated no-arg initialized() overloads carry @JsonNotification,
+# so org.eclipse.lsp4j.jsonrpc.Launcher.Builder.create() throws
+# "Duplicate RPC method initialized." for ANY implementer over stdio) -- fixed
+# in later releases (verified: 0.21.1 drops @JsonNotification from the
+# deprecated overload). Harmless for the sbt-integrated non-stdio IDE path
+# scala3-language-server was originally built/tested against, fatal for a
+# standalone `-stdio` server, so we use a newer release instead.
+cs fetch "org.eclipse.lsp4j:org.eclipse.lsp4j:0.21.1" \
+  "tools.jackson.core:jackson-databind:3.1.2" \
+  --classpath > "$WORK/lsp.cp"
+
 echo "OK: classpaths written to $WORK/*.cp"

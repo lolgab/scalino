@@ -1,0 +1,281 @@
+diff --git a/language-server/src/dotty/tools/languageserver/DottyClient.scala b/language-server/src/dotty/tools/languageserver/DottyClient.scala
+index c0b7c3c1..2ae09365 100644
+--- a/language-server/src/dotty/tools/languageserver/DottyClient.scala
++++ b/language-server/src/dotty/tools/languageserver/DottyClient.scala
+@@ -1,6 +1,8 @@
+ package dotty.tools.languageserver
+ 
++import org.eclipse.lsp4j.services.LanguageClient
++
+ /**
+   * A `LanguageClient` that regroups all language server features
+   */
+-trait DottyClient extends worksheet.WorksheetClient
+\ No newline at end of file
++trait DottyClient extends LanguageClient
+\ No newline at end of file
+diff --git a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
+index 78deb61b..c625c194 100644
+--- a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
++++ b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
+@@ -31,8 +31,6 @@ import Interactive.Include
+ import config.Printers.interactiv
+ 
+ import languageserver.config.ProjectConfig
+-import languageserver.worksheet.{Worksheet, WorksheetService}
+-import languageserver.decompiler.{TastyDecompilerService}
+ 
+ import lsp4j.services._
+ 
+@@ -45,9 +43,13 @@ import lsp4j.services._
+  *  - This implementation is based on the LSP4J library: https://github.com/eclipse/lsp4j
+  */
+ class DottyLanguageServer extends LanguageServer
+-    with TextDocumentService with WorkspaceService with WorksheetService with TastyDecompilerService { thisServer =>
++    with TextDocumentService with WorkspaceService with lsp4j.jsonrpc.json.JsonRpcMethodProvider { thisServer =>
+   import ast.tpd._
+ 
++  /** See `DottyLanguageServer.rpcMethods`. */
++  override def supportedMethods(): java.util.Map[String, lsp4j.jsonrpc.json.JsonRpcMethod] =
++    DottyLanguageServer.rpcMethods
++
+   import DottyLanguageServer._
+   import InteractiveDriver._
+ 
+@@ -251,7 +253,7 @@ class DottyLanguageServer extends LanguageServer
+ 
+     client.publishDiagnostics(new PublishDiagnosticsParams(
+       document.getUri,
+-      diags.flatMap(diagnostic).asJava))
++      diags.flatMap(toLspDiagnostic).asJava))
+   }
+ 
+   override def didChange(params: DidChangeTextDocumentParams): Unit = {
+@@ -278,7 +280,7 @@ class DottyLanguageServer extends LanguageServer
+ 
+       client.publishDiagnostics(new PublishDiagnosticsParams(
+         document.getUri,
+-        diags.flatMap(diagnostic).asJava))
++        diags.flatMap(toLspDiagnostic).asJava))
+     }
+   }
+ 
+@@ -321,7 +323,7 @@ class DottyLanguageServer extends LanguageServer
+    *  If cursor is on a definition, show this definition together with all overridden
+    *  and overriding definitions.
+    */
+-  override def definition(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
++  override def definition(params: DefinitionParams) = computeAsync { cancelToken =>
+     val uri = new URI(params.getTextDocument.getUri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+@@ -330,7 +332,7 @@ class DottyLanguageServer extends LanguageServer
+     val path = Interactive.pathTo(driver.openedTrees(uri), pos)
+ 
+     val definitions = Interactive.findDefinitions(path, pos, driver).toList
+-    definitions.flatMap(d => location(d.namePos)).asJava
++    JEither.forLeft(definitions.flatMap(d => location(d.namePos)).asJava)
+   }
+ 
+   override def references(params: ReferenceParams) = computeAsync { cancelToken =>
+@@ -439,7 +441,7 @@ class DottyLanguageServer extends LanguageServer
+     new WorkspaceEdit(changes.asJava)
+   }
+ 
+-  override def documentHighlight(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
++  override def documentHighlight(params: DocumentHighlightParams) = computeAsync { cancelToken =>
+     val uri = new URI(params.getTextDocument.getUri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+@@ -459,7 +461,7 @@ class DottyLanguageServer extends LanguageServer
+     }.distinct.asJava
+   }
+ 
+-  override def hover(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
++  override def hover(params: HoverParams) = computeAsync { cancelToken =>
+     val uri = new URI(params.getTextDocument.getUri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+@@ -510,16 +512,17 @@ class DottyLanguageServer extends LanguageServer
+   override def symbol(params: WorkspaceSymbolParams) = computeAsync { cancelToken =>
+     val query = params.getQuery
+ 
+-    drivers.values.toList.flatMap { driver =>
++    val infos = drivers.values.toList.flatMap { driver =>
+       implicit def ctx: Context = driver.currentCtx
+ 
+       val trees = driver.sourceTreesContaining(query)
+       val defs = Interactive.namedTrees(trees, Include.empty, _.name.toString.contains(query))
+       defs.flatMap(d => symbolInfo(d.tree.symbol, d.namePos))
+-    }.asJava
++    }
++    JEither.forLeft(infos.asJava)
+   }
+ 
+-  override def implementation(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
++  override def implementation(params: ImplementationParams) = computeAsync { cancelToken =>
+     val uri = new URI(params.getTextDocument.getUri)
+     val driver = driverFor(uri)
+ 
+@@ -547,10 +550,10 @@ class DottyLanguageServer extends LanguageServer
+       }
+     }.toList
+ 
+-    implementations.flatten.asJava
++    JEither.forLeft(implementations.flatten.asJava)
+   }
+ 
+-  override def signatureHelp(params: TextDocumentPositionParams) = computeAsync { canceltoken =>
++  override def signatureHelp(params: SignatureHelpParams) = computeAsync { canceltoken =>
+     val uri = new URI(params.getTextDocument.getUri)
+     val driver = driverFor(uri)
+ 
+@@ -652,6 +655,70 @@ object DottyLanguageServer {
+ 
+   final val IDE_CONFIG_FILE = ".dotty-ide.json"
+ 
++  // -- Safe RPC method discovery for the standalone `-stdio` launcher -----
++  //
++  // lsp4j's default reflective RPC-method discovery
++  // (`ServiceEndpoints.getSupportedMethods`/`GenericEndpoint`, used by
++  // `org.eclipse.lsp4j.jsonrpc.Launcher.Builder`) scans `server.getClass()`.
++  // dotc's Mixin phase materializes a concrete forwarder on
++  // `DottyLanguageServer` for *every* default method it inherits from
++  // `LanguageServer`/`TextDocumentService`/`WorkspaceService` -- not just
++  // the ones this class overrides -- and each forwarder still carries the
++  // original `@JsonNotification`/`@JsonRequest` annotation. So the same RPC
++  // method ends up declared twice (once on the interface, once as dotc's
++  // forwarder on the class), and lsp4j's scanner isn't dedup-aware: it
++  // throws "Duplicate RPC method X." the first time this happens (e.g. for
++  // `initialized`, `codeAction`, `formatting`, ... -- anything with a
++  // default body this class doesn't override). Plain Java implementers
++  // never hit this, since javac doesn't synthesize forwarders for
++  // un-overridden default methods.
++  //
++  // Worked around by scanning the three service *interfaces* directly
++  // (clean on their own) instead of the concrete class: `rpcMethods` feeds
++  // the wire-protocol method table (via `JsonRpcMethodProvider`, which
++  // `Launcher.Builder` already prefers over its own class scan when
++  // present), and `rpcDispatch` feeds local method dispatch (a hand-rolled
++  // `Endpoint` in `dotty.tools.languageserver.Main`, since
++  // `GenericEndpoint`/`ServiceEndpoints.toEndpoint` has no equivalent
++  // override hook).
++  private val serviceInterfaces: List[Class[?]] =
++    List(classOf[lsp4j.services.LanguageServer], classOf[lsp4j.services.TextDocumentService], classOf[lsp4j.services.WorkspaceService])
++
++  /** Mirrors `AnnotationUtil`'s (package-private, so not directly reusable)
++   *  method-naming logic: `@JsonSegment` on the interface prefixes
++   *  `@JsonRequest`/`@JsonNotification` methods unless `useSegment = false`. */
++  private def rpcName(interf: Class[?], m: java.lang.reflect.Method): Option[String] = {
++    val segment = {
++      val s = interf.getAnnotation(classOf[lsp4j.jsonrpc.services.JsonSegment])
++      if (s != null) s.value + "/" else ""
++    }
++    val req = m.getAnnotation(classOf[lsp4j.jsonrpc.services.JsonRequest])
++    if (req != null)
++      Some(if (req.useSegment) segment + (if (req.value.nonEmpty) req.value else m.getName) else req.value)
++    else {
++      val notif = m.getAnnotation(classOf[lsp4j.jsonrpc.services.JsonNotification])
++      if (notif != null)
++        Some(if (notif.useSegment) segment + (if (notif.value.nonEmpty) notif.value else m.getName) else notif.value)
++      else None
++    }
++  }
++
++  /** RPC method name -> the interface `Method` to invoke for it. */
++  val rpcDispatch: Map[String, java.lang.reflect.Method] =
++    (for
++      interf <- serviceInterfaces
++      m <- interf.getDeclaredMethods.toList
++      name <- rpcName(interf, m)
++    yield name -> m).toMap
++
++  /** The wire-protocol method table lsp4j needs, built the same safe way. */
++  val rpcMethods: java.util.Map[String, lsp4j.jsonrpc.json.JsonRpcMethod] = {
++    val merged = new java.util.LinkedHashMap[String, lsp4j.jsonrpc.json.JsonRpcMethod]
++    for (interf <- serviceInterfaces)
++      merged.putAll(lsp4j.jsonrpc.services.ServiceEndpoints.getSupportedMethods(interf))
++    merged
++  }
++
+   final val RENAME_OVERRIDDEN_QUESTION = "Do you want to rename the base member, or only this member?"
+   final val RENAME_OVERRIDDEN= "Rename the base member"
+   final val RENAME_NO_OVERRIDDEN = "Rename only this member"
+@@ -695,7 +762,7 @@ object DottyLanguageServer {
+   /**
+    * Convert a Diagnostic to an lsp4j.Diagnostic.
+    */
+-  def diagnostic(dia: Diagnostic)(implicit ctx: Context): Option[lsp4j.Diagnostic] =
++  def toLspDiagnostic(dia: Diagnostic)(implicit ctx: Context): Option[lsp4j.Diagnostic] =
+     if (!dia.pos.exists)
+       None // diagnostics without positions are not supported: https://github.com/Microsoft/language-server-protocol/issues/249
+     else {
+diff --git a/language-server/src/dotty/tools/languageserver/Main.scala b/language-server/src/dotty/tools/languageserver/Main.scala
+index 7f269eec..f9473d54 100644
+--- a/language-server/src/dotty/tools/languageserver/Main.scala
++++ b/language-server/src/dotty/tools/languageserver/Main.scala
+@@ -6,15 +6,54 @@ import java.util.function.Consumer
+ import java.io.{ File => JFile, InputStream, OutputStream, PrintWriter }
+ import java.net._
+ import java.nio.channels._
++import java.util.concurrent.CompletableFuture
+ 
+ import org.eclipse.lsp4j._
+ import org.eclipse.lsp4j.services._
+ import org.eclipse.lsp4j.launch._
+-import org.eclipse.lsp4j.jsonrpc.Launcher
++import org.eclipse.lsp4j.jsonrpc.{Endpoint, Launcher, MessageConsumer, RemoteEndpoint}
++import org.eclipse.lsp4j.jsonrpc.json.{MessageJsonHandler, StreamMessageConsumer}
+ 
+ /** Run the Dotty Language Server.
+  */
+ object Main {
++
++  /** Dispatches to `DottyLanguageServer.rpcDispatch` instead of lsp4j's own
++   *  `GenericEndpoint` (which reflectively scans `server.getClass()` and
++   *  hits the "Duplicate RPC method" bug documented on
++   *  `DottyLanguageServer.rpcDispatch`). */
++  private class SafeLocalEndpoint(server: DottyLanguageServer) extends Endpoint {
++    private def invoke(method: String, parameter: Object): Object =
++      DottyLanguageServer.rpcDispatch.get(method) match {
++        case Some(m) =>
++          val args: Array[Object] = if (m.getParameterCount == 0) Array.empty else Array(parameter)
++          m.invoke(server, args*)
++        case None =>
++          throw new UnsupportedOperationException(s"Unsupported method: $method")
++      }
++
++    override def request(method: String, parameter: Object): CompletableFuture[?] =
++      invoke(method, parameter).asInstanceOf[CompletableFuture[?]]
++
++    override def notify(method: String, parameter: Object): Unit =
++      invoke(method, parameter)
++  }
++
++  /** Only overrides local-endpoint construction (see `SafeLocalEndpoint`);
++   *  everything else (JSON handler via `JsonRpcMethodProvider`, remote
++   *  proxy, message processor) is unchanged from `Launcher.Builder`. */
++  private class SafeLauncherBuilder(server: DottyLanguageServer) extends Launcher.Builder[DottyClient] {
++    override def createRemoteEndpoint(jsonHandler: MessageJsonHandler): RemoteEndpoint = {
++      val outgoing: MessageConsumer = wrapMessageConsumer(new StreamMessageConsumer(output, jsonHandler))
++      val localEndpoint = new SafeLocalEndpoint(server)
++      val remoteEndpoint =
++        if (exceptionHandler == null) new RemoteEndpoint(outgoing, localEndpoint)
++        else new RemoteEndpoint(outgoing, localEndpoint, exceptionHandler)
++      jsonHandler.setMethodProvider(remoteEndpoint)
++      remoteEndpoint
++    }
++  }
++
+   def main(args: Array[String]): Unit = {
+     args.toList match {
+       case List("-stdio") =>
+@@ -35,7 +74,7 @@ object Main {
+ 
+     println("Starting server")
+     val launcher =
+-      new Launcher.Builder[DottyClient]()
++      new SafeLauncherBuilder(server)
+         .setLocalService(server)
+         .setRemoteInterface(classOf[DottyClient])
+         .setInput(in)

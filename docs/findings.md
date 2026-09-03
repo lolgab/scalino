@@ -340,6 +340,105 @@ causes, one in each layer:
    `examples/Hello.scala` went from 162 dependency recompiles / ~4.6s to 0
    recompiles / ~1.7s.
 
+## JVM-free language server (LSP)
+
+Goal: a Metals-equivalent for editors like Zed, without a JVM at runtime.
+Metals itself doesn't work here — it's an LSP *client architecture*
+(BSP + semanticdb + `mtags-interfaces`) built to bridge Scala into arbitrary
+JVM build tools, none of which this toolchain needs (it already owns
+compile/link/deps end to end via `scli`). What's actually needed is much
+smaller: dotc's own `interactive`/`InteractiveDriver` machinery, wired to a
+stdio LSP server.
+
+That server already existed: `vendor/scala3/language-server/` is dotty's own
+pre-Metals LSP implementation (`DottyLanguageServer.scala`, ~1000 lines, on
+`org.eclipse.lsp4j`), superseded and unmaintained once Metals took over, but
+functionally complete — `didOpen`/`hover`/`definition`/`completion`/
+`references`/`rename`/`documentSymbol`/workspace `symbol`/`implementation`/
+`signatureHelp`, all thin wrappers over `InteractiveDriver`. `dist/dotty-lsp-native`
+(`build/08-build-lsp-native.sh`) native-images a trimmed version of it —
+`patches/scala3-0002-trim-language-server.patch` drops `worksheet/` (spawns
+a forked JVM REPL subprocess — genuinely JVM-shaped, out of scope) and
+`decompiler/` (TASTy-decompile-on-request, not core LSP). Unlike
+`dotc-native`, this module was never published as a jar (dead since ~2019),
+so it's compiled JVM-side from source first (mirroring
+`03a-patch-compiler.sh`'s pattern) rather than jar-spliced.
+
+Three real bugs found and fixed, none anticipated by the initial scoping:
+
+1. **lsp4j 0.6.0 (the version `vendor/scala3`'s own `Build.scala` pins) has
+   a real bug**: its published jar's `LanguageServer.initialized()` (the
+   `@Deprecated` no-arg overload) carries a `@JsonNotification` annotation
+   that its own *sources* jar doesn't show — a binary/sources mismatch in
+   the 2019-era release — so `Launcher.Builder.create()` throws "Duplicate
+   RPC method initialized." for any `-stdio` launch. Fixed in later
+   releases (verified against 0.21.1). Since nothing appears to have run
+   this module over real `-stdio` since Metals took over, this plausibly
+   never worked even upstream. Fix: bumped to lsp4j 0.21.1 in
+   `build/01-fetch-deps.sh`, which in turn required three small API-shape
+   patches to `DottyLanguageServer.scala` (`TextDocumentPositionParams` split
+   into per-method subtypes like `HoverParams`/`DefinitionParams`;
+   `definition`/`implementation`/workspace `symbol` now return
+   `Either<List<...>, List<...>>` instead of a bare list; and a
+   `WorkspaceService.diagnostic` method added in newer lsp4j shadowed our
+   own like-named `diagnostic` helper, renamed to `toLspDiagnostic`) — all
+   in the same patch file.
+2. **A second, more fundamental duplicate-RPC-method bug, unrelated to lsp4j
+   version**: dotc's Mixin phase materializes a concrete forwarder on
+   `DottyLanguageServer` for *every* default method it inherits from
+   `LanguageServer`/`TextDocumentService`/`WorkspaceService` — not just the
+   ones the class overrides (`codeAction`, `formatting`, `foldingRange`, ...
+   dozens of them) — and each forwarder still carries the original
+   `@JsonNotification`/`@JsonRequest` annotation. lsp4j's reflective method
+   scanner (`ServiceEndpoints.getSupportedMethods`/`GenericEndpoint`) walks
+   both the concrete class *and* its interfaces unconditionally and isn't
+   dedup-aware, so it finds the same RPC method twice and throws. Plain Java
+   implementers never hit this, since javac doesn't synthesize forwarders
+   for un-overridden default methods — this is a genuine Scala/lsp4j interop
+   gap, not an lsp4j defect. Fixed by scanning the three service
+   *interfaces* directly (clean on their own) instead of the concrete class:
+   `DottyLanguageServer` implements `JsonRpcMethodProvider` (which
+   `Launcher.Builder` already prefers over its own class scan when present)
+   for the wire-protocol method table, and `dotty.tools.languageserver.Main`
+   builds its own minimal `Endpoint` for local dispatch, since
+   `GenericEndpoint`/`ServiceEndpoints.toEndpoint` has no equivalent
+   override hook. Both reuse `DottyLanguageServer.rpcDispatch`/`rpcMethods`
+   (a from-scratch, ~50-line reimplementation of lsp4j's `@JsonSegment`
+   method-naming logic, since the real one lives behind a package-private
+   type not reachable from outside `org.eclipse.lsp4j.jsonrpc.services`).
+3. **`InteractiveDriver` needs `-javabootclasspath` explicitly under
+   native-image**, exactly like `dotc-native`'s own compiles already do
+   (`docs/findings.md` "Blocker 1") — under a real JVM, dotc happily
+   resolves `java.lang.Object` etc. from the host JVM's own modules with no
+   flag needed, so this was invisible testing JVM-mode first; under
+   native-image there are no real JDK modules at runtime, so
+   `Definitions.init` fails opaquely (`asTerm called on not-a-Term val
+   <none>`) without it. Not a code fix — a requirement on whatever
+   generates a project's `.dotty-ide.json` (see below).
+
+**Verified working, real native binary, zero JVM at runtime** (checked via
+process-tree inspection while running): a hand-written `.dotty-ide.json`
+fixture pointing `dist/dotty-lsp-native -stdio` at `examples/Hello.scala`
+gets a correct `initialize` response, correct (empty) diagnostics on
+`didOpen`, real Scaladoc-sourced hover text for `println`, and a correct
+compiler type-error diagnostic (`Found: String, Required: Int`, right
+range) after a `didChange` introducing a real type error. Also confirmed:
+the real stdlib jar is `org.scala-lang:scala-library` (no `_3` suffix) —
+`scala3-library_3` is, as of the unified 2.13/3.x versioning line (3.8.x+),
+a 319-byte relocation stub on Maven Central, not real classfiles (same
+"decoy artifact" shape as `scalalib_native0.5_3`, documented above, but for
+an unrelated reason).
+
+Not yet done (v2, deliberately out of scope for this pass): `scli` should
+generate `.dotty-ide.json` (including the `-javabootclasspath` flag) instead
+of hand-writing it — it already resolves dependency classpaths and parses
+`//> using` directives, so this is mostly plumbing; Zed-side wiring/docs (a
+generic LSP-over-stdio client pointed at the binary should just work, but
+untested against the real editor); and deeper verification of
+`completion`/`references`/`rename`/workspace `symbol` (they reuse the same
+now-verified `InteractiveDriver`/dispatch plumbing as `hover`/diagnostics,
+so should work, but aren't individually exercised yet).
+
 ## Remaining work
 
 1. **General quote-pattern matching.** The biggest real gap — see

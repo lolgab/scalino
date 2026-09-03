@@ -2,9 +2,15 @@
 
 [![CI](https://github.com/lolgab/snc/actions/workflows/ci.yml/badge.svg)](https://github.com/lolgab/snc/actions/workflows/ci.yml)
 
-A self-contained Scala Native compiler toolchain: no JVM required to run it
-(a JVM is only needed once, at build time, to run GraalVM's native-image).
-Scala 3 only.
+Goal: a complete Scala 3 toolchain that never needs a JVM installed, at any
+step -- compile, link, build, and (in progress) IDE tooling. A JVM is only
+ever needed once, transiently, at *this project's own* build time, to run
+GraalVM's native-image; nothing it produces touches a JVM again. People
+should be able to write, build, and run Scala without installing Java.
+
+Today this covers the compiler + linker + build tool (`scli`). Next up: a
+JVM-free language server (LSP), so editors like Zed can get Scala IntelliSense
+without Metals' JVM dependency -- see [Status](#status).
 
 ## Prebuilt binaries
 
@@ -90,6 +96,16 @@ own test suite (`interpreter/test-fixtures/`, sourced from
 supported yet — general quote-pattern matching (`case '{ ... } => `) is the
 main known gap. See [`docs/findings.md`](docs/findings.md) for the full
 verified/blocked/remaining breakdown.
+
+**Also proven working, fully JVM-free: an LSP server** (`dist/dotty-lsp-native`,
+`build/08-build-lsp-native.sh`) for editors like Zed, so Scala gets
+diagnostics/hover without Metals' JVM dependency. Built by trimming and
+patching dotty's own pre-Metals `language-server/` module (see
+`docs/findings.md` "JVM-free language server (LSP)" for the three real bugs
+found and fixed along the way). Verified against a real native binary:
+correct diagnostics and real Scaladoc-sourced hover for a hand-written
+project config. Not yet wired up: `scli` generating that config
+automatically (hand-written for now) and Zed-side usage docs.
 
 ## Releasing
 

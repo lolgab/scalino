@@ -19,6 +19,7 @@ resolve_tool() {
   echo "$base"
 }
 JAVA="$(resolve_tool "$GRAAL_HOME/bin/java")"
+JAVAC="$(resolve_tool "$GRAAL_HOME/bin/javac")"
 NATIVE_IMAGE="$(resolve_tool "$GRAAL_HOME/bin/native-image")"
 JIMAGE="$(resolve_tool "$GRAAL_HOME/bin/jimage")"
 JAR="$(resolve_tool "$GRAAL_HOME/bin/jar")"
@@ -43,5 +44,6 @@ require() {
 }
 require cs
 require "$JAVA"
+require "$JAVAC"
 require "$NATIVE_IMAGE"
 require "$CLANG"
