@@ -199,22 +199,34 @@ object Scli:
    *  its own artifact caching, this just skips invoking it at all (and its
    *  network round-trip) when we've already resolved this exact dependency
    *  set before. */
+  /** True if every classpath entry in `cp` still exists on disk -- a cache
+   *  hit whose entries point into `~/.cache`/`~/Library/Caches/Coursier`
+   *  can go stale if that cache is cleared out from under it (by `cs
+   *  cache clear`, a disk-cleanup tool, etc), independently of this
+   *  cache's own key/mtime. Re-resolving in that case beats handing
+   *  dotc-native a classpath full of dangling paths and watching it
+   *  report every symbol from those jars as "not found". */
+  def cachedClasspathStillValid(cp: String): Boolean =
+    cp.split(":").filter(_.nonEmpty).forall(e => Files.exists(Paths.get(e)))
+
   def resolveDeps(deps: List[String], cacheDir: Path): String =
     if deps.isEmpty then ""
     else
       Files.createDirectories(cacheDir)
       val key = sanitizeKey(deps.sorted.mkString(","))
       val cacheFile = cacheDir.resolve(s"deps-$key.cp")
-      if Files.exists(cacheFile) then readFile(cacheFile)
-      else
-        val cs = findOnPath("cs")
-        val coords = deps.map(toCoursierCoord)
-        val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
-        System.err.println(s"scli: resolving ${deps.mkString(", ")}")
-        val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: List("--classpath"))
-        if code != 0 then fail(s"dependency resolution failed for: ${deps.mkString(", ")}")
-        Files.write(cacheFile, cp.getBytes("UTF-8"))
-        cp
+      val cached = Option.when(Files.exists(cacheFile))(readFile(cacheFile)).filter(cachedClasspathStillValid)
+      cached match
+        case Some(cp) => cp
+        case None =>
+          val cs = findOnPath("cs")
+          val coords = deps.map(toCoursierCoord)
+          val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
+          System.err.println(s"scli: resolving ${deps.mkString(", ")}")
+          val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: List("--classpath"))
+          if code != 0 then fail(s"dependency resolution failed for: ${deps.mkString(", ")}")
+          Files.write(cacheFile, cp.getBytes("UTF-8"))
+          cp
 
   // ---------------------------------------------------------------------
   // Entry-point detection, scala-cli/Mill-style: not a source-text
