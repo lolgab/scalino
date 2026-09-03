@@ -429,15 +429,22 @@ a 319-byte relocation stub on Maven Central, not real classfiles (same
 "decoy artifact" shape as `scalalib_native0.5_3`, documented above, but for
 an unrelated reason).
 
-Not yet done (v2, deliberately out of scope for this pass): `scli` should
-generate `.dotty-ide.json` (including the `-javabootclasspath` flag) instead
-of hand-writing it — it already resolves dependency classpaths and parses
-`//> using` directives, so this is mostly plumbing; Zed-side wiring/docs (a
-generic LSP-over-stdio client pointed at the binary should just work, but
-untested against the real editor); and deeper verification of
-`completion`/`references`/`rename`/workspace `symbol` (they reuse the same
-now-verified `InteractiveDriver`/dispatch plumbing as `hover`/diagnostics,
-so should work, but aren't individually exercised yet).
+Done since: `scli setup-ide <sources...>` (`cli/Scli.scala`) generates
+`.dotty-ide.json` (including `-javabootclasspath`) by reusing
+`buildBinary`'s own classpath/directive-parsing plumbing, instead of
+hand-writing it; and [`zed-extension/`](../zed-extension/) is a real Zed
+extension (modeled on
+[metals-zed](https://github.com/scalameta/metals-zed)) registering
+`dotty-lsp-native` as a second server on Zed's `Scala` language — its own
+`README.md` has install steps. Compiles clean (`cargo check`) against
+`zed_extension_api` 0.7.0; not yet built to wasm or run inside real Zed (no
+`rustup`/`wasm32-wasip2` target in this environment) — first thing to check
+if it doesn't load is `dev: open language server logs` in Zed.
+
+Not yet done: deeper verification of `completion`/`references`/`rename`/
+workspace `symbol` (they reuse the same now-verified
+`InteractiveDriver`/dispatch plumbing as `hover`/diagnostics, so should
+work, but aren't individually exercised yet).
 
 ## Remaining work
 

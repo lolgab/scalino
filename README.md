@@ -104,8 +104,11 @@ patching dotty's own pre-Metals `language-server/` module (see
 `docs/findings.md` "JVM-free language server (LSP)" for the three real bugs
 found and fixed along the way). Verified against a real native binary:
 correct diagnostics and real Scaladoc-sourced hover for a hand-written
-project config. Not yet wired up: `scli` generating that config
-automatically (hand-written for now) and Zed-side usage docs.
+project config. `dist/scli setup-ide <sources...>` generates that project
+config (`.dotty-ide.json`) instead of hand-writing it, and
+[`zed-extension/`](zed-extension/) wires the server into Zed as a real
+extension (`README.md` there for install steps) — untested end-to-end
+against the real editor as of this writing.
 
 ## Releasing
 

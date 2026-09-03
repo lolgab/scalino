@@ -1,0 +1,16 @@
+id = "dotty-lsp-native"
+name = "Dotty LSP Native"
+description = "JVM-free Scala language server (dotty-lsp-native, from scala-native-compiler) -- diagnostics and hover without Metals' JVM dependency."
+version = "0.1.0"
+schema_version = 1
+authors = ["Lorenzo Gabriele <lorenzo@codacy.com>"]
+repository = "https://github.com/lolgab/snc"
+
+# Reuses the "Scala" language (grammar/file association) that the official
+# Scala extension (metals-zed) already registers -- install that one too,
+# just disable its `metals` server in settings.json (see README.md) so the
+# two don't both attach to the same buffer:
+#   "languages": { "Scala": { "language_servers": ["!metals", "dotty-lsp-native"] } }
+[language_servers.dotty-lsp-native]
+name = "dotty-lsp-native"
+language = "Scala"

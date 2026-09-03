@@ -10,3 +10,4 @@
 *.class
 *.tasty
 *.nir
+/zed-extension/target/
