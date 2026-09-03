@@ -21,11 +21,19 @@ source ./00-env.sh
 
 BUILD_CP="$(cat "$WORK/compiler-patched.cp"):$(cat "$WORK/nativelibs.cp"):$(cat "$WORK/nscplugin.cp")"
 
+# -R:StackSize: our own-implementation Interpreter.scala (see
+# 03a-patch-compiler.sh) walks a tree-shaped call stack directly, no
+# JVM-reflection shortcut -- several native frames per one interpreted
+# step. A heavily-nested `derives` expansion (many mutually-referencing
+# case classes/enums all deriving the same typeclass) can blow GraalVM
+# native-image's default ~8MB main-thread stack well before it'd trouble
+# a real JVM; 64MB gives real-world derivation chains headroom.
 "$NATIVE_IMAGE" \
   -cp "$BUILD_CP" \
   --no-fallback \
   -H:ConfigurationFileDirectories="$ROOT/agent-config/dotc" \
   -H:+ReportExceptionStackTraces \
+  -R:StackSize=67108864 \
   -o "$DIST/dotc-native" \
   dotty.tools.dotc.Main
 
