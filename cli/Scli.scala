@@ -9,8 +9,10 @@
 //
 // Scope ("mini"): a single `//> using dep`/`//> using scala` directive
 // parser (one dep per line, no version constraints/exclusions), a
-// heuristic (not compiler-driven) entry-point scanner, and a persistent
-// on-disk cache for both dependency resolution and compile/link output.
+// compiled-classfile entry-point scanner (scala-cli/Mill-style: scan the
+// bytecode dotc-native emits for a real `public static void main(String[])`,
+// not a source-text heuristic), and a persistent on-disk cache for both
+// dependency resolution and compile/link output.
 // No watch mode, no multi-Scala-version support (this binary only ever
 // targets the one Scala/scala-native version it was built for -- a
 // `//> using scala` directive that disagrees just gets a warning).
@@ -81,6 +83,12 @@ object Scli:
     val proc = pb.start()
     val out = readAll(proc.getInputStream)
     (proc.waitFor(), out.trim)
+
+  def deleteRecursively(p: Path): Unit =
+    if Files.exists(p) then
+      if Files.isDirectory(p) then
+        Option(p.toFile.listFiles()).foreach(_.foreach(f => deleteRecursively(f.toPath)))
+      Files.delete(p)
 
   def findOnPath(name: String): String =
     val (code, out) = runCaptureStdout(List("sh", "-c", s"command -v $name"))
@@ -209,39 +217,112 @@ object Scli:
         cp
 
   // ---------------------------------------------------------------------
-  // Entry-point detection: a heuristic text scan, NOT compiler-driven (this
-  // binary has no reflection/introspection over its own compiled output to
-  // fall back on -- see docs/findings.md). Recognizes `@main def foo`,
-  // `object Foo extends App`, and `object Foo { ... def main(args: ... }`.
-  // Brace-depth tracking is naive (doesn't understand strings/comments) --
-  // fine for typical scripts, can misfire on adversarial formatting.
+  // Entry-point detection, scala-cli/Mill-style: not a source-text
+  // heuristic, but a scan of the *compiled* .class files for a real
+  // `public static void main(String[])` method. dotc-native emits plain
+  // JVM classfiles alongside .nir even though the final artifact is a
+  // native binary, so this needs no reflection/classloading machinery --
+  // just reading the classfile format directly (stable, tiny, and fully
+  // specified, so a hand-rolled parser is cheap and exact). `@main def`,
+  // `extends App`, and a hand-written `def main` inside an object all
+  // lower to exactly this static forwarder shape, so one check covers all
+  // three with no special-casing -- and, unlike a text scan, can't misfire
+  // on a `{`/`}` inside a string/comment or a non-top-level main-like def.
   // ---------------------------------------------------------------------
 
-  private val objectRe = """^\s*object\s+(\w+)\b.*$""".r
-  private val appRe = """^\s*object\s+(\w+)\s+extends\s+App\b.*$""".r
-  private val mainDefRe = """def\s+main\s*\(\s*\w+\s*:\s*Array\[String\]\s*\)""".r
-  private val atMainRe = """@main\s+def\s+(\w+)""".r
+  private val classMagic = 0xCAFEBABEL
 
-  def scanMainCandidates(text: String): List[String] =
-    var depth = 0
-    var currentObj: Option[(String, Int)] = None
+  private class ClassReader(bytes: Array[Byte]):
+    private var pos = 0
+    def u1(): Int = { val v = bytes(pos) & 0xFF; pos += 1; v }
+    def u2(): Int = { val hi = u1(); val lo = u1(); (hi << 8) | lo }
+    def u4(): Long = { val hi = u2().toLong; val lo = u2().toLong; (hi << 16) | lo }
+    def skip(n: Int): Unit = pos += n
+    def bytesOf(n: Int): Array[Byte] = { val r = bytes.slice(pos, pos + n); pos += n; r }
+
+  /** Parses just enough of a classfile to answer "does this class declare a
+   *  public static `main(String[]): Unit`, and what's its own name" --
+   *  constant pool (to resolve the this_class name and method
+   *  name/descriptor Utf8s), access flags, and the method table. Field
+   *  bodies/other attributes are skipped, not decoded. */
+  def scanClassFile(bytes: Array[Byte]): Option[String] =
+    try
+      val r = ClassReader(bytes)
+      if r.u4() != classMagic then return None
+      r.skip(4) // minor + major version
+      val cpCount = r.u2()
+      // Constant-pool entries are 1-indexed; index 0 is unused. Long/Double
+      // entries (tags 5/6) take up two consecutive indices per the spec.
+      // Only Utf8 (name/descriptor text) and Class (name_index, to resolve
+      // this_class) entries are ever looked up afterwards, so only those
+      // are retained.
+      val utf8 = new Array[String](cpCount)
+      val classNameIdx = new Array[Int](cpCount)
+      var i = 1
+      while i < cpCount do
+        val tag = r.u1()
+        tag match
+          case 1 => // Utf8
+            val len = r.u2()
+            utf8(i) = new String(r.bytesOf(len), "UTF-8")
+          case 7 => classNameIdx(i) = r.u2() // Class: name_index
+          case 8 | 16 | 19 | 20 => r.skip(2) // String/MethodType/Module/Package
+          case 15 => r.skip(3) // MethodHandle
+          case 3 | 4 => r.skip(4) // Integer/Float
+          case 5 | 6 => r.skip(8); i += 1 // Long/Double: wide entry
+          case 9 | 10 | 11 | 12 | 17 | 18 => r.skip(4) // Fieldref/Methodref/InterfaceMethodref/NameAndType/Dynamic/InvokeDynamic
+          case _ => return None // unrecognized tag -- bail rather than misparse
+        i += 1
+      r.skip(2) // access_flags
+      val thisClassIdx = r.u2()
+      r.skip(2) // super_class
+      val ifaceCount = r.u2()
+      r.skip(2 * ifaceCount)
+      val fieldCount = r.u2()
+      def skipMember(): Unit =
+        r.skip(6) // access_flags, name_index, descriptor_index
+        val attrCount = r.u2()
+        for _ <- 0 until attrCount do
+          r.skip(2) // attribute_name_index
+          val len = r.u4()
+          r.skip(len.toInt)
+      for _ <- 0 until fieldCount do skipMember()
+      val methodCount = r.u2()
+      var hasMain = false
+      for _ <- 0 until methodCount do
+        val accessFlags = r.u2()
+        val nameIdx = r.u2()
+        val descIdx = r.u2()
+        val attrCount = r.u2()
+        for _ <- 0 until attrCount do
+          r.skip(2)
+          val len = r.u4()
+          r.skip(len.toInt)
+        val isPublicStatic = (accessFlags & 0x0001) != 0 && (accessFlags & 0x0008) != 0
+        if isPublicStatic && utf8(nameIdx) == "main" && utf8(descIdx) == "([Ljava/lang/String;)V" then
+          hasMain = true
+      if !hasMain then None
+      else Some(utf8(classNameIdx(thisClassIdx)).replace('/', '.'))
+    catch case _: Exception => None
+
+  /** Recursively scans every `.class` file under `classesDir` (dotc-native's
+   *  `-d` output) and returns the distinct set of classes declaring a public
+   *  static `main(String[])`, in the order first seen. */
+  def findMainClasses(classesDir: Path): List[String] =
+    def walk(dir: Path): List[Path] =
+      val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
+      entries.flatMap(f => if f.isDirectory then walk(f.toPath) else if f.getName.endsWith(".class") then List(f.toPath) else Nil)
     val found = scala.collection.mutable.LinkedHashSet.empty[String]
-    for line <- text.linesIterator do
-      atMainRe.findFirstMatchIn(line).foreach(m => found += m.group(1))
-      appRe.findFirstMatchIn(line).foreach(m => found += m.group(1))
-      objectRe.findFirstMatchIn(line).foreach(m => currentObj = Some((m.group(1), depth)))
-      if mainDefRe.findFirstIn(line).isDefined then
-        currentObj.foreach((name, _) => found += name)
-      depth += line.count(_ == '{') - line.count(_ == '}')
+    for f <- walk(classesDir) do
+      scanClassFile(Files.readAllBytes(f)).foreach(found.+=)
     found.toList
 
-  def detectMainClass(sources: List[Path], explicit: Option[String]): String =
+  def detectMainClass(classesDir: Path, explicit: Option[String]): String =
     explicit.getOrElse {
-      val candidates = sources.flatMap(s => scanMainCandidates(readFile(s))).distinct
-      candidates match
+      findMainClasses(classesDir) match
         case List(one) => one
-        case Nil => fail("no entry point found (looked for `@main def`, `extends App`, or `def main(args: Array[String])`) -- pass --main-class")
-        case many => fail(s"multiple possible entry points found (${many.mkString(", ")}) -- pass --main-class to pick one")
+        case Nil => fail("no entry point found (looked for a compiled `public static void main(String[])`) -- pass --main-class")
+        case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one")
     }
 
   // ---------------------------------------------------------------------
@@ -296,17 +377,29 @@ object Scli:
   // (e.g. "lib/foo.jar") so dist/ stays relocatable -- resolve to absolute.
   def resolveCp(raw: String): String = raw.split(":").map(e => s"$dist/$e").mkString(":")
 
+  /** Compiles `sources`, then detects (or takes, if `explicitMainClass` is
+   *  set) the entry point from the *compiled* classfiles -- see
+   *  `detectMainClass` -- links, and copies the resulting binary to
+   *  `outFor(mainClass)`. Compilation always targets a single
+   *  mainClass-independent scratch dir (wiped before every build): compiling
+   *  isn't incremental here regardless of directory identity (every `scli`
+   *  build fully recompiles), so nothing is lost by not knowing the entry
+   *  point's name up front, and it sidesteps the chicken-and-egg problem of
+   *  needing a compiled classfile to name a directory the compiler is about
+   *  to compile into. Only linking (whose C-object cache genuinely benefits
+   *  from a stable, persistent path) is keyed by the resolved mainClass.
+   *  Returns the resolved mainClass. */
   def buildBinary(
     sources: List[Path],
-    mainClass: String,
+    explicitMainClass: Option[String],
     extraClasspath: String,
-    out: Path,
+    outFor: String => Path,
     extraOptions: List[String] = Nil,
-    extraCompileOnlyClasspath: String = ""
-  ): Unit =
-    val cacheRoot = Paths.get(".scli-build").resolve(mainClass)
-    val classesDir = cacheRoot.resolve("classes")
-    val linkDir = cacheRoot.resolve("link")
+    extraCompileOnlyClasspath: String = "",
+    logLevel: String = "info"
+  ): String =
+    val classesDir = Paths.get(".scli-build", "_scratch", "classes")
+    deleteRecursively(classesDir)
     Files.createDirectories(classesDir)
 
     val javaBase = s"$dist/java.base.jar"
@@ -325,16 +418,25 @@ object Scli:
     val scalalibRetained = s"$dist/lib/scalalib-retained.jar"
 
     // `compilerCp`/`nativelibsCp` each carry their own plain, scalac-compiled
-    // scala-library jar (2.13.16 and 2.13.18 respectively) -- having *both*
-    // that jar and scalalibRetained's recompiled one on the same classpath
-    // is genuinely ambiguous, not just redundant: which one dotc's classpath
-    // scanning resolves scala.Option/scala.Some/etc to (and so whether
-    // resolveExternalDefTree finds a real body at all) turned out to depend
-    // on timing/caching, not just declaration order -- non-deterministic
-    // between otherwise-identical runs. Drop the plain jar entirely from the
-    // compile classpath so scalalibRetained is the only one providing it.
+    // scala-library jar -- having *both* that jar and scalalibRetained's
+    // recompiled one on the same classpath is genuinely ambiguous, not just
+    // redundant: which one dotc's classpath scanning resolves
+    // scala.Option/scala.Some/etc to (and so whether resolveExternalDefTree
+    // finds a real body at all) turned out to depend on timing/caching, not
+    // just declaration order -- non-deterministic between otherwise-identical
+    // runs. Drop the plain jar entirely from the compile classpath so
+    // scalalibRetained is the only one providing it -- UNLESS it's the
+    // pinned Scala version's OWN jar (`scala-library-<SCALA_VERSION>.jar`):
+    // under Scala's unified 2.13/3.x versioning (3.8.x+), that filename is
+    // no longer just the legacy Scala-2 stdlib duplicate scalalibRetained
+    // substitutes for -- it's the ONLY place scala.caps/scala.compiletime/
+    // etc (and, per the real jar shipping genuine per-class .tasty now,
+    // arguably scalalibRetained's whole reason to exist) live at all;
+    // `scala3-library_3` itself publishes as a near-empty compat shim.
+    // Dropping it unconditionally removes essential Scala 3 stdlib content,
+    // not just a redundant duplicate.
     def dropPlainScalaLibrary(cp: String): String =
-      cp.split(":").filterNot(_.matches(""".*/scala-library-[0-9.]+\.jar""")).mkString(":")
+      cp.split(":").filterNot(j => j.matches(""".*/scala-library-[0-9.]+\.jar""") && !j.endsWith(s"/scala-library-${BuildInfo.scalaVersion}.jar")).mkString(":")
 
     val compileCp =
       List(scalalibRetained, dropPlainScalaLibrary(compilerCp), dropPlainScalaLibrary(nativelibsCp), extraClasspath, extraCompileOnlyClasspath)
@@ -353,6 +455,9 @@ object Scli:
     val compileExit = runInherited(compileCmd)
     if compileExit != 0 then fail("compilation failed")
 
+    val mainClass = detectMainClass(classesDir, explicitMainClass)
+    val linkDir = Paths.get(".scli-build").resolve(mainClass).resolve("link")
+
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir:$nativelibsCp"
       else s"$classesDir:$nativelibsCp:$extraClasspath"
@@ -360,7 +465,7 @@ object Scli:
     val clangpp = findOnPath("clang++")
 
     val linkExit = runInherited(
-      List(s"$dist/linkdriver-native", linkCp, linkDir.toString, mainClass, clang, clangpp)
+      List(s"$dist/linkdriver-native", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel)
     )
     if linkExit != 0 then fail("linking failed")
 
@@ -368,9 +473,11 @@ object Scli:
     val producedLower = linkDir.resolve(mainClass.toLowerCase)
     val actual = if Files.exists(produced) then produced else producedLower
     if !Files.exists(actual) then fail(s"expected linked binary at $actual, not found")
+    val out = outFor(mainClass)
     Files.createDirectories(Option(out.getParent).getOrElse(Paths.get(".")))
     Files.copy(actual, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     out.toFile.setExecutable(true)
+    mainClass
 
   // ---------------------------------------------------------------------
   // CLI surface, scala-cli-shaped:
@@ -381,7 +488,7 @@ object Scli:
   //   scli version / scli --help
   // options: --main-class X | -d/--dep coord | -S/--scala ver |
   //          -O/--scalac-option opt | -w/--watch | -o/--output path |
-  //          -- <program args...>
+  //          -v/--verbose | -q/--quiet | -- <program args...>
   // ---------------------------------------------------------------------
 
   private val unsupportedCommands = Set(
@@ -416,6 +523,8 @@ object Scli:
          |  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
          |  -w, --watch                rebuild (and, for `run`, rerun) on source changes
          |  -o, --output <path>        output path (compile only)
+         |  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
+         |  -q, --quiet                only show warnings/errors
          |  -- <args...>               arguments passed to the program (run only)
          |
          |directives (in source files), one per line:
@@ -438,8 +547,15 @@ object Scli:
     cliDeps: List[String] = Nil,
     cliScala: Option[String] = None,
     cliOptions: List[String] = Nil,
-    progArgs: List[String] = Nil
-  )
+    progArgs: List[String] = Nil,
+    verbose: Boolean = false,
+    quiet: Boolean = false
+  ):
+    // scala-cli-style: -v shows the full build-tool debug trace (raw
+    // clang/linker invocations, NativeConfig dumps), the default ("info")
+    // shows just progress lines, -q drops those too and only surfaces
+    // warnings/errors. -v wins if both are passed.
+    def logLevel: String = if verbose then "verbose" else if quiet then "quiet" else "info"
 
   def parseRunOpts(args: Array[String]): RunOpts =
     var o = RunOpts()
@@ -455,6 +571,8 @@ object Scli:
         case "-d" | "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
         case "-S" | "--scala" | "--scala-version" => o = o.copy(cliScala = Some(args(i + 1))); i += 1
         case "-O" | "--scalac-option" | "--scalac-opt" => o = o.copy(cliOptions = o.cliOptions :+ args(i + 1)); i += 1
+        case "-v" | "--verbose" => o = o.copy(verbose = true)
+        case "-q" | "--quiet" => o = o.copy(quiet = true)
         case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
     o
@@ -476,18 +594,18 @@ object Scli:
     val depsCache = Paths.get(".scli-build").resolve("deps-cache")
     val extraClasspath = resolveDeps(allDeps, depsCache)
     val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
-    val mainClass = detectMainClass(expanded, o.mainClassOpt.orElse(directives.mainClass))
+    val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
 
     mode match
       case "run" =>
-        val binPath = Paths.get(".scli-build").resolve(mainClass).resolve("bin")
-        buildBinary(expanded, mainClass, extraClasspath, binPath, options, extraCompileOnlyClasspath)
-        runInherited(binPath.toString :: o.progArgs)
+        def binPathFor(mc: String): Path = Paths.get(".scli-build").resolve(mc).resolve("bin")
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel)
+        runInherited(binPathFor(mainClass).toString :: o.progArgs)
       case "compile" =>
         val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `scli compile`")))
-        buildBinary(expanded, mainClass, extraClasspath, outPath, options, extraCompileOnlyClasspath)
-        println(s"scli: wrote $outPath")
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, _ => outPath, options, extraCompileOnlyClasspath, o.logLevel)
+        if !o.quiet then println(s"scli: wrote $outPath (main class: $mainClass)")
         0
 
   /** Polls source mtimes every 500ms and reruns `attempt` on change --
