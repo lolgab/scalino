@@ -30,10 +30,20 @@ source ./00-env.sh
 [[ -f "$WORK/nativelibs.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 
 VENDOR="$ROOT/vendor/scala3"
-[[ -d "$VENDOR/scala2-library-bootstrapped/src" ]] || {
-  echo "missing $VENDOR -- clone scala/scala3 there first (see docs/findings.md)" >&2
-  exit 1
-}
+
+# Scala's unified 2.13/3.x versioning (3.8.x+) merged the separate
+# scala2-library-bootstrapped/scala2-library-cc source trees this script
+# used to compile FROM directly into library/src itself -- and, more to the
+# point, the PUBLISHED scala-library-<ver>.jar for those versions already
+# ships genuine per-class .tasty (confirmed: scala/collection/immutable/
+# List.tasty is really in there), which was this whole script's reason to
+# exist (see the file header). So for 3.8+, this step is both unable to
+# find its old source directory AND unnecessary -- skip it cleanly instead
+# of failing on a missing path.
+if [[ ! -d "$VENDOR/scala2-library-bootstrapped/src" ]]; then
+  echo "skipping: vendor/scala3 has no scala2-library-bootstrapped (removed as of Scala's unified 2.13/3.x versioning, 3.8.x+) -- the published scala-library jar already ships real .tasty for this SCALA_VERSION, so scalalib-retained.jar is unnecessary" >&2
+  exit 0
+fi
 
 STDLIB_JAR="$(tr ':' '\n' < "$WORK/nativelibs.cp" | grep -E '/scala-library-[0-9.]+\.jar$')"
 [[ -n "$STDLIB_JAR" ]] || { echo "could not find scala-library jar on nativelibs.cp" >&2; exit 1; }
