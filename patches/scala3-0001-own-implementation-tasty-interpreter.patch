@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..8b3af75a 100644
+index 04cb637b..c2ab3ffb 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -92,7 +92,7 @@ index 04cb637b..8b3af75a 100644
    type Env = Map[Symbol, Object]
    def emptyEnv: Env = Map.empty
    inline def env(using e: Env): e.type = e
-@@ -59,43 +124,261 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -59,43 +124,282 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
    /** Returns the result of interpreting the code in the tree.
     *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
     */
@@ -145,6 +145,21 @@ index 04cb637b..8b3af75a 100644
 +      env.get(tree.symbol) match
 +        case Some(v) => v
 +        case None if tree.symbol.is(Module) => ModuleValue(tree.symbol)
++        // `reflectModule.this` (real Quotes.scala: `trait reflectModule {
++        // self: reflect.type => ... }`, the self-type every `quotes.reflect`
++        // member -- e.g. a real `TreeMap`'s own default `transformTerm`
++        // body -- is declared against): unlike an ordinary module, there's
++        // no single bound instance to look up in `env` here, since a
++        // self-type reference isn't threaded through as a parameter/`this`
++        // binding the way a real receiver is. But `QuotesImpl` carries no
++        // state of its own beyond the ambient `Context` (`QuotesImpl.apply`
++        // is a synonym for `new QuotesImpl`), so any freshly-built instance
++        // is a semantically valid stand-in for "the current quotes.reflect
++        // bundle" -- same story as `ExprImpl`/`TypeImpl` being built fresh
++        // from a tree elsewhere in this file, just for the reflect-bundle
++        // receiver itself instead of an expression/type value.
++        case None if tree.symbol.name.toString == "reflectModule" =>
++          scala.quoted.runtime.impl.QuotesImpl().asInstanceOf[Object]
 +        case None => unexpectedTree(tree)
 +
 +    // `super.foo(...)`: the receiver value is just the same `this` --
@@ -170,10 +185,16 @@ index 04cb637b..8b3af75a 100644
 +        // a real `Throwable` `throw` could raise directly) -- match cases
 +        // against the *unwrapped* value, same as a real `catch` would see
 +        // the real exception object, not some wrapper around it.
-+        catch case InterpretedThrow(value) =>
-+          interpretCases(cases, value).getOrElse(throw InterpretedThrow(value))
-+        catch case NonFatalInterpretedException(ex) =>
-+          interpretCases(cases, ex).getOrElse(throw ex)
++        catch
++          case InterpretedThrow(value) =>
++            interpretCases(cases, value).getOrElse(throw InterpretedThrow(value))
++          // `NonFatalInterpretedException` is `scala.util.control.NonFatal`
++          // itself, which never matches `StopInterpretation` (a
++          // `ControlThrowable`, see its own doc) -- so this genuinely only
++          // ever sees a real exception from the program being interpreted,
++          // never our own "give up, unsupported" signal.
++          case NonFatalInterpretedException(ex) =>
++            interpretCases(cases, ex).getOrElse(throw ex)
 +      finally
 +        if !finalizer.isEmpty then interpretTree(finalizer)
 +
@@ -362,7 +383,7 @@ index 04cb637b..8b3af75a 100644
      // Interpret `foo(j = x, i = y)` which it is expanded to
      // `val j$1 = x; val i$1 = y; foo(i = i$1, j = j$1)`
      case Block(stats, expr) => interpretBlock(stats, expr)
-@@ -113,6 +396,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -113,6 +417,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        unexpectedTree(tree)
    }
  
@@ -382,7 +403,7 @@ index 04cb637b..8b3af75a 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,186 +437,2988 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +458,3531 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -822,6 +843,78 @@ index 04cb637b..8b3af75a 100644
 +              case b: Bind @unchecked => Some(List(b.name.toString, b.body))
 +              case _ => None
 +            }
++            // `quotes.reflect.Inferred`'s own `TypeTest[Tree, Inferred]`
++            // (real QuotesImpl, QuotesImpl.scala:1196-1200): any `TypeTree`
++            // whose own type isn't `TypeBounds` -- used by the real default
++            // `TreeMap#transformTypeTree`'s own `case Inferred() => tree`
++            // (a nested `UnApply` pair: this type test wrapping the
++            // nullary `Inferred.unapply` confirmation just below it).
++            case "InferredTypeTest" => Some {
++              case t: dotty.tools.dotc.ast.tpd.TypeTree if !t.tpe.isInstanceOf[TypeBounds] => Some(List(t))
++              case _ => None
++            }
++            // `Inferred.unapply(x): true` -- a nullary confirming check
++            // (the type test above already narrowed the shape), so it
++            // always succeeds with no captured bindings of its own.
++            case "Inferred" => Some {
++              case _: Tree => Some(Nil)
++              case _ => None
++            }
++            // `quotes.reflect.SummonFrom`'s own `TypeTest[Tree, SummonFrom]`
++            // (real QuotesImpl, QuotesImpl.scala:992-995): a `Match` whose
++            // selector is empty -- unlike ordinary `Match` (`MatchTypeTest`
++            // above, which doesn't exclude this), so checked ahead of it.
++            case "SummonFromTypeTest" => Some {
++              case t: Match @unchecked if t.selector.isEmpty => Some(List(t))
++              case _ => None
++            }
++            case "SummonFrom" => Some {
++              case t: Match @unchecked => Some(List(t.cases))
++              case _ => None
++            }
++            case "Return" => Some {
++              case t: dotty.tools.dotc.ast.tpd.Return @unchecked => Some(List(t.expr, t.from.symbol))
++              case _ => None
++            }
++            case "Try" => Some {
++              case t: dotty.tools.dotc.ast.tpd.Try @unchecked =>
++                Some(List(t.expr, t.cases, if t.finalizer.isEmpty then None else Some(t.finalizer)))
++              case _ => None
++            }
++            case "While" => Some {
++              case t: dotty.tools.dotc.ast.tpd.WhileDo @unchecked => Some(List(t.cond, t.body))
++              case _ => None
++            }
++            // `quotes.reflect.Closure`'s own `TypeTest[Tree, Closure]` (real
++            // QuotesImpl, QuotesImpl.scala:902-906): plain `isInstance`
++            // against the real `tpd.Closure` class.
++            case "ClosureTypeTest" => Some {
++              case t: dotty.tools.dotc.ast.tpd.Closure @unchecked => Some(List(t))
++              case _ => None
++            }
++            // `Closure.unapply(x): (Term, Option[TypeRepr])` (real
++            // QuotesImpl, QuotesImpl.scala:913-914): `(x.meth, x.tpeOpt)`,
++            // `tpeOpt` reading the closure's own optional target-type tree.
++            case "Closure" => Some {
++              case c: dotty.tools.dotc.ast.tpd.Closure @unchecked =>
++                Some(List(c.meth, if c.tpt.isEmpty then None else Some(c.tpt.tpe)))
++              case _ => None
++            }
++            // `quotes.reflect.Term`'s own `TypeTest[Tree, Term]` (real
++            // QuotesImpl, QuotesImpl.scala:422-431): `Term = Tree` under the
++            // hood, so this isn't really an `isInstance` check against some
++            // narrower subclass (unlike the generic `TypeTest` fallback
++            // below) -- real semantics faithfully ported, minus excluding
++            // pattern-context trees (`PatternTree`), which a real macro's
++            // own term-shaped scrutinee never actually is.
++            case "TermTypeTest" => Some {
++              case t: SeqLiteral => Some(List(t))
++              case t: Inlined => Some(List(t))
++              case t: NamedArg => Some(List(t))
++              case t: Typed => Some(List(t))
++              case t: Tree => if t.isTerm then Some(List(t)) else None
++              case _ => None
++            }
 +            case name =>
 +              // Generic `TypeTest[TypeRepr, SomeDotcTypeSubclass]` shape:
 +              // matches iff the scrutinee's real runtime type (dotc's own
@@ -866,10 +959,62 @@ index 04cb637b..8b3af75a 100644
 +        case sel @ TypeApply(Select(qual, _), _) => regexReceiver(sel, qual)
 +        case sel @ Select(qual, _) => regexReceiver(sel, qual)
 +        case _ => None
++      // Generic fallback for a user-defined `unapply`/`unapplySeq` that
++      // ISN'T one of the well-known extractors curated above: interpret its
++      // own retained body the same way any other macro helper method is
++      // interpreted (`callUserDefDef`, the same call this UnApply's own
++      // enclosing macro body itself is dispatched through), instead of
++      // needing a hardcoded case per extractor name. Needed by macro
++      // libraries that deconstruct their own tree shapes via custom
++      // (often private) extractor objects rather than the well-known
++      // `quotes.reflect`/stdlib ones above -- e.g. utest's own
++      // `TestBuilder.Stats`/`Test`/`TestMethod`/`IsTest` (`scli test`, see
++      // docs/findings.md). Returns one element per `patterns` slot the same
++      // way the curated extractors above do, so it plugs into the exact
++      // same size-matching/varargs logic below unchanged: a real arity>1
++      // `unapply` returns its bindings as a `TupleN` (a `Product`), a
++      // real arity-1 `unapply` returns the single bound value directly
++      // (whether or not that value itself happens to also be a `Product`).
++      // Peels `fun` down to its base `Select(qual, "unapply")`, collecting
++      // every argument list applied along the way (in order). Needed
++      // because a CURRIED `unapply` (e.g. `def unapply(using Quotes)(tree:
++      // Tree): Option[...]`, the standard shape for a macro's own
++      // `quotes`-taking extractor object) makes `fun` itself
++      // `Apply(Select(qual, "unapply"), List(givenQuotesArg))`, not a bare
++      // `Select`/`TypeApply(Select(...), _)` -- the scrutinee than binds
++      // against the extractor's OWN LAST parameter list, applied
++      // implicitly by the pattern match itself, on top of these.
++      def qualAndLeadingArgs(t: Tree): Option[(Tree, List[Tree])] = t match
++        case Apply(inner, args) => qualAndLeadingArgs(inner).map((q, prev) => (q, prev ::: args))
++        case TypeApply(inner, _) => qualAndLeadingArgs(inner)
++        case Select(qual, _) => Some((qual, Nil))
++        case _ => None
++      def genericUserUnapply(t: Tree): Option[Object => Option[List[Object]]] =
++        val unapplySym = fun.symbol
++        if !unapplySym.exists then None
++        else qualAndLeadingArgs(t).flatMap { case (qual, leadingArgTrees) =>
++          resolveExternalDefTree(unapplySym) match
++            case ddef: DefDef if !ddef.rhs.isEmpty =>
++              val receiver = interpretTree(qual)
++              val leadingArgs = leadingArgTrees.map(interpretTree)
++              Some { (v: Object) =>
++                callUserDefDef(Some(receiver), ddef, leadingArgs :+ v) match
++                  case opt: Option[Object @unchecked] @unchecked =>
++                    opt match
++                      case Some(extracted) =>
++                        extracted match
++                          case p: Product if patterns.size > 1 && p.productArity == patterns.size =>
++                            Some((0 until patterns.size).map(i => p.productElement(i).asInstanceOf[Object]).toList)
++                          case single => Some(List(single))
++                      case None => None
++                  case _ => None
++              }
++            case _ => None
++        }
 +      val concreteUnapply: Option[Object => Option[List[Object]]] = regexUnapply.orElse(fun match
 +        case TypeApply(Select(qual, _), _) => matchConcreteUnapply(qual) // e.g. generic `::.unapply[A]`
 +        case Select(qual, _) => matchConcreteUnapply(qual)
-+        case _ => None)
++        case _ => None).orElse(genericUserUnapply(fun))
 +      concreteUnapply match
 +        case Some(unapply) =>
 +          unapply(scrutinee) match
@@ -943,6 +1088,18 @@ index 04cb637b..8b3af75a 100644
 +    case Typed(patExpr, _) =>
 +      val scrutExpr = scrutTree match { case Typed(e, _) => e; case _ => scrutTree }
 +      matchQuoteBodyTree(patExpr, scrutExpr, scope, bindingSyms)
++    case New(patTpt) =>
++      // `case '{ new StringContext(...) } =>` (real scala-library
++      // `FromExpr[StringContext]`'s own pattern, `FromExpr.scala:143` --
++      // used by essentially any macro accepting a `StringContext`-based
++      // literal, e.g. http4s's own `uri"..."` via the `literally` library):
++      // `New`'s OWN `.symbol` is always `NoSymbol` (only its `tpt` child
++      // actually names a class), so falling through to the generic leaf
++      // case below would compare two `NoSymbol`s and always fail --
++      // recurse into `tpt` instead, whose real class symbol IS meaningful.
++      scrutTree match
++        case New(scrutTpt) => matchQuoteBodyTree(patTpt, scrutTpt, scope, bindingSyms)
++        case _ => None
 +    case Apply(patFn, patArgs) =>
 +      scrutTree match
 +        case Apply(scrutFn, scrutArgs) if patArgs.size == scrutArgs.size =>
@@ -955,7 +1112,17 @@ index 04cb637b..8b3af75a 100644
 +    case Select(patQual, patName) =>
 +      scrutTree match
 +        case Select(scrutQual, scrutName) if patName == scrutName => matchQuoteBodyTree(patQual, scrutQual, scope, bindingSyms)
-+        case _ => None
++        // The scrutinee isn't ALSO a `Select` of the same shape (e.g. a
++        // plain `Ident` instead, printed WITH a qualifier prefix purely for
++        // disambiguation, not because it's really a multi-hop `Select`
++        // tree) -- same underlying reference can gain or lose qualifier
++        // hops (a package vs. its synthetic package-OBJECT accessor,
++        // `import`-shortened idents, ...) independent of anything the
++        // ORIGINAL source actually wrote differently on either side. Fall
++        // back to whole-reference symbol identity (same as the leaf case
++        // below) rather than failing outright on a structural mismatch
++        // that doesn't reflect a real difference.
++        case _ => if pat.symbol.exists && pat.symbol == scrutTree.symbol then Some(env) else None
 +    case _ =>
 +      // A leaf reference (e.g. `StringContext`'s own `Ident`/module select):
 +      // match by symbol identity, not structurally.
@@ -1046,6 +1213,9 @@ index 04cb637b..8b3af75a 100644
 +    case "AssignTypeTest" => Some(classOf[Assign])
 +    case "IfTypeTest" => Some(classOf[If])
 +    case "MatchTypeTest" => Some(classOf[Match])
++    case "ReturnTypeTest" => Some(classOf[dotty.tools.dotc.ast.tpd.Return])
++    case "TryTypeTest" => Some(classOf[dotty.tools.dotc.ast.tpd.Try])
++    case "WhileTypeTest" => Some(classOf[dotty.tools.dotc.ast.tpd.WhileDo])
 +    case "CaseDefTypeTest" => Some(classOf[CaseDef])
 +    case "BindTypeTest" => Some(classOf[Bind])
 +    case "DefDefTypeTest" => Some(classOf[DefDef])
@@ -1402,6 +1572,21 @@ index 04cb637b..8b3af75a 100644
 +          System.arraycopy(src, srcPos, dest, destPos, length)
 +          Some(().asInstanceOf[Object])
 +        case _ => None
++    // `java.lang.System.getProperty`/`getenv`: real JVM-native statics, no
++    // Scala source ever -- `scala.sys.SystemProperties`'s own real
++    // (interpreted) source calls `getProperty` directly (e.g. munit's own
++    // `MacroCompat`'s `sys.props("user.dir")`, used to relativize a
++    // reported test-failure path).
++    else if fn.name.toString == "getProperty" && fn.owner.name.toString.stripSuffix("$") == "System" && fn.owner.is(JavaDefined) then
++      args match
++        case (key: String) :: Nil => Some(System.getProperty(key))
++        case (key: String) :: (default: String) :: Nil => Some(System.getProperty(key, default))
++        case _ => None
++    else if fn.name.toString == "getenv" && fn.owner.name.toString.stripSuffix("$") == "System" && fn.owner.is(JavaDefined) then
++      args match
++        case (key: String) :: Nil => Some(System.getenv(key))
++        case Nil => Some(System.getenv())
++        case _ => None
 +    // A handful of common `java.lang.{Integer,Long}` real JDK-native
 +    // static parsing methods -- no Scala source ever, but exercised by
 +    // e.g. ip4s's own literal-validation macros hand-parsing numbers at
@@ -1422,6 +1607,16 @@ index 04cb637b..8b3af75a 100644
 +        case ("Long", "parseLong", (s: String) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.parseLong(s)))
 +        case ("Long", "parseLong", (s: String) :: (radix: Integer) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.parseLong(s, radix)))
 +        case ("Long", "compare", (x: java.lang.Long) :: (y: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.compare(x, y)))
++        case _ => None
++    // `java.util.regex.Pattern.compile`/`.quote`: real JDK-native statics
++    // (no Scala source ever) -- `scala.util.matching.Regex`'s own
++    // (real, interpreted) constructor calls `Pattern.compile` directly, and
++    // `Regex.quote` forwards to `Pattern.quote`.
++    else if fn.owner.name.toString.stripSuffix("$") == "Pattern" && fn.owner.is(JavaDefined) then
++      (fn.name.toString, args) match
++        case ("compile", (s: String) :: Nil) => Some(java.util.regex.Pattern.compile(s))
++        case ("compile", (s: String) :: (flags: Integer) :: Nil) => Some(java.util.regex.Pattern.compile(s, flags))
++        case ("quote", (s: String) :: Nil) => Some(java.util.regex.Pattern.quote(s))
 +        case _ => None
 +    else None
  
@@ -1748,6 +1943,24 @@ index 04cb637b..8b3af75a 100644
 +        case "NoSuchElementException" => Some(new NoSuchElementException(messageArg.orNull))
 +        case "RuntimeException" => Some(new RuntimeException(messageArg.orNull))
 +        case _ => None
++    // `java.lang.StringBuilder`: a real JDK class, no retained Scala source
++    // -- checked by `JavaDefined` (like `WeakReference` above), BEFORE the
++    // bare-name `"StringBuilder"` case below (which builds a
++    // `scala.collection.mutable.StringBuilder` instead): both share the
++    // same simple name (`scala.StringBuilder` is a root package-object
++    // alias for the mutable one), so bare-name matching alone can't tell
++    // them apart. Needed by `scala.util.matching.Regex`'s own
++    // `Replacement` trait (`private val sb = new java.lang.StringBuilder`,
++    // used by `replaceAllIn`/`replaceSomeIn`) -- building the wrong
++    // (Scala) one here would make the real `java.util.regex.Matcher#
++    // appendReplacement`/`appendTail` calls just below fail to find a
++    // matching overload.
++    else if fn.owner.name.toString == "StringBuilder" && fn.owner.is(JavaDefined) then
++      rawArgs.filterNot(_.isEmpty).map(interpretTree) match
++        case Nil => Some(new java.lang.StringBuilder())
++        case (n: Integer) :: Nil => Some(new java.lang.StringBuilder(n))
++        case (s: String) :: Nil => Some(new java.lang.StringBuilder(s))
++        case _ => None
 +    else fn.owner.showFullName match
 +      case "scala.collection.mutable.HashMap" | "scala.collection.mutable.Map" =>
 +        Some(mutable.HashMap.empty[Object, Object])
@@ -1798,7 +2011,51 @@ index 04cb637b..8b3af75a 100644
 +    else newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs))
 +
 +  private def interpretNewFromTree(fn: Symbol, rawArgs: List[Tree])(using Env): Object =
-+    resolveExternalDefTree(fn.owner.primaryConstructor) match
++    // A secondary/auxiliary constructor (`def this(...) = this(...)`,
++    // e.g. `scala.util.matching.Regex`'s own `def this(regex: String,
++    // groupNames: String*) = this(Pattern.compile(regex), groupNames*)`):
++    // real JVM semantics, this does NOT build a second object -- it just
++    // continues initializing the same one the delegated ctor call builds.
++    // Unlike the primary-constructor case below (whose params double as
++    // the instance's own fields), this constructor's OWN params (e.g.
++    // `regex: String`) generally do NOT correspond to any real field, so
++    // there's no sensible "build a shell instance, bind these as its
++    // fields" here at all -- bind ITS OWN params from `rawArgs` (the actual
++    // call-site arguments) and just interpret its body, almost always a
++    // single delegating `this(...)` call. That's an ordinary
++    // constructor-`Call` (dispatches straight back into `interpretNew`/
++    // this same function, recursively, for whichever constructor it
++    // delegates to), so its evaluated arguments (e.g. a real
++    // `Pattern.compile(regex)` call, not the raw string) are exactly what
++    // finally reaches the primary constructor -- unlike unconditionally
++    // jumping straight to `fn.owner.primaryConstructor` (the previous,
++    // buggy behavior), which skipped this delegation entirely and bound
++    // `rawArgs` positionally against the PRIMARY constructor's own
++    // differently-shaped params instead (e.g. leaving `Regex#pattern`
++    // holding the raw source STRING, not a compiled `Pattern`).
++    if !fn.isPrimaryConstructor then
++      resolveExternalDefTree(fn) match
++        case ddef: DefDef if !ddef.rhs.isEmpty =>
++          val params = ddef.termParamss.flatten.map(_.symbol)
++          val withParams = bindNonErased(params, rawArgs).foldLeft(env)((e, pv) => e.updated(pv._1, pv._2))
++          // The body is `Block(delegatingThisCall :: rest, ())` -- a
++          // constructor's body is `Unit`-typed at the language level (it
++          // mutates `this`, never "returns" the delegated-to instance), so
++          // ordinary `Block` evaluation would interpret the delegating call
++          // only for its (discarded) side effect and yield `()`, losing the
++          // actual constructed instance entirely. Interpret the delegating
++          // call specially instead, keep ITS result as the real instance
++          // (same object identity the delegated-to constructor built), and
++          // run any statements after it (rare for a trivial forwarding aux
++          // constructor, but not disallowed) against that instance's `this`.
++          ddef.rhs match
++            case Block((delegate @ Call(callee, _)) :: rest, _) if callee.symbol.isConstructor =>
++              val instance = interpretTree(delegate)(using withParams)
++              rest.foreach(interpretTree(_)(using bindThis(withParams, fn.owner, instance)))
++              instance
++            case _ => notInterpretable(fn)
++        case _ => notInterpretable(fn)
++    else resolveExternalDefTree(fn.owner.primaryConstructor) match
 +      case ddef: DefDef =>
 +        // Build the instance by running the constructor body with a fresh
 +        // field-store, then binding `this` to it for any later calls.
@@ -2127,13 +2384,46 @@ index 04cb637b..8b3af75a 100644
 +      case _ => None
 +
 +  private def interpretStaticFieldAccess(sym: Symbol)(using Context): Object =
-+    wellKnownSingleton(sym).orElse(javaPrimitiveTypeConstant(sym)).orElse(javaBoxedConstant(sym)).getOrElse {
++    wellKnownSingleton(sym).orElse(javaPrimitiveTypeConstant(sym)).orElse(javaBoxedConstant(sym)).orElse(javaStaticFieldConstant(sym)).getOrElse {
 +      resolveExternalDefTree(sym) match
 +        case vdef: ValDef => interpretTree(vdef.rhs)(using emptyEnv)
 +        case _ => notInterpretable(sym)
      }
 -    allParams.map(paramClass)
 -  }
++
++  /** A handful of common real JDK `public static final` fields -- no Scala
++   *  source ever, so `resolveExternalDefTree` can never find a body -- read
++   *  by evaluating the real Java field directly, same story as
++   *  `interpretJavaReflectionIntrinsic`'s static methods just below.
++   *  Curated by name as specific ones get exercised, not exhaustive.
++   */
++  private def javaStaticFieldConstant(sym: Symbol): Option[Object] =
++    if sym.owner.is(JavaDefined) then
++      sym.owner.name.toString.stripSuffix("$") match
++        case "StandardCharsets" =>
++          sym.name.toString match
++            case "UTF_8" => Some(java.nio.charset.StandardCharsets.UTF_8)
++            case "US_ASCII" => Some(java.nio.charset.StandardCharsets.US_ASCII)
++            case "ISO_8859_1" => Some(java.nio.charset.StandardCharsets.ISO_8859_1)
++            case "UTF_16" => Some(java.nio.charset.StandardCharsets.UTF_16)
++            case "UTF_16BE" => Some(java.nio.charset.StandardCharsets.UTF_16BE)
++            case "UTF_16LE" => Some(java.nio.charset.StandardCharsets.UTF_16LE)
++            case _ => None
++        case "File" =>
++          // `java.io.File.separator`/`.separatorChar`/`.pathSeparator`/
++          // `.pathSeparatorChar` -- real JDK-native platform-dependent
++          // constants (munit's own `MacroCompat`'s `workingDirectory`
++          // computation reads `File.separator` directly at macro-expansion
++          // time).
++          sym.name.toString match
++            case "separator" => Some(java.io.File.separator)
++            case "separatorChar" => Some(Character.valueOf(java.io.File.separatorChar))
++            case "pathSeparator" => Some(java.io.File.pathSeparator)
++            case "pathSeparatorChar" => Some(Character.valueOf(java.io.File.pathSeparatorChar))
++            case _ => None
++        case _ => None
++    else None
 +
 +  private def notInterpretable(sym: Symbol): Nothing =
 +    val hint =
@@ -2208,6 +2498,19 @@ index 04cb637b..8b3af75a 100644
 +        // an explicit arg, same extension-method desugaring as valueOrAbort.
 +        (receiver.toList ::: args).collectFirst { case sf: dotty.tools.dotc.util.SourceFile => sf.file.jpath }
 +
++      case "getJPath" if (receiver.toList ::: args).exists(_.isInstanceOf[dotty.tools.dotc.util.SourceFile]) =>
++        // `SourceFileMethods#getJPath(self)` (real QuotesImpl,
++        // QuotesImpl.scala:3391): `jpath`'s non-deprecated, `Option`-typed
++        // replacement -- `None` for a virtual file with no real filesystem
++        // path (`self.file.jpath` itself is allowed to be `null` there).
++        (receiver.toList ::: args).collectFirst { case sf: dotty.tools.dotc.util.SourceFile => Option(sf.file.jpath) }
++
++      case "name" if (receiver.toList ::: args).exists(_.isInstanceOf[dotty.tools.dotc.util.SourceFile]) =>
++        (receiver.toList ::: args).collectFirst { case sf: dotty.tools.dotc.util.SourceFile => sf.name }
++
++      case "path" if (receiver.toList ::: args).exists(_.isInstanceOf[dotty.tools.dotc.util.SourceFile]) =>
++        (receiver.toList ::: args).collectFirst { case sf: dotty.tools.dotc.util.SourceFile => sf.path }
++
 +      case "getFileName" if (receiver.toList ::: args).exists(_.isInstanceOf[java.nio.file.Path]) =>
 +        (receiver.toList ::: args).collectFirst { case p: java.nio.file.Path => p.getFileName }
 +
@@ -2220,6 +2523,19 @@ index 04cb637b..8b3af75a 100644
 +        // normal pretty-printer) is what QuotesImpl's real TreeMethods#show
 +        // renders through anyway.
 +        (receiver.toList ::: args).collectFirst { case t: Tree => t.show.asInstanceOf[Object] }
++
++      case "show" if (receiver.toList ::: args).exists(_.isInstanceOf[scala.quoted.runtime.impl.ExprImpl]) =>
++        // `Expr#show(self)` -- unlike every other `XMethods` extension bag,
++        // `Expr`'s own extensions (`show`/`matches`/`valueOrAbort`/...) are
++        // declared directly inside `trait Quotes` itself (real Quotes.scala:
++        // "Extension methods for `Expr[T]`"), so `fn.owner` here is
++        // `Quotes`, not a separate marker trait -- can't dispatch by owner
++        // name the way everything else does, only by an `ExprImpl` actually
++        // showing up in the args. Real QuotesImpl (QuotesImpl.scala:51-53):
++        // `reflect.Printer.TreeCode.show(reflect.asTerm(self))`, i.e. just
++        // the wrapped tree's own real `.show` -- same as `TreeMethods#show`
++        // just above.
++        (receiver.toList ::: args).collectFirst { case e: scala.quoted.runtime.impl.ExprImpl => e.tree.show.asInstanceOf[Object] }
 +
 +      case name if fn.owner.name.toString == "reflectModule" && args.isEmpty =>
 +        // Any zero-arg accessor directly under `quotes.reflect` (the
@@ -2367,6 +2683,19 @@ index 04cb637b..8b3af75a 100644
 +        args.headOption.collect { case s: Symbol => s.denot.fullName.toString }
 +      case "flags" if fn.owner.name.toString == "SymbolMethods" =>
 +        args.headOption.collect { case s: Symbol => s.flags.asInstanceOf[Object] }
++      case "pos" if fn.owner.name.toString == "SymbolMethods" =>
++        // Real QuotesImpl (QuotesImpl.scala:2964-2972): `None` for a
++        // nonexistent symbol or one truly outside any source, else its own
++        // `sourcePos` or (as with `TreeMethods#pos` above) a zero-span
++        // fallback in its source file.
++        args.headOption.collect { case s: Symbol =>
++          if !s.exists then None
++          else
++            val symPos = s.sourcePos
++            if symPos.exists then Some(symPos)
++            else if s.source.exists then Some(s.source.atSpan(dotty.tools.dotc.util.Spans.Span(0)))
++            else None
++        }
 +      case "exists" if fn.owner.name.toString == "SymbolMethods" =>
 +        args.headOption.collect { case s: Symbol => Boolean.box(s != NoSymbol) }
 +      case "isNoSymbol" if fn.owner.name.toString == "SymbolMethods" =>
@@ -2414,6 +2743,10 @@ index 04cb637b..8b3af75a 100644
 +            Some(s.denot.typeRef.decls.iterator.filter(sym =>
 +              sym.isTerm && sym.is(Method) && !sym.isConstructor && sym.name.toString == name).toList)
 +          case _ => None
++      case "isDefDef" if fn.owner.name.toString == "SymbolMethods" =>
++        args.headOption.collect { case s: Symbol => Boolean.box(s.is(Method)) }
++      case "isClassConstructor" if fn.owner.name.toString == "SymbolMethods" =>
++        args.headOption.collect { case s: Symbol => Boolean.box(s.denot.isClassConstructor) }
 +      case "isTypeDef" if fn.owner.name.toString == "SymbolMethods" =>
 +        args.headOption.collect { case s: Symbol => Boolean.box(s.isType && !s.isClass && !s.is(Case)) }
 +      case "isClassDef" if fn.owner.name.toString == "SymbolMethods" =>
@@ -2649,6 +2982,14 @@ index 04cb637b..8b3af75a 100644
 +
 +      case "symbol" if fn.owner.name.toString == "TreeMethods" =>
 +        args.headOption.collect { case t: Tree => t.symbol }
++      case "pos" if fn.owner.name.toString == "TreeMethods" =>
++        // Real QuotesImpl (QuotesImpl.scala:103-108): the tree's own
++        // `sourcePos` when it has one, else a synthetic zero-span position
++        // in its source file (macros never see a tree with no source at all).
++        args.headOption.collect { case t: Tree =>
++          val treePos = t.sourcePos
++          if treePos.exists then treePos else t.source.atSpan(dotty.tools.dotc.util.Spans.Span(0))
++        }
 +      case "asExpr" if fn.owner.name.toString == "TreeMethods" =>
 +        args.headOption.collect { case t: Tree => new ExprImpl(t, SpliceScope.getCurrent) }
 +      case "asExprOf" if fn.owner.name.toString == "TreeMethods" =>
@@ -2666,6 +3007,18 @@ index 04cb637b..8b3af75a 100644
 +        args.headOption.collect { case t: TypeDef => t.rhs.asInstanceOf[Template].constr }
 +      case "parents" if fn.owner.name.toString == "ClassDefMethods" =>
 +        args.headOption.collect { case t: TypeDef => t.rhs.asInstanceOf[Template].parents }
++      case "name" if fn.owner.name.toString == "DefinitionMethods" =>
++        args.headOption.collect { case m: dotty.tools.dotc.ast.tpd.MemberDef => m.name.toString }
++      case "tpt" if fn.owner.name.toString == "ValDefMethods" =>
++        args.headOption.collect { case v: ValDef => v.tpt }
++      case "rhs" if fn.owner.name.toString == "ValDefMethods" =>
++        args.headOption.collect { case v: ValDef => if v.rhs.isEmpty then None else Some(v.rhs) }
++      case "returnTpt" if fn.owner.name.toString == "DefDefMethods" =>
++        args.headOption.collect { case d: DefDef => d.tpt }
++      case "rhs" if fn.owner.name.toString == "DefDefMethods" =>
++        args.headOption.collect { case d: DefDef => if d.rhs.isEmpty then None else Some(d.rhs) }
++      case "paramss" if fn.owner.name.toString == "DefDefMethods" =>
++        args.headOption.collect { case d: DefDef => d.paramss }
 +      case "select" if fn.owner.name.toString == "TermMethods" =>
 +        args match
 +          case (self: Tree) :: (sym: Symbol) :: Nil => Some(tpd.Select(self, TermRef(self.tpe, sym)))
@@ -2689,6 +3042,12 @@ index 04cb637b..8b3af75a 100644
 +          case _ => None
 +      case "tpe" if fn.owner.name.toString == "TermMethods" =>
 +        args.headOption.collect { case t: Tree => t.tpe.widenSkolem }
++      case "underlyingArgument" if fn.owner.name.toString == "TermMethods" =>
++        // Real QuotesImpl (QuotesImpl.scala:463): `new tpd.TreeOps(self).underlyingArgument`,
++        // a plain real dotc method -- called directly like `changeOwner` above.
++        args.headOption.collect { case t: Tree => tpd.TreeOps(t).underlyingArgument }
++      case "underlying" if fn.owner.name.toString == "TermMethods" =>
++        args.headOption.collect { case t: Tree => tpd.TreeOps(t).underlying }
 +
 +      case "asTerm" if fn.owner.name.toString == "reflectModule" =>
 +        args.headOption.collect { case e: ExprImpl => e.tree }
@@ -2707,6 +3066,33 @@ index 04cb637b..8b3af75a 100644
 +
 +      case "ofMacroExpansion" if fn.owner.name.toString == "PositionModule" =>
 +        Some(pos.sourcePos)
++
++      // `PositionMethods`: `Position` (`quotes.reflect.Position`) is a real
++      // dotc `SourcePosition` under the hood -- these are its own plain real
++      // members (real QuotesImpl, QuotesImpl.scala:3363-3373), called
++      // directly the same way `TreeMethods#pos` above is. Needed by
++      // munit/utest's own `Location`/`Clue`/source-echoing macros, which is
++      // where this real-world gap was found (see docs/findings.md).
++      case "start" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.start) }
++      case "end" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.end) }
++      case "sourceFile" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => p.source }
++      case "startLine" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.startLine) }
++      case "endLine" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.endLine) }
++      case "startColumn" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.startColumn) }
++      case "endColumn" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.endColumn) }
++      case "sourceCode" if fn.owner.name.toString == "PositionMethods" =>
++        args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition =>
++          val contents = p.source.content()
++          if contents.length < p.end then None
++          else Some(new String(contents, p.start, p.end - p.start))
++        }
 +
 +      // `scala.StringContext` (real Java/Scala library, not part of Quotes
 +      // at all) -- macros build interpolated diagnostic strings (like
@@ -2783,12 +3169,147 @@ index 04cb637b..8b3af75a 100644
 +      case "hi" if fn.owner.name.toString == "TypeBoundsMethods" =>
 +        args.headOption.collect { case b: TypeBounds => b.hi.stripLazyRef }
 +
++      // `TermModule#betaReduce(term)`: real QuotesImpl (QuotesImpl.scala:
++      // 434-449) reduces `((x1, ..., xn) => body)(v1, ..., vn)`-shaped
++      // applications via dotc's own REAL `dotty.tools.dotc.transform.
++      // BetaReduce` utility -- called directly, same as any other
++      // dotc-internal API this file already calls straight (not part of
++      // the Quotes stub surface at all, a genuine compiler-internal
++      // transform living in this same binary). Needed by macro libraries
++      // that build a lambda application via `Expr.betaReduce` rather than
++      // relying on the backend to inline it later (e.g. utest's own
++      // `Tracer.traceOneWithCode`/`Tracer.apply`, `scli test`, see
++      // docs/findings.md).
++      case "betaReduce" if fn.owner.name.toString == "TermModule" =>
++        args.headOption.collect { case t: Tree =>
++          val reduced = new tpd.TreeMap {
++            override def transform(tree: Tree)(using Context): Tree = tree match
++              case tpd.Block(Nil, _) | tpd.Inlined(_, Nil, _) => super.transform(tree)
++              case tpd.Apply(sel @ tpd.Select(expr, nme), args2) =>
++                val t2 = tpd.cpy.Apply(tree)(tpd.cpy.Select(sel)(transform(expr), nme), args2)
++                dotty.tools.dotc.transform.BetaReduce(t2).withSpan(tree.span)
++              case tpd.Apply(ta @ tpd.TypeApply(sel @ tpd.Select(expr: Apply, nme), tpts), args2) =>
++                val t2 = tpd.cpy.Apply(tree)(tpd.cpy.TypeApply(ta)(tpd.cpy.Select(sel)(transform(expr), nme), tpts), args2)
++                dotty.tools.dotc.transform.BetaReduce(t2).withSpan(tree.span)
++              case _ => dotty.tools.dotc.transform.BetaReduce(tree).withSpan(tree.span)
++          }.transform(t)
++          if reduced == t then None else Some(reduced)
++        }
++
 +      case "apply" if fn.owner.name.toString == "MethodTypeModule" =>
 +        args match
 +          case (paramNames: List[String @unchecked]) :: (paramInfosExp: Function1[Object, Object] @unchecked) :: (resultTypeExp: Function1[Object, Object] @unchecked) :: Nil =>
 +            Some(MethodType(paramNames.map(_.toTermName))(
 +              mt => paramInfosExp(mt.asInstanceOf[Object]).asInstanceOf[List[Type]],
 +              mt => resultTypeExp(mt.asInstanceOf[Object]).asInstanceOf[Type]))
++          case _ => None
++
++      // `quotes.reflect.XxxModule#copy(original)(...)`: real QuotesImpl
++      // implements essentially all of these as a thin `tpd.cpy.Xxx(original)(...)`
++      // (dotc's own tree-copier, preserving span/type from `original` while
++      // substituting the given children) -- needed by the real default
++      // `TreeMap#transformTerm`/etc (`Quotes.scala`'s own library source,
++      // itself real interpretable Scala, calling BACK into these `copy`
++      // module methods for every tree shape it doesn't special-case), which
++      // any macro's own `new TreeMap { override def transformXxx = ... }`
++      // (calling `super.transformXxx` for every shape it doesn't override
++      // itself) exercises broadly -- e.g. utest's own `Tracer.tracingMap`
++      // (`scli test`, see docs/findings.md). Curated over the common TERM
++      // shapes as exercised; `TypeTree`-shape copies
++      // (`TypeSelect`/`Annotated`/etc) aren't covered yet.
++      case "copy" if fn.owner.name.toString == "SelectModule" =>
++        args match
++          case (original: Tree) :: (qual: Tree) :: (name: String) :: Nil => Some(tpd.cpy.Select(original)(qual, name.toTermName))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "IdentModule" =>
++        args match
++          case (original: Tree) :: (name: String) :: Nil => Some(tpd.cpy.Ident(original)(name.toTermName))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "SuperModule" =>
++        args match
++          case (original: Tree) :: (qual: Tree) :: (mixOpt: Option[String @unchecked]) :: Nil =>
++            Some(tpd.cpy.Super(original)(qual, mixOpt.map(x => dotty.tools.dotc.ast.untpd.Ident(x.toTypeName)).getOrElse(dotty.tools.dotc.ast.untpd.EmptyTypeIdent)))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "ApplyModule" =>
++        args match
++          case (original: Tree) :: (fn2: Tree) :: (as: List[Tree @unchecked]) :: Nil => Some(tpd.cpy.Apply(original)(fn2, as))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "TypeApplyModule" =>
++        args match
++          case (original: Tree) :: (fn2: Tree) :: (as: List[Tree @unchecked]) :: Nil => Some(tpd.cpy.TypeApply(original)(fn2, as))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "LiteralModule" =>
++        args match
++          case (original: Tree) :: (c: dotty.tools.dotc.core.Constants.Constant) :: Nil => Some(tpd.cpy.Literal(original)(c))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "NewModule" =>
++        args match
++          case (original: Tree) :: (tpt: Tree) :: Nil => Some(tpd.cpy.New(original)(tpt))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "TypedModule" || fn.owner.name.toString == "TypedOrTestModule" =>
++        args match
++          case (original: Tree) :: (expr: Tree) :: (tpt: Tree) :: Nil => Some(tpd.cpy.Typed(original)(expr, tpt))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "NamedArgModule" =>
++        args match
++          case (original: Tree) :: (name: String) :: (arg: Tree) :: Nil => Some(tpd.cpy.NamedArg(original)(name.toTermName, arg))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "AssignModule" =>
++        args match
++          case (original: Tree) :: (lhs: Tree) :: (rhs: Tree) :: Nil => Some(tpd.cpy.Assign(original)(lhs, rhs))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "BlockModule" =>
++        args match
++          case (original: Tree) :: (stats: List[Tree @unchecked]) :: (expr: Tree) :: Nil => Some(tpd.cpy.Block(original)(stats, expr))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "IfModule" =>
++        args match
++          case (original: Tree) :: (cond: Tree) :: (thenp: Tree) :: (elsep: Tree) :: Nil => Some(tpd.cpy.If(original)(cond, thenp, elsep))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "MatchModule" =>
++        args match
++          case (original: Tree) :: (sel: Tree) :: (cases: List[CaseDef @unchecked]) :: Nil => Some(tpd.cpy.Match(original)(sel, cases))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "ClosureModule" =>
++        args match
++          case (original: Tree) :: (meth: Tree) :: (tpeOpt: Option[Type @unchecked]) :: Nil =>
++            Some(tpd.cpy.Closure(original)(Nil, meth, tpeOpt.map(tpd.TypeTree(_)).getOrElse(tpd.EmptyTree)))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "SummonFromModule" =>
++        args match
++          case (original: Tree) :: (cases: List[CaseDef @unchecked]) :: Nil => Some(tpd.cpy.Match(original)(tpd.EmptyTree, cases))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "ReturnModule" =>
++        args match
++          case (original: Tree) :: (expr: Tree) :: (from: Symbol) :: Nil => Some(tpd.cpy.Return(original)(expr, tpd.ref(from)))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "TryModule" =>
++        args match
++          case (original: Tree) :: (expr: Tree) :: (cases: List[CaseDef @unchecked]) :: (finalizerOpt: Option[Tree @unchecked]) :: Nil =>
++            Some(tpd.cpy.Try(original)(expr, cases, finalizerOpt.getOrElse(tpd.EmptyTree)))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "WhileModule" =>
++        args match
++          case (original: Tree) :: (cond: Tree) :: (body: Tree) :: Nil => Some(tpd.cpy.WhileDo(original)(cond, body))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "RepeatedModule" =>
++        args match
++          case (original: Tree) :: (elems: List[Tree @unchecked]) :: (elemtpt: Tree) :: Nil => Some(tpd.cpy.SeqLiteral(original)(elems, elemtpt))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "CaseDefModule" =>
++        args match
++          case (original: Tree) :: (pat: Tree) :: (guardOpt: Option[Tree @unchecked]) :: (rhs: Tree) :: Nil =>
++            Some(tpd.cpy.CaseDef(original)(pat, guardOpt.getOrElse(tpd.EmptyTree), rhs))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "ValDefModule" =>
++        args match
++          case (original: Tree) :: (name: String) :: (tpt: Tree) :: (rhsOpt: Option[Tree @unchecked]) :: Nil =>
++            Some(tpd.cpy.ValDef(original)(name.toTermName, tpt, rhsOpt.getOrElse(tpd.EmptyTree)))
++          case _ => None
++      case "copy" if fn.owner.name.toString == "DefDefModule" =>
++        args match
++          case (original: Tree) :: (name: String) :: (paramss: List[Tree @unchecked]) :: (tpt: Tree) :: (rhsOpt: Option[Tree @unchecked]) :: Nil =>
++            Some(tpd.cpy.DefDef(original)(name.toTermName, paramss.asInstanceOf[List[tpd.ParamClause]], tpt, rhsOpt.getOrElse(tpd.EmptyTree)))
 +          case _ => None
 +
 +      case _ => None
@@ -2972,6 +3493,28 @@ index 04cb637b..8b3af75a 100644
 +      Console.err.println(s"[interpretStdlibIntrinsic] receiver.getClass=${if receiver == null then "null" else receiver.getClass} fn.name=${fn.name} args=${args.map(a => if a == null then "null" else a.getClass)}")
 +    (receiver, fn.name.toString, args) match
 +      case (r: java.lang.ref.WeakReference[Object @unchecked], "get", Nil) => Some(r.get())
++      // `java.util.regex.Pattern`/`Matcher`: real JDK classes, no retained
++      // Scala source ever -- needed by `scala.util.matching.Regex`'s own
++      // `replaceAllIn`/`findFirstIn`/etc (interpreted, since `Regex` itself
++      // is real, retained Scala source), used by e.g. a derivation macro's
++      // own compile-time string post-processing (utest's
++      // `StringUtilHelpers.stripScalaCorePrefixes`, `scli test`, see
++      // docs/findings.md). `java.lang.StringBuilder` (not `StringBuffer`)
++      // since that's the overload `Regex.Replacement` builds against --
++      // see the matching `newStdlibCollection` case.
++      case (p: java.util.regex.Pattern, "matcher", List(s: CharSequence @unchecked)) => Some(p.matcher(s))
++      case (m: java.util.regex.Matcher, "find", Nil) => Some(Boolean.box(m.find()))
++      case (m: java.util.regex.Matcher, "group", Nil) => Some(m.group())
++      case (m: java.util.regex.Matcher, "group", List(i: Integer)) => Some(m.group(i))
++      case (m: java.util.regex.Matcher, "group", List(s: String)) => Some(m.group(s))
++      case (m: java.util.regex.Matcher, "start", Nil) => Some(Int.box(m.start()))
++      case (m: java.util.regex.Matcher, "start", List(i: Integer)) => Some(Int.box(m.start(i)))
++      case (m: java.util.regex.Matcher, "end", Nil) => Some(Int.box(m.end()))
++      case (m: java.util.regex.Matcher, "end", List(i: Integer)) => Some(Int.box(m.end(i)))
++      case (m: java.util.regex.Matcher, "groupCount", Nil) => Some(Int.box(m.groupCount()))
++      case (m: java.util.regex.Matcher, "appendReplacement", List(sb: java.lang.StringBuilder @unchecked, r: String)) => Some(m.appendReplacement(sb, r))
++      case (m: java.util.regex.Matcher, "appendTail", List(sb: java.lang.StringBuilder @unchecked)) => Some(m.appendTail(sb))
++      case (sb: java.lang.StringBuilder, "toString", Nil) => Some(sb.toString)
 +      // `scala.runtime.Statics.pfMarker`: a real `Statics` field access
 +      // (`Statics` is a Java class, so it never matches the `Ident`/`Call`
 +      // dispatch's own `fn.symbol.is(Module)`-based static-access
@@ -3521,7 +4064,29 @@ index 04cb637b..8b3af75a 100644
 +
  object Interpreter:
    /** Exception that stops interpretation if some issue is found */
-   class StopInterpretation(val msg: Message, val pos: SrcPos) extends Exception
+-  class StopInterpretation(val msg: Message, val pos: SrcPos) extends Exception
++  // `ControlThrowable`, not a plain `Exception`: this is a control-flow
++  // signal ("give up interpreting, report this and abort"), never a real
++  // exception raised by the program being interpreted -- and per its own
++  // doc, `scala.util.control.NonFatal` deliberately does NOT match
++  // `ControlThrowable` ("should not normally be caught"). That distinction
++  // is load-bearing here, not cosmetic: interpreted STDLIB/library source
++  // frequently wraps calls in its own `try { ... } catch { case
++  // NonFatal(e) => ... }` (e.g. `scala.sys.SystemProperties#wrapAccess`),
++  // and this interpreter's own `Try`-node handling (see `interpretTree0`)
++  // matches a catch clause's exception type via `matchesRuntimeType`, which
++  // defaults to `true` ("matches") for any type it doesn't specifically
++  // recognize -- so a plain-`Exception` `StopInterpretation` raised INSIDE
++  // such a `try` used to get silently swallowed by totally unrelated catch
++  // clauses (e.g. `case _: AccessControlException => None`), turning a
++  // clean "unsupported feature" abort into silently wrong output instead
++  // of a compile error. `ControlThrowable` fixes this at the root for
++  // every such site at once, instead of needing an explicit rethrow guard
++  // at each one.
++  class StopInterpretation(val msg: Message, val pos: SrcPos) extends scala.util.control.ControlThrowable
+ 
+   object Call:
+     import tpd.*
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 index a40db72d..8c47a1b3 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala

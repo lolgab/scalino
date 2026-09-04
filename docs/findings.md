@@ -497,24 +497,178 @@ work, but aren't individually exercised yet).
    probe, driver codegen, link, run, pass/fail/exit-code all verified
    correct).
 
-   **Known real-world blocker, orthogonal to `scli test` itself:** munit,
-   utest, and scalatest all failed to even *compile* against this
-   toolchain when smoke-tested for real (not the hand-rolled framework) --
-   every one of them hit `Interpreter (own implementation) does not support
-   calling method sourceFile in trait PositionMethods` (also
-   `underlyingArgument`/`TermMethods`), from their `test(...)`/`assert*`
-   position-capture macros. This is remaining-work item 1 above (general
-   quote-pattern-matching support in the macro interpreter) biting a much
-   wider set of real-world macros than expected -- essentially every
-   mainstream Scala test framework leans on this exact kind of macro for
-   its ergonomic API, so `scli test` is currently blocked end-to-end on
-   real projects until that interpreter gap closes, independent of
-   anything in `scli` itself. Auto-detection was independently confirmed
-   working against a real published framework regardless (a project
+   **munit: fixed (2026-09-04), verified end to end.** The blocker above
+   (`PositionMethods`/`TermMethods` position-capture macros) is closed --
+   `Interpreter.scala` now implements `TreeMethods#pos`, `SymbolMethods#pos`,
+   `TermMethods#underlyingArgument`/`underlying`, and the full
+   `PositionMethods` surface (`start`/`end`/`sourceFile`/`startLine`/
+   `endLine`/`startColumn`/`endColumn`/`sourceCode`) as direct real-dotc
+   calls, the same pattern as every other `XMethods` extension bag. A real
+   `munit.FunSuite` test (`assertEquals`, real `Location`/`Clue` macros)
+   now compiles, links, and passes via `scli test` end to end -- see
+   `patches/scala3-0001-*.patch` for the diff, applied to
+   `vendor/scala3/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala`.
+
+   **utest: interpreter-side gaps closed, blocked on a separate, later
+   dotc bug (2026-09-04).** Getting `assert(...)`/`Tests { ... }` to
+   interpret correctly needed a long tail of real, narrow gaps closed in
+   `Interpreter.scala`, in the order they surfaced:
+   - **General user-defined `unapply`/`unapplySeq` fallback** (this is
+     the real fix for remaining-work item 1's "general quote-pattern
+     matching" gap, as far as CUSTOM extractor objects with a retained
+     tree go): previously `UnApply` matching only worked for a curated
+     list of well-known extractors. Now, when none of those match, it
+     falls back to actually INTERPRETING the extractor's own retained
+     `unapply` body via `callUserDefDef` -- the same machinery any other
+     macro helper method already goes through -- instead of requiring a
+     hardcoded case per extractor. Needed to handle curried `unapply`s
+     (`def unapply(using Quotes)(tree): Option[...]`, unwrapping the
+     `Apply(Select(qual,"unapply"), givenArgs)` shape down to the base
+     `Select` and threading the leading args through).
+   - `quotes.reflect.Term`'s `TermTypeTest`, `Inferred`/`InferredTypeTest`,
+     `Closure`/`ClosureTypeTest`, `Return`/`Try`/`While`/`SummonFrom` (+
+     their TypeTests) -- the remaining `quotes.reflect` tree-shape
+     extractors the real default `TreeMap#transformTerm`/`transformTypeTree`
+     (`Quotes.scala`'s own library source, itself interpreted like any
+     other macro-adjacent code) needs when a macro's own `new TreeMap {
+     override def transformTerm = ... }` calls `super.transformTerm` for
+     shapes it doesn't override.
+   - The matching `XxxModule#copy(original)(...)` for every one of those
+     shapes (`Select`/`Ident`/`Super`/`Apply`/`TypeApply`/`Literal`/`New`/
+     `Typed`/`NamedArg`/`Assign`/`Block`/`If`/`Match`/`Closure`/`Repeated`/
+     `CaseDef`/`ValDef`/`DefDef`/`Return`/`Try`/`While`/`SummonFrom`) --
+     real QuotesImpl implements essentially all of these as a thin
+     `tpd.cpy.Xxx(original)(...)`, called the same direct way.
+   - `reflectModule.this` (the `quotes.reflect` bundle's own self-type,
+     referenced by its default trait methods): falls back to a freshly
+     built `QuotesImpl()` (stateless beyond the ambient `Context`, so any
+     instance is a valid stand-in), instead of crashing as an unbound
+     `This`.
+   - `SymbolMethods#isDefDef`/`isClassConstructor`, `DefinitionMethods#name`,
+     `ValDefMethods#tpt`/`rhs`, `DefDefMethods#returnTpt`/`rhs`/`paramss`.
+   - `Expr#show` (declared directly on `trait Quotes`, not a separate
+     `XMethods` bag, so dispatched by an `ExprImpl` showing up in the args
+     rather than by owner name) and `TermModule#betaReduce` (a direct call
+     into dotc's own real `dotty.tools.dotc.transform.BetaReduce`
+     compiler-internal utility, exactly like calling any other dotc-internal
+     API this file already does).
+   - **A real, general bug in secondary/auxiliary-constructor
+     interpretation**, found via `scala.util.matching.Regex`'s own `def
+     this(regex: String, ...) = this(Pattern.compile(regex), ...)`:
+     `interpretNewFromTree` used to always jump straight to
+     `fn.owner.primaryConstructor`'s body regardless of which overload was
+     actually called, binding the call's real arguments against the
+     PRIMARY constructor's differently-shaped params -- e.g. leaving
+     `Regex#pattern` holding the raw source STRING, not a compiled
+     `Pattern`. Fixed to interpret the actual called constructor's own
+     body when it isn't the primary one (almost always a single delegating
+     `this(...)` call, handled by interpreting that call and keeping ITS
+     result as the real instance, since a constructor body is `Unit`-typed
+     at the language level and would otherwise discard it).
+   - `java.util.regex.Pattern`/`Matcher` and `java.lang.StringBuilder`
+     (real JDK classes, no retained source) as direct-call intrinsics --
+     needed by `Regex#replaceAllIn`'s own real (interpreted) source.
+   - A quote-pattern structural-matching gap: the SAME real symbol can be
+     referenced through a different number of `Select` hops depending on
+     unrelated context (a package vs. its synthetic package-OBJECT
+     accessor, e.g. `utest.package.test` vs. plain `utest.test` for the
+     identical `test` method) -- `matchQuoteBodyTree`'s `Select` case now
+     falls back to whole-reference symbol identity when the scrutinee
+     isn't ALSO `Select`-shaped, instead of failing outright on a
+     structural difference that isn't a real one.
+
+   With all of that, utest's `Tests { ... }`/`assert(...)` macros now
+   interpret and expand SUCCESSFULLY (verified via the JVM-based
+   `dotty.tools.dotc.Main` fast-iteration path, bypassing the ~2min
+   native-image rebuild per change) -- but the EXPANDED code then crashes
+   real dotc's `LambdaLift` phase (`Dependencies$NoPath` in
+   `Dependencies.markFree`, i.e. this is *after* our own-implementation
+   interpreter's job is done and normal dotc compilation of the
+   macro-expanded tree has taken over). This is a **separate, deeper dotc
+   compiler-internals issue** -- not a macro-interpretation gap -- and
+   needs its own investigation (likely an owner-chain/`-Yretain-trees`
+   interaction affecting how a macro-expanded closure's free variables get
+   resolved). Confirmed via both the JVM fast-loop and the real native
+   `scli test` pipeline (`dotc-native`), so not an artifact of either path.
+   Repro: `//> using dep "com.lihaoyi::utest::0.8.4"` +
+   `object T extends utest.TestSuite { val tests = utest.Tests { test("x")
+   { assert(1 == 1) } } }`, `scli test .`.
+
+   scalatest not retested this session (untouched since the original
+   blocker note) -- likely has its own similar tail of gaps given it also
+   uses position-capture macros, not yet investigated.
+
+   **Serious general bug found and fixed via a real third-party project
+   (2026-09-04): the interpreter's own `StopInterpretation` "give up,
+   unsupported" signal could be SILENTLY SWALLOWED by an ordinary `try`/
+   `catch` inside interpreted macro code.** `matchesRuntimeType` (used for
+   a catch clause's `case _: SomeType =>` typed-wildcard pattern) has an
+   explicit `else true // best effort; a wrong positive only widens
+   matching, doesn't crash` fallback for any type it doesn't specifically
+   recognize (only `Int`/`Long`/`Boolean`/`String` are checked precisely).
+   Combined with `NonFatalInterpretedException.unapply` being a bare
+   `scala.util.control.NonFatal.unapply` (which doesn't and can't
+   distinguish "a real exception from the program being interpreted" from
+   "the interpreter's own internal abort signal", since `StopInterpretation
+   extends Exception` is unremarkably non-fatal), this meant: whenever
+   interpreted macro code caught an exception with `case _: X => ...` for
+   ANY `X` (however narrow or unrelated), a `StopInterpretation` raised
+   *inside* that `try` was wrongly treated as "matches" and swallowed --
+   turning a clean "unsupported feature" error into silently wrong/garbage
+   output instead. Found via `scala.sys.SystemProperties#wrapAccess` (`try
+   Some(body) catch case _: AccessControlException => None`, used by
+   munit's own `MacroCompat`'s working-directory computation): calling the
+   then-unsupported `System.getProperty` inside `body` didn't fail loudly,
+   it silently returned `None` -> `null`, corrupting `MacroCompat`'s
+   computed path and causing a CASCADE of unrelated-looking downstream
+   failures (`endsWith`/`getJPath` errors) across every test file in the
+   project, not just the one that actually needed `System.getProperty`.
+   **Fixed** by making `StopInterpretation extends scala.util.control.
+   ControlThrowable` instead of plain `Exception` -- `ControlThrowable` is
+   Scala's own established mechanism for exactly this ("a parent class for
+   throwable objects intended for flow control ... instances should not
+   normally be caught", its own doc says outright that `NonFatal` won't
+   match it), so `NonFatalInterpretedException` (line above) now correctly
+   never matches a `StopInterpretation` at ANY catch site, current or
+   future, without needing a manual rethrow guard at each one (the first
+   fix attempt added exactly such a guard to the one `Try`-node site found;
+   the `ControlThrowable` fix subsumes and replaces it, verified to
+   reproduce the identical error reduction). This is a correctness fix
+   independent of any specific macro library -- any macro whose real
+   source wraps a not-yet-supported call in a `try`/`catch` was previously
+   at risk of silently wrong (not just incomplete) macro expansion.
+
+   **Other concrete gaps closed the same session** (found via a real,
+   large third-party project -- http4s/upickle/porcupine/cats-effect, not
+   just munit/utest): `SourceFileMethods#getJPath`/`name`/`path` (munit
+   1.3.4's `MacroCompat` uses `getJPath`, not the deprecated `jpath` 1.0.0
+   used); `java.io.File.separator`/`separatorChar`/`pathSeparator`/
+   `pathSeparatorChar` and `java.lang.System.getProperty`/`getenv` (real
+   JDK statics, no retained source); a `New(...)` quote-pattern case in
+   `matchQuoteBodyTree` (`case '{ new StringContext(...) } =>`, real
+   scala-library `FromExpr[StringContext]`'s own pattern -- `New`'s own
+   `.symbol` is always `NoSymbol`, so matching needs to recurse into the
+   `tpt` child instead, whose class symbol is meaningful).
+
+   **Known still-open gaps found via the same project** (not yet fixed,
+   third-party-library-specific, lower priority than the general bug
+   above): upickle's `derives ReadWriter` for `enum`/case-object types
+   needs `java.lang.Class#getClassLoader` somewhere in its `isSingleton`/
+   `Mirror`-adjacent macro machinery (`upickle.implicits.macros`) -- not
+   yet traced to the exact call site. A separate `self` field-accessor
+   failure surfaces deep inside `scala.collection.IterableOps.WithFilter`
+   interpretation (real stdlib `for`-comprehension-with-guard desugaring),
+   encountered via http4s's `uri"..."` literal macro
+   (`org.typelevel.literally.Literally`) but NOT actually part of that
+   macro's own quote-pattern matching (a red herring from the error's
+   `fn.owner` name, "Typed", which is coincidental/misleading here) --
+   needs its own trace, not yet done.
+
+   Auto-detection was independently confirmed working against a real
+   published framework regardless of any of the above (a project
    depending on `munit` with no test classes correctly reports "no tests
    found" rather than "no test framework found" -- i.e. `munit.Framework`
-   really was found and probed successfully; it's only compiling real
-   `munit.FunSuite` subclasses that's blocked).
+   really was found and probed successfully).
    Known scope gaps vs real scala-cli, by design (not blocked on anything):
    only `SubclassFingerprint`-based frameworks (covers
    munit/utest/scalatest/zio-test-sbt), not JUnit4-style
