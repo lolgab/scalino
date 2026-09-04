@@ -150,18 +150,27 @@ object Scli:
     var mainClass = Option.empty[String]
     var options = List.empty[String]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
-    for src <- sources; line <- readFile(src).linesIterator do
-      anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
-        val key = m.group(1)
-        if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
-          System.err.println(s"scli: warning: unsupported directive '//> using $key' in $src -- ignoring")
-      }
-      directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
-      directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
-      directiveValues(line, "test.dep", "test.deps").foreach(vs => testDeps = testDeps ++ vs)
-      directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
-      directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
-      directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
+    // Directive lines must be a comment-only line, `//>` as its first
+    // non-blank characters -- NOT just "contains `//>` anywhere". An
+    // unanchored scan also matches `//> using ...` mentioned in prose
+    // (scaladoc explaining the directive syntax, a `printUsage` help-text
+    // string literal like `|  //> using dep "..."`, etc.), which isn't a
+    // directive at all -- this repo's own cli/Scli.scala is full of such
+    // mentions, and scanning "." pulls that file in as a source.
+    for src <- sources; rawLine <- readFile(src).linesIterator do
+      val line = rawLine.trim
+      if line.startsWith("//>") then
+        anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
+          val key = m.group(1)
+          if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
+            System.err.println(s"scli: warning: unsupported directive '//> using $key' in $src -- ignoring")
+        }
+        directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
+        directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
+        directiveValues(line, "test.dep", "test.deps").foreach(vs => testDeps = testDeps ++ vs)
+        directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
+        directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
+        directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
     Directives(deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options)
 
   /** scala-cli's three dependency formats:
@@ -359,7 +368,12 @@ object Scli:
   // this tool's own build-output dirs.
   // ---------------------------------------------------------------------
 
-  private val skipDirNames = Set(".scli-build", "target", "out")
+  // "vendor" excluded because vendor/scala3 is a full gitignored dotty
+  // checkout (~18k .scala files) -- sweeping it into IDE/run/compile source
+  // scanning made `scli setup-ide .` (and any other directory-arg command)
+  // hang for minutes walking+directive-parsing files that aren't this
+  // project's own sources.
+  private val skipDirNames = Set(".scli-build", "target", "out", "vendor")
 
   def collectScalaFiles(dir: Path): List[Path] =
     val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
@@ -766,6 +780,35 @@ object Scli:
     val configPath = Paths.get(".dotty-ide.json")
     Files.write(configPath, json.getBytes("UTF-8"))
     println(s"scli: wrote ${configPath.toAbsolutePath} -- point dist/dotty-lsp-native (or an editor's LSP binary override) at this project")
+
+    // Also pin Zed's dotty-lsp-native binary path (zed-extension/README.md
+    // step 4, "optional" there) so opening the project in Zed works without
+    // dist/ on PATH -- `dist` is resolved from scli's own binary location
+    // (see val dist above), so this is correct however the toolchain was
+    // installed. Only written if .zed/settings.json doesn't exist yet: a
+    // real settings file may hold unrelated keys this hand-rolled JSON
+    // writer isn't equipped to merge into.
+    val lspBinaryPath = Paths.get(dist, "dotty-lsp-native").toString
+    val zedSettingsPath = Paths.get(".zed", "settings.json")
+    if !Files.exists(zedSettingsPath) then
+      Files.createDirectories(zedSettingsPath.getParent)
+      val zedJson =
+        s"""{
+           |  "lsp": {
+           |    "dotty-lsp-native": {
+           |      "binary": {
+           |        "path": ${jsonStr(lspBinaryPath)},
+           |        "arguments": ${jsonArr(List("-stdio"))}
+           |      }
+           |    }
+           |  }
+           |}
+           |""".stripMargin
+      Files.write(zedSettingsPath, zedJson.getBytes("UTF-8"))
+      println(s"scli: wrote ${zedSettingsPath.toAbsolutePath} -- pins Zed's dotty-lsp-native binary to $lspBinaryPath")
+    else
+      println(s"scli: ${zedSettingsPath.toAbsolutePath} already exists -- leaving it alone; add this to pin the LSP binary if needed:")
+      println(s"""  "lsp": { "dotty-lsp-native": { "binary": { "path": ${jsonStr(lspBinaryPath)} } } }""")
 
   def main(args: Array[String]): Unit =
     if args.isEmpty then { printUsage(System.err); sys.exit(1) }

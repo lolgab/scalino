@@ -11,3 +11,5 @@
 *.tasty
 *.nir
 /zed-extension/target/
+/.dotty-ide.json
+/.zed/
