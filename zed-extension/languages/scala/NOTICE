@@ -1,0 +1,10 @@
+The .scm query files and config.toml in this directory are copied, unmodified,
+from scalameta/metals-zed (https://github.com/scalameta/metals-zed), licensed
+Apache License 2.0 (see /LICENSE at this repo's root for the full text).
+Copied so this extension can define the "Scala" language/grammar itself
+without depending on the metals-zed extension (which also bundles a
+JVM-backed Metals language server this toolchain is deliberately avoiding).
+
+The tree-sitter grammar itself (referenced, not vendored, via
+[grammars.scala] in ../../extension.toml) is
+https://github.com/tree-sitter/tree-sitter-scala, MIT licensed.
