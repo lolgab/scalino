@@ -746,3 +746,129 @@ work, but aren't individually exercised yet).
    in the graph -- the file containing it still recompiles correctly on
    its own changes, the gap is only in rippling to files that reference
    that nested name specifically.
+8. **Four more general interpreter bugs found + fixed (2026-09-04/05), via
+   `sn-cli test .` against a real large third-party project (`~/scala/ape`:
+   http4s/ip4s/cats-effect/upickle) instead of a curated fixture.** Fresh
+   regression coverage for all four lives in `examples/interpreter-
+   regressions/` (self-contained, no external deps) and runs in CI
+   alongside `examples/macro-hello/`.
+
+   - **`Regex#unapplySeq`'s own varargs/`_*` pattern slot** (`case
+     SomeRegex(_*) => ...`) was being matched through the interpreter's
+     GENERAL `Typed(Ident(WILDCARD), tpt)` case, which type-tests the
+     extracted value's runtime class against `tpt.tpe`'s class -- but that
+     slot's own declared type is the synthetic `scala.<repeated>[...]`
+     marker, not `Seq[...]` itself, and has no real ancestry relationship
+     to the extracted `List`/`Nil` at all, so a genuinely-matching regex
+     (real `unapplySeq` returning `Some(Nil)`) still fell through to
+     `case _ => None`. Found via ip4s's own `Hostname.fromString` (`case
+     Pattern(_*) => ...`) silently reporting "Invalid hostname" for a
+     hostname that plainly is valid. Fixed by special-casing this ONE
+     pattern slot (`Interpreter.scala`'s `matchPattern`, the varargs-size-
+     mismatch branch) to unwrap `Typed`/`Bind` directly instead of going
+     through the general type-test path: `_*` always matches, `xs @ _*`
+     binds the whole list.
+   - **`String#split`'s own JDK-native intrinsic returned `.toSeq`**
+     instead of the real `Array[String]` real Java/Scala semantics
+     produce. Looked harmless (our own `Seq`-based `map`/`filter`
+     intrinsics then applied directly, no real `ArrayOps` interpretation
+     needed) but is a genuine representation mismatch: the SOURCE tree
+     already has an implicit `scala.Predef.refArrayOps`/`genericArrayOps`
+     conversion node wrapping the split result wherever it needs
+     `.iterator`/etc (inserted by dotc's typer, which only ever saw the
+     static `Array[String]` return type) -- interpreting that conversion
+     with an `ArraySeq` substituted for the real array it expects crashes
+     deep inside real `ArrayOps` source, which pattern-matches on its own
+     `xs` field's runtime type (`Array[AnyRef]`/`Array[Int]`/etc) to pick a
+     primitive-vs-reference iteration strategy and has no case for a boxed
+     `ArraySeq`. Found via the same `Hostname.fromString` (`value.split
+     ('.').iterator.map(...)`), one call after the varargs-slot fix above.
+     Fixed by simply returning the real array from both `split` overloads.
+   - **`new Base(args) {}` (anonymous-subclass instantiation) lost its own
+     constructor args entirely** whenever the real arg expression needed
+     evaluating (e.g. a closure literal for a `Function0`-typed field): the
+     synthetic `$anon` class's OWN primary constructor takes no value
+     params at all, since the real args live in the SUPERCLASS constructor
+     call, in `$anon`'s `Template.parents` -- which `-Yretain-trees` never
+     puts in `$anon`'s own trivial ctor body. A previous session already
+     built `moduleSuperCtorCall`/`findTemplate` to work around the same gap
+     for `object Foo extends Bar(args)`, but two more gaps stood between
+     that and covering anonymous classes too: `ClassSymbol#rootTree` is
+     unconditionally `EmptyTree` for anything that isn't a TOP-LEVEL class
+     (a `$anon` never is, confirmed via `SNC_INTERP_DEBUG` -- every lookup
+     came back empty), and `findTemplate` itself only recursed into nested
+     class-body members, never into a method/`val` body where a LOCAL
+     anonymous class actually lives. Fixed both: `moduleSuperCtorCall` now
+     starts from `topLevelClass` (walking up to the nearest real top-level
+     symbol, a no-op for the original module case) instead of the target
+     class itself, and `findTemplate` now also recurses into `Block`s and
+     `ValOrDefDef` bodies. `interpretNewFromTree`'s own primary-ctor branch
+     then binds the found superclass call's args onto the anon instance's
+     fields, gated strictly by `isAnonymousClass` so it can't touch the
+     already-working named-class path (a broader, ungated version of this
+     same idea was tried and reverted in an earlier session -- see the
+     comment left in place above it). Found via cats' own `Eval.defer`
+     (`new Eval.Defer[A](() => a) {}`), manifesting as "Interpreter (own
+     implementation) does not support calling method apply in trait
+     Function0" (a real host closure the interpreter already knows how to
+     call, `Defer`'s `thunk` field just never actually held it) -- reached
+     through http4s's `uri"..."` literal macro.
+   - **`scala.runtime.ClassValueCompat`'s abstract `computeValue` was
+     unreachable from ANY module extending it**, because `interpretModule
+     Access`'s existing (already-known, already-documented) workaround for
+     `object Foo extends Bar(args)` deliberately builds a throwaway,
+     separate instance of the superclass rather than one identified as the
+     module itself -- so a module like `scala.reflect.ClassTag`'s own
+     private `cache` object, which overrides `computeValue` concretely,
+     never got virtual dispatch to find that override; the abstract
+     declaration is all `notInterpretable` ever saw. The obvious general
+     fix (bind the instance as the module class) was already tried
+     BROADLY in an earlier session and reverted -- it regressed unrelated
+     modules (upickle's `ReadWriter` derivation, `StackOverflowError`).
+     Fixed narrowly instead: `interpretModuleAccess` now builds the
+     module-identified instance ONLY when the super-called class is
+     specifically `scala.runtime.ClassValueCompat` (checked by the actual
+     class being extended, not by the module's own name/shape), so no
+     unrelated module can be affected. Found via `ClassTag`'s own internal
+     caching, reached through http4s's `uri"..."` literal macro.
+   - **A curated, by-bare-name extractor ("Ident", meant for `quotes
+     .reflect.Ident`) silently shadowed an unrelated same-named user case
+     class** (cats' own private `Eval.Ident[A, B](ev: A <:< B)`, its
+     `Eval` trampoline's continuation-stack ADT) -- the curated handler
+     correctly fails closed (returns "no match") for a value that isn't
+     really a `quotes.reflect` tree, but since that `None` came from
+     INVOKING the found handler rather than failing to find one at all,
+     the generic case-class-unapply fallback never got a turn, and `case
+     Ident(ev) => ev(a)` wrongly reported "doesn't match" for a value that
+     structurally is one -- a `MatchError` several frames later. A BROAD
+     fix (compose every curated handler with the generic fallback on its
+     own `None`) was tried first and regressed several other,
+     previously-working macros (ip4s's `port"..."`, upickle enum
+     derivation, several `derives ReadWriter` sites) -- `genericUserUnapply`'s
+     own "try this candidate speculatively regardless of the
+     scrutinee's actual shape" strategy isn't safe as a blanket fallback.
+     Reverted to composing ONLY the one curated name actually known to
+     collide (`"Ident"`), leaving every other curated extractor's original
+     behavior untouched. Found via cats' `Eval#value` trampoline, reached
+     through http4s's `uri"..."` literal macro.
+
+   **Known still-open gap, found but NOT fixed this session:** http4s's own
+   `uri"..."` literal macro still doesn't fully interpret end-to-end --
+   after the four fixes above, it progresses much further (`Main.scala`'s
+   `host"..."`/`port"..."` literals and every `derives ReadWriter` site in
+   `~/scala/ape` now compile clean) but still fails inside cats-parse's own
+   parser-simplification machinery: `Parser.Impl.unmap(pa: Parser[Any])`
+   (a real, hand-written exhaustive match with no case for `Pure`) somehow
+   receives a genuine `Pure` instance as `pa`, which real, correctly-typed
+   compiled code could never do (`Pure` is a `Parser0`, not the stricter
+   `Parser` `unmap` demands) -- a `MatchError` deep inside `cats.parse
+   .Parser.Impl.unmap`. Confirmed this is NOT `matchesRuntimeType` being
+   wrong again (every real `Parser`-vs-`Parser0` runtime type test observed
+   via `SNC_INTERP_DEBUG` across a full test run, including several
+   involving `Pure` itself, returned the CORRECT answer) -- the `Pure`
+   value must be reaching `unmap` through some OTHER path (likely
+   `Parser.Impl.expect1`'s own `case p1: Parser[A] => p1` narrowing, or a
+   `OneOf0`-simplification step upstream returning an unexpected shape),
+   not yet traced to its exact origin. `sn-cli test .` on `~/scala/ape`
+   still fails on this one file (`test/http/RoutesTest.scala`, every test
+   method using the `uri"/"` literal) as a result.

@@ -60,6 +60,10 @@ jobs:
         shell: bash
         run: ./dist/sn-cli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
 
+      - name: Smoke test -- interpreter bug-fix regressions
+        shell: bash
+        run: ./dist/sn-cli run examples/interpreter-regressions/Test.scala examples/interpreter-regressions/Foo.scala
+
       - name: Smoke test -- dist/ is relocatable (flat, like a release tarball)
         shell: bash
         run: |
