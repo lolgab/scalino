@@ -464,9 +464,9 @@ work, but aren't individually exercised yet).
    platform) instead of a build-time-baked-in absolute path. `dist/` is now a
    self-contained, copyable/tarball-able distribution.
 4. **`scli` follow-ups.** See "Toward a build-tool experience without a JVM"
-   above for what's implemented (including watch mode and directory/CLI-flag
-   parity with scala-cli as of the "closing the gap" pass). Still missing:
-   incremental Scala compilation (see item 7), multi-module/multi-target
+   above for what's implemented (including watch mode, directory/CLI-flag
+   parity with scala-cli as of the "closing the gap" pass, and incremental
+   compilation -- see item 7). Still missing: multi-module/multi-target
    projects, a real (not heuristic-text-scan) entry-point detector, and
    scala-cli's `fmt`/`repl`/`package`/`publish`/`bsp`/`export` commands --
    none of those have an obvious JVM-free equivalent yet (no scalafmt, no
@@ -545,7 +545,50 @@ work, but aren't individually exercised yet).
    still naive (unlike `scli`, which auto-detects) — for multi-file macro
    examples via `bin/snc` directly, the entry-point file must be listed
    first (see `examples/macro-hello/` usage in the README).
-7. Only compiling Scala source is incremental-cache-free right now — `dotc`
-   always fully recompiles every given source file. The native-library object
-   cache fixed above, and `scli`'s dependency-resolution cache, are the only
-   incremental pieces so far.
+7. ~~Only compiling Scala source is incremental-cache-free.~~ **Fixed
+   (2026-09-04): own zinc-style incremental compilation, no real Zinc/JVM
+   involved.** Real sbt Zinc gets its invalidation graph from a "compiler
+   bridge" hooked deep into the compiler's own symbol table -- exactly the
+   kind of JVM/dotty-internals tie this project's vendor+patch+splice
+   approach exists to avoid taking on wholesale (and the same reason full
+   self-hosting was ruled out in the first place -- see the top of this
+   doc). Actual Zinc is also a poor native-image candidate on its own
+   terms: it dynamically classloads the compiler bridge by reflection, the
+   same closed-world-hostile shape that's caused problems elsewhere in
+   this codebase.
+
+   Instead, `compileToClasses`/`buildBinary` (`cli/Scli.scala`) reconstruct
+   an *approximate* dependency graph purely from source text: which
+   top-level names each file declares (a regex scan, same spirit as this
+   file's existing directive/entry-point heuristics), and which of those
+   names each *other* file's text mentions. On a rebuild: hash every given
+   source file's content (FNV-1a, same as the existing dependency-classpath
+   cache keys), diff against the last successful build's manifest
+   (`.incr-manifest`, a plain tab/newline file next to the classes dir --
+   this project's usual style for on-disk caches, no JSON parser needed)
+   to get the changed set, then widen it by walking the "who textually
+   mentions one of this file's declared names" graph to a fixed point.
+   Only that closure is handed to `dotc-native`; the classes directory is no
+   longer wiped before every build and is added to the compile classpath,
+   so everything outside the closure resolves from its already-compiled
+   `.tasty`/`.class` instead of needing its source recompiled -- the same
+   trick real Zinc uses to avoid recompiling unaffected compilation units,
+   just driven by a text-scan graph instead of a real symbol table. Stale
+   artifacts (a class renamed or removed from a file since the last build,
+   or a whole source file dropped from the set) are purged by filename
+   match before recompiling.
+
+   Deliberately more conservative than real Zinc's name-hashing: it
+   invalidates a dependent on ANY change to a file it mentions, not just
+   an API-visible one (no attempt to tell a body-only edit from a
+   signature change), so it recompiles strictly more than a real bridge
+   would -- but it can never *under*-invalidate, so a stale binary isn't a
+   failure mode this approach can produce. A whole-project fingerprint
+   (compile classpath, scalac options, `dotc-native`'s own mtime) forces a
+   full rebuild whenever any of those change, since none of them are
+   tracked per-file. `--no-incremental` forces a full rebuild on demand.
+   Known gap: the declaration scan is top-level-only (by regex, not real
+   parsing), so a name declared only inside a nested object has no edges
+   in the graph -- the file containing it still recompiles correctly on
+   its own changes, the gap is only in rippling to files that reference
+   that nested name specifically.

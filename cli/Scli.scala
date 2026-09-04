@@ -818,13 +818,14 @@ object Scli:
    *  set) the entry point from the *compiled* classfiles -- see
    *  `detectMainClass` -- links, and copies the resulting binary to
    *  `outFor(mainClass)`. Compilation always targets a single
-   *  mainClass-independent scratch dir (wiped before every build): compiling
-   *  isn't incremental here regardless of directory identity (every `scli`
-   *  build fully recompiles), so nothing is lost by not knowing the entry
-   *  point's name up front, and it sidesteps the chicken-and-egg problem of
-   *  needing a compiled classfile to name a directory the compiler is about
-   *  to compile into. Only linking (whose C-object cache genuinely benefits
-   *  from a stable, persistent path) is keyed by the resolved mainClass.
+   *  mainClass-independent scratch dir (never mainClass-keyed, so nothing
+   *  is lost by not knowing the entry point's name up front, and it
+   *  sidesteps the chicken-and-egg problem of needing a compiled classfile
+   *  to name a directory the compiler is about to compile into) -- but,
+   *  since `compileToClasses` below is now incremental, that dir persists
+   *  across builds rather than being wiped every time. Only linking (whose
+   *  C-object cache genuinely benefits from a stable, persistent path) is
+   *  keyed by the resolved mainClass.
    *  Returns the resolved mainClass. */
   /** javaBase/pluginJar/compileCp for a dotc-native invocation -- shared by
    *  `buildBinary` (compile/run) and `handleSetupIde` (`setup-ide`) so the
@@ -876,29 +877,224 @@ object Scli:
 
     CompileClasspath(javaBase, pluginJar, compileCp, nativelibsCp)
 
+  // ---------------------------------------------------------------------
+  // Incremental compilation -- own implementation, not real Zinc (see
+  // docs/findings.md remaining-work item 7 for the design writeup). Real
+  // sbt Zinc gets its invalidation graph from a "compiler bridge" hooked
+  // deep into the compiler's own symbol table -- exactly the kind of
+  // JVM/dotty-internals tie this project's vendor+patch+splice approach
+  // (see the top-level project summary) is built to avoid taking on
+  // wholesale. Instead of a real bridge, this reconstructs an
+  // *approximate* dependency graph purely from source text: which
+  // top-level names each file declares, and which of those names each
+  // *other* file's text mentions.
+  //
+  // On a rebuild: hash every given source file's content, diff against
+  // the last successful build's manifest to get the changed set, then
+  // widen it by walking the textual "who mentions one of this file's
+  // declared names" graph to a fixed point. Only that closure is handed
+  // to dotc-native; everything else is resolved from its already-compiled
+  // .class/.tasty sitting in classesDir (added to the compile classpath),
+  // the same way real Zinc reuses unaffected compilation units instead of
+  // recompiling the whole project.
+  //
+  // This is strictly more conservative than real Zinc's name-hashing --
+  // it invalidates a dependent on ANY change to a file it mentions, not
+  // just an API-visible one (real Zinc can skip recompiling a dependent
+  // when only a method body changed) -- but it can never *under*-invalidate:
+  // any textual mention of a changed or removed name recompiles the file
+  // mentioning it, so a stale binary isn't a risk this approach can create.
+  // A whole-project fingerprint (compile classpath, scalac options,
+  // dotc-native's own mtime) forces a full rebuild whenever any of those
+  // change, since none of them are tracked per-file.
+  // ---------------------------------------------------------------------
+
+  case class FileRecord(hash: String, pkg: String, declaredNames: List[String])
+  case class IncrManifest(fingerprint: String, files: Map[String, FileRecord])
+
+  // Top-level only by convention, not by indentation-tracking: matches
+  // scala-cli-shaped single-file examples fine, and under-matching (e.g. a
+  // name declared only inside a nested object) just means that name's
+  // edges are missing from the graph -- conservative, since a file with an
+  // untracked declared name still gets recompiled itself on any of its own
+  // changes, it just can't ripple further to a file that only mentions a
+  // nested name of its own.
+  private val topLevelDeclRe =
+    """(?m)^\s*(?:(?:final|sealed|abstract|open|case)\s+)*(?:class|trait|object|enum|given)\s+([A-Za-z_][A-Za-z0-9_]*)""".r
+  private val packageRe = """(?m)^\s*package\s+([A-Za-z0-9_.]+)""".r
+
+  def extractPackage(text: String): String =
+    packageRe.findFirstMatchIn(text).map(_.group(1)).getOrElse("")
+
+  def extractDeclaredNames(text: String): List[String] =
+    topLevelDeclRe.findAllMatchIn(text).map(_.group(1)).toList.distinct
+
+  /** Whole-project fingerprint: anything that isn't tracked per-file
+   *  (dependency classpath, scalac flags, the compiler binary itself)
+   *  forces a full rebuild when it changes, rather than risk silently
+   *  reusing classfiles built under a now-stale environment. */
+  def computeFingerprint(cc: CompileClasspath, extraOptions: List[String]): String =
+    val dotcMtime = Files.getLastModifiedTime(Paths.get(s"$dist/dotc-native")).toMillis
+    hashKey(List(cc.compileCp, cc.javaBase, cc.pluginJar, extraOptions.mkString(" "), dotcMtime.toString).mkString(" "))
+
+  /** Parses the manifest this module itself wrote (see `saveManifest`) --
+   *  tab/newline-delimited like this project's other on-disk caches
+   *  (`deps-*.cp`, the test-probe cache), rather than pulling in a JSON
+   *  parser for one internal format nothing else needs to read. Any parse
+   *  trouble (missing file, corrupted line, a manifest from an old,
+   *  incompatible version of this code) is treated as a cache miss --
+   *  falling back to a full rebuild is always safe, just slower. */
+  def loadManifest(path: Path): Option[IncrManifest] =
+    try
+      if !Files.exists(path) then None
+      else
+        readFile(path).linesIterator.toList match
+          case fingerprint :: rest =>
+            val files = rest.filter(_.nonEmpty).map { line =>
+              val parts = line.split("\t", -1)
+              val names = if parts(3).isEmpty then Nil else parts(3).split(",").toList
+              parts(0) -> FileRecord(parts(1), parts(2), names)
+            }.toMap
+            Some(IncrManifest(fingerprint, files))
+          case Nil => None
+    catch case _: Exception => None
+
+  def saveManifest(path: Path, m: IncrManifest): Unit =
+    Files.createDirectories(Option(path.getParent).getOrElse(Paths.get(".")))
+    val lines = m.fingerprint :: m.files.toList.map { case (p, r) =>
+      s"$p\t${r.hash}\t${r.pkg}\t${r.declaredNames.mkString(",")}"
+    }
+    Files.write(path, lines.mkString("\n").getBytes("UTF-8"))
+
+  private def manifestPathFor(classesDir: Path): Path =
+    classesDir.resolveSibling(classesDir.getFileName.toString + ".incr-manifest")
+
+  /** Deletes whatever `classesDir` holds for the given (package, declared
+   *  top-level names) -- `Name.class`/`Name.tasty` plus anything dotc
+   *  nests under it (`Name$.class` for an object's static forwarder,
+   *  `Name$Inner.class`, ...), matched by filename prefix. Called before
+   *  recompiling a changed file (in case a class inside it was renamed or
+   *  removed since the last build -- leaving the old file behind would
+   *  keep shipping a stale class on the link classpath) and for files
+   *  dropped from the source set entirely. */
+  def purgeArtifactsFor(classesDir: Path, pkg: String, names: List[String]): Unit =
+    val dir = if pkg.isEmpty then classesDir else pkg.split("\\.").foldLeft(classesDir)(_.resolve(_))
+    if Files.exists(dir) then
+      names.foreach { n =>
+        Option(dir.toFile.listFiles((_, name) => name == s"$n.class" || name == s"$n.tasty" || name.startsWith(s"$n$$")))
+          .foreach(_.foreach(f => Files.deleteIfExists(f.toPath)))
+      }
+
   /** Just the dotc-native compile step (shared by `buildBinary` and the
    *  `scli test` pipeline, which needs to compile once to scan the resulting
-   *  classfiles for test discovery before a mainClass is known/generated). */
+   *  classfiles for test discovery before a mainClass is known/generated).
+   *  Incremental by default (see the design note above) -- pass
+   *  `incremental = false` to always fully recompile (`--no-incremental`). */
   def compileToClasses(
     sources: List[Path],
     classesDir: Path,
     cc: CompileClasspath,
-    extraOptions: List[String] = Nil
+    extraOptions: List[String] = Nil,
+    incremental: Boolean = true
   ): Unit =
-    deleteRecursively(classesDir)
-    Files.createDirectories(classesDir)
-    val compileCmd = List(
-      s"$dist/dotc-native",
-      "-javabootclasspath", cc.javaBase,
-      "-classpath", cc.compileCp,
-      "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
-      "-Yretain-trees"
-    ) ++ extraOptions ++ List(
-      "-d", classesDir.toString
-    ) ++ sources.map(_.toString)
+    val manifestPath = manifestPathFor(classesDir)
+    val fingerprint = computeFingerprint(cc, extraOptions)
+    val prev = if incremental then loadManifest(manifestPath) else None
+    // Keyed by path.toString throughout (not Path) -- the manifest itself
+    // is string-keyed (see FileRecord/IncrManifest), and the dependency
+    // graph below needs a plain-value key it can put in a Set/Queue.
+    val texts = sources.map(p => p.toString -> readFile(p)).toMap
+    val curHash = texts.view.mapValues(hashKey).toMap
+    val curDeclared = texts.view.mapValues(extractDeclaredNames).toMap
+    val curPkg = texts.view.mapValues(extractPackage).toMap
 
-    val compileExit = runInherited(compileCmd)
-    if compileExit != 0 then fail("compilation failed")
+    val fullRebuild = !incremental || prev.isEmpty || prev.exists(_.fingerprint != fingerprint) || !Files.isDirectory(classesDir)
+
+    val (toCompile, removedRecords): (List[Path], List[(String, FileRecord)]) =
+      if fullRebuild then (sources, Nil)
+      else
+        val m = prev.get
+        val curPaths = sources.map(_.toString).toSet
+        val removed = m.files.filter { case (p, _) => !curPaths(p) }
+        val changed = sources.filter(p => m.files.get(p.toString).forall(_.hash != curHash(p.toString)))
+
+        // name -> declaring file(s), recomputed fresh from the CURRENT
+        // source set every run -- this is what stands in for dotc's own
+        // symbol table: any textual mention of a name is treated as a
+        // dependency edge on whoever currently declares it.
+        val nameToFile = curDeclared.toList.flatMap { case (p, names) => names.map(_ -> p) }.groupMap(_._1)(_._2)
+        // names that vanished because their declaring file was removed
+        // still need to invalidate whoever references them -- dotc will
+        // then fail that file with a real "not found" error, correctly.
+        val removedNames = removed.values.flatMap(_.declaredNames).toSet
+        val allKnownNames = nameToFile.keySet ++ removedNames
+
+        def usedNames(text: String): Set[String] =
+          allKnownNames.filter(n => ("\\b" + java.util.regex.Pattern.quote(n) + "\\b").r.findFirstIn(text).isDefined)
+        val usedBy = texts.view.mapValues(usedNames).toMap
+        def dependentsOf(n: String): Iterable[String] = usedBy.collect { case (p, used) if used(n) => p }
+
+        // BFS closure: if file A is invalidated, anyone whose text
+        // mentions any name A declares is invalidated too (conservative:
+        // on ANY change to A, not just an API-visible one -- see the
+        // design note above).
+        val invalid = scala.collection.mutable.LinkedHashSet.empty[String]
+        val queue = scala.collection.mutable.Queue.empty[String]
+        def markInvalid(p: String): Unit = if invalid.add(p) then queue.enqueue(p)
+        changed.foreach(p => markInvalid(p.toString))
+        removedNames.foreach(n => dependentsOf(n).foreach(markInvalid))
+        while queue.nonEmpty do
+          val p = queue.dequeue()
+          curDeclared.getOrElse(p, Nil).foreach(n => dependentsOf(n).foreach(markInvalid))
+
+        (sources.filter(p => invalid(p.toString)), removed.toList)
+
+    if fullRebuild then
+      deleteRecursively(classesDir)
+      Files.createDirectories(classesDir)
+    else
+      Files.createDirectories(classesDir)
+      for p <- toCompile do
+        prev.flatMap(_.files.get(p.toString)).foreach(r => purgeArtifactsFor(classesDir, r.pkg, r.declaredNames))
+      for (_, r) <- removedRecords do
+        purgeArtifactsFor(classesDir, r.pkg, r.declaredNames)
+
+    if toCompile.nonEmpty then
+      // classesDir on the compile classpath (harmless on a full rebuild --
+      // it's freshly emptied above) is what lets dotc-native resolve
+      // symbols from files it isn't recompiling this round out of their
+      // already-compiled .tasty/.class instead of needing their source.
+      val compileCp = s"$classesDir:${cc.compileCp}"
+      val compileCmd = List(
+        s"$dist/dotc-native",
+        "-javabootclasspath", cc.javaBase,
+        "-classpath", compileCp,
+        "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
+        "-Yretain-trees"
+      ) ++ extraOptions ++ List(
+        "-d", classesDir.toString
+      ) ++ toCompile.map(_.toString)
+
+      val compileExit = runInherited(compileCmd)
+      if compileExit != 0 then fail("compilation failed")
+      // On failure, the manifest is deliberately left untouched: it still
+      // describes the last known-good state, so the next attempt treats
+      // every file in this failed batch as still-changed and retries it
+      // (plus dependents) rather than caching a broken result as if it
+      // compiled.
+
+    if incremental then
+      val toCompileSet = toCompile.toSet
+      val newFiles = sources.map { p =>
+        val key = p.toString
+        val record =
+          if fullRebuild || toCompileSet(p) then FileRecord(curHash(key), curPkg(key), curDeclared(key))
+          else prev.get.files(key)
+        key -> record
+      }.toMap
+      saveManifest(manifestPath, IncrManifest(fingerprint, newFiles))
+    else
+      Files.deleteIfExists(manifestPath)
 
   def buildBinary(
     sources: List[Path],
@@ -907,11 +1103,12 @@ object Scli:
     outFor: String => Path,
     extraOptions: List[String] = Nil,
     extraCompileOnlyClasspath: String = "",
-    logLevel: String = "info"
+    logLevel: String = "info",
+    incremental: Boolean = true
   ): String =
     val classesDir = Paths.get(".scli-build", "_scratch", "classes")
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
-    compileToClasses(sources, classesDir, cc, extraOptions)
+    compileToClasses(sources, classesDir, cc, extraOptions, incremental)
 
     val mainClass = detectMainClass(classesDir, explicitMainClass)
     val linkDir = Paths.get(".scli-build").resolve(mainClass).resolve("link")
@@ -979,6 +1176,11 @@ object Scli:
          |and excluded from `run`/`compile` -- scala-cli's convention. `test`
          |compiles both scopes together (test sources depend on main scope).
          |
+         |compilation is incremental by default: unchanged sources (and
+         |anything that doesn't textually mention a changed name) are reused
+         |from the last build instead of being recompiled -- pass
+         |--no-incremental to always fully recompile.
+         |
          |options:
          |  --main-class <name>        explicit entry point (skips auto-detection)
          |  --dep <coord>              add a dependency (repeatable; no -d short form -- real
@@ -990,6 +1192,7 @@ object Scli:
          |  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
          |  -q, --quiet                only show warnings/errors
          |  --test-framework <class>   explicit test framework class (skips auto-detection; test only)
+         |  --no-incremental           always fully recompile (skip the incremental-compile cache)
          |  -- <args...>               program args (run) or test-framework filter args (test),
          |                             e.g. `scli test . -- "*MySuite*"` (munit/utest-style filter)
          |
@@ -1033,7 +1236,8 @@ object Scli:
     progArgs: List[String] = Nil,
     verbose: Boolean = false,
     quiet: Boolean = false,
-    testFrameworkOpt: Option[String] = None
+    testFrameworkOpt: Option[String] = None,
+    noIncremental: Boolean = false
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (raw
     // clang/linker invocations, NativeConfig dumps), the default ("info")
@@ -1059,6 +1263,7 @@ object Scli:
         case "-v" | "--verbose" => o = o.copy(verbose = true)
         case "-q" | "--quiet" => o = o.copy(quiet = true)
         case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
+        case "--no-incremental" => o = o.copy(noIncremental = true)
         case f if f.startsWith("-") => die(s"unknown option: $f")
         case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
@@ -1087,11 +1292,11 @@ object Scli:
     mode match
       case "run" =>
         def binPathFor(mc: String): Path = Paths.get(".scli-build").resolve(mc).resolve("bin")
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
         runInherited(binPathFor(mainClass).toString :: o.progArgs)
       case "compile" =>
         val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `scli compile`")))
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, _ => outPath, options, extraCompileOnlyClasspath, o.logLevel)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, _ => outPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
         if !o.quiet then println(s"scli: wrote $outPath (main class: $mainClass)")
         0
 
@@ -1166,7 +1371,7 @@ object Scli:
       // test discovery before the driver (which references those classes
       // by name) is even generated.
       val classesDir = Paths.get(".scli-build", "_scratch", "test-classes")
-      compileToClasses(expanded, classesDir, cc, options)
+      compileToClasses(expanded, classesDir, cc, options, !o.noIncremental)
 
       val testJars = testClasspath.split(":").filter(_.nonEmpty).toList
       val explicitFramework = o.testFrameworkOpt.orElse(directives.testFramework)
@@ -1201,7 +1406,7 @@ object Scli:
         val driverSrc = Paths.get(".scli-build", "_scratch", "ScliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scli-build", "ScliTestMain", "bin")
-        buildBinary(expanded :+ driverSrc, Some("ScliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel)
+        buildBinary(expanded :+ driverSrc, Some("ScliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
         runInherited(binPath.toString :: o.progArgs)
 
     if o.watch then
