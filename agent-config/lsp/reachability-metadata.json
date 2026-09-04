@@ -34,6 +34,9 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.ast.Trees$ValDef[]"
+    },
+    {
       "type": "dotty.tools.dotc.ast.tpd$",
       "fields": [
         {
@@ -308,6 +311,28 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.interactive.Completion$",
+      "fields": [
+        {
+          "name": "keywords$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "dotty.tools.dotc.interactive.Completion$Completer",
+      "fields": [
+        {
+          "name": "completionsFilter$lzy1"
+        },
+        {
+          "name": "isNew$lzy1"
+        },
+        {
+          "name": "scopeCompletions$lzy1"
+        }
+      ]
+    },
+    {
       "type": "dotty.tools.dotc.parsing.Parsers$Parser",
       "fields": [
         {
@@ -472,6 +497,17 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.typer.OpenSearch",
+      "fields": [
+        {
+          "name": "coveringSet$lzy1"
+        },
+        {
+          "name": "typeSize$lzy1"
+        }
+      ]
+    },
+    {
       "type": "dotty.tools.dotc.typer.Typer",
       "fields": [
         {
@@ -615,6 +651,9 @@
       "type": "org.eclipse.lsp4j.CallHierarchyRegistrationOptions"
     },
     {
+      "type": "org.eclipse.lsp4j.ChangeAnnotation"
+    },
+    {
       "type": "org.eclipse.lsp4j.ClientCapabilities",
       "methods": [
         {
@@ -654,10 +693,81 @@
       "type": "org.eclipse.lsp4j.ColorProviderOptions"
     },
     {
+      "type": "org.eclipse.lsp4j.Command"
+    },
+    {
       "type": "org.eclipse.lsp4j.CompletionCapabilities"
     },
     {
+      "type": "org.eclipse.lsp4j.CompletionContext"
+    },
+    {
+      "type": "org.eclipse.lsp4j.CompletionItem",
+      "fields": [
+        {
+          "name": "additionalTextEdits"
+        },
+        {
+          "name": "command"
+        },
+        {
+          "name": "commitCharacters"
+        },
+        {
+          "name": "data"
+        },
+        {
+          "name": "deprecated"
+        },
+        {
+          "name": "detail"
+        },
+        {
+          "name": "documentation"
+        },
+        {
+          "name": "filterText"
+        },
+        {
+          "name": "insertText"
+        },
+        {
+          "name": "insertTextFormat"
+        },
+        {
+          "name": "insertTextMode"
+        },
+        {
+          "name": "kind"
+        },
+        {
+          "name": "label"
+        },
+        {
+          "name": "labelDetails"
+        },
+        {
+          "name": "preselect"
+        },
+        {
+          "name": "sortText"
+        },
+        {
+          "name": "tags"
+        },
+        {
+          "name": "textEdit"
+        },
+        {
+          "name": "textEditText"
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.CompletionItemCapabilities"
+    },
+    {
+      "type": "org.eclipse.lsp4j.CompletionItemDefaults"
     },
     {
       "type": "org.eclipse.lsp4j.CompletionItemInsertTextModeSupportCapabilities"
@@ -672,6 +782,9 @@
     },
     {
       "type": "org.eclipse.lsp4j.CompletionItemKindCapabilities"
+    },
+    {
+      "type": "org.eclipse.lsp4j.CompletionItemLabelDetails"
     },
     {
       "type": "org.eclipse.lsp4j.CompletionItemOptions"
@@ -691,10 +804,47 @@
       "type": "org.eclipse.lsp4j.CompletionItemTagSupportCapabilities"
     },
     {
+      "type": "org.eclipse.lsp4j.CompletionList",
+      "fields": [
+        {
+          "name": "isIncomplete"
+        },
+        {
+          "name": "itemDefaults"
+        },
+        {
+          "name": "items"
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.CompletionListCapabilities"
     },
     {
       "type": "org.eclipse.lsp4j.CompletionOptions"
+    },
+    {
+      "type": "org.eclipse.lsp4j.CompletionParams",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.CompletionTriggerKind",
+      "fields": [
+        {
+          "name": "value"
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.CreateFile"
+    },
+    {
+      "type": "org.eclipse.lsp4j.CreateFileOptions"
     },
     {
       "type": "org.eclipse.lsp4j.DeclarationCapabilities"
@@ -716,6 +866,12 @@
           "parameterTypes": []
         }
       ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.DeleteFile"
+    },
+    {
+      "type": "org.eclipse.lsp4j.DeleteFileOptions"
     },
     {
       "type": "org.eclipse.lsp4j.Diagnostic",
@@ -851,6 +1007,20 @@
       "type": "org.eclipse.lsp4j.DocumentSymbolOptions"
     },
     {
+      "type": "org.eclipse.lsp4j.DocumentSymbolParams",
+      "fields": [
+        {
+          "name": "textDocument"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.DynamicRegistrationCapabilities"
     },
     {
@@ -958,6 +1128,20 @@
       "type": "org.eclipse.lsp4j.InlineValueWorkspaceCapabilities"
     },
     {
+      "type": "org.eclipse.lsp4j.InsertReplaceEdit"
+    },
+    {
+      "type": "org.eclipse.lsp4j.InsertReplaceRange"
+    },
+    {
+      "type": "org.eclipse.lsp4j.InsertTextFormat",
+      "fields": [
+        {
+          "name": "value"
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.InsertTextMode",
       "fields": [
         {
@@ -972,7 +1156,15 @@
       "type": "org.eclipse.lsp4j.LinkedEditingRangeRegistrationOptions"
     },
     {
-      "type": "org.eclipse.lsp4j.Location"
+      "type": "org.eclipse.lsp4j.Location",
+      "fields": [
+        {
+          "name": "range"
+        },
+        {
+          "name": "uri"
+        }
+      ]
     },
     {
       "type": "org.eclipse.lsp4j.MarkdownCapabilities"
@@ -1075,7 +1267,35 @@
       "type": "org.eclipse.lsp4j.RangeFormattingCapabilities"
     },
     {
+      "type": "org.eclipse.lsp4j.ReferenceContext",
+      "fields": [
+        {
+          "name": "includeDeclaration"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.ReferenceOptions"
+    },
+    {
+      "type": "org.eclipse.lsp4j.ReferenceParams",
+      "fields": [
+        {
+          "name": "context"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
     },
     {
       "type": "org.eclipse.lsp4j.ReferencesCapabilities"
@@ -1087,7 +1307,30 @@
       "type": "org.eclipse.lsp4j.RenameCapabilities"
     },
     {
+      "type": "org.eclipse.lsp4j.RenameFile"
+    },
+    {
+      "type": "org.eclipse.lsp4j.RenameFileOptions"
+    },
+    {
       "type": "org.eclipse.lsp4j.RenameOptions"
+    },
+    {
+      "type": "org.eclipse.lsp4j.RenameParams",
+      "fields": [
+        {
+          "name": "newName"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.ResourceOperation"
     },
     {
       "type": "org.eclipse.lsp4j.SaveOptions"
@@ -1186,6 +1429,9 @@
       ]
     },
     {
+      "type": "org.eclipse.lsp4j.TextDocumentEdit"
+    },
+    {
       "type": "org.eclipse.lsp4j.TextDocumentIdentifier",
       "fields": [
         {
@@ -1249,6 +1495,17 @@
       "type": "org.eclipse.lsp4j.TextDocumentSyncOptions"
     },
     {
+      "type": "org.eclipse.lsp4j.TextEdit",
+      "fields": [
+        {
+          "name": "newText"
+        },
+        {
+          "name": "range"
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.TypeDefinitionCapabilities"
     },
     {
@@ -1270,13 +1527,47 @@
       "type": "org.eclipse.lsp4j.WindowShowMessageRequestCapabilities"
     },
     {
+      "type": "org.eclipse.lsp4j.WorkDoneProgressAndPartialResultParams"
+    },
+    {
       "type": "org.eclipse.lsp4j.WorkspaceClientCapabilities"
+    },
+    {
+      "type": "org.eclipse.lsp4j.WorkspaceEdit",
+      "fields": [
+        {
+          "name": "changeAnnotations"
+        },
+        {
+          "name": "changes"
+        },
+        {
+          "name": "documentChanges"
+        }
+      ]
     },
     {
       "type": "org.eclipse.lsp4j.WorkspaceEditCapabilities"
     },
     {
       "type": "org.eclipse.lsp4j.WorkspaceEditChangeAnnotationSupportCapabilities"
+    },
+    {
+      "type": "org.eclipse.lsp4j.WorkspaceFolder",
+      "fields": [
+        {
+          "name": "name"
+        },
+        {
+          "name": "uri"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
     },
     {
       "type": "org.eclipse.lsp4j.WorkspaceFoldersOptions"
@@ -1288,10 +1579,51 @@
       "type": "org.eclipse.lsp4j.WorkspaceSymbolOptions"
     },
     {
+      "type": "org.eclipse.lsp4j.WorkspaceSymbolParams",
+      "fields": [
+        {
+          "name": "query"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.WorkspaceSymbolResolveSupportCapabilities"
     },
     {
       "type": "org.eclipse.lsp4j.adapters.CodeActionResponseAdapter",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.adapters.CompletionItemDefaultsEditRangeTypeAdapter",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.adapters.CompletionItemTextEditTypeAdapter",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.adapters.DocumentChangeListAdapter",
       "methods": [
         {
           "name": "<init>",
@@ -1354,7 +1686,25 @@
       ]
     },
     {
+      "type": "org.eclipse.lsp4j.adapters.ResourceOperationTypeAdapter",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
       "type": "org.eclipse.lsp4j.adapters.SemanticTokensFullDeltaResponseAdapter",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "org.eclipse.lsp4j.adapters.SymbolInformationTypeAdapter$Factory",
       "methods": [
         {
           "name": "<init>",
@@ -1396,6 +1746,10 @@
       "type": "org.eclipse.lsp4j.services.LanguageServer",
       "methods": [
         {
+          "name": "exit",
+          "parameterTypes": []
+        },
+        {
           "name": "initialize",
           "parameterTypes": [
             "org.eclipse.lsp4j.InitializeParams"
@@ -1406,6 +1760,10 @@
           "parameterTypes": [
             "org.eclipse.lsp4j.InitializedParams"
           ]
+        },
+        {
+          "name": "shutdown",
+          "parameterTypes": []
         }
       ]
     },
@@ -1415,6 +1773,12 @@
     {
       "type": "org.eclipse.lsp4j.services.TextDocumentService",
       "methods": [
+        {
+          "name": "completion",
+          "parameterTypes": [
+            "org.eclipse.lsp4j.CompletionParams"
+          ]
+        },
         {
           "name": "definition",
           "parameterTypes": [
@@ -1434,15 +1798,41 @@
           ]
         },
         {
+          "name": "documentSymbol",
+          "parameterTypes": [
+            "org.eclipse.lsp4j.DocumentSymbolParams"
+          ]
+        },
+        {
           "name": "hover",
           "parameterTypes": [
             "org.eclipse.lsp4j.HoverParams"
+          ]
+        },
+        {
+          "name": "references",
+          "parameterTypes": [
+            "org.eclipse.lsp4j.ReferenceParams"
+          ]
+        },
+        {
+          "name": "rename",
+          "parameterTypes": [
+            "org.eclipse.lsp4j.RenameParams"
           ]
         }
       ]
     },
     {
-      "type": "org.eclipse.lsp4j.services.WorkspaceService"
+      "type": "org.eclipse.lsp4j.services.WorkspaceService",
+      "methods": [
+        {
+          "name": "symbol",
+          "parameterTypes": [
+            "org.eclipse.lsp4j.WorkspaceSymbolParams"
+          ]
+        }
+      ]
     },
     {
       "type": "scala.StringContext",
@@ -1460,6 +1850,20 @@
       "fields": [
         {
           "name": "emptyImpl$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.collection.immutable.NumericRange",
+      "fields": [
+        {
+          "name": "hashCode$lzy1"
+        },
+        {
+          "name": "isEmpty$lzy1"
+        },
+        {
+          "name": "length$lzy1"
         }
       ]
     },

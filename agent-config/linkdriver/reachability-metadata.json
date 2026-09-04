@@ -25,16 +25,15 @@
       "type": "java.lang.String[]"
     },
     {
-      "type": "java.lang.invoke.VarHandle",
-      "methods": [
-        {
-          "name": "releaseFence",
-          "parameterTypes": []
-        }
-      ]
+      "type": "jdk.internal.jrtfs.JrtFileSystemProvider"
     },
     {
-      "type": "jdk.internal.jrtfs.JrtFileSystemProvider"
+      "type": "scala.collection.LinearSeqIterator$LazyCell",
+      "fields": [
+        {
+          "name": "v$lzy1"
+        }
+      ]
     },
     {
       "type": "scala.collection.concurrent.CNodeBase"
@@ -47,6 +46,33 @@
     },
     {
       "type": "scala.collection.concurrent.TrieMap"
+    },
+    {
+      "type": "scala.collection.immutable.ArraySeq$",
+      "fields": [
+        {
+          "name": "emptyImpl$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.concurrent.ExecutionContext$",
+      "fields": [
+        {
+          "name": "global$lzy1"
+        },
+        {
+          "name": "opportunistic$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.math.BigDecimal$",
+      "fields": [
+        {
+          "name": "cache$lzy1"
+        }
+      ]
     },
     {
       "type": "scala.scalanative.build.Config$Impl",
@@ -68,7 +94,7 @@
       "type": "scala.scalanative.build.LLVM$",
       "fields": [
         {
-          "name": "0bitmap$1"
+          "name": "msysExtras$lzy1"
         }
       ]
     },
@@ -386,6 +412,17 @@
       "fields": [
         {
           "name": "0bitmap$1"
+        }
+      ]
+    },
+    {
+      "type": "scala.sys.process.Process$",
+      "fields": [
+        {
+          "name": "Future$lzy1"
+        },
+        {
+          "name": "Spawn$lzy1"
         }
       ]
     },
