@@ -115,6 +115,16 @@ object Scli:
   private val quotedRe = """"([^"]*)"""".r
   private def usingRe(key: String) = s"""//>\\s*using\\s+${java.util.regex.Pattern.quote(key)}\\b(.*)$$""".r
 
+  /** Every `//> using <key>` this parser actually understands -- kept in
+   *  sync by hand with parseDirectives below, so an unrecognized key (e.g.
+   *  scala-cli's `platform`/`jvm`/`toolkit`/`resourceDir`/`publish.*`) can be
+   *  flagged instead of silently doing nothing. */
+  private val recognizedDirectiveKeys = Set(
+    "dep", "deps", "compileOnly.dep", "compileOnly.deps", "test.dep", "test.deps",
+    "scala", "mainClass", "options", "option"
+  )
+  private val anyDirectiveKeyRe = """//>\s*using\s+(\S+)""".r
+
   /** All values on a `//> using <key> ...` line, trying each of `keys` in
    *  turn (so callers can accept e.g. both `dep` and `deps`). Values are
    *  normally quoted (scala-cli's `"org::name:version"` form), but a lone
@@ -139,7 +149,13 @@ object Scli:
     var scalaVersion = Option.empty[String]
     var mainClass = Option.empty[String]
     var options = List.empty[String]
+    val warnedKeys = scala.collection.mutable.Set.empty[String]
     for src <- sources; line <- readFile(src).linesIterator do
+      anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
+        val key = m.group(1)
+        if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
+          System.err.println(s"scli: warning: unsupported directive '//> using $key' in $src -- ignoring")
+      }
       directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
       directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
       directiveValues(line, "test.dep", "test.deps").foreach(vs => testDeps = testDeps ++ vs)
@@ -510,13 +526,13 @@ object Scli:
   //   scli run <sources...> [options]
   //   scli compile <sources...> -o <out> [options]
   //   scli version / scli --help
-  // options: --main-class X | -d/--dep coord | -S/--scala ver |
+  // options: --main-class X | --dep coord | -S/--scala ver |
   //          -O/--scalac-option opt | -w/--watch | -o/--output path |
   //          -v/--verbose | -q/--quiet | -- <program args...>
   // ---------------------------------------------------------------------
 
   private val unsupportedCommands = Set(
-    "test", "fmt", "repl", "package", "publish", "publish-local", "clean",
+    "test", "fmt", "repl", "publish", "publish-local", "clean",
     "bsp", "export", "doctor", "install-completions",
     "dependency-update", "shebang"
   )
@@ -532,6 +548,8 @@ object Scli:
          |  scli <sources...>                   run (default command)
          |  scli run <sources...> [options]     compile and run
          |  scli compile <sources...> [options] -o <out>   compile to a native binary
+         |                                     (alias: package -- unlike real scala-cli,
+         |                                     there's no separate typecheck-only mode)
          |  scli setup-ide <sources...> [options]   write .dotty-ide.json for editor LSP support
          |  scli version                        print version info
          |  scli --help                         this message
@@ -543,7 +561,8 @@ object Scli:
          |
          |options:
          |  --main-class <name>        explicit entry point (skips auto-detection)
-         |  -d, --dep <coord>          add a dependency (repeatable)
+         |  --dep <coord>              add a dependency (repeatable; no -d short form -- real
+         |                             scala-cli's -d means --output, not --dependency)
          |  -S, --scala <version>      declare a Scala version (must match ${BuildInfo.scalaVersion})
          |  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
          |  -w, --watch                rebuild (and, for `run`, rerun) on source changes
@@ -600,11 +619,13 @@ object Scli:
         case "--main-class" => o = o.copy(mainClassOpt = Some(args(i + 1))); i += 1
         case "-o" | "--output" => o = o.copy(out = Some(args(i + 1))); i += 1
         case "-w" | "--watch" => o = o.copy(watch = true)
-        case "-d" | "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
+        // no `-d` short form: real scala-cli's `-d` means `--output`, not `--dependency` -- don't collide with it.
+        case "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
         case "-S" | "--scala" | "--scala-version" => o = o.copy(cliScala = Some(args(i + 1))); i += 1
         case "-O" | "--scalac-option" | "--scalac-opt" => o = o.copy(cliOptions = o.cliOptions :+ args(i + 1)); i += 1
         case "-v" | "--verbose" => o = o.copy(verbose = true)
         case "-q" | "--quiet" => o = o.copy(quiet = true)
+        case f if f.startsWith("-") => die(s"unknown option: $f")
         case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
     o
@@ -712,8 +733,15 @@ object Scli:
     val options = directives.options ++ o.cliOptions
 
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+    // Unlike buildBinary, deliberately drop -Xplugin/-Xplugin-require:scalanative here:
+    // InteractiveCompiler (vendor/scala3 dotc.interactive) hardcodes its own phases
+    // list (Parser/TyperPhase/SetRootTree/CookComments only, no backend/scalanative
+    // phase ever runs), and dotty-lsp-native's native-image build never bakes in
+    // nscplugin's classes -- so requiring the plugin here always fails to load it
+    // reflectively and every request after `initialize` (which needs a driver built
+    // from these arguments) times out, regardless of native-image or not.
     val compilerArguments =
-      List("-javabootclasspath", cc.javaBase, "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative", "-Yretain-trees") ++ options
+      List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ options
 
     val sourceDirectories = expanded.map(_.toAbsolutePath.getParent.toString).distinct.sorted
     val dependencyClasspath = cc.compileCp.split(":").filter(_.nonEmpty).toList
@@ -745,10 +773,13 @@ object Scli:
       case "-h" | "--help" => printUsage(System.out)
       case "--version" | "version" => printVersion()
       case "run" => handleRunOrCompile("run", args.drop(1))
-      case "compile" => handleRunOrCompile("compile", args.drop(1))
+      // Note: unlike real scala-cli, `compile` here always links a native binary
+      // (there's no separate typecheck-only mode) -- `package` is the name real
+      // scala-cli uses for that, so accept it too rather than only the surprising name.
+      case "compile" | "package" => handleRunOrCompile("compile", args.drop(1))
       case "setup-ide" => handleSetupIde(args.drop(1))
       case cmd if unsupportedCommands(cmd) =>
-        die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, version")
+        die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, setup-ide, version")
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
         handleRunOrCompile("run", args) // implicit `run`, e.g. `scli Foo.scala`
       case other =>
