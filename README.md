@@ -14,12 +14,30 @@ without Metals' JVM dependency -- see [Status](#status).
 
 ## Prebuilt binaries
 
-Each [release](https://github.com/lolgab/snc/releases) ships
-a self-contained `dist/` tarball (compiler + linker + `scli`, no JVM needed to
-run any of it) for Linux, macOS, and Windows, on both x86_64 and arm64.
-Windows support is experimental/best-effort -- see
-[`docs/findings.md`](docs/findings.md). Download the tarball for your
-platform, extract it, and use `dist/scli` as described below.
+```
+curl -fsSL https://raw.githubusercontent.com/lolgab/snc/main/install.sh | bash
+```
+
+Downloads the latest [release](https://github.com/lolgab/snc/releases) for
+your OS/arch, verifies its checksum, and installs `scli` to `~/.local/bin`
+(override with `$SNC_INSTALL_DIR`/`$SNC_BIN_DIR`/`$SNC_VERSION`). Or do it by
+hand: each release ships a self-contained `dist/` tarball (compiler + linker
++ `scli`, no JVM needed to run any of it) for Linux, macOS, and Windows, on
+both x86_64 and arm64 -- download it, extract it, and use `scli`/`dist/scli`
+as described below. Windows support is experimental/best-effort -- see
+[`docs/findings.md`](docs/findings.md).
+
+Either way, two things are still required on the machine you *run* this on
+(not bundled -- both are pre-existing standalone binaries, not a JVM, so
+they don't compromise the "no JVM to write Scala" goal, but they're real
+prerequisites a fresh machine may not have):
+- **`clang`/`clang++`** -- needed for every build, even a zero-dependency
+  Hello World, since scala-native always links through clang. Usually
+  already present on macOS (Xcode Command Line Tools) and installable via
+  the system package manager elsewhere (`apt install clang`, etc).
+- **`cs`** ([coursier](https://get-coursier.io/)'s own launcher, itself a
+  prebuilt native binary, not a JVM) -- only needed if you use
+  `//> using dep`/`--dep` or `scli setup-ide` on a project with dependencies.
 
 ## Build from source
 
@@ -57,7 +75,8 @@ source file order doesn't matter, and understands the common
 in any of scala-cli's `org:name:version` / `org::name:version` /
 `org::name::version` forms), `scala` (declares a Scala version — must match
 this toolchain's, see below), `mainClass`, and `options`/`option` (extra
-compiler flags). The same things are available as flags: `-d/--dep`,
+compiler flags). The same things are available as flags: `--dep` (no `-d`
+short form -- real scala-cli's `-d` means `--output`, not `--dependency`),
 `-S/--scala`, `-O/--scalac-option`, `--main-class`, `-w/--watch`,
 `-o/--output`, and `-- <args...>` for the program's own arguments. Run
 `scli --help` for the full list. Dependency resolution shells out to `cs`
