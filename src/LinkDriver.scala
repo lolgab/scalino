@@ -32,7 +32,20 @@ object LinkDriver:
       .withMainClass(Some(mainClass))
       .withClassPath(cp)
       .withLogger(logger)
-      .withCompilerConfig(_.withClang(Paths.get(args(3))).withClangPP(Paths.get(args(4))))
+      .withCompilerConfig(
+        _.withClang(Paths.get(args(3)))
+          .withClangPP(Paths.get(args(4)))
+          // `NativeConfig.empty` leaves these at `Seq.empty` -- real
+          // scala-cli/sbt-scala-native wire in `Discover`'s defaults
+          // (`/opt/homebrew/lib` etc. on macOS) so system libs a native
+          // dependency needs (e.g. `@link("crypto")` from http4s-crypto)
+          // are actually findable; without this, linking anything that
+          // needs a Homebrew-installed system lib fails with "library
+          // 'x' not found" even though the same project links fine
+          // under real scala-cli on the same machine.
+          .withLinkingOptions(Discover.linkingOptions())
+          .withCompileOptions(Discover.compileOptions())
+      )
 
     val outPath = Scope.apply[java.nio.file.Path] { (s: Scope) =>
       given Scope = s

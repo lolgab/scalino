@@ -3523,7 +3523,7 @@ index 04cb637b..8b3af75a 100644
    /** Exception that stops interpretation if some issue is found */
    class StopInterpretation(val msg: Message, val pos: SrcPos) extends Exception
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index a40db72d..9a053566 100644
+index a40db72d..8c47a1b3 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 @@ -6,6 +6,7 @@ import java.io.{PrintWriter, StringWriter}
@@ -3534,6 +3534,15 @@ index a40db72d..9a053566 100644
  import dotty.tools.dotc.core.Contexts.*
  import dotty.tools.dotc.core.Decorators.*
  import dotty.tools.dotc.core.Flags.*
+@@ -26,7 +27,7 @@ import dotty.tools.io.AbstractFileClassLoader
+ 
+ import scala.reflect.ClassTag
+ 
+-import dotty.tools.dotc.quoted.{PickledQuotes, QuoteUtils}
++import dotty.tools.dotc.quoted.PickledQuotes
+ 
+ import scala.quoted.Quotes
+ import scala.quoted.runtime.impl.*
 @@ -58,7 +59,29 @@ object Splicer {
  
              // Some parts of the macro are evaluated during the unpickling performed in quotedExprToTree
@@ -3587,7 +3596,7 @@ index a40db72d..9a053566 100644
          case NonFatal(ex) =>
            val msg =
              em"""Failed to evaluate macro.
-@@ -256,7 +294,37 @@ object Splicer {
+@@ -256,14 +294,77 @@ object Splicer {
            case tree: Inlined if tree.inlinedFromOuterScope => tree.expansion
            case _ => body
          }
@@ -3622,11 +3631,13 @@ index a40db72d..9a053566 100644
 +        val body3 =
 +          if typeBindings.isEmpty then body2
 +          else new TreeTypeMap(typeMap = _.subst(typeBindings.map(_._1), typeBindings.map(_._2))).transform(body2)
-+        new ExprImpl(Inlined(EmptyTree, Nil, QuoteUtils.changeOwnerOfTree(body3, ctx.owner)).withSpan(body3.span), SpliceScope.getCurrent)
++        new ExprImpl(Inlined(EmptyTree, Nil, body3.changeNonLocalOwners(ctx.owner)).withSpan(body3.span), SpliceScope.getCurrent)
  
        // Interpret level -1 `Type.of[T]`
        case Apply(TypeApply(fn, quoted :: Nil), _) if fn.symbol == defn.QuotedTypeModule_of =>
-@@ -265,5 +333,38 @@ object Splicer {
+-        new TypeImpl(QuoteUtils.changeOwnerOfTree(quoted, ctx.owner), SpliceScope.getCurrent)
++        new TypeImpl(quoted.changeNonLocalOwners(ctx.owner), SpliceScope.getCurrent)
+ 
        case _ =>
          super.interpretTree(tree)
      }
