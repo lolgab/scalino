@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Vendors every jar bin/snc and scli need at runtime into dist/lib and
+# Vendors every jar bin/snc and sn-cli need at runtime into dist/lib and
 # rewrites the classpath manifests (compiler.cp, nativelibs.cp,
 # nscplugin.jar.txt) to hold dist-relative paths ("lib/foo.jar") instead of
 # absolute coursier-cache paths -- so dist/ can be tarred up and copied to
-# another machine and still work. bin/snc and cli/Scli.scala resolve those
+# another machine and still work. bin/snc and cli/SnCli.scala resolve those
 # relative entries against their own dist/ root at runtime.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"

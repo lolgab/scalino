@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-line installer for scala-native-compiler's `scli` toolchain.
+# One-line installer for scala-native-compiler's `sn-cli` toolchain.
 #
 #   curl -fsSL https://raw.githubusercontent.com/lolgab/snc/main/install.sh | bash
 #
 # Downloads the latest (or $SNC_VERSION-pinned) GitHub release tarball for
 # the current OS/arch, verifies its sha256 checksum, unpacks it into a
 # versioned directory under $SNC_INSTALL_DIR (default: ~/.local/share/snc),
-# and symlinks `scli` into $SNC_BIN_DIR (default: ~/.local/bin). scli
+# and symlinks `sn-cli` into $SNC_BIN_DIR (default: ~/.local/bin). sn-cli
 # resolves its own dist root from its real (symlink-resolved) path at
 # runtime -- see cli/selfexe/*.scala -- so a symlink here is safe and the
 # rest of dist/ (dotc-native, linkdriver-native, lib/, dotty-lsp-native)
@@ -91,10 +91,10 @@ else
 fi
 
 mkdir -p "$bin_dir"
-ln -sf "$dest_dir/scli" "$bin_dir/scli"
-chmod +x "$dest_dir/scli"
+ln -sf "$dest_dir/sn-cli" "$bin_dir/sn-cli"
+chmod +x "$dest_dir/sn-cli"
 
-echo "install.sh: installed scli $tag -> $bin_dir/scli (dist: $dest_dir)"
+echo "install.sh: installed sn-cli $tag -> $bin_dir/sn-cli (dist: $dest_dir)"
 
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
@@ -102,7 +102,7 @@ case ":$PATH:" in
 esac
 
 if ! command -v clang >/dev/null 2>&1; then
-  echo "install.sh: warning -- clang not found on PATH. scli needs clang/clang++ to build anything, even a zero-dependency Hello World."
+  echo "install.sh: warning -- clang not found on PATH. sn-cli needs clang/clang++ to build anything, even a zero-dependency Hello World."
 fi
 
-echo "install.sh: try it: echo '@main def hello(): Unit = println(\"hello\")' > Hello.scala && scli run Hello.scala"
+echo "install.sh: try it: echo '@main def hello(): Unit = println(\"hello\")' > Hello.scala && sn-cli run Hello.scala"

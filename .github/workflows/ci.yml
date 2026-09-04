@@ -52,24 +52,24 @@ jobs:
       - name: Smoke test -- plain program
         shell: bash
         run: |
-          out="$(./dist/scli run examples/Hello.scala)"
+          out="$(./dist/sn-cli run examples/Hello.scala)"
           echo "$out"
           [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
 
       - name: Smoke test -- real macro
         shell: bash
-        run: ./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
+        run: ./dist/sn-cli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
 
       - name: Smoke test -- dist/ is relocatable (flat, like a release tarball)
         shell: bash
         run: |
           # Mirrors release.yml's packaging: dist/'s *contents* copied flat
           # into an arbitrarily-named directory (no "dist/" wrapper) --
-          # scli must locate its own lib/, compiler.cp etc. as siblings of
+          # sn-cli must locate its own lib/, compiler.cp etc. as siblings of
           # itself, not by assuming a directory literally named "dist".
           pkg="$(mktemp -d)/scala-native-compiler-smoketest"
           mkdir -p "$pkg"
           cp -a dist/. "$pkg/"
           workdir="$(mktemp -d)"
           cp examples/Hello.scala "$workdir/Hello.scala"
-          ( cd "$workdir" && "$pkg/scli" run Hello.scala )
+          ( cd "$workdir" && "$pkg/sn-cli" run Hello.scala )

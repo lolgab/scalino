@@ -12,7 +12,7 @@ registers types it saw exercised during a traced run.
 Usage: lsp-trace-drive.py <project-dir> <command...>
 <project-dir> must contain Model.scala, Greeter.scala, Main.scala (see
 build/lsp-trace-fixture/) and have a .dotty-ide.json already generated
-there (e.g. via `dist/scli setup-ide Model.scala Greeter.scala Main.scala`).
+there (e.g. via `dist/sn-cli setup-ide Model.scala Greeter.scala Main.scala`).
 """
 import json, subprocess, sys, threading, time, queue, os
 

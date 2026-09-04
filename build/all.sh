@@ -9,6 +9,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 ./04a-patch-tools.sh
 ./04-build-linkdriver-native.sh
 ./06-package.sh
-./07-build-scli.sh
+./07-build-sn-cli.sh
 ./08-build-lsp-native.sh
 echo "OK: toolchain built in $(cd .. && pwd)/dist"

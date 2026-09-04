@@ -17,6 +17,6 @@ object SelfExe:
     val cap = 4096
     val buf = alloc[Byte](cap.toUInt)
     val n = Kernel32.GetModuleFileNameA(null, buf, cap)
-    if n == 0 then throw new RuntimeException("scli: GetModuleFileNameA failed")
+    if n == 0 then throw new RuntimeException("sn-cli: GetModuleFileNameA failed")
     fromCString(buf)
   }

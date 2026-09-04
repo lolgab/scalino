@@ -51,8 +51,8 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          ./dist/scli run examples/Hello.scala
-          ./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
+          ./dist/sn-cli run examples/Hello.scala
+          ./dist/sn-cli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
 
       - name: Package
         shell: bash

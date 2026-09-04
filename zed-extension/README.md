@@ -35,9 +35,9 @@ same file extensions, which Zed doesn't support cleanly.
 5. In your Scala project's root, generate the IDE config the server reads on
    `initialize` (`dotty.tools.languageserver.DottyLanguageServer.IDE_CONFIG_FILE`):
    ```
-   dist/scli setup-ide <your sources...>
+   dist/sn-cli setup-ide <your sources...>
    ```
-   writes `.dotty-ide.json` there (`../cli/Scli.scala`'s `setup-ide` command).
+   writes `.dotty-ide.json` there (`../cli/SnCli.scala`'s `setup-ide` command).
 6. Open the project in Zed. Check `cmd-shift-p` -> "dev: open language
    server logs" if diagnostics/hover don't show up.
 

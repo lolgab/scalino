@@ -968,7 +968,7 @@ index 04cb637b..c2ab3ffb 100644
 +      // libraries that deconstruct their own tree shapes via custom
 +      // (often private) extractor objects rather than the well-known
 +      // `quotes.reflect`/stdlib ones above -- e.g. utest's own
-+      // `TestBuilder.Stats`/`Test`/`TestMethod`/`IsTest` (`scli test`, see
++      // `TestBuilder.Stats`/`Test`/`TestMethod`/`IsTest` (`sn-cli test`, see
 +      // docs/findings.md). Returns one element per `patterns` slot the same
 +      // way the curated extractors above do, so it plugs into the exact
 +      // same size-matching/varargs logic below unchanged: a real arity>1
@@ -3178,7 +3178,7 @@ index 04cb637b..c2ab3ffb 100644
 +      // transform living in this same binary). Needed by macro libraries
 +      // that build a lambda application via `Expr.betaReduce` rather than
 +      // relying on the backend to inline it later (e.g. utest's own
-+      // `Tracer.traceOneWithCode`/`Tracer.apply`, `scli test`, see
++      // `Tracer.traceOneWithCode`/`Tracer.apply`, `sn-cli test`, see
 +      // docs/findings.md).
 +      case "betaReduce" if fn.owner.name.toString == "TermModule" =>
 +        args.headOption.collect { case t: Tree =>
@@ -3214,7 +3214,7 @@ index 04cb637b..c2ab3ffb 100644
 +      // any macro's own `new TreeMap { override def transformXxx = ... }`
 +      // (calling `super.transformXxx` for every shape it doesn't override
 +      // itself) exercises broadly -- e.g. utest's own `Tracer.tracingMap`
-+      // (`scli test`, see docs/findings.md). Curated over the common TERM
++      // (`sn-cli test`, see docs/findings.md). Curated over the common TERM
 +      // shapes as exercised; `TypeTree`-shape copies
 +      // (`TypeSelect`/`Annotated`/etc) aren't covered yet.
 +      case "copy" if fn.owner.name.toString == "SelectModule" =>
@@ -3498,7 +3498,7 @@ index 04cb637b..c2ab3ffb 100644
 +      // `replaceAllIn`/`findFirstIn`/etc (interpreted, since `Regex` itself
 +      // is real, retained Scala source), used by e.g. a derivation macro's
 +      // own compile-time string post-processing (utest's
-+      // `StringUtilHelpers.stripScalaCorePrefixes`, `scli test`, see
++      // `StringUtilHelpers.stripScalaCorePrefixes`, `sn-cli test`, see
 +      // docs/findings.md). `java.lang.StringBuilder` (not `StringBuffer`)
 +      // since that's the overload `Regex.Replacement` builds against --
 +      // see the matching `newStdlibCollection` case.

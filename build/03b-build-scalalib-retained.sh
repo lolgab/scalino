@@ -18,7 +18,7 @@
 # turning almost all of that hand-written-intrinsic surface into generically
 # interpreted real library code instead.
 #
-# scli (cli/Scli.scala) puts dist/lib/scalalib-retained.jar first on every
+# sn-cli (cli/SnCli.scala) puts dist/lib/scalalib-retained.jar first on every
 # project's compile classpath, ahead of the plain scala-library from
 # nativelibs.cp, so this benefits every project automatically -- not just
 # ones we've manually special-cased.
@@ -75,12 +75,12 @@ done
     cp -f "$VENDOR/scala2-library-bootstrapped/src/$relpath" "$SRC_DIR/$relpath"
   done
 
-echo "compiling with dist/dotc-native (the real compiler scli itself runs)..."
+echo "compiling with dist/dotc-native (the real compiler sn-cli itself runs)..."
 # `-javabootclasspath`: dotc-native is a native-image build with no real JDK
 # rt.jar/module-path of its own to fall back on (unlike a plain `$JAVA -cp
 # ... dotty.tools.dotc.Main` invocation) -- without it, even
 # `Definitions#init` itself fails (`ObjectClass`/`AnyRefAlias` can't resolve
-# `java.lang.Object`). Same flag scli itself always passes.
+# `java.lang.Object`). Same flag sn-cli itself always passes.
 "$DIST/dotc-native" \
   -javabootclasspath "$DIST/java.base.jar" \
   -classpath "$(cat "$WORK/compiler.cp")" \
@@ -98,7 +98,7 @@ echo "merging in the plain jar's Java-sourced classes (scala.runtime.* etc, neve
 # classes for anything CLASSES_DIR doesn't already provide, so
 # scalalib-retained.jar is a complete, self-contained replacement and
 # never needs the plain jar alongside it on the same classpath (see
-# cli/Scli.scala's dropPlainScalaLibrary -- two jars both providing
+# cli/SnCli.scala's dropPlainScalaLibrary -- two jars both providing
 # scala.Option/etc turned out to make dotc's classpath resolution
 # non-deterministic, not just redundant).
 PLAIN_DIR="$WORK/scalalib-plain-classes"

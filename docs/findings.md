@@ -175,10 +175,10 @@ resolution costs no JVM despite coursier being JVM Scala under the hood),
 and hand-roll the rest (directives, an incremental-compile cache, watch mode)
 purpose-built rather than porting zinc/BSP.
 
-### `scli`: implemented, self-hosted
+### `sn-cli`: implemented, self-hosted
 
-`cli/Scli.scala` is a mini scala-cli-style CLI (`scli run`/`scli compile`),
-built by `build/07-build-scli.sh` -- itself compiled by
+`cli/SnCli.scala` is a mini scala-cli-style CLI (`sn-cli run`/`sn-cli compile`),
+built by `build/07-build-sn-cli.sh` -- itself compiled by
 `dist/dotc-native`+`dist/linkdriver-native` (bootstrapped once those exist),
 **not** by any JVM. This closes the loop: the build tool driving the
 compiler is itself a product of that same compiler.
@@ -197,7 +197,7 @@ What it does:
   multi-version support, this binary only ever targets the Scala/scala-native
   version it was built for.
 - Resolves dependencies via a native `cs fetch --classpath` subprocess,
-  cached on disk (`.scli-build/deps-cache/`) keyed by the sorted dependency
+  cached on disk (`.sn-cli-build/deps-cache/`) keyed by the sorted dependency
   list, so repeat runs skip the resolution step (and its network
   round-trip) entirely, not just the artifact download `cs` already caches
   itself. Excludes scala-native's own runtime artifacts
@@ -221,7 +221,7 @@ What it does:
   limitation -- source file order no longer matters.
 - Drives `dotc-native`/`linkdriver-native` directly (reading the same
   `dist/*.cp` manifests `bin/snc` uses), with the resolved dependency
-  classpath folded in, into the same persistent `.scli-build/<mainClass>/`
+  classpath folded in, into the same persistent `.sn-cli-build/<mainClass>/`
   caching layout `bin/snc` uses (see the C-object-cache fix above).
 
 Verified against `examples/Hello.scala` (plain), `examples/macro-hello/`
@@ -236,17 +236,17 @@ cross-platform). The last one is the strongest proof: not just resolved but
 scala-native library) compiled, linked, and printed the correct working
 directory end to end.
 
-### `scli`: closing the gap with scala-cli's CLI surface
+### `sn-cli`: closing the gap with scala-cli's CLI surface
 
 Follow-up pass specifically aimed at making the command line itself feel
 like scala-cli's, not just the directive parsing underneath:
 
-- `scli <sources...>` with no subcommand now means `run` (scala-cli's
-  signature `scala-cli Foo.scala` UX); `scli run`/`scli compile` still work
+- `sn-cli <sources...>` with no subcommand now means `run` (scala-cli's
+  signature `scala-cli Foo.scala` UX); `sn-cli run`/`sn-cli compile` still work
   explicitly.
-- A source argument may be a directory (`scli run .`): every `.scala` file
+- A source argument may be a directory (`sn-cli run .`): every `.scala` file
   under it is collected recursively, skipping hidden and build-output
-  (`.scli-build`/`target`/`out`) directories.
+  (`.sn-cli-build`/`target`/`out`) directories.
 - New directives: `mainClass` (explicit entry point, alternative to
   `--main-class`) and `options`/`option` (extra `dotc-native` flags, e.g.
   `//> using options "-explain"`).
@@ -259,9 +259,9 @@ like scala-cli's, not just the directive parsing underneath:
   simpler and doesn't depend on that API's support in this toolchain's
   javalib port, which is unverified. Build/link/resolve failures during a
   watch iteration are caught and reported without killing the loop (see
-  `BuildFailed` in `Scli.scala`); a genuinely bad CLI invocation still exits
+  `BuildFailed` in `SnCli.scala`); a genuinely bad CLI invocation still exits
   immediately, before the loop ever starts.
-- `scli version` and `scli --help`/`-h`.
+- `sn-cli version` and `sn-cli --help`/`-h`.
 - Typing an unimplemented scala-cli command (`test`, `fmt`, `repl`,
   `package`, `publish`, `publish-local`, `clean`, `bsp`, `export`,
   `doctor`, `setup-ide`, `install-completions`, `dependency-update`,
@@ -285,7 +285,7 @@ bodies, so code that actually *called into* it would fail at the link step
 with unreachable symbols, same as it would under real scala-cli targeting
 `--native` with a JVM-only dependency.
 
-Not implemented: watch mode, incremental Scala compilation (every `scli`
+Not implemented: watch mode, incremental Scala compilation (every `sn-cli`
 build fully recompiles every given source file -- only the native-library
 object cache and the dependency-resolution cache are incremental),
 multi-module projects, and anything past the one directive kind above
@@ -346,7 +346,7 @@ Goal: a Metals-equivalent for editors like Zed, without a JVM at runtime.
 Metals itself doesn't work here — it's an LSP *client architecture*
 (BSP + semanticdb + `mtags-interfaces`) built to bridge Scala into arbitrary
 JVM build tools, none of which this toolchain needs (it already owns
-compile/link/deps end to end via `scli`). What's actually needed is much
+compile/link/deps end to end via `sn-cli`). What's actually needed is much
 smaller: dotc's own `interactive`/`InteractiveDriver` machinery, wired to a
 stdio LSP server.
 
@@ -429,7 +429,7 @@ a 319-byte relocation stub on Maven Central, not real classfiles (same
 "decoy artifact" shape as `scalalib_native0.5_3`, documented above, but for
 an unrelated reason).
 
-Done since: `scli setup-ide <sources...>` (`cli/Scli.scala`) generates
+Done since: `sn-cli setup-ide <sources...>` (`cli/SnCli.scala`) generates
 `.dotty-ide.json` (including `-javabootclasspath`) by reusing
 `buildBinary`'s own classpath/directive-parsing plumbing, instead of
 hand-writing it; and [`zed-extension/`](../zed-extension/) is a real Zed
@@ -458,12 +458,12 @@ work, but aren't individually exercised yet).
    instead.
 3. ~~**Packaging/relocatability.**~~ Fixed: `build/06-package.sh` now vendors
    every jar into `dist/lib/` and rewrites `dist/*.cp` manifests to
-   dist-relative paths; `bin/snc` and `scli` resolve them against their own
-   dist root at runtime, and `scli` locates that root via its own executable
+   dist-relative paths; `bin/snc` and `sn-cli` resolve them against their own
+   dist root at runtime, and `sn-cli` locates that root via its own executable
    path (`cli/selfexe/*.scala`, one small OS-specific native binding per
    platform) instead of a build-time-baked-in absolute path. `dist/` is now a
    self-contained, copyable/tarball-able distribution.
-4. **`scli` follow-ups.** See "Toward a build-tool experience without a JVM"
+4. **`sn-cli` follow-ups.** See "Toward a build-tool experience without a JVM"
    above for what's implemented (including watch mode, directory/CLI-flag
    parity with scala-cli as of the "closing the gap" pass, and incremental
    compilation -- see item 7). Still missing: multi-module/multi-target
@@ -473,11 +473,11 @@ work, but aren't individually exercised yet).
    bloop), so they currently just print "not implemented" rather than being
    faked.
 
-   `scli test` (2026-09-04) *is* now implemented, with no JVM anywhere in
+   `sn-cli test` (2026-09-04) *is* now implemented, with no JVM anywhere in
    the chain -- see the doc comment above `readAllBytes`/`ClassInfo` in
-   `cli/Scli.scala` for the full design. In short: real (JVM) sbt-scala-native
+   `cli/SnCli.scala` for the full design. In short: real (JVM) sbt-scala-native
    drives test execution from the sbt/JVM side over a ComRunner socket
-   protocol; `scli` instead (1) structurally scans the resolved test
+   protocol; `sn-cli` instead (1) structurally scans the resolved test
    classpath's jars for a class implementing `sbt.testing.Framework` --  no
    hardcoded per-framework list, so any framework with a scala-native port
    is found the same way -- (2) compiles+links+runs a tiny throwaway "probe"
@@ -489,7 +489,7 @@ work, but aren't individually exercised yet).
    generates a small driver source that instantiates the framework(s) by
    literal name (no reflection) and drains `Task.execute` synchronously.
    Test-object instantiation inside a discovered `Task` turned out to need
-   no bridging work at all on `scli`'s end: scala-native's native test-port
+   no bridging work at all on `sn-cli`'s end: scala-native's native test-port
    authors already rely on `scala.scalanative.reflect.Reflect`/
    `@EnableReflectiveInstantiation` for it (confirmed both via source
    research and by a from-scratch hand-rolled `sbt.testing.Framework` smoke
@@ -505,7 +505,7 @@ work, but aren't individually exercised yet).
    `endLine`/`startColumn`/`endColumn`/`sourceCode`) as direct real-dotc
    calls, the same pattern as every other `XMethods` extension bag. A real
    `munit.FunSuite` test (`assertEquals`, real `Location`/`Clue` macros)
-   now compiles, links, and passes via `scli test` end to end -- see
+   now compiles, links, and passes via `sn-cli test` end to end -- see
    `patches/scala3-0001-*.patch` for the diff, applied to
    `vendor/scala3/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala`.
 
@@ -589,10 +589,10 @@ work, but aren't individually exercised yet).
    needs its own investigation (likely an owner-chain/`-Yretain-trees`
    interaction affecting how a macro-expanded closure's free variables get
    resolved). Confirmed via both the JVM fast-loop and the real native
-   `scli test` pipeline (`dotc-native`), so not an artifact of either path.
+   `sn-cli test` pipeline (`dotc-native`), so not an artifact of either path.
    Repro: `//> using dep "com.lihaoyi::utest::0.8.4"` +
    `object T extends utest.TestSuite { val tests = utest.Tests { test("x")
-   { assert(1 == 1) } } }`, `scli test .`.
+   { assert(1 == 1) } } }`, `sn-cli test .`.
 
    scalatest not retested this session (untouched since the original
    blocker note) -- likely has its own similar tail of gaps given it also
@@ -696,7 +696,7 @@ work, but aren't individually exercised yet).
    intermediate `.build-work/*.cp` files (not currently uploaded anywhere),
    or a real Windows box -- deliberately not guessed at blind here.
 6. `bin/snc`'s "first source file's basename is the main class" convention is
-   still naive (unlike `scli`, which auto-detects) — for multi-file macro
+   still naive (unlike `sn-cli`, which auto-detects) — for multi-file macro
    examples via `bin/snc` directly, the entry-point file must be listed
    first (see `examples/macro-hello/` usage in the README).
 7. ~~Only compiling Scala source is incremental-cache-free.~~ **Fixed
@@ -711,7 +711,7 @@ work, but aren't individually exercised yet).
    same closed-world-hostile shape that's caused problems elsewhere in
    this codebase.
 
-   Instead, `compileToClasses`/`buildBinary` (`cli/Scli.scala`) reconstruct
+   Instead, `compileToClasses`/`buildBinary` (`cli/SnCli.scala`) reconstruct
    an *approximate* dependency graph purely from source text: which
    top-level names each file declares (a regex scan, same spirit as this
    file's existing directive/entry-point heuristics), and which of those

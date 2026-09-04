@@ -6,7 +6,7 @@
 .bsp/
 .metals/
 .snc-build/
-.scli-build/
+.sn-cli-build/
 *.class
 *.tasty
 *.nir

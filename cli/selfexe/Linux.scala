@@ -17,7 +17,7 @@ object SelfExe:
     val cap = 4096
     val buf = alloc[Byte](cap.toUInt)
     val n = CLib.readlink(c"/proc/self/exe", buf, cap.toUInt)
-    if n <= 0 then throw new RuntimeException("scli: readlink(/proc/self/exe) failed")
+    if n <= 0 then throw new RuntimeException("sn-cli: readlink(/proc/self/exe) failed")
     buf(n) = 0.toByte
     fromCString(buf)
   }

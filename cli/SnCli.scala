@@ -1,5 +1,5 @@
-// scli: a mini scala-cli, self-hosted -- this file is itself compiled by
-// dist/dotc-native + dist/linkdriver-native (see build/07-build-scli.sh) into
+// sn-cli: a mini scala-cli, self-hosted -- this file is itself compiled by
+// dist/dotc-native + dist/linkdriver-native (see build/07-build-sn-cli.sh) into
 // a standalone Scala Native binary. No JVM anywhere in this tool or in
 // anything it invokes: it drives dist/dotc-native and dist/linkdriver-native
 // directly, and shells out to `cs` for dependency resolution -- coursier's
@@ -22,24 +22,24 @@ import java.lang.{ProcessBuilder => JProcessBuilder}
 import java.nio.file.{Files, Path, Paths}
 import scala.jdk.CollectionConverters.*
 
-object Scli:
+object SnCli:
 
   // `dist` is wherever this binary itself lives, resolved from its own path
   // (not baked in at build time) so a copied/relocated/extracted-from-a-
   // release-tarball dist/ still works -- see docs/findings.md "Packaging/
   // relocatability". Deliberately NOT "two levels up from the binary,
   // then + /dist": that hardcoded a directory literally named `dist`,
-  // which release.yml's tarball layout (scli sitting directly next to
+  // which release.yml's tarball layout (sn-cli sitting directly next to
   // lib/, compiler.cp, etc., with no `dist/` wrapper) doesn't have.
   // selfexe.SelfExe is one of three OS-specific implementations
-  // (cli/selfexe/*.scala); build/07-build-scli.sh picks the right one for
+  // (cli/selfexe/*.scala); build/07-build-sn-cli.sh picks the right one for
   // the host OS at compile time.
   val dist: String =
     val exe = selfexe.SelfExe.path()
     Paths.get(exe).toRealPath().getParent.toString
 
   def die(msg: String): Nothing =
-    System.err.println(s"scli: $msg")
+    System.err.println(s"sn-cli: $msg")
     sys.exit(1)
 
   /** Raised by anything in the compile/link/resolve pipeline that can fail
@@ -157,7 +157,7 @@ object Scli:
     // unanchored scan also matches `//> using ...` mentioned in prose
     // (scaladoc explaining the directive syntax, a `printUsage` help-text
     // string literal like `|  //> using dep "..."`, etc.), which isn't a
-    // directive at all -- this repo's own cli/Scli.scala is full of such
+    // directive at all -- this repo's own cli/SnCli.scala is full of such
     // mentions, and scanning "." pulls that file in as a source.
     for src <- sources; rawLine <- readFile(src).linesIterator do
       val line = rawLine.trim
@@ -165,7 +165,7 @@ object Scli:
         anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
           val key = m.group(1)
           if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
-            System.err.println(s"scli: warning: unsupported directive '//> using $key' in $src -- ignoring")
+            System.err.println(s"sn-cli: warning: unsupported directive '//> using $key' in $src -- ignoring")
         }
         directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
         directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
@@ -263,7 +263,7 @@ object Scli:
           val cs = findOnPath("cs")
           val coords = deps.map(toCoursierCoord)
           val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
-          System.err.println(s"scli: resolving ${deps.mkString(", ")}")
+          System.err.println(s"sn-cli: resolving ${deps.mkString(", ")}")
           val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: List("--classpath"))
           if code != 0 then fail(s"dependency resolution failed for: ${deps.mkString(", ")}")
           Files.write(cacheFile, cp.getBytes("UTF-8"))
@@ -379,7 +379,7 @@ object Scli:
     }
 
   // ---------------------------------------------------------------------
-  // `scli test`: bridging sbt's test-interface (`sbt.testing.Framework` et
+  // `sn-cli test`: bridging sbt's test-interface (`sbt.testing.Framework` et
   // al -- the same API munit/utest/scalatest/zio-test's *native* ports all
   // implement, since it's the one interface every scala-native test
   // framework port targets) into a JVM-free build, with no reflection and
@@ -418,7 +418,7 @@ object Scli:
   //      transitively across both classesDir and the classpath jars)
   //      include the fingerprint's marker superclass, and does it look like
   //      a Scala object or a plain class to match `isModule`.
-  //   4. Driver codegen: generate a small `ScliTestMain.scala` that
+  //   4. Driver codegen: generate a small `SnCliTestMain.scala` that
   //      literally instantiates the framework(s) by name (`new
   //      munit.Framework()` -- direct, static, no reflection) and builds
   //      `TaskDef`s from the discovered class names, then compiles it in
@@ -610,7 +610,7 @@ object Scli:
 
   def probeSourceFor(frameworkFqcns: List[String]): String =
     val entries = frameworkFqcns.map(fqcn => s"""    "$fqcn" -> new $fqcn()""").mkString(",\n")
-    s"""object ScliProbeMain:
+    s"""object SnCliProbeMain:
        |  def main(args: Array[String]): Unit =
        |    val fws: List[(String, sbt.testing.Framework)] = List(
        |$entries
@@ -648,9 +648,9 @@ object Scli:
     val cacheFile = cacheDir.resolve(s"probe-$key.tsv")
     if Files.exists(cacheFile) then parseProbeOutput(readFile(cacheFile))
     else
-      val scratch = Paths.get(".scli-build", "_scratch", "probe")
+      val scratch = Paths.get(".sn-cli-build", "_scratch", "probe")
       Files.createDirectories(scratch)
-      val probeSrc = scratch.resolve("ScliProbeMain.scala")
+      val probeSrc = scratch.resolve("SnCliProbeMain.scala")
       Files.write(probeSrc, probeSourceFor(frameworkFqcns).getBytes("UTF-8"))
       val probeClasses = scratch.resolve("classes")
       val ccWithUserClasses = cc.copy(compileCp = s"$userClassesDir:${cc.compileCp}")
@@ -659,10 +659,10 @@ object Scli:
       val linkCp = s"$probeClasses:$userClassesDir:${cc.nativelibsCp}:$testClasspath"
       val clang = findOnPath("clang")
       val clangpp = findOnPath("clang++")
-      val linkExit = runInherited(List(s"$dist/linkdriver-native", linkCp, linkDir.toString, "ScliProbeMain", clang, clangpp, logLevel))
+      val linkExit = runInherited(List(s"$dist/linkdriver-native", linkCp, linkDir.toString, "SnCliProbeMain", clang, clangpp, logLevel))
       if linkExit != 0 then fail("linking the test-framework probe failed")
-      val produced = linkDir.resolve("ScliProbeMain")
-      val actual = if Files.exists(produced) then produced else linkDir.resolve("scliprobemain")
+      val produced = linkDir.resolve("SnCliProbeMain")
+      val actual = if Files.exists(produced) then produced else linkDir.resolve("sncliprobemain")
       if !Files.exists(actual) then fail(s"expected probe binary at $actual, not found")
       val (exit, out) = runCaptureStdout(List(actual.toString))
       if exit != 0 then fail("test-framework probe binary failed to run")
@@ -692,7 +692,7 @@ object Scli:
       }
     found.values.toList
 
-  /** Generates `ScliTestMain.scala`: one real (statically instantiated, no
+  /** Generates `SnCliTestMain.scala`: one real (statically instantiated, no
    *  reflection) `Framework` per distinct `frameworkFqcn` among `matches`,
    *  a `TaskDef` per discovered test class (looking its real `Fingerprint`
    *  back up from that framework's own `fingerprints()` at run time, by the
@@ -721,7 +721,7 @@ object Scli:
          |    if summary$idx != null && summary$idx.nonEmpty then println(summary$idx)""".stripMargin
     }.mkString("\n\n")
 
-    s"""object ScliTestMain:
+    s"""object SnCliTestMain:
        |  def main(args: Array[String]): Unit =
        |    val logger = new sbt.testing.Logger:
        |      def ansiCodesSupported(): Boolean = false
@@ -753,22 +753,22 @@ object Scli:
        |
        |$groups
        |
-       |    println("scli: " + passed + " passed, " + failed + " failed, " + errored + " errored, " + skipped + " skipped")
+       |    println("sn-cli: " + passed + " passed, " + failed + " failed, " + errored + " errored, " + skipped + " skipped")
        |    if failed > 0 || errored > 0 then sys.exit(1)
        |""".stripMargin
 
   // ---------------------------------------------------------------------
-  // Source expansion: a directory argument (e.g. `scli run .`) means "every
+  // Source expansion: a directory argument (e.g. `sn-cli run .`) means "every
   // .scala file under here", scala-cli-style -- skipping hidden dirs and
   // this tool's own build-output dirs.
   // ---------------------------------------------------------------------
 
   // "vendor" excluded because vendor/scala3 is a full gitignored dotty
   // checkout (~18k .scala files) -- sweeping it into IDE/run/compile source
-  // scanning made `scli setup-ide .` (and any other directory-arg command)
+  // scanning made `sn-cli setup-ide .` (and any other directory-arg command)
   // hang for minutes walking+directive-parsing files that aren't this
   // project's own sources.
-  private val skipDirNames = Set(".scli-build", "target", "out", "vendor")
+  private val skipDirNames = Set(".sn-cli-build", "target", "out", "vendor")
 
   def collectScalaFiles(dir: Path): List[Path] =
     val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
@@ -792,7 +792,7 @@ object Scli:
   // scope (test sources typically reference a test framework like munit
   // that's declared via `//> using test.dep`, not a plain `dep`, and so
   // isn't even on the main scope's classpath -- compiling them in would
-  // just fail). `scli test` (handleTest, below) compiles both scopes
+  // just fail). `sn-cli test` (handleTest, below) compiles both scopes
   // together instead, since test sources depend on main scope.
   // ---------------------------------------------------------------------
 
@@ -986,7 +986,7 @@ object Scli:
       }
 
   /** Just the dotc-native compile step (shared by `buildBinary` and the
-   *  `scli test` pipeline, which needs to compile once to scan the resulting
+   *  `sn-cli test` pipeline, which needs to compile once to scan the resulting
    *  classfiles for test discovery before a mainClass is known/generated).
    *  Incremental by default (see the design note above) -- pass
    *  `incremental = false` to always fully recompile (`--no-incremental`). */
@@ -1106,12 +1106,12 @@ object Scli:
     logLevel: String = "info",
     incremental: Boolean = true
   ): String =
-    val classesDir = Paths.get(".scli-build", "_scratch", "classes")
+    val classesDir = Paths.get(".sn-cli-build", "_scratch", "classes")
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
     compileToClasses(sources, classesDir, cc, extraOptions, incremental)
 
     val mainClass = detectMainClass(classesDir, explicitMainClass)
-    val linkDir = Paths.get(".scli-build").resolve(mainClass).resolve("link")
+    val linkDir = Paths.get(".sn-cli-build").resolve(mainClass).resolve("link")
 
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir:${cc.nativelibsCp}"
@@ -1136,11 +1136,11 @@ object Scli:
 
   // ---------------------------------------------------------------------
   // CLI surface, scala-cli-shaped:
-  //   scli <sources...>                       run (default command, like
+  //   sn-cli <sources...>                       run (default command, like
   //                                            `scala-cli Foo.scala`)
-  //   scli run <sources...> [options]
-  //   scli compile <sources...> -o <out> [options]
-  //   scli version / scli --help
+  //   sn-cli run <sources...> [options]
+  //   sn-cli compile <sources...> -o <out> [options]
+  //   sn-cli version / sn-cli --help
   // options: --main-class X | --dep coord | -S/--scala ver |
   //          -O/--scalac-option opt | -w/--watch | -o/--output path |
   //          -v/--verbose | -q/--quiet | -- <program args...>
@@ -1153,22 +1153,22 @@ object Scli:
   )
 
   def printVersion(): Unit =
-    println(s"scli (scala-native-compiler) -- Scala ${BuildInfo.scalaVersion}, scala-native ${BuildInfo.nativeBinaryVersion}.x")
+    println(s"sn-cli (scala-native-compiler) -- Scala ${BuildInfo.scalaVersion}, scala-native ${BuildInfo.nativeBinaryVersion}.x")
 
   def printUsage(out: java.io.PrintStream): Unit =
     out.print(
-      s"""scli: a mini scala-cli, self-hosted on scala-native-compiler (no JVM anywhere)
+      s"""sn-cli: a mini scala-cli, self-hosted on scala-native-compiler (no JVM anywhere)
          |
          |usage:
-         |  scli <sources...>                   run (default command)
-         |  scli run <sources...> [options]     compile and run
-         |  scli compile <sources...> [options] -o <out>   compile to a native binary
+         |  sn-cli <sources...>                   run (default command)
+         |  sn-cli run <sources...> [options]     compile and run
+         |  sn-cli compile <sources...> [options] -o <out>   compile to a native binary
          |                                     (alias: package -- unlike real scala-cli,
          |                                     there's no separate typecheck-only mode)
-         |  scli test <sources...> [options] [-- <framework args>]   compile and run tests
-         |  scli setup-ide <sources...> [options]   write .dotty-ide.json for editor LSP support
-         |  scli version                        print version info
-         |  scli --help                         this message
+         |  sn-cli test <sources...> [options] [-- <framework args>]   compile and run tests
+         |  sn-cli setup-ide <sources...> [options]   write .dotty-ide.json for editor LSP support
+         |  sn-cli version                        print version info
+         |  sn-cli --help                         this message
          |
          |a source argument may be a directory: every .scala file under it is
          |included (skipping hidden and build-output directories). files under
@@ -1194,7 +1194,7 @@ object Scli:
          |  --test-framework <class>   explicit test framework class (skips auto-detection; test only)
          |  --no-incremental           always fully recompile (skip the incremental-compile cache)
          |  -- <args...>               program args (run) or test-framework filter args (test),
-         |                             e.g. `scli test . -- "*MySuite*"` (munit/utest-style filter)
+         |                             e.g. `sn-cli test . -- "*MySuite*"` (munit/utest-style filter)
          |
          |directives (in source files), one per line:
          |  //> using dep "org::name:version"
@@ -1279,11 +1279,11 @@ object Scli:
     directives.scalaVersion.orElse(o.cliScala).foreach { v =>
       if !BuildInfo.scalaVersion.startsWith(v) then
         System.err.println(
-          s"scli: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
+          s"sn-cli: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
         )
     }
     val allDeps = (directives.deps ++ o.cliDeps).distinct
-    val depsCache = Paths.get(".scli-build").resolve("deps-cache")
+    val depsCache = Paths.get(".sn-cli-build").resolve("deps-cache")
     val extraClasspath = resolveDeps(allDeps, depsCache)
     val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
@@ -1291,13 +1291,13 @@ object Scli:
 
     mode match
       case "run" =>
-        def binPathFor(mc: String): Path = Paths.get(".scli-build").resolve(mc).resolve("bin")
+        def binPathFor(mc: String): Path = Paths.get(".sn-cli-build").resolve(mc).resolve("bin")
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
         runInherited(binPathFor(mainClass).toString :: o.progArgs)
       case "compile" =>
-        val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `scli compile`")))
+        val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `sn-cli compile`")))
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, _ => outPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
-        if !o.quiet then println(s"scli: wrote $outPath (main class: $mainClass)")
+        if !o.quiet then println(s"sn-cli: wrote $outPath (main class: $mainClass)")
         0
 
   /** Polls source mtimes every 500ms and reruns `attempt` on change --
@@ -1308,14 +1308,14 @@ object Scli:
     def mtimes(): Map[Path, Long] =
       sources.filter(Files.exists(_)).map(p => p -> Files.getLastModifiedTime(p).toMillis).toMap
     attempt()
-    System.err.println("scli: watching for changes (Ctrl+C to stop)...")
+    System.err.println("sn-cli: watching for changes (Ctrl+C to stop)...")
     var last = mtimes()
     while true do
       Thread.sleep(500)
       val cur = mtimes()
       if cur != last then
         last = cur
-        System.err.println("scli: change detected, rebuilding...")
+        System.err.println("sn-cli: change detected, rebuilding...")
         attempt()
 
   def handleRunOrCompile(mode: String, args: Array[String]): Unit =
@@ -1326,19 +1326,19 @@ object Scli:
     if allExpanded.isEmpty then die("no .scala files found")
     val (expanded, testSources) = partitionSources(allExpanded)
     if testSources.nonEmpty then
-      System.err.println(s"scli: excluding ${testSources.length} test source(s) under test/ from `$mode` (test scope isn't run yet)")
+      System.err.println(s"sn-cli: excluding ${testSources.length} test source(s) under test/ from `$mode` (test scope isn't run yet)")
     if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
 
     if o.watch then
       watchLoop(expanded) { () =>
         try buildAndMaybeRun(mode, expanded, o)
-        catch case BuildFailed(msg) => System.err.println(s"scli: $msg")
+        catch case BuildFailed(msg) => System.err.println(s"sn-cli: $msg")
       }
     else
       try sys.exit(buildAndMaybeRun(mode, expanded, o))
       catch case BuildFailed(msg) => die(msg)
 
-  /** `scli test` -- see the design note above `readAllBytes`/`ClassInfo` for
+  /** `sn-cli test` -- see the design note above `readAllBytes`/`ClassInfo` for
    *  the overall approach (structural framework discovery, a probe binary
    *  for real fingerprint data, structural test discovery, generated
    *  driver). Unlike `run`/`compile`, compiles main *and* test scope
@@ -1356,10 +1356,10 @@ object Scli:
       directives.scalaVersion.orElse(o.cliScala).foreach { v =>
         if !BuildInfo.scalaVersion.startsWith(v) then
           System.err.println(
-            s"scli: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
+            s"sn-cli: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
           )
       }
-      val depsCache = Paths.get(".scli-build").resolve("deps-cache")
+      val depsCache = Paths.get(".sn-cli-build").resolve("deps-cache")
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache)
       val testOnlyClasspath = resolveDeps(directives.testDeps, depsCache)
       val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
@@ -1370,7 +1370,7 @@ object Scli:
       // Pass 1: compile the user's own sources only, to scan the result for
       // test discovery before the driver (which references those classes
       // by name) is even generated.
-      val classesDir = Paths.get(".scli-build", "_scratch", "test-classes")
+      val classesDir = Paths.get(".sn-cli-build", "_scratch", "test-classes")
       compileToClasses(expanded, classesDir, cc, options, !o.noIncremental)
 
       val testJars = testClasspath.split(":").filter(_.nonEmpty).toList
@@ -1378,7 +1378,7 @@ object Scli:
       val frameworkFqcns = explicitFramework match
         case Some(fqcn) => List(fqcn)
         case None =>
-          val cacheDir = Paths.get(".scli-build").resolve("test-framework-cache")
+          val cacheDir = Paths.get(".sn-cli-build").resolve("test-framework-cache")
           Files.createDirectories(cacheDir)
           val key = hashKey(testClasspath)
           val cacheFile = cacheDir.resolve(s"fw-$key.txt")
@@ -1391,7 +1391,7 @@ object Scli:
         fail("no test framework found on the classpath -- add a `//> using test.dep \"org::name:version\"` for " +
           "a framework with a scala-native port (e.g. munit, utest, scalatest, zio-test-sbt), or pass --test-framework <class>")
 
-      val probeCacheDir = Paths.get(".scli-build").resolve("test-probe-cache")
+      val probeCacheDir = Paths.get(".sn-cli-build").resolve("test-probe-cache")
       val specs = probeFingerprints(frameworkFqcns, testClasspath, cc, classesDir, probeCacheDir, o.logLevel)
       if specs.isEmpty then
         fail(s"${frameworkFqcns.mkString(", ")}: no SubclassFingerprint reported -- annotation-based " +
@@ -1399,20 +1399,20 @@ object Scli:
 
       val matches = discoverTestClasses(classesDir, specs, testJars)
       if matches.isEmpty then
-        if !o.quiet then println("scli: no tests found")
+        if !o.quiet then println("sn-cli: no tests found")
         0
       else
-        if !o.quiet then println(s"scli: found ${matches.length} test class(es): ${matches.map(_.className).sorted.mkString(", ")}")
-        val driverSrc = Paths.get(".scli-build", "_scratch", "ScliTestMain.scala")
+        if !o.quiet then println(s"sn-cli: found ${matches.length} test class(es): ${matches.map(_.className).sorted.mkString(", ")}")
+        val driverSrc = Paths.get(".sn-cli-build", "_scratch", "SnCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
-        val binPath = Paths.get(".scli-build", "ScliTestMain", "bin")
-        buildBinary(expanded :+ driverSrc, Some("ScliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
+        val binPath = Paths.get(".sn-cli-build", "SnCliTestMain", "bin")
+        buildBinary(expanded :+ driverSrc, Some("SnCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
         runInherited(binPath.toString :: o.progArgs)
 
     if o.watch then
       watchLoop(expanded) { () =>
         try attempt()
-        catch case BuildFailed(msg) => System.err.println(s"scli: $msg")
+        catch case BuildFailed(msg) => System.err.println(s"sn-cli: $msg")
       }
     else
       try sys.exit(attempt())
@@ -1425,7 +1425,7 @@ object Scli:
   def jsonStr(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
   def jsonArr(xs: List[String]): String = xs.map(jsonStr).mkString("[", ", ", "]")
 
-  /** `scli setup-ide` -- same command name as scala-cli's own `setup-ide`,
+  /** `sn-cli setup-ide` -- same command name as scala-cli's own `setup-ide`,
    *  but writes `.dotty-ide.json` (dotty's pre-Metals IDE config format --
    *  `ProjectConfig.java`, read by dist/dotty-lsp-native on `initialize`,
    *  see DottyLanguageServer.IDE_CONFIG_FILE) instead of scala-cli's BSP
@@ -1441,12 +1441,12 @@ object Scli:
     if allExpanded.isEmpty then die("no .scala files found")
     val (expanded, testSources) = partitionSources(allExpanded)
     if testSources.nonEmpty then
-      System.err.println(s"scli: excluding ${testSources.length} test source(s) under test/ from IDE config (test scope isn't run yet)")
+      System.err.println(s"sn-cli: excluding ${testSources.length} test source(s) under test/ from IDE config (test scope isn't run yet)")
     if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
 
     val directives = parseDirectives(expanded)
     val allDeps = (directives.deps ++ o.cliDeps).distinct
-    val depsCache = Paths.get(".scli-build").resolve("deps-cache")
+    val depsCache = Paths.get(".sn-cli-build").resolve("deps-cache")
     val extraClasspath = resolveDeps(allDeps, depsCache)
     val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
     val options = directives.options ++ o.cliOptions
@@ -1464,7 +1464,7 @@ object Scli:
 
     val sourceDirectories = expanded.map(_.toAbsolutePath.getParent.toString).distinct.sorted
     val dependencyClasspath = cc.compileCp.split(":").filter(_.nonEmpty).toList
-    val classDirectory = Paths.get(".scli-build", ".dotty-ide-classes").toAbsolutePath
+    val classDirectory = Paths.get(".sn-cli-build", ".dotty-ide-classes").toAbsolutePath
     Files.createDirectories(classDirectory)
     val projectId = Option(Paths.get(".").toAbsolutePath.normalize.getFileName).map(_.toString).getOrElse("root")
 
@@ -1484,11 +1484,11 @@ object Scli:
 
     val configPath = Paths.get(".dotty-ide.json")
     Files.write(configPath, json.getBytes("UTF-8"))
-    println(s"scli: wrote ${configPath.toAbsolutePath} -- point dist/dotty-lsp-native (or an editor's LSP binary override) at this project")
+    println(s"sn-cli: wrote ${configPath.toAbsolutePath} -- point dist/dotty-lsp-native (or an editor's LSP binary override) at this project")
 
     // Also pin Zed's dotty-lsp-native binary path (zed-extension/README.md
     // step 4, "optional" there) so opening the project in Zed works without
-    // dist/ on PATH -- `dist` is resolved from scli's own binary location
+    // dist/ on PATH -- `dist` is resolved from sn-cli's own binary location
     // (see val dist above), so this is correct however the toolchain was
     // installed. Only written if .zed/settings.json doesn't exist yet: a
     // real settings file may hold unrelated keys this hand-rolled JSON
@@ -1510,9 +1510,9 @@ object Scli:
            |}
            |""".stripMargin
       Files.write(zedSettingsPath, zedJson.getBytes("UTF-8"))
-      println(s"scli: wrote ${zedSettingsPath.toAbsolutePath} -- pins Zed's dotty-lsp-native binary to $lspBinaryPath")
+      println(s"sn-cli: wrote ${zedSettingsPath.toAbsolutePath} -- pins Zed's dotty-lsp-native binary to $lspBinaryPath")
     else
-      println(s"scli: ${zedSettingsPath.toAbsolutePath} already exists -- leaving it alone; add this to pin the LSP binary if needed:")
+      println(s"sn-cli: ${zedSettingsPath.toAbsolutePath} already exists -- leaving it alone; add this to pin the LSP binary if needed:")
       println(s"""  "lsp": { "dotty-lsp-native": { "binary": { "path": ${jsonStr(lspBinaryPath)} } } }""")
 
   def main(args: Array[String]): Unit =
@@ -1530,6 +1530,6 @@ object Scli:
       case cmd if unsupportedCommands(cmd) =>
         die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, test, setup-ide, version")
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
-        handleRunOrCompile("run", args) // implicit `run`, e.g. `scli Foo.scala`
+        handleRunOrCompile("run", args) // implicit `run`, e.g. `sn-cli Foo.scala`
       case other =>
-        die(s"unknown command or file '$other' -- run 'scli --help'")
+        die(s"unknown command or file '$other' -- run 'sn-cli --help'")

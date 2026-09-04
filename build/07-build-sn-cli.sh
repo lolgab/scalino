@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds scli: the mini scala-cli-style build tool, self-hosted -- compiled
+# Builds sn-cli: the mini scala-cli-style build tool, self-hosted -- compiled
 # by the very toolchain it wraps (dist/dotc-native + dist/linkdriver-native),
-# not by any JVM. See cli/Scli.scala and docs/findings.md "Toward a
+# not by any JVM. See cli/SnCli.scala and docs/findings.md "Toward a
 # build-tool experience without a JVM".
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -12,7 +12,7 @@ for f in "$DIST/dotc-native" "$DIST/linkdriver-native" "$DIST/java.base.jar" \
   [[ -e "$f" ]] || { echo "missing $f -- run build/all.sh first" >&2; exit 1; }
 done
 
-SRC_DIR="$WORK/scli-src"
+SRC_DIR="$WORK/sn-cli-src"
 rm -rf "$SRC_DIR"
 mkdir -p "$SRC_DIR"
 
@@ -26,17 +26,17 @@ object BuildInfo:
   val nativeBinaryVersion: String = "$NATIVE_BINARY_VERSION"
 EOF
 
-# scli locates its own dist/ root via a tiny OS-specific native binding
+# sn-cli locates its own dist/ root via a tiny OS-specific native binding
 # (cli/selfexe/*.scala) -- pick the one matching the host we're building on.
 case "$(uname -s)" in
   Linux) SELFEXE="$ROOT/cli/selfexe/Linux.scala" ;;
   Darwin) SELFEXE="$ROOT/cli/selfexe/Macos.scala" ;;
   MINGW*|MSYS*|CYGWIN*) SELFEXE="$ROOT/cli/selfexe/Windows.scala" ;;
-  *) echo "07-build-scli.sh: unsupported host OS $(uname -s)" >&2; exit 1 ;;
+  *) echo "07-build-sn-cli.sh: unsupported host OS $(uname -s)" >&2; exit 1 ;;
 esac
 
-CLASSES_DIR="$WORK/scli-classes"
-LINK_DIR="$WORK/scli-link"
+CLASSES_DIR="$WORK/sn-cli-classes"
+LINK_DIR="$WORK/sn-cli-link"
 rm -rf "$CLASSES_DIR" "$LINK_DIR"
 mkdir -p "$CLASSES_DIR"
 
@@ -53,11 +53,11 @@ COMPILE_CP="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIS
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
   -Yretain-trees \
   -d "$CLASSES_DIR" \
-  "$ROOT/cli/Scli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
+  "$ROOT/cli/SnCli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
 LINK_CP="$CLASSES_DIR:$(resolve_cp "$(cat "$DIST/nativelibs.cp")")"
-"$DIST/linkdriver-native" "$LINK_CP" "$LINK_DIR" Scli "$CLANG" "$CLANGPP"
+"$DIST/linkdriver-native" "$LINK_CP" "$LINK_DIR" SnCli "$CLANG" "$CLANGPP"
 
-cp "$LINK_DIR/Scli" "$DIST/scli"
-chmod +x "$DIST/scli"
-echo "OK: $DIST/scli"
+cp "$LINK_DIR/SnCli" "$DIST/sn-cli"
+chmod +x "$DIST/sn-cli"
+echo "OK: $DIST/sn-cli"

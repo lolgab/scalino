@@ -57,11 +57,11 @@ echo "== tracing dotty-lsp-native (real editor-shaped LSP session) =="
 # language server (LSP)" for the bug this step exists to prevent regressing.
 [[ -f "$WORK/lsp.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 [[ -d "$WORK/lsp-classes" && -d "$WORK/lsp-java-classes" ]] || { echo "run 08-build-lsp-native.sh first (needs its compiled classes)" >&2; exit 1; }
-[[ -x "$DIST/scli" ]] || { echo "run 07-build-scli.sh first (needed to generate the fixture's .dotty-ide.json)" >&2; exit 1; }
+[[ -x "$DIST/sn-cli" ]] || { echo "run 07-build-sn-cli.sh first (needed to generate the fixture's .dotty-ide.json)" >&2; exit 1; }
 LSP_CP="$(cat "$WORK/lsp.cp")"
 LSP_COMPILE_CP="$(cat "$WORK/compiler-patched.cp")"
 LSP_FIXTURE="$ROOT/build/lsp-trace-fixture"
-( cd "$LSP_FIXTURE" && rm -f .dotty-ide.json && "$DIST/scli" setup-ide Model.scala Greeter.scala Main.scala >/dev/null )
+( cd "$LSP_FIXTURE" && rm -f .dotty-ide.json && "$DIST/sn-cli" setup-ide Model.scala Greeter.scala Main.scala >/dev/null )
 rm -rf "$ROOT/agent-config/lsp" "$WORK/lsp-agent-out"
 mkdir -p "$WORK/lsp-agent-out"
 python3 "$ROOT/build/lsp-trace-drive.py" "$LSP_FIXTURE" \
@@ -70,6 +70,6 @@ python3 "$ROOT/build/lsp-trace-drive.py" "$LSP_FIXTURE" \
   dotty.tools.languageserver.Main -stdio
 mkdir -p "$ROOT/agent-config/lsp"
 cp "$WORK/lsp-agent-out/reachability-metadata.json" "$ROOT/agent-config/lsp/"
-rm -rf "$LSP_FIXTURE/.dotty-ide.json" "$LSP_FIXTURE/.scli-build"
+rm -rf "$LSP_FIXTURE/.dotty-ide.json" "$LSP_FIXTURE/.sn-cli-build"
 
 echo "OK: agent-config refreshed, review with git diff before committing"

@@ -8,7 +8,7 @@ ever needed once, transiently, at *this project's own* build time, to run
 GraalVM's native-image; nothing it produces touches a JVM again. People
 should be able to write, build, and run Scala without installing Java.
 
-Today this covers the compiler + linker + build tool (`scli`). Next up: a
+Today this covers the compiler + linker + build tool (`sn-cli`). Next up: a
 JVM-free language server (LSP), so editors like Zed can get Scala IntelliSense
 without Metals' JVM dependency -- see [Status](#status).
 
@@ -19,11 +19,11 @@ curl -fsSL https://raw.githubusercontent.com/lolgab/snc/main/install.sh | bash
 ```
 
 Downloads the latest [release](https://github.com/lolgab/snc/releases) for
-your OS/arch, verifies its checksum, and installs `scli` to `~/.local/bin`
+your OS/arch, verifies its checksum, and installs `sn-cli` to `~/.local/bin`
 (override with `$SNC_INSTALL_DIR`/`$SNC_BIN_DIR`/`$SNC_VERSION`). Or do it by
 hand: each release ships a self-contained `dist/` tarball (compiler + linker
-+ `scli`, no JVM needed to run any of it) for Linux, macOS, and Windows, on
-both x86_64 and arm64 -- download it, extract it, and use `scli`/`dist/scli`
++ `sn-cli`, no JVM needed to run any of it) for Linux, macOS, and Windows, on
+both x86_64 and arm64 -- download it, extract it, and use `sn-cli`/`dist/sn-cli`
 as described below. Windows support is experimental/best-effort -- see
 [`docs/findings.md`](docs/findings.md).
 
@@ -37,7 +37,7 @@ prerequisites a fresh machine may not have):
   the system package manager elsewhere (`apt install clang`, etc).
 - **`cs`** ([coursier](https://get-coursier.io/)'s own launcher, itself a
   prebuilt native binary, not a JVM) -- only needed if you use
-  `//> using dep`/`--dep` or `scli setup-ide` on a project with dependencies.
+  `//> using dep`/`--dep` or `sn-cli setup-ide` on a project with dependencies.
 
 ## Build from source
 
@@ -52,21 +52,21 @@ This clones `scala/scala3` and `scala-native/scala-native` into `vendor/`
 (pinned versions, see `versions.env`), applies our patches from `patches/`,
 and produces `dist/dotc-native` (standalone compiler + scala-native plugin,
 our patched macro interpreter baked in), `dist/linkdriver-native` (standalone
-NIR→native linker), and `dist/scli` (see below) -- plus the classpath
-manifests `bin/snc`/`scli` need.
+NIR→native linker), and `dist/sn-cli` (see below) -- plus the classpath
+manifests `bin/snc`/`sn-cli` need.
 
 ## Use
 
-The easy way — `scli`, a mini scala-cli, self-hosted (see `cli/Scli.scala`),
+The easy way — `sn-cli`, a mini scala-cli, self-hosted (see `cli/SnCli.scala`),
 itself compiled by this toolchain, not by a JVM. Its CLI is deliberately
 shaped like [scala-cli](https://scala-cli.virtuslab.org/)'s:
 
 ```
-./dist/scli examples/Hello.scala                                                # `run` is the default command
-./dist/scli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala  # a real macro
-./dist/scli run examples/ --main-class Hello                                    # a directory: every .scala file under it
-./dist/scli run examples/Hello.scala -w                                         # watch mode: rebuild+rerun on change
-./dist/scli compile examples/Hello.scala -o hello && ./hello
+./dist/sn-cli examples/Hello.scala                                                # `run` is the default command
+./dist/sn-cli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala  # a real macro
+./dist/sn-cli run examples/ --main-class Hello                                    # a directory: every .scala file under it
+./dist/sn-cli run examples/Hello.scala -w                                         # watch mode: rebuild+rerun on change
+./dist/sn-cli compile examples/Hello.scala -o hello && ./hello
 ```
 
 It auto-detects the entry point (`@main`, `extends App`, or `def main`), so
@@ -79,10 +79,10 @@ compiler flags). The same things are available as flags: `--dep` (no `-d`
 short form -- real scala-cli's `-d` means `--output`, not `--dependency`),
 `-S/--scala`, `-O/--scalac-option`, `--main-class`, `-w/--watch`,
 `-o/--output`, and `-- <args...>` for the program's own arguments. Run
-`scli --help` for the full list. Dependency resolution shells out to `cs`
+`sn-cli --help` for the full list. Dependency resolution shells out to `cs`
 (coursier's own launcher is itself a prebuilt GraalVM native-image binary,
 so this costs no JVM either), and both the resolved classpath and the
-compiled/linked output are cached in `.scli-build/`. Only libraries actually
+compiled/linked output are cached in `.sn-cli-build/`. Only libraries actually
 cross-published for scala-native will *link* successfully (JVM-only jars
 resolve and typecheck fine, but have no native code to call into) — see
 `docs/findings.md`.
@@ -93,15 +93,15 @@ switching, no JVM/Scala.js platforms), and doesn't implement scala-cli's
 `test`/`fmt`/`repl`/`package`/`publish`/`bsp`/`export` commands — running
 any of those prints a clear "not implemented" instead of guessing.
 
-The lower-level way — `bin/snc`, a plain bash wrapper (what `scli` itself
-was bootstrapped from, and what `scli`'s own build script still uses):
+The lower-level way — `bin/snc`, a plain bash wrapper (what `sn-cli` itself
+was bootstrapped from, and what `sn-cli`'s own build script still uses):
 
 ```
 ./bin/snc build examples/Hello.scala -o hello
 ./hello
 ```
 
-Neither `dotc-native`, `linkdriver-native`, `scli`, nor `snc` invoke a JVM.
+Neither `dotc-native`, `linkdriver-native`, `sn-cli`, nor `snc` invoke a JVM.
 
 ## Status
 
@@ -123,7 +123,7 @@ patching dotty's own pre-Metals `language-server/` module (see
 `docs/findings.md` "JVM-free language server (LSP)" for the three real bugs
 found and fixed along the way). Verified against a real native binary:
 correct diagnostics and real Scaladoc-sourced hover for a hand-written
-project config. `dist/scli setup-ide <sources...>` generates that project
+project config. `dist/sn-cli setup-ide <sources...>` generates that project
 config (`.dotty-ide.json`) instead of hand-writing it, and
 [`zed-extension/`](zed-extension/) wires the server into Zed as a real
 extension (`README.md` there for install steps) — untested end-to-end
