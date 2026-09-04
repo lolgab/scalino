@@ -109,7 +109,8 @@ object Scli:
     testDeps: List[String],
     scalaVersion: Option[String],
     mainClass: Option[String],
-    options: List[String]
+    options: List[String],
+    testFramework: Option[String]
   )
 
   private val quotedRe = """"([^"]*)"""".r
@@ -121,7 +122,7 @@ object Scli:
    *  flagged instead of silently doing nothing. */
   private val recognizedDirectiveKeys = Set(
     "dep", "deps", "compileOnly.dep", "compileOnly.deps", "test.dep", "test.deps",
-    "scala", "mainClass", "options", "option"
+    "scala", "mainClass", "options", "option", "testFramework", "test.framework"
   )
   private val anyDirectiveKeyRe = """//>\s*using\s+(\S+)""".r
 
@@ -149,6 +150,7 @@ object Scli:
     var scalaVersion = Option.empty[String]
     var mainClass = Option.empty[String]
     var options = List.empty[String]
+    var testFramework = Option.empty[String]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must be a comment-only line, `//>` as its first
     // non-blank characters -- NOT just "contains `//>` anywhere". An
@@ -171,7 +173,8 @@ object Scli:
         directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
         directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
         directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
-    Directives(deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options)
+        directiveValues(line, "testFramework", "test.framework").foreach(_.headOption.foreach(v => testFramework = Some(v)))
+    Directives(deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework)
 
   /** scala-cli's three dependency formats:
    *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
@@ -195,6 +198,19 @@ object Scli:
 
   def sanitizeKey(s: String): String =
     s.map(c => if c.isLetterOrDigit then c else '_')
+
+  /** FNV-1a 64-bit, hex-encoded -- for cache keys derived from a *resolved
+   *  classpath* (many absolute paths) rather than a short dep-coordinate
+   *  list: `sanitizeKey` only substitutes characters 1:1, so a classpath's
+   *  worth of them still blows past the filesystem's filename-length limit
+   *  ("File name too long") -- this collapses it to a fixed-size digest
+   *  instead. */
+  def hashKey(s: String): String =
+    var hash = 0xcbf29ce484222325L
+    val prime = 0x100000001b3L
+    for b <- s.getBytes("UTF-8") do
+      hash = (hash ^ (b & 0xffL)) * prime
+    java.lang.Long.toHexString(hash)
 
   /** A `::name::version` (scala-native cross) dependency's own published
    *  build pulls its OWN version of scala-native's runtime jars transitively
@@ -363,6 +379,385 @@ object Scli:
     }
 
   // ---------------------------------------------------------------------
+  // `scli test`: bridging sbt's test-interface (`sbt.testing.Framework` et
+  // al -- the same API munit/utest/scalatest/zio-test's *native* ports all
+  // implement, since it's the one interface every scala-native test
+  // framework port targets) into a JVM-free build, with no reflection and
+  // no sbt/ComRunner on either end.
+  //
+  // Real (JVM) sbt-scala-native drives this from the sbt/JVM side: it loads
+  // the framework's classfile on a JVM classloader just to call
+  // `.fingerprints()` (cheap metadata, not real test execution), and
+  // generates a `TestMain` that talks back to that JVM process over a
+  // socket for every actual test run. None of that is available here --
+  // there's no JVM anywhere in this toolchain's chain, at build time or
+  // runtime. Instead:
+  //
+  //   1. Framework discovery: scan every class in the resolved test
+  //      classpath's jars (not just a hardcoded list of known frameworks --
+  //      structurally, via the same classfile-ancestry walk used for test
+  //      discovery below) for a concrete, public, no-arg-constructible class
+  //      that implements `sbt.testing.Framework`. This is exactly the same
+  //      check sbt itself does, just done by us via a hand-rolled classfile
+  //      reader instead of a JVM classloader.
+  //   2. Fingerprint probing: `Framework#fingerprints()` returns real
+  //      `Fingerprint` values (which marker superclass/annotation identifies
+  //      a test class, whether it's a Scala object or a plain class) that
+  //      are *computed at runtime* by that framework's own code -- there's
+  //      no way to know them without actually running it, and we have no
+  //      bytecode interpreter to run arbitrary 3rd-party code at build time.
+  //      So: compile+link a throwaway "probe" binary (via the exact same
+  //      dotc-native/linkdriver-native pipeline as any other build) whose
+  //      only job is to instantiate the discovered framework(s) and print
+  //      their fingerprints, run it, and parse its output. Cached (like
+  //      dependency resolution) keyed by the framework classes + classpath,
+  //      so this only costs a real compile+link once per project.
+  //   3. Test discovery: with real fingerprint data in hand, scan the
+  //      user's *compiled* test sources (classesDir) the same way -- does
+  //      this class's ancestry (superclass chain + interfaces, walked
+  //      transitively across both classesDir and the classpath jars)
+  //      include the fingerprint's marker superclass, and does it look like
+  //      a Scala object or a plain class to match `isModule`.
+  //   4. Driver codegen: generate a small `ScliTestMain.scala` that
+  //      literally instantiates the framework(s) by name (`new
+  //      munit.Framework()` -- direct, static, no reflection) and builds
+  //      `TaskDef`s from the discovered class names, then compiles it in
+  //      alongside the user's sources for a normal final compile+link. The
+  //      actual test-object instantiation inside a discovered `Task` is the
+  //      framework's own problem at that point (its native port relies on
+  //      scala-native's own `@EnableReflectiveInstantiation` support, not
+  //      the (dummy, unimplemented on scala-native) `ClassLoader` passed to
+  //      `Framework#runner` -- that's supplied only because the API
+  //      requires *some* `ClassLoader` value, never actually invoked).
+  //
+  // Known gaps vs real scala-cli: only `SubclassFingerprint`-based
+  // frameworks are supported (covers munit/utest/scalatest/zio-test-sbt --
+  // every framework this was verified against); `AnnotatedFingerprint`
+  // (JUnit4-style `@Test`-per-method discovery) is not, since JUnit's own
+  // sbt-scala-native support is a separate compiler-plugin-level mechanism,
+  // not a plain Framework probe. No per-test-method selector filtering --
+  // only whole test classes are ever selected (`SuiteSelector`); `--`
+  // arguments are forwarded to the framework's own `Runner` untouched
+  // (munit/utest both accept a `"*NameSubstring*"`-style filter there,
+  // matching real scala-cli's own `-- <pattern>` convention).
+  // ---------------------------------------------------------------------
+
+  def readAllBytes(in: InputStream): Array[Byte] =
+    val buf = new ByteArrayOutputStream()
+    val tmp = new Array[Byte](8192)
+    var n = in.read(tmp)
+    while n != -1 do
+      buf.write(tmp, 0, n)
+      n = in.read(tmp)
+    buf.toByteArray
+
+  /** A superset of what `scanClassFile` extracts -- also the superclass/
+   *  interface names (for ancestry walks) and enough field/method info to
+   *  tell a Scala object from a plain class and detect a public no-arg
+   *  constructor. Kept separate from `scanClassFile` (some parsing logic is
+   *  duplicated) rather than refactoring that already-relied-upon function,
+   *  to keep this purely additive. */
+  case class ClassInfo(
+    thisClass: String,
+    superClass: Option[String],
+    interfaces: List[String],
+    accessFlags: Int,
+    isModule: Boolean,
+    hasPublicNoArgCtor: Boolean
+  )
+
+  def analyzeClassFile(bytes: Array[Byte]): Option[ClassInfo] =
+    try
+      val r = ClassReader(bytes)
+      if r.u4() != classMagic then return None
+      r.skip(4)
+      val cpCount = r.u2()
+      val utf8 = new Array[String](cpCount)
+      val classNameIdx = new Array[Int](cpCount)
+      var i = 1
+      while i < cpCount do
+        val tag = r.u1()
+        tag match
+          case 1 =>
+            val len = r.u2()
+            utf8(i) = new String(r.bytesOf(len), "UTF-8")
+          case 7 => classNameIdx(i) = r.u2()
+          case 8 | 16 | 19 | 20 => r.skip(2)
+          case 15 => r.skip(3)
+          case 3 | 4 => r.skip(4)
+          case 5 | 6 => r.skip(8); i += 1
+          case 9 | 10 | 11 | 12 | 17 | 18 => r.skip(4)
+          case _ => return None
+        i += 1
+      val accessFlags = r.u2()
+      val thisClassIdx = r.u2()
+      val superClassIdx = r.u2()
+      val ifaceCount = r.u2()
+      val ifaceIdxs = (0 until ifaceCount).map(_ => r.u2()).toList
+      def className(classCpIdx: Int): String = utf8(classNameIdx(classCpIdx)).replace('/', '.')
+      val thisClass = className(thisClassIdx)
+      val superClass = if superClassIdx == 0 then None else Some(className(superClassIdx))
+      val interfaces = ifaceIdxs.map(className)
+
+      val fieldCount = r.u2()
+      var isModule = false
+      for _ <- 0 until fieldCount do
+        val fAccess = r.u2()
+        val fNameIdx = r.u2()
+        val fDescIdx = r.u2()
+        val attrCount = r.u2()
+        for _ <- 0 until attrCount do
+          r.skip(2)
+          val len = r.u4()
+          r.skip(len.toInt)
+        val isStatic = (fAccess & 0x0008) != 0
+        if isStatic && utf8(fNameIdx) == "MODULE$" then isModule = true
+
+      val methodCount = r.u2()
+      var hasPublicNoArgCtor = false
+      for _ <- 0 until methodCount do
+        val mAccess = r.u2()
+        val mNameIdx = r.u2()
+        val mDescIdx = r.u2()
+        val attrCount = r.u2()
+        for _ <- 0 until attrCount do
+          r.skip(2)
+          val len = r.u4()
+          r.skip(len.toInt)
+        val isPublic = (mAccess & 0x0001) != 0
+        if isPublic && utf8(mNameIdx) == "<init>" && utf8(mDescIdx) == "()V" then hasPublicNoArgCtor = true
+
+      Some(ClassInfo(thisClass, superClass, interfaces, accessFlags, isModule, hasPublicNoArgCtor))
+    catch case _: Exception => None
+
+  /** Every `.class` file under `dir`, recursively. Shared by main-class
+   *  detection and test discovery. */
+  def walkClassFiles(dir: Path): List[Path] =
+    val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
+    entries.flatMap(f => if f.isDirectory then walkClassFiles(f.toPath) else if f.getName.endsWith(".class") then List(f.toPath) else Nil)
+
+  def readClassFromJar(jarPath: String, internalDottedName: String): Option[Array[Byte]] =
+    try
+      val zf = new java.util.zip.ZipFile(jarPath)
+      try
+        Option(zf.getEntry(internalDottedName.replace('.', '/') + ".class")).map(e => readAllBytes(zf.getInputStream(e)))
+      finally zf.close()
+    catch case _: Exception => None
+
+  /** Resolves a (dotted) class name to its bytes, checking the local
+   *  compiled-output directory first, then every jar on the classpath in
+   *  order -- used by `isAssignable`'s ancestry walk, which needs to follow
+   *  a chain that starts in user code and typically ends inside a
+   *  dependency jar (e.g. `MySuite extends munit.FunSuite extends
+   *  munit.Suite`). */
+  def findClassBytes(name: String, classesDir: Path, jars: List[String]): Option[Array[Byte]] =
+    val local = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".class")
+    if Files.exists(local) then Some(Files.readAllBytes(local))
+    else jars.iterator.flatMap(j => readClassFromJar(j, name).iterator).nextOption()
+
+  /** Does `startClass`'s ancestry (superclass chain and, at every step,
+   *  every implemented interface -- since Scala traits compile to
+   *  interfaces, and a `SubclassFingerprint`'s marker is very often a trait
+   *  like `munit.Suite`/`utest.TestSuite`) include `target`? A from-scratch,
+   *  classfile-level substitute for the JVM's `Class#isAssignableFrom`. */
+  def isAssignable(startClass: String, target: String, classesDir: Path, jars: List[String]): Boolean =
+    val visited = scala.collection.mutable.Set.empty[String]
+    def go(name: String): Boolean =
+      if name == target then true
+      else if name == "java.lang.Object" || !visited.add(name) then false
+      else
+        findClassBytes(name, classesDir, jars).flatMap(analyzeClassFile) match
+          case None => false
+          case Some(info) => info.superClass.exists(go) || info.interfaces.exists(go)
+    go(startClass)
+
+  private val sbtTestingFramework = "sbt.testing.Framework"
+
+  /** Structurally scans every class in `jars` for a concrete (public,
+   *  non-abstract), no-arg-constructible implementor of
+   *  `sbt.testing.Framework` -- no hardcoded per-framework list, so any
+   *  framework with a scala-native port that follows the standard
+   *  sbt-testing-interface contract (munit, utest, scalatest, zio-test-sbt,
+   *  and anything else shaped the same way) is found the same way. Synthetic
+   *  classes (lambdas, anonymous classes, nested `$`-named classes) are
+   *  skipped -- framework entry points are always a plain top-level class. */
+  def findFrameworkClasses(jars: List[String]): List[String] =
+    val found = scala.collection.mutable.LinkedHashSet.empty[String]
+    for jar <- jars do
+      try
+        val zf = new java.util.zip.ZipFile(jar)
+        try
+          val entries = zf.entries()
+          while entries.hasMoreElements do
+            val e = entries.nextElement()
+            if e.getName.endsWith(".class") && !e.getName.contains("$") then
+              analyzeClassFile(readAllBytes(zf.getInputStream(e))).foreach { info =>
+                val isPublic = (info.accessFlags & 0x0001) != 0
+                val isAbstract = (info.accessFlags & 0x0400) != 0
+                val isInterface = (info.accessFlags & 0x0200) != 0
+                if isPublic && !isAbstract && !isInterface && info.hasPublicNoArgCtor
+                   && info.thisClass != sbtTestingFramework
+                   && isAssignable(info.thisClass, sbtTestingFramework, Paths.get("."), jars)
+                then found += info.thisClass
+              }
+        finally zf.close()
+      catch case _: Exception => ()
+    found.toList
+
+  /** A `SubclassFingerprint` a framework reported, as probed from a real
+   *  (compiled+linked+run) instance of it -- see the probe step above. */
+  case class SubclassSpec(frameworkFqcn: String, superclassName: String, isModule: Boolean, requireNoArgConstructor: Boolean)
+
+  def probeSourceFor(frameworkFqcns: List[String]): String =
+    val entries = frameworkFqcns.map(fqcn => s"""    "$fqcn" -> new $fqcn()""").mkString(",\n")
+    s"""object ScliProbeMain:
+       |  def main(args: Array[String]): Unit =
+       |    val fws: List[(String, sbt.testing.Framework)] = List(
+       |$entries
+       |    )
+       |    for (name, fw) <- fws; fp <- fw.fingerprints() do
+       |      fp match
+       |        case s: sbt.testing.SubclassFingerprint =>
+       |          println("SUB\\t" + name + "\\t" + s.superclassName() + "\\t" + s.isModule() + "\\t" + s.requireNoArgConstructor())
+       |        case a: sbt.testing.AnnotatedFingerprint =>
+       |          println("ANN\\t" + name + "\\t" + a.annotationName() + "\\t" + a.isModule())
+       |        case _ => ()
+       |""".stripMargin
+
+  def parseProbeOutput(output: String): List[SubclassSpec] =
+    output.linesIterator.flatMap { line =>
+      line.split("\t") match
+        case Array("SUB", fqcn, superclassName, isModule, requireNoArgCtor) =>
+          List(SubclassSpec(fqcn, superclassName, isModule.toBoolean, requireNoArgCtor.toBoolean))
+        case _ => Nil // ANN (AnnotatedFingerprint) or an unrecognized line -- not supported, see note above
+    }.toList
+
+  /** Compiles+links+runs the probe binary described above and parses its
+   *  output into fingerprint specs, cached on disk keyed by the framework
+   *  classes + resolved test classpath (a real compile+link, so worth
+   *  skipping on repeat runs the same way `resolveDeps` skips re-resolving).
+   *  `userClassesDir` (pass 1's compiled output) is put on the probe's
+   *  classpath too -- not needed for a normal published-dependency
+   *  framework (those are already on `testClasspath`), but harmless, and
+   *  lets a project-local `sbt.testing.Framework` implementation (picked via
+   *  explicit `--test-framework`, since auto-detection only scans jars)
+   *  resolve as well. */
+  def probeFingerprints(frameworkFqcns: List[String], testClasspath: String, cc: CompileClasspath, userClassesDir: Path, cacheDir: Path, logLevel: String): List[SubclassSpec] =
+    Files.createDirectories(cacheDir)
+    val key = sanitizeKey(frameworkFqcns.sorted.mkString(",")) + "-" + hashKey(testClasspath)
+    val cacheFile = cacheDir.resolve(s"probe-$key.tsv")
+    if Files.exists(cacheFile) then parseProbeOutput(readFile(cacheFile))
+    else
+      val scratch = Paths.get(".scli-build", "_scratch", "probe")
+      Files.createDirectories(scratch)
+      val probeSrc = scratch.resolve("ScliProbeMain.scala")
+      Files.write(probeSrc, probeSourceFor(frameworkFqcns).getBytes("UTF-8"))
+      val probeClasses = scratch.resolve("classes")
+      val ccWithUserClasses = cc.copy(compileCp = s"$userClassesDir:${cc.compileCp}")
+      compileToClasses(List(probeSrc), probeClasses, ccWithUserClasses)
+      val linkDir = scratch.resolve("link")
+      val linkCp = s"$probeClasses:$userClassesDir:${cc.nativelibsCp}:$testClasspath"
+      val clang = findOnPath("clang")
+      val clangpp = findOnPath("clang++")
+      val linkExit = runInherited(List(s"$dist/linkdriver-native", linkCp, linkDir.toString, "ScliProbeMain", clang, clangpp, logLevel))
+      if linkExit != 0 then fail("linking the test-framework probe failed")
+      val produced = linkDir.resolve("ScliProbeMain")
+      val actual = if Files.exists(produced) then produced else linkDir.resolve("scliprobemain")
+      if !Files.exists(actual) then fail(s"expected probe binary at $actual, not found")
+      val (exit, out) = runCaptureStdout(List(actual.toString))
+      if exit != 0 then fail("test-framework probe binary failed to run")
+      Files.write(cacheFile, out.getBytes("UTF-8"))
+      parseProbeOutput(out)
+
+  case class TestMatch(className: String, isModule: Boolean, frameworkFqcn: String, superclassName: String)
+
+  /** Scans every compiled class under `classesDir` and matches it against
+   *  `specs`, the framework(s)' real fingerprints. A module's reported name
+   *  drops the compiler-generated trailing `$` (its companion object's
+   *  *module class* is what actually carries the ancestry/`MODULE$` field;
+   *  sbt-testing's own convention is that a module fingerprint's
+   *  fullyQualifiedName excludes it). */
+  def discoverTestClasses(classesDir: Path, specs: List[SubclassSpec], jars: List[String]): List[TestMatch] =
+    val found = scala.collection.mutable.LinkedHashMap.empty[String, TestMatch]
+    for f <- walkClassFiles(classesDir) do
+      analyzeClassFile(Files.readAllBytes(f)).foreach { info =>
+        val isModuleClass = info.thisClass.endsWith("$") && info.isModule
+        val reportedName = if isModuleClass then info.thisClass.stripSuffix("$") else info.thisClass
+        if !found.contains(reportedName) then
+          specs
+            .find(s => s.isModule == isModuleClass
+                       && (s.isModule || !s.requireNoArgConstructor || info.hasPublicNoArgCtor)
+                       && isAssignable(info.thisClass, s.superclassName, classesDir, jars))
+            .foreach(s => found(reportedName) = TestMatch(reportedName, isModuleClass, s.frameworkFqcn, s.superclassName))
+      }
+    found.values.toList
+
+  /** Generates `ScliTestMain.scala`: one real (statically instantiated, no
+   *  reflection) `Framework` per distinct `frameworkFqcn` among `matches`,
+   *  a `TaskDef` per discovered test class (looking its real `Fingerprint`
+   *  back up from that framework's own `fingerprints()` at run time, by the
+   *  same (superclassName, isModule) pair used to discover it), and a
+   *  synchronous drain-loop `Task.execute` runner with a plain pass/fail/
+   *  error/skipped tally -- see the design note above for why this can be
+   *  this simple (no ComRunner protocol, no JVM classloader tricks). */
+  def generateTestMain(matches: List[TestMatch]): String =
+    val byFramework = matches.groupBy(_.frameworkFqcn).toList
+    val groups = byFramework.zipWithIndex.map { case ((fqcn, ms), idx) =>
+      val taskDefs = ms.map { m =>
+        s"""      new sbt.testing.TaskDef(${'"'}${m.className}${'"'}, pick$idx(${'"'}${m.superclassName}${'"'}, ${m.isModule}), false, Array(new sbt.testing.SuiteSelector))"""
+      }.mkString(",\n")
+      s"""    val fw$idx: sbt.testing.Framework = new $fqcn()
+         |    val fps$idx = fw$idx.fingerprints()
+         |    def pick$idx(superclassName: String, isModule: Boolean): sbt.testing.Fingerprint =
+         |      fps$idx.collectFirst { case s: sbt.testing.SubclassFingerprint if s.superclassName() == superclassName && s.isModule() == isModule => s }.get
+         |    val taskDefs$idx: Array[sbt.testing.TaskDef] = Array(
+         |$taskDefs
+         |    )
+         |    val runner$idx = fw$idx.runner(args, Array.empty[String], getClass.getClassLoader)
+         |    var tasks$idx = runner$idx.tasks(taskDefs$idx)
+         |    while tasks$idx.nonEmpty do
+         |      tasks$idx = tasks$idx.flatMap(t => t.execute(handler, loggers))
+         |    val summary$idx = runner$idx.done()
+         |    if summary$idx != null && summary$idx.nonEmpty then println(summary$idx)""".stripMargin
+    }.mkString("\n\n")
+
+    s"""object ScliTestMain:
+       |  def main(args: Array[String]): Unit =
+       |    val logger = new sbt.testing.Logger:
+       |      def ansiCodesSupported(): Boolean = false
+       |      def error(msg: String): Unit = System.err.println(msg)
+       |      def warn(msg: String): Unit = System.err.println(msg)
+       |      def info(msg: String): Unit = println(msg)
+       |      def debug(msg: String): Unit = ()
+       |      def trace(t: Throwable): Unit = t.printStackTrace()
+       |    val loggers = Array[sbt.testing.Logger](logger)
+       |
+       |    var passed = 0
+       |    var failed = 0
+       |    var errored = 0
+       |    var skipped = 0
+       |    val handler = new sbt.testing.EventHandler:
+       |      def handle(e: sbt.testing.Event): Unit =
+       |        e.status() match
+       |          case sbt.testing.Status.Success => passed += 1
+       |          case sbt.testing.Status.Failure =>
+       |            failed += 1
+       |            println("FAILED: " + e.fullyQualifiedName())
+       |            if e.throwable().isDefined() then e.throwable().get().printStackTrace()
+       |          case sbt.testing.Status.Error =>
+       |            errored += 1
+       |            println("ERROR: " + e.fullyQualifiedName())
+       |            if e.throwable().isDefined() then e.throwable().get().printStackTrace()
+       |          case sbt.testing.Status.Skipped | sbt.testing.Status.Ignored | sbt.testing.Status.Pending | sbt.testing.Status.Canceled =>
+       |            skipped += 1
+       |
+       |$groups
+       |
+       |    println("scli: " + passed + " passed, " + failed + " failed, " + errored + " errored, " + skipped + " skipped")
+       |    if failed > 0 || errored > 0 then sys.exit(1)
+       |""".stripMargin
+
+  // ---------------------------------------------------------------------
   // Source expansion: a directory argument (e.g. `scli run .`) means "every
   // .scala file under here", scala-cli-style -- skipping hidden dirs and
   // this tool's own build-output dirs.
@@ -397,8 +792,8 @@ object Scli:
   // scope (test sources typically reference a test framework like munit
   // that's declared via `//> using test.dep`, not a plain `dep`, and so
   // isn't even on the main scope's classpath -- compiling them in would
-  // just fail). There's no `scli test` yet (still in unsupportedCommands)
-  // to actually execute the test scope.
+  // just fail). `scli test` (handleTest, below) compiles both scopes
+  // together instead, since test sources depend on main scope.
   // ---------------------------------------------------------------------
 
   def isTestSource(p: Path): Boolean =
@@ -481,21 +876,17 @@ object Scli:
 
     CompileClasspath(javaBase, pluginJar, compileCp, nativelibsCp)
 
-  def buildBinary(
+  /** Just the dotc-native compile step (shared by `buildBinary` and the
+   *  `scli test` pipeline, which needs to compile once to scan the resulting
+   *  classfiles for test discovery before a mainClass is known/generated). */
+  def compileToClasses(
     sources: List[Path],
-    explicitMainClass: Option[String],
-    extraClasspath: String,
-    outFor: String => Path,
-    extraOptions: List[String] = Nil,
-    extraCompileOnlyClasspath: String = "",
-    logLevel: String = "info"
-  ): String =
-    val classesDir = Paths.get(".scli-build", "_scratch", "classes")
+    classesDir: Path,
+    cc: CompileClasspath,
+    extraOptions: List[String] = Nil
+  ): Unit =
     deleteRecursively(classesDir)
     Files.createDirectories(classesDir)
-
-    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
-
     val compileCmd = List(
       s"$dist/dotc-native",
       "-javabootclasspath", cc.javaBase,
@@ -508,6 +899,19 @@ object Scli:
 
     val compileExit = runInherited(compileCmd)
     if compileExit != 0 then fail("compilation failed")
+
+  def buildBinary(
+    sources: List[Path],
+    explicitMainClass: Option[String],
+    extraClasspath: String,
+    outFor: String => Path,
+    extraOptions: List[String] = Nil,
+    extraCompileOnlyClasspath: String = "",
+    logLevel: String = "info"
+  ): String =
+    val classesDir = Paths.get(".scli-build", "_scratch", "classes")
+    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+    compileToClasses(sources, classesDir, cc, extraOptions)
 
     val mainClass = detectMainClass(classesDir, explicitMainClass)
     val linkDir = Paths.get(".scli-build").resolve(mainClass).resolve("link")
@@ -546,7 +950,7 @@ object Scli:
   // ---------------------------------------------------------------------
 
   private val unsupportedCommands = Set(
-    "test", "fmt", "repl", "publish", "publish-local", "clean",
+    "fmt", "repl", "publish", "publish-local", "clean",
     "bsp", "export", "doctor", "install-completions",
     "dependency-update", "shebang"
   )
@@ -564,6 +968,7 @@ object Scli:
          |  scli compile <sources...> [options] -o <out>   compile to a native binary
          |                                     (alias: package -- unlike real scala-cli,
          |                                     there's no separate typecheck-only mode)
+         |  scli test <sources...> [options] [-- <framework args>]   compile and run tests
          |  scli setup-ide <sources...> [options]   write .dotty-ide.json for editor LSP support
          |  scli version                        print version info
          |  scli --help                         this message
@@ -571,7 +976,8 @@ object Scli:
          |a source argument may be a directory: every .scala file under it is
          |included (skipping hidden and build-output directories). files under
          |a `test/` directory (or sbt-style `src/test/scala/`) are test scope
-         |and excluded from `run`/`compile` -- scala-cli's convention.
+         |and excluded from `run`/`compile` -- scala-cli's convention. `test`
+         |compiles both scopes together (test sources depend on main scope).
          |
          |options:
          |  --main-class <name>        explicit entry point (skips auto-detection)
@@ -583,15 +989,27 @@ object Scli:
          |  -o, --output <path>        output path (compile only)
          |  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
          |  -q, --quiet                only show warnings/errors
-         |  -- <args...>               arguments passed to the program (run only)
+         |  --test-framework <class>   explicit test framework class (skips auto-detection; test only)
+         |  -- <args...>               program args (run) or test-framework filter args (test),
+         |                             e.g. `scli test . -- "*MySuite*"` (munit/utest-style filter)
          |
          |directives (in source files), one per line:
          |  //> using dep "org::name:version"
          |  //> using compileOnly.dep "org::name:version"
-         |  //> using test.dep "org::name:version"    (test scope only; parsed, not yet run)
+         |  //> using test.dep "org::name:version"    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
+         |  //> using testFramework "fully.qualified.Framework"   (explicit override)
          |  //> using scala "3.x"
          |  //> using mainClass "Foo"
          |  //> using options "-flag1", "-flag2"
+         |
+         |`test` auto-detects the test framework structurally (scans the resolved
+         |test classpath for a class implementing sbt.testing.Framework -- no
+         |hardcoded list, so any framework with a scala-native port works, not
+         |just the ones this was verified against). Only SubclassFingerprint-based
+         |frameworks are supported (covers munit/utest/scalatest/zio-test-sbt);
+         |JUnit4-style @Test-annotated discovery is not. Whole test classes are
+         |selected (no per-test-method filtering) -- use `-- <pattern>` to filter,
+         |forwarded to the framework's own runner untouched.
          |
          |`setup-ide` writes `.dotty-ide.json` at the project root -- dotty's
          |own pre-Metals IDE config format (compilerArguments/
@@ -614,7 +1032,8 @@ object Scli:
     cliOptions: List[String] = Nil,
     progArgs: List[String] = Nil,
     verbose: Boolean = false,
-    quiet: Boolean = false
+    quiet: Boolean = false,
+    testFrameworkOpt: Option[String] = None
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (raw
     // clang/linker invocations, NativeConfig dumps), the default ("info")
@@ -639,6 +1058,7 @@ object Scli:
         case "-O" | "--scalac-option" | "--scalac-opt" => o = o.copy(cliOptions = o.cliOptions :+ args(i + 1)); i += 1
         case "-v" | "--verbose" => o = o.copy(verbose = true)
         case "-q" | "--quiet" => o = o.copy(quiet = true)
+        case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
         case f if f.startsWith("-") => die(s"unknown option: $f")
         case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
@@ -711,6 +1131,86 @@ object Scli:
       }
     else
       try sys.exit(buildAndMaybeRun(mode, expanded, o))
+      catch case BuildFailed(msg) => die(msg)
+
+  /** `scli test` -- see the design note above `readAllBytes`/`ClassInfo` for
+   *  the overall approach (structural framework discovery, a probe binary
+   *  for real fingerprint data, structural test discovery, generated
+   *  driver). Unlike `run`/`compile`, compiles main *and* test scope
+   *  together (test sources depend on main scope) in one pass, so it
+   *  doesn't call `partitionSources` at all. */
+  def handleTest(args: Array[String]): Unit =
+    val o = parseRunOpts(args)
+    if o.sources.isEmpty then die("no source files given")
+    o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
+    val expanded = expandSources(o.sources)
+    if expanded.isEmpty then die("no .scala files found")
+
+    def attempt(): Int =
+      val directives = parseDirectives(expanded)
+      directives.scalaVersion.orElse(o.cliScala).foreach { v =>
+        if !BuildInfo.scalaVersion.startsWith(v) then
+          System.err.println(
+            s"scli: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
+          )
+      }
+      val depsCache = Paths.get(".scli-build").resolve("deps-cache")
+      val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache)
+      val testOnlyClasspath = resolveDeps(directives.testDeps, depsCache)
+      val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
+      val testClasspath = List(mainClasspath, testOnlyClasspath).filter(_.nonEmpty).mkString(":")
+      val options = directives.options ++ o.cliOptions
+      val cc = computeCompileClasspath(testClasspath, extraCompileOnlyClasspath)
+
+      // Pass 1: compile the user's own sources only, to scan the result for
+      // test discovery before the driver (which references those classes
+      // by name) is even generated.
+      val classesDir = Paths.get(".scli-build", "_scratch", "test-classes")
+      compileToClasses(expanded, classesDir, cc, options)
+
+      val testJars = testClasspath.split(":").filter(_.nonEmpty).toList
+      val explicitFramework = o.testFrameworkOpt.orElse(directives.testFramework)
+      val frameworkFqcns = explicitFramework match
+        case Some(fqcn) => List(fqcn)
+        case None =>
+          val cacheDir = Paths.get(".scli-build").resolve("test-framework-cache")
+          Files.createDirectories(cacheDir)
+          val key = hashKey(testClasspath)
+          val cacheFile = cacheDir.resolve(s"fw-$key.txt")
+          if Files.exists(cacheFile) then readFile(cacheFile).linesIterator.filter(_.nonEmpty).toList
+          else
+            val fws = findFrameworkClasses(testJars)
+            Files.write(cacheFile, fws.mkString("\n").getBytes("UTF-8"))
+            fws
+      if frameworkFqcns.isEmpty then
+        fail("no test framework found on the classpath -- add a `//> using test.dep \"org::name:version\"` for " +
+          "a framework with a scala-native port (e.g. munit, utest, scalatest, zio-test-sbt), or pass --test-framework <class>")
+
+      val probeCacheDir = Paths.get(".scli-build").resolve("test-probe-cache")
+      val specs = probeFingerprints(frameworkFqcns, testClasspath, cc, classesDir, probeCacheDir, o.logLevel)
+      if specs.isEmpty then
+        fail(s"${frameworkFqcns.mkString(", ")}: no SubclassFingerprint reported -- annotation-based " +
+          "(JUnit4-style) test discovery isn't supported")
+
+      val matches = discoverTestClasses(classesDir, specs, testJars)
+      if matches.isEmpty then
+        if !o.quiet then println("scli: no tests found")
+        0
+      else
+        if !o.quiet then println(s"scli: found ${matches.length} test class(es): ${matches.map(_.className).sorted.mkString(", ")}")
+        val driverSrc = Paths.get(".scli-build", "_scratch", "ScliTestMain.scala")
+        Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
+        val binPath = Paths.get(".scli-build", "ScliTestMain", "bin")
+        buildBinary(expanded :+ driverSrc, Some("ScliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel)
+        runInherited(binPath.toString :: o.progArgs)
+
+    if o.watch then
+      watchLoop(expanded) { () =>
+        try attempt()
+        catch case BuildFailed(msg) => System.err.println(s"scli: $msg")
+      }
+    else
+      try sys.exit(attempt())
       catch case BuildFailed(msg) => die(msg)
 
   /** JSON string/array literals for `.dotty-ide.json` -- hand-rolled rather
@@ -820,9 +1320,10 @@ object Scli:
       // (there's no separate typecheck-only mode) -- `package` is the name real
       // scala-cli uses for that, so accept it too rather than only the surprising name.
       case "compile" | "package" => handleRunOrCompile("compile", args.drop(1))
+      case "test" => handleTest(args.drop(1))
       case "setup-ide" => handleSetupIde(args.drop(1))
       case cmd if unsupportedCommands(cmd) =>
-        die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, setup-ide, version")
+        die(s"'$cmd' is not implemented in this minimal scala-cli-alike -- supported: run, compile, test, setup-ide, version")
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
         handleRunOrCompile("run", args) // implicit `run`, e.g. `scli Foo.scala`
       case other =>

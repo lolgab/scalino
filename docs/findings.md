@@ -468,10 +468,59 @@ work, but aren't individually exercised yet).
    parity with scala-cli as of the "closing the gap" pass). Still missing:
    incremental Scala compilation (see item 7), multi-module/multi-target
    projects, a real (not heuristic-text-scan) entry-point detector, and
-   scala-cli's `test`/`fmt`/`repl`/`package`/`publish`/`bsp`/`export`
-   commands -- none of those have an obvious JVM-free equivalent yet (no
-   vendored test framework, no scalafmt, no bloop), so they currently just
-   print "not implemented" rather than being faked.
+   scala-cli's `fmt`/`repl`/`package`/`publish`/`bsp`/`export` commands --
+   none of those have an obvious JVM-free equivalent yet (no scalafmt, no
+   bloop), so they currently just print "not implemented" rather than being
+   faked.
+
+   `scli test` (2026-09-04) *is* now implemented, with no JVM anywhere in
+   the chain -- see the doc comment above `readAllBytes`/`ClassInfo` in
+   `cli/Scli.scala` for the full design. In short: real (JVM) sbt-scala-native
+   drives test execution from the sbt/JVM side over a ComRunner socket
+   protocol; `scli` instead (1) structurally scans the resolved test
+   classpath's jars for a class implementing `sbt.testing.Framework` --  no
+   hardcoded per-framework list, so any framework with a scala-native port
+   is found the same way -- (2) compiles+links+runs a tiny throwaway "probe"
+   binary that instantiates it and prints its real `fingerprints()` (cached
+   after the first run), since there's no JVM to query that cheaply, (3)
+   scans the user's *compiled* test classes structurally against those
+   fingerprints (ancestry walk across both compiled output and classpath
+   jars -- a from-scratch substitute for `Class#isAssignableFrom`), and (4)
+   generates a small driver source that instantiates the framework(s) by
+   literal name (no reflection) and drains `Task.execute` synchronously.
+   Test-object instantiation inside a discovered `Task` turned out to need
+   no bridging work at all on `scli`'s end: scala-native's native test-port
+   authors already rely on `scala.scalanative.reflect.Reflect`/
+   `@EnableReflectiveInstantiation` for it (confirmed both via source
+   research and by a from-scratch hand-rolled `sbt.testing.Framework` smoke
+   test using that exact mechanism, exercised end to end -- discovery,
+   probe, driver codegen, link, run, pass/fail/exit-code all verified
+   correct).
+
+   **Known real-world blocker, orthogonal to `scli test` itself:** munit,
+   utest, and scalatest all failed to even *compile* against this
+   toolchain when smoke-tested for real (not the hand-rolled framework) --
+   every one of them hit `Interpreter (own implementation) does not support
+   calling method sourceFile in trait PositionMethods` (also
+   `underlyingArgument`/`TermMethods`), from their `test(...)`/`assert*`
+   position-capture macros. This is remaining-work item 1 above (general
+   quote-pattern-matching support in the macro interpreter) biting a much
+   wider set of real-world macros than expected -- essentially every
+   mainstream Scala test framework leans on this exact kind of macro for
+   its ergonomic API, so `scli test` is currently blocked end-to-end on
+   real projects until that interpreter gap closes, independent of
+   anything in `scli` itself. Auto-detection was independently confirmed
+   working against a real published framework regardless (a project
+   depending on `munit` with no test classes correctly reports "no tests
+   found" rather than "no test framework found" -- i.e. `munit.Framework`
+   really was found and probed successfully; it's only compiling real
+   `munit.FunSuite` subclasses that's blocked).
+   Known scope gaps vs real scala-cli, by design (not blocked on anything):
+   only `SubclassFingerprint`-based frameworks (covers
+   munit/utest/scalatest/zio-test-sbt), not JUnit4-style
+   `AnnotatedFingerprint`; whole-test-class selection only, no per-test-
+   method filtering (`-- <pattern>` is forwarded to the framework's own
+   runner, matching real scala-cli's own convention there).
 5. Now covered by CI (`.github/workflows/ci.yml`) on Linux and macOS,
    x86_64 and arm64 -- all four build, link, and run the plain-program and
    real-macro smoke tests, plus a relocatability check that mirrors the
