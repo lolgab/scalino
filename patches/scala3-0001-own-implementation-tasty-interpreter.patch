@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..56f602b8 100644
+index 04cb637b..693210a5 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -496,7 +496,7 @@ index 04cb637b..56f602b8 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +546,4313 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4315 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -3518,6 +3518,8 @@ index 04cb637b..56f602b8 100644
 +        args match { case (path: String) :: Nil => Some(requiredClass(path)); case _ => None }
 +      case "requiredModule" if fn.owner.name.toString == "SymbolModule" =>
 +        args match { case (path: String) :: Nil => Some(requiredModule(path)); case _ => None }
++      case "requiredMethod" if fn.owner.name.toString == "SymbolModule" =>
++        args match { case (path: String) :: Nil => Some(requiredMethod(path)); case _ => None }
 +      case "spliceOwner" if fn.owner.name.toString == "SymbolModule" =>
 +        if sys.env.contains("SNC_INTERP_DEBUG") then
 +          Console.err.println(s"[spliceOwner] ctx.owner=${ctx.owner} id=${System.identityHashCode(ctx.owner)}")
