@@ -220,6 +220,36 @@ object SnCli:
    *  duplicate-symbol errors (two copies of the GC, two copies of libc
    *  shims, ...). We always supply these ourselves (dist/nativelibs.cp), so
    *  they're excluded here rather than resolved a second time. */
+  /** Root coordinates always added to every `cs fetch`, regardless of what
+   *  the user asked for -- `cs fetch` (unlike a real build tool's own
+   *  dependency management) resolves Maven `provided`-scope dependencies as
+   *  excluded by default, with no CLI flag to change that (confirmed
+   *  against real `cs fetch --help`/`cs resolve --help`: neither exposes a
+   *  scope/configuration override). A dependency listed explicitly as a
+   *  ROOT coordinate, though, always resolves at ITS OWN default scope
+   *  (compile) regardless of what scope it'd have as someone else's
+   *  transitive dependency -- so re-requesting it directly here is enough
+   *  to pull it in.
+   *
+   *  `org.typelevel:scalac-compat-annotation_3` is exactly this case: it's
+   *  a `provided`-scope dependency of `org.typelevel::literally` (itself
+   *  pulled in by `http4s-core` and others), needed at MACRO-EXPANSION
+   *  time (an inlined reference to one of its annotation classes shows up
+   *  in the retained tree literally's own macro splices), not at runtime --
+   *  found via `sn-cli test .` against a real project (`~/scala/ape`)
+   *  using http4s's `uri"..."` literal macro, which failed to even TYPE
+   *  (a generic "undefined: ..." dotc error, unrelated to macro
+   *  interpretation) because the annotation class was simply missing from
+   *  the resolved classpath. Tiny (a handful of annotation-only classes,
+   *  no real behavior) and broadly needed by any typelevel library using
+   *  the same `literally`-based macro pattern, not just this one project --
+   *  same category of "always supply this ourselves" as the scala-native
+   *  runtime libs below, just for a compile-time gap instead of a runtime
+   *  duplicate-symbol one.
+   */
+  private def alwaysIncludedArtifacts: List[String] =
+    List("org.typelevel:scalac-compat-annotation_3:0.1.4")
+
   private def excludedArtifacts: List[String] =
     val v = BuildInfo.nativeBinaryVersion
     List(
@@ -261,7 +291,7 @@ object SnCli:
         case Some(cp) => cp
         case None =>
           val cs = findOnPath("cs")
-          val coords = deps.map(toCoursierCoord)
+          val coords = deps.map(toCoursierCoord) ::: alwaysIncludedArtifacts
           val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
           System.err.println(s"sn-cli: resolving ${deps.mkString(", ")}")
           val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: List("--classpath"))
@@ -1490,10 +1520,17 @@ object SnCli:
     // step 4, "optional" there) so opening the project in Zed works without
     // dist/ on PATH -- `dist` is resolved from sn-cli's own binary location
     // (see val dist above), so this is correct however the toolchain was
-    // installed. Only written if .zed/settings.json doesn't exist yet: a
-    // real settings file may hold unrelated keys this hand-rolled JSON
-    // writer isn't equipped to merge into.
+    // installed. Plus a `file_types` override assigning .scala to the
+    // zed-extension's own "Scala (snc)" language (zed-extension/
+    // languages/scala/config.toml) -- without it, if metals-zed is also
+    // installed, Zed arbitrarily picks one extension's "Scala"-named
+    // language for .scala files, and that pick isn't stable across a
+    // dev-extension reinstall (see zed-extension/README.md). Only written
+    // if .zed/settings.json doesn't exist yet: a real settings file may
+    // hold unrelated keys this hand-rolled JSON writer isn't equipped to
+    // merge into.
     val lspBinaryPath = Paths.get(dist, "dotty-lsp-native").toString
+    val scalaSncFileTypes = jsonArr(List("scala"))
     val zedSettingsPath = Paths.get(".zed", "settings.json")
     if !Files.exists(zedSettingsPath) then
       Files.createDirectories(zedSettingsPath.getParent)
@@ -1506,14 +1543,18 @@ object SnCli:
            |        "arguments": ${jsonArr(List("-stdio"))}
            |      }
            |    }
+           |  },
+           |  "file_types": {
+           |    "Scala (snc)": $scalaSncFileTypes
            |  }
            |}
            |""".stripMargin
       Files.write(zedSettingsPath, zedJson.getBytes("UTF-8"))
-      println(s"sn-cli: wrote ${zedSettingsPath.toAbsolutePath} -- pins Zed's dotty-lsp-native binary to $lspBinaryPath")
+      println(s"sn-cli: wrote ${zedSettingsPath.toAbsolutePath} -- pins Zed's dotty-lsp-native binary to $lspBinaryPath and assigns .scala to the \"Scala (snc)\" language")
     else
-      println(s"sn-cli: ${zedSettingsPath.toAbsolutePath} already exists -- leaving it alone; add this to pin the LSP binary if needed:")
-      println(s"""  "lsp": { "dotty-lsp-native": { "binary": { "path": ${jsonStr(lspBinaryPath)} } } }""")
+      println(s"sn-cli: ${zedSettingsPath.toAbsolutePath} already exists -- leaving it alone; add this to pin the LSP binary and avoid colliding with metals-zed's own \"Scala\" language if needed:")
+      println(s"""  "lsp": { "dotty-lsp-native": { "binary": { "path": ${jsonStr(lspBinaryPath)} } } },""")
+      println(s"""  "file_types": { "Scala (snc)": $scalaSncFileTypes }""")
 
   def main(args: Array[String]): Unit =
     if args.isEmpty then { printUsage(System.err); sys.exit(1) }

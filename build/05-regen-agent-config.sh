@@ -28,6 +28,34 @@ mkdir -p "$WORK/agent-out" "$WORK/agent-compile-out"
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
   -Yretain-trees \
   -d "$WORK/agent-compile-out" "$FIXTURE/Foo.scala" "$FIXTURE/Test.scala"
+
+# Second pass, MERGED into the same config dir (`config-merge-dir`, not
+# `config-output-dir` -- the latter would overwrite the first pass' trace
+# instead of adding to it): `examples/interpreter-regressions/{Foo,Test}
+# .scala`, which exercises this interpreter's OWN reflective field
+# read/write (`reflectiveFieldRead`/`reflectiveFieldWrite` in
+# `Interpreter.scala`, used whenever a real host object's uncurated method
+# reads/writes its own private state, e.g. `ArrayBuffer#update` reading
+# `size0`/writing `mutationCount`) -- a code path the first fixture never
+# touches. Can't just add these files to the FIRST invocation's arg list:
+# both fixtures independently declare top-level `object Foo`/`object Test`
+# with no package, so compiling them together is a duplicate-definition
+# error. Native-image's closed-world reflection needs every class/field
+# actually reflected on traced at agent time or the same "silently falls
+# back to old, wrong behavior" class of bug this docstring's own project
+# has hit repeatedly (see docs/findings.md) bites again -- confirmed via a
+# real regression: this exact gap (untraced `ArrayBuffer` fields) is what
+# broke `sn-cli test .` against `~/scala/ape`'s `uri"..."` literal macro
+# under `dotc-native` even after the underlying interpreter bug itself was
+# fixed and verified working via the (unrestricted-reflection) JVM.
+REGRESSIONS_FIXTURE="$ROOT/examples/interpreter-regressions"
+mkdir -p "$WORK/agent-compile-out2"
+"$JAVA" -agentlib:native-image-agent=config-merge-dir="$WORK/agent-out" \
+  -cp "$FULL_CP:$PLUGIN_JAR" dotty.tools.dotc.Main \
+  -javabootclasspath "$DIST/java.base.jar" -classpath "$FULL_CP" \
+  -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
+  -Yretain-trees \
+  -d "$WORK/agent-compile-out2" "$REGRESSIONS_FIXTURE/Foo.scala" "$REGRESSIONS_FIXTURE/Test.scala"
 mkdir -p "$ROOT/agent-config/dotc"
 cp "$WORK/agent-out/reachability-metadata.json" "$ROOT/agent-config/dotc/"
 

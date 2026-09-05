@@ -314,6 +314,9 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.ast.Trees$ValDef[]"
+    },
+    {
       "type": "dotty.tools.dotc.ast.tpd$",
       "fields": [
         {
@@ -544,6 +547,9 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.core.Names$TermName[]"
+    },
+    {
       "type": "dotty.tools.dotc.core.Phases$Phase[]"
     },
     {
@@ -564,6 +570,9 @@
           "name": "primitive$lzy1"
         }
       ]
+    },
+    {
+      "type": "dotty.tools.dotc.core.Symbols$ClassSymbol[]"
     },
     {
       "type": "dotty.tools.dotc.core.Symbols$Symbol[]"
@@ -938,6 +947,14 @@
       "type": "dotty.tools.dotc.transform.HoistSuperArgs"
     },
     {
+      "type": "dotty.tools.dotc.transform.HoistSuperArgs$$anon$1",
+      "fields": [
+        {
+          "name": "origToParam$lzy1"
+        }
+      ]
+    },
+    {
       "type": "dotty.tools.dotc.transform.InlinePatterns",
       "fields": [
         {
@@ -996,6 +1013,29 @@
     },
     {
       "type": "dotty.tools.dotc.transform.PatternMatcher"
+    },
+    {
+      "type": "dotty.tools.dotc.transform.PatternMatcher$Translator",
+      "fields": [
+        {
+          "name": "GuardTest$lzy1"
+        },
+        {
+          "name": "NonEmptyTest$lzy1"
+        },
+        {
+          "name": "NonNullTest$lzy1"
+        },
+        {
+          "name": "TestPlan$lzy1"
+        },
+        {
+          "name": "VarArgPattern$lzy1"
+        },
+        {
+          "name": "WildcardPattern$lzy1"
+        }
+      ]
     },
     {
       "type": "dotty.tools.dotc.transform.Pickler",
@@ -1102,6 +1142,9 @@
       ]
     },
     {
+      "type": "dotty.tools.dotc.transform.patmat.Space[]"
+    },
+    {
       "type": "dotty.tools.dotc.typer.Namer",
       "fields": [
         {
@@ -1130,6 +1173,14 @@
     },
     {
       "type": "dotty.tools.dotc.typer.RefChecks"
+    },
+    {
+      "type": "dotty.tools.dotc.typer.Synthesizer",
+      "fields": [
+        {
+          "name": "MirrorSource$lzy1"
+        }
+      ]
     },
     {
       "type": "dotty.tools.dotc.typer.Typer",
@@ -1233,6 +1284,37 @@
       "fields": [
         {
           "name": "emptyImpl$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.collection.immutable.List[]"
+    },
+    {
+      "type": "scala.collection.immutable.NumericRange",
+      "fields": [
+        {
+          "name": "hashCode$lzy1"
+        },
+        {
+          "name": "isEmpty$lzy1"
+        },
+        {
+          "name": "length$lzy1"
+        }
+      ]
+    },
+    {
+      "type": "scala.collection.mutable.ArrayBuffer",
+      "fields": [
+        {
+          "name": "array"
+        },
+        {
+          "name": "mutationCount"
+        },
+        {
+          "name": "size0"
         }
       ]
     },
@@ -1538,7 +1620,13 @@
       "type": "scala.tools.asm.Handle[]"
     },
     {
+      "type": "scala.tools.asm.Handle[][]"
+    },
+    {
       "type": "scala.tools.asm.Label[]"
+    },
+    {
+      "type": "scala.tools.asm.Type[]"
     },
     {
       "type": "scala.util.Properties$",

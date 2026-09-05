@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..74c97d51 100644
+index 04cb637b..3aafcbbb 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -80,7 +80,7 @@ index 04cb637b..74c97d51 100644
  class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
    import Interpreter.*
    import tpd.*
-@@ -38,7 +100,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -38,11 +100,34 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          new AbstractFileClassLoader(ctx.settings.outputDir.value, classLoader0)
      else classLoader0
  
@@ -92,7 +92,31 @@ index 04cb637b..74c97d51 100644
    type Env = Map[Symbol, Object]
    def emptyEnv: Env = Map.empty
    inline def env(using e: Env): e.type = e
-@@ -59,43 +124,318 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+ 
++  /** Memoizes `interpretStaticFieldAccess` per symbol, for the lifetime of
++   *  this `Interpreter` instance (itself scoped to one macro expansion --
++   *  see `Splicer`'s `new SpliceInterpreter` per splice). Real JVM `object`
++   *  fields are computed exactly once (at module init) and every later read
++   *  returns that SAME instance; without this cache, re-interpreting the
++   *  field's RHS tree on every access instead built a FRESH value each
++   *  time. Third-party library internals routinely rely on `eq` (physical
++   *  identity) against a cached top-level `val` as a fast-path sentinel --
++   *  e.g. cats-parse's `Parser.Impl.unmap0`/`unmap`, which compare a
++   *  recursively-simplified sub-parser against `Parser.unit` via `eq` to
++   *  detect "this already reduced to the always-succeeds parser". A fresh
++   *  `Parser.unit` instance on each access made that `eq` check always
++   *  false, so the "already unit" fast path was skipped and the un-reduced
++   *  value flowed into a later match with no case for it -- a spurious
++   *  `MatchError` several calls downstream, reached through http4s's
++   *  `uri"..."` literal macro (which validates the literal via cats-parse's
++   *  real parser-simplification machinery at macro-expansion time).
++   */
++  private val staticFieldCache = mutable.Map[Symbol, Object]()
++
+   /** Returns the result of interpreting the code in the tree.
+    *  Return Some of the result or None if the result type is not consistent with the expected type.
+    *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
+@@ -59,43 +144,350 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
    /** Returns the result of interpreting the code in the tree.
     *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
     */
@@ -250,6 +274,17 @@ index 04cb637b..74c97d51 100644
 +        case Select(qual, name) =>
 +          interpretTree(qual) match
 +            case inst: InterpretedInstance => inst.fields(name.toString) = interpretTree(rhs); interpretUnit()
++            // The write-side counterpart of `reflectiveFieldRead`: a REAL
++            // host object's own uncurated method body mutating its OWN
++            // private state (e.g. `ArrayBuffer#update`'s real
++            // `mutationCount = mutationCount + 1` bookkeeping, reached
++            // through cats-parse's own `DropRightIterator`, itself reached
++            // through http4s's `uri"..."` literal macro) -- there's no
++            // `.fields` map on a real object to write into, so without this
++            // the assignment just crashes as an "unexpected tree". Write
++            // the REAL field via reflection instead, when the receiver
++            // actually has one.
++            case recv if reflectiveFieldWrite(recv, lhs.symbol, interpretTree(rhs)) => interpretUnit()
 +            case _ => unexpectedTree(tree)
 +        case _ => unexpectedTree(tree)
 +
@@ -305,8 +340,29 @@ index 04cb637b..74c97d51 100644
 +        // `Object`s" story as ordinary `.asInstanceOf`.
 +        interpretTree(fn.qualifier)
 +      else if fn.name == nme.isInstanceOf_ then
-+        interpretTree(fn.qualifier) // force for side effects/errors
-+        Boolean.box(true) // best effort: we don't retain the type argument through the `Call` extractor
++        // Previously always `true` ("best effort: we don't retain the type
++        // argument through the `Call` extractor") -- but `typeArgs` above
++        // (recovered from the ORIGINAL tree for exactly this kind of case,
++        // see its own doc comment) already carries it, this just wasn't
++        // wired up. An always-true `isInstanceOf` silently breaks any real
++        // runtime type dispatch built on it -- e.g. cats-parse's own
++        // `Parser.oneOf0`, which fast-paths via
++        // `ps.forall(_.isInstanceOf[Parser[_]])` before treating `ps` as a
++        // `List[Parser[A]]`; with this stubbed true, a `Parser0`-only
++        // element (e.g. `Pure`, from `Parser.unit`) sailed through into
++        // that `Parser`-typed fast path and later reached `Parser.Impl
++        // .unmap` (which, unlike `unmap0`, has no case for `Pure`) -- a
++        // spurious `MatchError` several calls downstream, reached through
++        // http4s's `uri"..."` literal macro (which validates the literal
++        // via cats-parse's real parser-simplification machinery at macro-
++        // expansion time). Reuses `matchesRuntimeType`'s real ancestry
++        // check -- same logic already relied on for typed pattern tests
++        // (`case x: Foo => ...`), just invoked here as a plain boolean
++        // instead of driving a match.
++        val v = interpretTree(fn.qualifier)
++        typeArgs.headOption match
++          case Some(t) => Boolean.box(matchesRuntimeType(v, t))
++          case None => Boolean.box(true) // no recovered type arg -- best effort
 +      // `&&`/`||` on `Boolean` are call-by-name on their right operand
 +      // (real signature: `def &&(that: => Boolean): Boolean`) specifically
 +      // so short-circuiting can skip it -- unlike every OTHER primitive op
@@ -420,7 +476,7 @@ index 04cb637b..74c97d51 100644
      // Interpret `foo(j = x, i = y)` which it is expanded to
      // `val j$1 = x; val i$1 = y; foo(i = i$1, j = j$1)`
      case Block(stats, expr) => interpretBlock(stats, expr)
-@@ -113,6 +453,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -113,6 +505,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        unexpectedTree(tree)
    }
  
@@ -440,7 +496,7 @@ index 04cb637b..74c97d51 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +494,4070 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4265 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -1379,6 +1435,128 @@ index 04cb637b..74c97d51 100644
 +    case "AnnotatedTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.AnnotatedType])
 +    case _ => None
 +
++  /** Real JVM "zero value" for a var's own static type, for `var x: T = _`/
++   *  `compiletime.uninitialized` -- there's no real initializer tree to
++   *  interpret, so this has to be synthesized instead. `null` is only
++   *  correct for reference types; every primitive value type has its own
++   *  scalar default (`0`/`0L`/`false`/...), which a blanket `null` silently
++   *  violates the moment a primitive-typed var (not just a reference-typed
++   *  one, e.g. `Array[T] = _`) uses `compiletime.uninitialized` -- its main
++   *  use case, since it replaces `_` specifically to also cover value types
++   *  `_` alone couldn't (a bare `_` initializer is invalid for a value
++   *  type). Mirrors `matchesRuntimeType`'s own `cls ==` dispatch above.
++   */
++  private def defaultValueOf(tpe: Type)(using Context): Object =
++    val cls = tpe.classSymbol
++    if cls == defn.IntClass then Int.box(0)
++    else if cls == defn.LongClass then java.lang.Long.valueOf(0L)
++    else if cls == defn.BooleanClass then java.lang.Boolean.valueOf(false)
++    else if cls == defn.DoubleClass then java.lang.Double.valueOf(0.0)
++    else if cls == defn.FloatClass then java.lang.Float.valueOf(0.0f)
++    else if cls == defn.CharClass then Character.valueOf(0.toChar)
++    else if cls == defn.ByteClass then java.lang.Byte.valueOf(0.toByte)
++    else if cls == defn.ShortClass then java.lang.Short.valueOf(0.toShort)
++    else if cls == defn.UnitClass then interpretUnit()
++    else null
++
++  /** Whether `t` is GraalVM native-image's own
++   *  `org.graalvm.nativeimage.MissingReflectionRegistrationError` -- thrown
++   *  (as a bare `Error`, NOT a `ReflectiveOperationException`) when a
++   *  reflective call under native-image's closed-world model hits a
++   *  class/field/method that wasn't traced into `reachability-metadata
++   *  .json` at build time. Checked by CLASS NAME rather than a real
++   *  `case _: MissingReflectionRegistrationError` (which would need
++   *  `org.graalvm.nativeimage` on this file's own compile classpath --
++   *  it's a native-image-only runtime type, absent from the plain Maven
++   *  classpath `03a-patch-compiler.sh` compiles this file against). Every
++   *  reflective call `reflectiveFieldRead`/`reflectiveFieldWrite` make
++   *  needs this caught alongside `ReflectiveOperationException`: no amount
++   *  of pre-emptive tracing (see `build/05-regen-agent-config.sh`) can
++   *  cover the truly unbounded set of real host classes/fields a third-
++   *  party macro might reach through this generic path, so a graceful
++   *  fallback here -- not a hard crash -- is the only sound general
++   *  answer. Confirmed via a real regression: retracing did fix the
++   *  originally-found `ArrayBuffer` gap, but the very next real class
++   *  reached the same way (`scala.collection.immutable.NumericRange`,
++   *  its own `step` field) crashed the whole compiler outright (an
++   *  UNCAUGHT `Error`, not a graceful per-macro failure) instead of
++   *  falling back, reached through http4s's `uri"..."` literal macro
++   *  against `~/scala/ape` (a real project, not a curated fixture).
++   */
++  private def isMissingReflectionRegistration(t: Throwable): Boolean =
++    t.getClass.getName == "org.graalvm.nativeimage.MissingReflectionRegistrationError"
++
++  /** Finds a real JVM field by name, walking up from `cls` through its real
++   *  superclasses (a plain `getDeclaredField` only sees the exact class, not
++   *  inherited private/protected fields declared higher up, e.g.
++   *  `ArrayBuffer`'s own `size0`/`mutationCount` on a receiver whose runtime
++   *  class might be a further subclass). Shared by `reflectiveFieldRead`/
++   *  `reflectiveFieldWrite` below.
++   */
++  private def findRealField(cls: Class[?], name: String): Option[java.lang.reflect.Field] =
++    if cls == null then None
++    else
++      try Some(cls.getDeclaredField(name))
++      catch
++        case _: NoSuchFieldException => findRealField(cls.getSuperclass, name)
++        case e if isMissingReflectionRegistration(e) => None
++
++  /** Reads a field's CURRENT value directly off a genuine REAL host object
++   *  via reflection, when the receiver actually is one (not one of our own
++   *  `InterpretedInstance`/`ModuleValue` representations) and its runtime
++   *  class actually declares the field. See the call site's own doc for why
++   *  this matters: real mutation applied through a curated intrinsic (e.g.
++   *  `ArrayBuffer#addOne`, which calls the genuine host `+=`) is otherwise
++   *  invisible to an uncurated method's generic tree-interpretation of that
++   *  same object's OTHER fields/methods, which has no `.fields` map to read
++   *  live state from and would otherwise just replay the field's original
++   *  initializer forever. `None` on any failure (wrong/missing field,
++   *  inaccessible, erased away, ...) -- the caller falls back to the old
++   *  tree-replay behavior, no worse than before this existed.
++   */
++  private def reflectiveFieldRead(receiver: Object, fn: Symbol)(using Context): Option[Object] =
++    if receiver == null || receiver.isInstanceOf[InterpretedInstance] || receiver.isInstanceOf[ModuleValue] then None
++    else
++      findRealField(receiver.getClass, fn.name.toString).flatMap { f =>
++        try
++          f.setAccessible(true)
++          Some(f.get(receiver))
++        catch
++          case _: ReflectiveOperationException | _: SecurityException => None
++          case e if isMissingReflectionRegistration(e) => None
++      }
++
++  /** Write-side counterpart of `reflectiveFieldRead` (see its own doc) --
++   *  sets a field's value directly on a genuine REAL host object via
++   *  reflection, when the receiver actually is one and its runtime class
++   *  actually declares the field. Returns whether the write succeeded; the
++   *  caller falls back to the old "unexpected tree" crash on `false`, no
++   *  worse than before this existed.
++   */
++  private def reflectiveFieldWrite(receiver: Object, fn: Symbol, value: Object)(using Context): Boolean =
++    if receiver == null || receiver.isInstanceOf[InterpretedInstance] || receiver.isInstanceOf[ModuleValue] then false
++    else
++      findRealField(receiver.getClass, fn.name.toString) match
++        case Some(f) =>
++          try
++            f.setAccessible(true)
++            f.set(receiver, value)
++            true
++          catch
++            case _: ReflectiveOperationException | _: SecurityException => false
++            case e if isMissingReflectionRegistration(e) => false
++        case None => false
++
++  /** Whether `v` is one of our own interpreted plain-function values (a real
++   *  host `scala.FunctionN` -- a Scala/Java lambda, or any other genuine
++   *  `FunctionN` implementor), as opposed to a wrapped `InterpretedInstance`
++   *  or some other real object. Used by `matchesRuntimeType`'s own fallback,
++   *  see its doc for why.
++   */
++  private def isBareFunctionValue(v: Object): Boolean = v match
++    case _: Function0[?] | _: Function1[?, ?] | _: Function2[?, ?, ?] => true
++    case _ => false
++
 +  private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
 +    val cls = tpe.classSymbol
 +    if cls == defn.IntClass then v.isInstanceOf[Integer]
@@ -1404,6 +1582,26 @@ index 04cb637b..74c97d51 100644
 +      val result =
 +        if actual.exists && cls.exists && cls.isClass then
 +          actual == cls || (actual.isClass && actual.asClass.baseClasses.contains(cls))
++        // A bare closure (one of our own interpreted `FunctionN` values,
++        // never itself constructed via `interpretNew` -- any REAL wrapped
++        // instance of a richer type would already have `actual.exists` and
++        // take the branch above) can never ALSO be an instance of some
++        // other, non-function class -- but hits this same lenient fallback
++        // otherwise, since `receiverConcreteClass` doesn't recognize a raw
++        // closure either. That wrongly matters for the common real Scala
++        // idiom `f match { case wrapped: SomeWrapper[..] => ...; case _ =>
++        // Wrap(f) }` (an unchecked cast testing "is this plain function
++        // value ALREADY the wrapped type"): e.g. cats' own
++        // `AndThen.apply`/`#andThen`, `case ref: AndThen[A, B] @unchecked
++        // => ref` -- under the old blanket fallback this always matched a
++        // plain closure too, skipping the real `Single(f, 0)` wrapping a
++        // fresh `AndThen` needs. The unwrapped closure then got stored
++        // directly where a real `Single`/`Concat` was expected (e.g.
++        // `Concat`'s own `left`/`right` fields), and `AndThen#runLoop`'s
++        // later exhaustive match over those two cases threw a spurious
++        // `MatchError` -- reached, several calls further, through http4s's
++        // `uri"..."` literal macro.
++        else if !defn.isFunctionClass(cls) && isBareFunctionValue(v) then false
 +        else true
 +      if sys.env.contains("SNC_INTERP_DEBUG") then
 +        Console.err.println(s"[matchesRuntimeType] v.getClass=${if v == null then "null" else v.getClass} tpe=${tpe.show} cls=$cls cls.exists=${cls.exists} cls.isClass=${cls.isClass} actual=$actual actual.exists=${actual.exists} baseClasses=${if actual.exists && actual.isClass then actual.asClass.baseClasses else Nil} result=$result")
@@ -1502,11 +1700,6 @@ index 04cb637b..74c97d51 100644
 -      // is top level object
 -      val moduleClass = loadClass(sym.fullName.toString)
 -      moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
--    }
--    else {
--      // nested object in an object
--      val clazz = loadClass(sym.binaryClassName)
--      clazz.getConstructor().newInstance().asInstanceOf[Object]
 +  private def interpretStaticCall(moduleClass: Symbol, fn: Symbol, rawArgs: List[Tree], typeArgs: List[Type] = Nil)(using Env): Object =
 +    lazy val args = evalNonErased(rawArgs, fn)
 +    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
@@ -1518,11 +1711,11 @@ index 04cb637b..74c97d51 100644
 +        case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(ModuleValue(moduleClass)), ddef, args, typeArgs)
 +        case _ => notInterpretable(fn)
      }
- 
--  private def loadReplLineClass(moduleClass: Symbol): Class[?] = {
--    val lineClassloader = new AbstractFileClassLoader(ctx.settings.outputDir.value, classLoader)
--    lineClassloader.loadClass(moduleClass.name.firstPart.toString)
--  }
+-    else {
+-      // nested object in an object
+-      val clazz = loadClass(sym.binaryClassName)
+-      clazz.getConstructor().newInstance().asInstanceOf[Object]
++
 +  /** `Vector(...)`/`Set(...)`/`Seq(...)`/etc: `fn.owner` is useless here
 +   *  (always the abstract `IterableFactory`/`SeqFactory` trait, since the
 +   *  call site's static type is that trait, not the concrete companion) --
@@ -1568,65 +1761,11 @@ index 04cb637b..74c97d51 100644
 +      cls.derivesFrom(requiredClass("scala.collection.MapFactory")) ||
 +      cls == requiredModule("scala.Array").moduleClass
 +    )
- 
--  private def loadClass(name: String): Class[?] =
--    try classLoader.loadClass(name)
--    catch
--      case MissingClassValidInCurrentRun(sym, origin) =>
--        suspendOnMissing(sym, origin, pos)
--
--
--  private def getMethod(clazz: Class[?], name: Name, paramClasses: List[Class[?]]): JLRMethod =
--    try clazz.getMethod(name.toString, paramClasses*)
--    catch {
--      case _: NoSuchMethodException =>
--        val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
--        throw new StopInterpretation(msg, pos)
--      case MissingClassValidInCurrentRun(sym, origin) =>
--        suspendOnMissing(sym, origin, pos)
--    }
++
 +  private def interpretCollectionFactory(moduleClass: Symbol, fn: Symbol, args: => List[Object])(using Env): Option[Object] =
 +    if !isStdlibCollectionCompanion(moduleClass) then None
 +    else interpretCollectionFactory0(moduleClass, fn, args)
- 
--  private def stopIfRuntimeException[T](thunk: => T, method: JLRMethod): T =
--    try thunk
--    catch {
--      case ex: RuntimeException =>
--        val sw = new StringWriter()
--        sw.write("A runtime exception occurred while executing macro expansion\n")
--        sw.write(ex.getMessage)
--        sw.write("\n")
--        ex.printStackTrace(new PrintWriter(sw))
--        sw.write("\n")
--        throw new StopInterpretation(sw.toString.toMessage, pos)
--      case ex: InvocationTargetException =>
--        ex.getTargetException match {
--          case ex: scala.quoted.runtime.StopMacroExpansion =>
--            throw ex
--          case MissingClassValidInCurrentRun(sym, origin) =>
--            suspendOnMissing(sym, origin, pos)
--          case targetException =>
--            val sw = new StringWriter()
--            sw.write("Exception occurred while executing macro expansion.\n")
--            if (!ctx.settings.Ydebug.value) {
--              val end = targetException.getStackTrace.lastIndexWhere { x =>
--                x.getClassName == method.getDeclaringClass.getCanonicalName && x.getMethodName == method.getName
--              }
--              val shortStackTrace = targetException.getStackTrace.take(end + 1)
--              targetException.setStackTrace(shortStackTrace)
--              targetException.printStackTrace(new PrintWriter(sw))
--
--              targetException match
--                case _: CyclicReference => sw.write("\nSee full stack trace using -Ydebug")
--                case _ =>
--            } else {
--              targetException.printStackTrace(new PrintWriter(sw))
--            }
--            sw.write("\n")
--            throw new StopInterpretation(sw.toString.toMessage, pos)
--        }
--    }
++
 +  private def interpretCollectionFactory0(moduleClass: Symbol, fn: Symbol, args: => List[Object])(using Env): Option[Object] =
 +    def elems: scala.collection.Seq[Object] = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
 +    def buildFrom(name: String, source: scala.collection.Seq[Object]): Option[Object] =
@@ -1678,37 +1817,7 @@ index 04cb637b..74c97d51 100644
 +          case v :: Nil => buildFrom(name, forceIterable(v))
 +          case _ => None
 +      case _ => None
- 
--  /** List of classes of the parameters of the signature of `sym` */
--  private def paramsSig(sym: Symbol): List[Class[?]] = {
--    def paramClass(param: Type): Class[?] = {
--      def arrayDepth(tpe: Type, depth: Int): (Type, Int) = tpe match {
--        case JavaArrayType(elemType) => arrayDepth(elemType, depth + 1)
--        case _ => (tpe, depth)
--      }
--      def javaArraySig(tpe: Type): String = {
--        val (elemType, depth) = arrayDepth(tpe, 0)
--        val sym = elemType.classSymbol
--        val suffix =
--          if (sym == defn.BooleanClass) "Z"
--          else if (sym == defn.ByteClass) "B"
--          else if (sym == defn.ShortClass) "S"
--          else if (sym == defn.IntClass) "I"
--          else if (sym == defn.LongClass) "J"
--          else if (sym == defn.FloatClass) "F"
--          else if (sym == defn.DoubleClass) "D"
--          else if (sym == defn.CharClass) "C"
--          else "L" + javaSig(elemType) + ";"
--        ("[" * depth) + suffix
--      }
--      def javaSig(tpe: Type): String = tpe match {
--        case tpe: JavaArrayType => javaArraySig(tpe)
--        case _ =>
--          // Take the flatten name of the class and the full package name
--          val pack = tpe.classSymbol.topLevelClass.owner
--          val packageName = if (pack == defn.EmptyPackageClass) "" else s"${pack.fullName}."
--          packageName + tpe.classSymbol.fullNameSeparated(FlatName).toString
--      }
++
 +  /** `Nil`/`None`: in the `scala` package, referenced as plain vals (not
 +   *  `Module`-flagged symbols, so the generic `fn.symbol.is(Module)` case in
 +   *  `interpretTree0` doesn't catch them) whose forwarder body lives in
@@ -1743,17 +1852,7 @@ index 04cb637b..74c97d51 100644
 +      // placeholder is fine here.
 +      case "List" | "Vector" | "Map" | "Set" | "Seq" | "Array" => Some(ModuleValue(fn))
 +      case _ => None
- 
--      val sym = param.classSymbol
--      if (sym == defn.BooleanClass) classOf[Boolean]
--      else if (sym == defn.ByteClass) classOf[Byte]
--      else if (sym == defn.CharClass) classOf[Char]
--      else if (sym == defn.ShortClass) classOf[Short]
--      else if (sym == defn.IntClass) classOf[Int]
--      else if (sym == defn.LongClass) classOf[Long]
--      else if (sym == defn.FloatClass) classOf[Float]
--      else if (sym == defn.DoubleClass) classOf[Double]
--      else java.lang.Class.forName(javaSig(param), false, classLoader)
++
 +  /** `Int.box`/`Int.unbox` and friends: compiler-generated calls with no
 +   *  retained source at all (they're synthesized, not really library code).
 +   *  Our values are already boxed `Object`s uniformly, so these are no-ops.
@@ -1918,7 +2017,23 @@ index 04cb637b..74c97d51 100644
 +          // `var x: T = _` (uninitialized): dotc represents the placeholder
 +          // rhs as a literal `Ident(nme.WILDCARD)`, not `EmptyTree` --
 +          // either way there's no real initializer to interpret.
-+          val uninitialized = vdef.rhs.isEmpty || (vdef.rhs match { case Ident(nme.WILDCARD) => true; case _ => false })
++          // `var x: T = compiletime.uninitialized` (the 3.x replacement for
++          // `_`): normally the real `UninitializedDefs` MiniPhase rewrites
++          // this RHS to the same `Ident(WILDCARD)` placeholder above, before
++          // erasure ever sees it -- but `-Yretain-trees` captures trees from
++          // an earlier point in the pipeline, so the tree this interpreter
++          // walks still has the ORIGINAL `compiletime.uninitialized` call.
++          // Left unrecognized, that call gets genuinely interpreted -- its
++          // real body is `throw new NotImplementedError(...)` (a
++          // `@compileTimeOnly` marker method, never meant to actually run),
++          // wrongly blowing up field reads that are supposed to just see
++          // `null`/zero-value. Recognize the same symbol `UninitializedDefs`
++          // itself checks for.
++          val uninitialized = vdef.rhs.isEmpty || (vdef.rhs match {
++            case Ident(nme.WILDCARD) => true
++            case rhs: RefTree => rhs.symbol == defn.Compiletime_uninitialized
++            case _ => false
++          })
 +          receiver match
 +            case inst: InterpretedInstance =>
 +              // `inst.outerEnv` (captured when this instance was
@@ -1931,7 +2046,7 @@ index 04cb637b..74c97d51 100644
 +              // literal macro validating via a real, interpreted
 +              // `cats.Eval` trampoline) -- same reasoning `callUserDefDef`
 +              // already uses `inst.outerEnv` for method bodies for.
-+              inst.fields.getOrElseUpdate(fn.name.toString, if uninitialized then null else interpretTree(vdef.rhs)(using bindThis(inst.outerEnv, fn.owner, inst)))
++              inst.fields.getOrElseUpdate(fn.name.toString, if uninitialized then defaultValueOf(fn.info) else interpretTree(vdef.rhs)(using bindThis(inst.outerEnv, fn.owner, inst)))
 +            // A value class's (`extends AnyVal`) own primary-constructor
 +            // param accessor (e.g. `RichInt#self`): such an instance is
 +            // never wrapped in an `InterpretedInstance` (it's represented
@@ -1946,8 +2061,28 @@ index 04cb637b..74c97d51 100644
 +            case _ =>
 +              // No `.fields` to memoize into (e.g. a `ModuleValue` receiver)
 +              // -- re-runs the initializer per access, which is wasteful but
-+              // still correct for a once-per-macro-expansion interpreter.
-+              if uninitialized then null else interpretTree(vdef.rhs)(using bindThis(env, fn.owner, receiver))
++              // still correct for a once-per-macro-expansion interpreter
++              // PROVIDED there's no real mutable state to go stale. That
++              // proviso fails when `receiver` is a genuine REAL host object
++              // (not one of our own interpreted representations) whose class
++              // actually declares this field: e.g. `ArrayBuffer`'s own
++              // `size0`, mutated by a real host `+=` whenever this
++              // interpreter's own curated `addOne` intrinsic runs (see
++              // `interpretPrimitiveOp`'s `Growable` case) -- but `size0`'s
++              // own GETTER has no curated intrinsic, so reading it falls
++              // through to here, and blindly replaying its ORIGINAL
++              // initializer (`initialSize`, frozen at construction) would
++              // hide every real mutation since. Reached through cats-parse's
++              // own `DropRightIterator#init`/`next` (itself reached through
++              // http4s's `uri"..."` literal macro), whose later
++              // `buf.update(...)` then saw a permanently-empty `size0` and
++              // threw a spurious `IndexOutOfBoundsException`. Prefer the
++              // REAL live field via reflection whenever the receiver
++              // actually has one; only fall back to tree-replay when it
++              // doesn't (e.g. the field is erased/inlined away, or the
++              // receiver is one of our own synthetic representations).
++              reflectiveFieldRead(receiver, fn).getOrElse(
++                if uninitialized then defaultValueOf(fn.info) else interpretTree(vdef.rhs)(using bindThis(env, fn.owner, receiver)))
 +        case _ =>
 +          // A constructor-parameter accessor (e.g. a `(using Quotes)` clause):
 +          // no retained DefDef body, but `interpretNew` already stashed the
@@ -2039,12 +2174,11 @@ index 04cb637b..74c97d51 100644
 +                      case _ => notInterpretable(fn)
 +              else notInterpretable(fn)
      }
--    def getExtraParams(tp: Type): List[Type] = tp.widenDealias match {
--      case tp: AppliedType if defn.isContextFunctionType(tp) =>
--        // Call context function type direct method
--        tp.args.init.map(arg => TypeErasure.erasure(arg)) ::: getExtraParams(tp.args.last)
--      case _ => Nil
-+
+ 
+-  private def loadReplLineClass(moduleClass: Symbol): Class[?] = {
+-    val lineClassloader = new AbstractFileClassLoader(ctx.settings.outputDir.value, classLoader)
+-    lineClassloader.loadClass(moduleClass.name.firstPart.toString)
+-  }
 +  /** Takes already-evaluated `args` (never raw argument `Tree`s to
 +   *  re-interpret) -- callers always already have these on hand (to try
 +   *  matching an intrinsic first), and re-interpreting the raw trees here on
@@ -2205,6 +2339,10 @@ index 04cb637b..74c97d51 100644
 +        case "IllegalStateException" => Some(new IllegalStateException(messageArg.orNull))
 +        case "NoSuchElementException" => Some(new NoSuchElementException(messageArg.orNull))
 +        case "RuntimeException" => Some(new RuntimeException(messageArg.orNull))
++        // Seen via cats-parse's own `DropRightIterator` (a real, genuinely-
++        // thrown-in-normal-control-flow exception, not just an "unreachable"
++        // fallback), reached through http4s's `uri"..."` literal macro.
++        case "IndexOutOfBoundsException" => Some(new IndexOutOfBoundsException(messageArg.orNull))
 +        case _ => None
 +    // `java.lang.StringBuilder`: a real JDK class, no retained Scala source
 +    // -- checked by `JavaDefined` (like `WeakReference` above), BEFORE the
@@ -2472,7 +2610,22 @@ index 04cb637b..74c97d51 100644
 +    case vd: ValOrDefDef => findTemplate(vd.rhs, target)
 +    case Block(stats, expr) => (stats.iterator ++ Iterator.single(expr)).map(findTemplate(_, target)).collectFirst { case Some(t) => t }
 +    case _ => None
-+
+ 
+-  private def loadClass(name: String): Class[?] =
+-    try classLoader.loadClass(name)
+-    catch
+-      case MissingClassValidInCurrentRun(sym, origin) =>
+-        suspendOnMissing(sym, origin, pos)
+-
+-
+-  private def getMethod(clazz: Class[?], name: Name, paramClasses: List[Class[?]]): JLRMethod =
+-    try clazz.getMethod(name.toString, paramClasses*)
+-    catch {
+-      case _: NoSuchMethodException =>
+-        val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
+-        throw new StopInterpretation(msg, pos)
+-      case MissingClassValidInCurrentRun(sym, origin) =>
+-        suspendOnMissing(sym, origin, pos)
 +  /** `object Foo extends Foo(a, b, ...)` (a common "default instance"
 +   *  pattern for config-like case classes, e.g. jsoniter-scala's
 +   *  `CodecMakerConfig`): the real field values live in this super
@@ -2775,11 +2928,43 @@ index 04cb637b..74c97d51 100644
 +        case Some(parentTree) => interpretTree(parentTree)
 +        case None => ModuleValue(fn.moduleClass)
      }
--    val extraParams = getExtraParams(sym.info.finalResultType)
--    val allParams = TypeErasure.erasure(sym.info) match {
--      case meth: MethodType => meth.paramInfos ::: extraParams
--      case _ => extraParams
-+
+ 
+-  private def stopIfRuntimeException[T](thunk: => T, method: JLRMethod): T =
+-    try thunk
+-    catch {
+-      case ex: RuntimeException =>
+-        val sw = new StringWriter()
+-        sw.write("A runtime exception occurred while executing macro expansion\n")
+-        sw.write(ex.getMessage)
+-        sw.write("\n")
+-        ex.printStackTrace(new PrintWriter(sw))
+-        sw.write("\n")
+-        throw new StopInterpretation(sw.toString.toMessage, pos)
+-      case ex: InvocationTargetException =>
+-        ex.getTargetException match {
+-          case ex: scala.quoted.runtime.StopMacroExpansion =>
+-            throw ex
+-          case MissingClassValidInCurrentRun(sym, origin) =>
+-            suspendOnMissing(sym, origin, pos)
+-          case targetException =>
+-            val sw = new StringWriter()
+-            sw.write("Exception occurred while executing macro expansion.\n")
+-            if (!ctx.settings.Ydebug.value) {
+-              val end = targetException.getStackTrace.lastIndexWhere { x =>
+-                x.getClassName == method.getDeclaringClass.getCanonicalName && x.getMethodName == method.getName
+-              }
+-              val shortStackTrace = targetException.getStackTrace.take(end + 1)
+-              targetException.setStackTrace(shortStackTrace)
+-              targetException.printStackTrace(new PrintWriter(sw))
+-
+-              targetException match
+-                case _: CyclicReference => sw.write("\nSee full stack trace using -Ydebug")
+-                case _ =>
+-            } else {
+-              targetException.printStackTrace(new PrintWriter(sw))
+-            }
+-            sw.write("\n")
+-            throw new StopInterpretation(sw.toString.toMessage, pos)
 +  /** `java.lang.Byte.TYPE`/etc: real JDK-native `Class<Byte>` constants for
 +   *  the primitive types (used by reflection-driven code, e.g.
 +   *  `ArrayBuilder`'s dispatch on `tag.runtimeClass`) -- no Scala source,
@@ -2823,13 +3008,12 @@ index 04cb637b..74c97d51 100644
 +      case _ => None
 +
 +  private def interpretStaticFieldAccess(sym: Symbol)(using Context): Object =
-+    wellKnownSingleton(sym).orElse(javaPrimitiveTypeConstant(sym)).orElse(javaBoxedConstant(sym)).orElse(javaStaticFieldConstant(sym)).getOrElse {
-+      resolveExternalDefTree(sym) match
-+        case vdef: ValDef => interpretTree(vdef.rhs)(using emptyEnv)
-+        case _ => notInterpretable(sym)
-     }
--    allParams.map(paramClass)
--  }
++    staticFieldCache.getOrElseUpdate(sym,
++      wellKnownSingleton(sym).orElse(javaPrimitiveTypeConstant(sym)).orElse(javaBoxedConstant(sym)).orElse(javaStaticFieldConstant(sym)).getOrElse {
++        resolveExternalDefTree(sym) match
++          case vdef: ValDef => interpretTree(vdef.rhs)(using emptyEnv)
++          case _ => notInterpretable(sym)
++      })
 +
 +  /** A handful of common real JDK `public static final` fields -- no Scala
 +   *  source ever, so `resolveExternalDefTree` can never find a body -- read
@@ -3006,8 +3190,39 @@ index 04cb637b..74c97d51 100644
 +          val types = args(1).asInstanceOf[Seq[scala.quoted.Type[?]] | Null]
 +          val termHole = args(2).asInstanceOf[(Null | ((Int, Seq[scala.quoted.Type[?] | scala.quoted.Expr[Any]], scala.quoted.Quotes) => scala.quoted.Expr[?]))]
 +          q.unpickleExprV2(pickled, types, termHole).asInstanceOf[Object]
-+        }
-+
+         }
+-    }
+ 
+-  /** List of classes of the parameters of the signature of `sym` */
+-  private def paramsSig(sym: Symbol): List[Class[?]] = {
+-    def paramClass(param: Type): Class[?] = {
+-      def arrayDepth(tpe: Type, depth: Int): (Type, Int) = tpe match {
+-        case JavaArrayType(elemType) => arrayDepth(elemType, depth + 1)
+-        case _ => (tpe, depth)
+-      }
+-      def javaArraySig(tpe: Type): String = {
+-        val (elemType, depth) = arrayDepth(tpe, 0)
+-        val sym = elemType.classSymbol
+-        val suffix =
+-          if (sym == defn.BooleanClass) "Z"
+-          else if (sym == defn.ByteClass) "B"
+-          else if (sym == defn.ShortClass) "S"
+-          else if (sym == defn.IntClass) "I"
+-          else if (sym == defn.LongClass) "J"
+-          else if (sym == defn.FloatClass) "F"
+-          else if (sym == defn.DoubleClass) "D"
+-          else if (sym == defn.CharClass) "C"
+-          else "L" + javaSig(elemType) + ";"
+-        ("[" * depth) + suffix
+-      }
+-      def javaSig(tpe: Type): String = tpe match {
+-        case tpe: JavaArrayType => javaArraySig(tpe)
+-        case _ =>
+-          // Take the flatten name of the class and the full package name
+-          val pack = tpe.classSymbol.topLevelClass.owner
+-          val packageName = if (pack == defn.EmptyPackageClass) "" else s"${pack.fullName}."
+-          packageName + tpe.classSymbol.fullNameSeparated(FlatName).toString
+-      }
 +      case "unpickleTypeV2" =>
 +        receiver.collect { case q: QuotesImpl => q }.map { q =>
 +          val pickled = args(0).asInstanceOf[String | List[String]]
@@ -4225,6 +4440,12 @@ index 04cb637b..74c97d51 100644
 +      case (s: String, "indexOf", (v: Integer) :: Nil) => Some(Int.box(s.indexOf(v)))
 +      case (s: String, "lastIndexOf", (v: String) :: Nil) => Some(Int.box(s.lastIndexOf(v)))
 +      case (s: String, "startsWith", (v: String) :: Nil) => Some(Boolean.box(s.startsWith(v)))
++      // Seen via cats-parse's own `Rep0Impl`/literal-matching machinery,
++      // reached through http4s's `uri"..."` literal macro.
++      case (s: String, "regionMatches", (toffset: Integer) :: (other: String) :: (ooffset: Integer) :: (len: Integer) :: Nil) =>
++        Some(Boolean.box(s.regionMatches(toffset, other, ooffset, len)))
++      case (s: String, "regionMatches", (ignoreCase: java.lang.Boolean) :: (toffset: Integer) :: (other: String) :: (ooffset: Integer) :: (len: Integer) :: Nil) =>
++        Some(Boolean.box(s.regionMatches(ignoreCase, toffset, other, ooffset, len)))
 +      case (s: String, "endsWith", (v: String) :: Nil) => Some(Boolean.box(s.endsWith(v)))
 +      case (s: String, "contains", (v: CharSequence) :: Nil) => Some(Boolean.box(s.contains(v)))
 +      case (s: String, "replace", (a: CharSequence) :: (b: CharSequence) :: Nil) => Some(s.replace(a, b))
@@ -4457,6 +4678,12 @@ index 04cb637b..74c97d51 100644
 +      case (c: Character, "to", (end: Character) :: Nil) =>
 +        Some((c.charValue to end.charValue))
 +      case (r, "toString", Nil) => Some(r.toString)
++      // `Throwable#getMessage`/`#getCause`: real JDK methods with no
++      // retained Scala source, needed by any interpreted `catch` handler
++      // that inspects the exception it caught (e.g. a curated real
++      // exception like `IndexOutOfBoundsException`, constructed above).
++      case (t: Throwable, "getMessage", Nil) => Some(t.getMessage)
++      case (t: Throwable, "getCause", Nil) => Some(t.getCause)
 +      // A `ModuleValue`-qualified static call (e.g. `java.util.Arrays.copyOf`)
 +      // reaches this dispatcher too (not just `interpretStaticCall`), since
 +      // `Call`'s qualifier-based static branch now runs it through
@@ -4547,7 +4774,31 @@ index 04cb637b..74c97d51 100644
 +
 +  private def unexpectedTree(tree: Tree): Object =
 +    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}", tree.srcPos)
-+
+ 
+-      val sym = param.classSymbol
+-      if (sym == defn.BooleanClass) classOf[Boolean]
+-      else if (sym == defn.ByteClass) classOf[Byte]
+-      else if (sym == defn.CharClass) classOf[Char]
+-      else if (sym == defn.ShortClass) classOf[Short]
+-      else if (sym == defn.IntClass) classOf[Int]
+-      else if (sym == defn.LongClass) classOf[Long]
+-      else if (sym == defn.FloatClass) classOf[Float]
+-      else if (sym == defn.DoubleClass) classOf[Double]
+-      else java.lang.Class.forName(javaSig(param), false, classLoader)
+-    }
+-    def getExtraParams(tp: Type): List[Type] = tp.widenDealias match {
+-      case tp: AppliedType if defn.isContextFunctionType(tp) =>
+-        // Call context function type direct method
+-        tp.args.init.map(arg => TypeErasure.erasure(arg)) ::: getExtraParams(tp.args.last)
+-      case _ => Nil
+-    }
+-    val extraParams = getExtraParams(sym.info.finalResultType)
+-    val allParams = TypeErasure.erasure(sym.info) match {
+-      case meth: MethodType => meth.paramInfos ::: extraParams
+-      case _ => extraParams
+-    }
+-    allParams.map(paramClass)
+-  }
  end Interpreter
  
 +/** A module value that was never reflectively instantiated -- calls on it are
