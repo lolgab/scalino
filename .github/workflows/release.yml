@@ -51,14 +51,14 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          ./dist/sn-cli run examples/Hello.scala
-          ./dist/sn-cli run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
+          ./dist/scalino run examples/Hello.scala
+          ./dist/scalino run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
 
       - name: Package
         shell: bash
         run: |
           version="${{ inputs.tag || github.ref_name }}"
-          pkg="scala-native-compiler-${version}-${{ matrix.target }}"
+          pkg="scalino-${version}-${{ matrix.target }}"
           mkdir -p "out/$pkg"
           cp -a dist/. "out/$pkg/"
           cp README.md LICENSE "out/$pkg/"

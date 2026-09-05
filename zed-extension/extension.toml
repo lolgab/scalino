@@ -1,13 +1,13 @@
-id = "dotty-lsp-native"
-name = "Dotty LSP Native"
-description = "JVM-free Scala language server (dotty-lsp-native, from scala-native-compiler) -- diagnostics and hover without Metals' JVM dependency."
+id = "scalino-lsp"
+name = "Scalino LSP"
+description = "JVM-free Scala language server (scalino-lsp, from scalino) -- diagnostics and hover without Metals' JVM dependency."
 version = "0.2.0"
 schema_version = 1
 authors = ["Lorenzo Gabriele <lorenzo@codacy.com>"]
-repository = "https://github.com/lolgab/snc"
+repository = "https://github.com/lolgab/scalino"
 languages = ["languages/scala"]
 
-# Defines its OWN language, "Scala (snc)" (languages/scala/, copied from
+# Defines its OWN language, "Scala (scalino)" (languages/scala/, copied from
 # metals-zed -- see languages/scala/NOTICE), deliberately named differently
 # from metals-zed's own "Scala" language rather than trying to own/reuse
 # that name. Two extensions both naming a language "Scala" for the same
@@ -15,9 +15,9 @@ languages = ["languages/scala"]
 # extension-load order -- observed in practice to flip after a routine dev
 # extension reinstall, silently reattaching metals-zed's language_servers
 # entry (bound to "Scala") to files this extension is supposed to own. A
-# distinct language name sidesteps that: pin `.scala` to "Scala (snc)" via
-# `file_types` in settings.json (written automatically by `sn-cli
-# setup-ide`, see cli/SnCli.scala) and metals-zed's `language = "Scala"`
+# distinct language name sidesteps that: pin `.scala` to "Scala (scalino)" via
+# `file_types` in settings.json (written automatically by `scalino
+# setup-ide`, see cli/ScalinoCli.scala) and metals-zed's `language = "Scala"`
 # entry never attaches, whether or not metals-zed itself stays installed.
 # Deliberately only `.scala`, not `.sbt`/`.sc`/`.mill` like metals-zed's own
 # language covers -- narrower scope, on purpose.
@@ -25,6 +25,6 @@ languages = ["languages/scala"]
 repository = "https://github.com/tree-sitter/tree-sitter-scala"
 commit = "97aead18d97708190a51d4f551ea9b05b60641c9"
 
-[language_servers.dotty-lsp-native]
-name = "dotty-lsp-native"
-language = "Scala (snc)"
+[language_servers.scalino-lsp]
+name = "scalino-lsp"
+language = "Scala (scalino)"

@@ -5,9 +5,9 @@ import java.nio.file.Paths
 object LinkDriver:
   /** `Logger.default` (used unconditionally before) always prints debug/trace
    *  (raw clang invocations, full NativeConfig dumps) to stderr, with no way
-   *  to dial it down -- sn-cli now passes its own resolved log level as an
+   *  to dial it down -- scalino now passes its own resolved log level as an
    *  optional 6th arg ("quiet"|"info"|"verbose", default "info") so `-v`/`-q`
-   *  actually affect the link step, not just sn-cli's own output. */
+   *  actually affect the link step, not just scalino's own output. */
   def loggerFor(level: String): Logger = level match
     case "quiet" => Logger.apply(_ => (), _ => (), _ => (), _ => (), msg => System.err.println(s"[error] $msg"))
     case "verbose" => Logger.default

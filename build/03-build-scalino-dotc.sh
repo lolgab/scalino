@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds dotc-native: a standalone binary of dotc + the scala-native compiler
+# Builds scalino-dotc: a standalone binary of dotc + the scala-native compiler
 # plugin, no JVM required to run it.
 #
 # The plugin MUST be on native-image's own build classpath. Compiler plugins
@@ -35,7 +35,7 @@ BUILD_CP="$(cat "$WORK/compiler-patched.cp"):$(cat "$WORK/nativelibs.cp"):$(cat 
   -H:+ReportExceptionStackTraces \
   -R:StackSize=67108864 \
   -J--sun-misc-unsafe-memory-access=allow \
-  -o "$DIST/dotc-native" \
+  -o "$DIST/scalino-dotc" \
   dotty.tools.dotc.Main
 
-echo "OK: $DIST/dotc-native"
+echo "OK: $DIST/scalino-dotc"

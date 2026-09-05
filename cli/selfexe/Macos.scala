@@ -22,7 +22,7 @@ object SelfExe:
     !size = cap.toUInt
     val buf = alloc[Byte](cap.toUInt)
     val rc = Dyld._NSGetExecutablePath(buf, size)
-    if rc != 0 then throw new RuntimeException("sn-cli: _NSGetExecutablePath failed")
+    if rc != 0 then throw new RuntimeException("scalino: _NSGetExecutablePath failed")
     val resolved = alloc[Byte](cap.toUInt)
     val res = CLib.realpath(buf, resolved)
     fromCString(if res == null then buf else resolved)

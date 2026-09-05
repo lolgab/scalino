@@ -45,8 +45,8 @@ mkdir -p "$WORK/agent-out" "$WORK/agent-compile-out"
 # back to old, wrong behavior" class of bug this docstring's own project
 # has hit repeatedly (see docs/findings.md) bites again -- confirmed via a
 # real regression: this exact gap (untraced `ArrayBuffer` fields) is what
-# broke `sn-cli test .` against `~/scala/ape`'s `uri"..."` literal macro
-# under `dotc-native` even after the underlying interpreter bug itself was
+# broke `scalino test .` against `~/scala/ape`'s `uri"..."` literal macro
+# under `scalino-dotc` even after the underlying interpreter bug itself was
 # fixed and verified working via the (unrestricted-reflection) JVM.
 REGRESSIONS_FIXTURE="$ROOT/examples/interpreter-regressions"
 mkdir -p "$WORK/agent-compile-out2"
@@ -73,14 +73,14 @@ mkdir -p "$WORK/agent-out2" "$WORK/agent-link-out"
 mkdir -p "$ROOT/agent-config/linkdriver"
 cp "$WORK/agent-out2/reachability-metadata.json" "$ROOT/agent-config/linkdriver/"
 
-# No more "tracing dotty-lsp-native" step here: that module (Main.scala,
+# No more "tracing scalino-lsp" step here: that module (Main.scala,
 # Lsp.scala) no longer uses lsp4j/Gson at all -- it's a hand-rolled
 # JSON-RPC/LSP implementation over hand-written jsoniter-scala codecs, with
 # zero runtime reflection, after discovering a GraalVM native-image-specific
 # pathology where Gson's reflective TypeAdapter construction for a real
 # editor's full `initialize` payload silently never completed under
 # native-image (see docs/findings.md "JVM-free language server (LSP)").
-# build/08-build-lsp-native.sh's own native-image invocation no longer
+# build/08-build-scalino-lsp.sh's own native-image invocation no longer
 # passes `-H:ConfigurationFileDirectories` at all -- add a real trace step
 # back here only if a genuine MissingReflectionRegistrationError ever shows
 # up at runtime again.

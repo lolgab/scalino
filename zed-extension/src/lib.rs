@@ -1,28 +1,28 @@
-// Zed extension for dotty-lsp-native (scala-native-compiler's JVM-free Scala
+// Zed extension for scalino-lsp (scalino's JVM-free Scala
 // LSP -- see /README.md and /docs/findings.md "JVM-free language server
-// (LSP)"). Defines its own "Scala (snc)" language/grammar (languages/scala/,
+// (LSP)"). Defines its own "Scala (scalino)" language/grammar (languages/scala/,
 // copied from https://github.com/scalameta/metals-zed -- see
 // languages/scala/NOTICE), deliberately named differently from metals-zed's
 // own "Scala" language (and scoped to just `.scala`, not
 // `.sbt`/`.sc`/`.mill`) so the two never collide over the same file
 // extensions -- see the longer comment in extension.toml. Registers
-// `dotty-lsp-native` as the only language server for it.
+// `scalino-lsp` as the only language server for it.
 //
 // No DAP support (the worksheet/decompiler modules that would need one were
 // trimmed from the server -- see patches/scala3-0002-trim-language-server.patch)
-// and no auto-download: dotty-lsp-native isn't published anywhere generic,
-// it's this repo's own dist/ build output (build/08-build-lsp-native.sh, or
+// and no auto-download: scalino-lsp isn't published anywhere generic,
+// it's this repo's own dist/ build output (build/08-build-scalino-lsp.sh, or
 // a release tarball). Resolved the same way any other manually-installed
 // LSP binary is in Zed: on PATH (`worktree.which`), or pinned explicitly via
-// `lsp.dotty-lsp-native.binary.path` in settings.json.
+// `lsp.scalino-lsp.binary.path` in settings.json.
 
 use zed_extension_api::{self as zed, settings::LspSettings, Result};
 
-const SERVER_ID: &str = "dotty-lsp-native";
+const SERVER_ID: &str = "scalino-lsp";
 
-struct DottyLspNativeExtension;
+struct ScalinoLspExtension;
 
-impl zed::Extension for DottyLspNativeExtension {
+impl zed::Extension for ScalinoLspExtension {
     fn new() -> Self {
         Self
     }
@@ -41,7 +41,7 @@ impl zed::Extension for DottyLspNativeExtension {
             .or_else(|| worktree.which(SERVER_ID))
             .ok_or_else(|| {
                 format!(
-                    "{SERVER_ID} not found on PATH -- build it (build/08-build-lsp-native.sh, \
+                    "{SERVER_ID} not found on PATH -- build it (build/08-build-scalino-lsp.sh, \
                      or use a release tarball's dist/{SERVER_ID}) and either add dist/ to PATH \
                      or set `lsp.{SERVER_ID}.binary.path` in settings.json"
                 )
@@ -75,4 +75,4 @@ impl zed::Extension for DottyLspNativeExtension {
     }
 }
 
-zed::register_extension!(DottyLspNativeExtension);
+zed::register_extension!(ScalinoLspExtension);

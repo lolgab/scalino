@@ -1,4 +1,4 @@
-name = "Scala (snc)"
+name = "Scala (scalino)"
 grammar = "scala"
 path_suffixes = ["scala"]
 line_comments = ["// "]

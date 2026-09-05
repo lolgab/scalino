@@ -5,12 +5,12 @@
 .scala-build/
 .bsp/
 .metals/
-.snc-build/
-.sn-cli-build/
+.scalino-bootstrap-build/
+.scalino-build/
 *.class
 *.tasty
 *.nir
 /zed-extension/target/
 .dotty-ide.json
 .zed/
-.dotty-lsp-native.log
+.scalino-lsp.log

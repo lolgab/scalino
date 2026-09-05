@@ -5,10 +5,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 ./01-fetch-deps.sh
 ./02-build-java-base.sh
 ./03a-patch-compiler.sh
-./03-build-dotc-native.sh
+./03-build-scalino-dotc.sh
 ./04a-patch-tools.sh
-./04-build-linkdriver-native.sh
+./04-build-scalino-linkdriver.sh
 ./06-package.sh
-./07-build-sn-cli.sh
-./08-build-lsp-native.sh
+./07-build-scalino.sh
+./08-build-scalino-lsp.sh
 echo "OK: toolchain built in $(cd .. && pwd)/dist"

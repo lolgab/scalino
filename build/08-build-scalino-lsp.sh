@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds dotty-lsp-native: a standalone binary of dotty's own pre-Metals LSP
+# Builds scalino-lsp: a standalone binary of dotty's own pre-Metals LSP
 # server (vendor/scala3/language-server/, trimmed by
 # patches/scala3-0002-trim-language-server.patch to drop the worksheet
 # JVM-subprocess-REPL and TASTy-decompiler endpoints, neither of which core
 # LSP needs). No JVM required to run it.
 #
-# Unlike dotc-native (native-image'd directly from published jars), this
+# Unlike scalino-dotc (native-image'd directly from published jars), this
 # module isn't published anywhere -- it was dotty's IDE support before
 # Metals existed and never shipped a Maven artifact. So we compile it
 # ourselves first, JVM-side, the same way 03a-patch-compiler.sh compiles its
@@ -51,7 +51,7 @@ echo "== native-image =="
   --no-fallback \
   -H:+ReportExceptionStackTraces \
   -J--sun-misc-unsafe-memory-access=allow \
-  -o "$DIST/dotty-lsp-native" \
+  -o "$DIST/scalino-lsp" \
   dotty.tools.languageserver.Main
 
-echo "OK: $DIST/dotty-lsp-native"
+echo "OK: $DIST/scalino-lsp"

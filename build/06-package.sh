@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Vendors every jar bin/snc and sn-cli need at runtime into dist/lib and
+# Vendors every jar bin/scalino-bootstrap and scalino need at runtime into dist/lib and
 # rewrites the classpath manifests (compiler.cp, nativelibs.cp,
 # nscplugin.jar.txt) to hold dist-relative paths ("lib/foo.jar") instead of
 # absolute coursier-cache paths -- so dist/ can be tarred up and copied to
-# another machine and still work. bin/snc and cli/SnCli.scala resolve those
+# another machine and still work. bin/scalino-bootstrap and cli/ScalinoCli.scala resolve those
 # relative entries against their own dist/ root at runtime.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -38,8 +38,8 @@ cp -p "$PLUGIN_JAR" "$DIST/lib/$PLUGIN_BASE"
 echo "lib/$PLUGIN_BASE" > "$DIST/nscplugin.jar.txt"
 
 # Build-time-only intermediates (their classes are already baked into the
-# dotc-native/linkdriver-native binaries) -- not needed at runtime, drop them
+# scalino-dotc/scalino-linkdriver binaries) -- not needed at runtime, drop them
 # so they don't end up in release tarballs.
 rm -f "$DIST/scala3-compiler-patched.jar" "$DIST/tools-patched.jar"
 
-echo "OK: $DIST is ready (self-contained, relocatable). Try: bin/snc build spike/Hello.scala -o /tmp/hello"
+echo "OK: $DIST is ready (self-contained, relocatable). Try: bin/scalino-bootstrap build spike/Hello.scala -o /tmp/hello"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds linkdriver-native: a standalone binary wrapping scala-native's
+# Builds scalino-linkdriver: a standalone binary wrapping scala-native's
 # tools_3 library (NIR -> LLVM IR -> clang -> native executable). All classes
 # are known at build time (no dynamic plugin loading here), so this is a
 # plain native-image build, no reflection surgery needed beyond the agent
@@ -28,7 +28,7 @@ mkdir -p "$WORK/driver-classes"
   -H:+ReportExceptionStackTraces \
   --enable-url-protocols=http,https \
   -J--sun-misc-unsafe-memory-access=allow \
-  -o "$DIST/linkdriver-native" \
+  -o "$DIST/scalino-linkdriver" \
   LinkDriver
 
-echo "OK: $DIST/linkdriver-native"
+echo "OK: $DIST/scalino-linkdriver"

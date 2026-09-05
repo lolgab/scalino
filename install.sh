@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# One-line installer for scala-native-compiler's `sn-cli` toolchain.
+# One-line installer for scalino's `scalino` toolchain.
 #
-#   curl -fsSL https://raw.githubusercontent.com/lolgab/snc/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/lolgab/scalino/main/install.sh | bash
 #
-# Downloads the latest (or $SNC_VERSION-pinned) GitHub release tarball for
+# Downloads the latest (or $SCALINO_VERSION-pinned) GitHub release tarball for
 # the current OS/arch, verifies its sha256 checksum, unpacks it into a
-# versioned directory under $SNC_INSTALL_DIR (default: ~/.local/share/snc),
-# and symlinks `sn-cli` into $SNC_BIN_DIR (default: ~/.local/bin). sn-cli
+# versioned directory under $SCALINO_INSTALL_DIR (default: ~/.local/share/scalino),
+# and symlinks `scalino` into $SCALINO_BIN_DIR (default: ~/.local/bin). scalino
 # resolves its own dist root from its real (symlink-resolved) path at
 # runtime -- see cli/selfexe/*.scala -- so a symlink here is safe and the
-# rest of dist/ (dotc-native, linkdriver-native, lib/, dotty-lsp-native)
+# rest of dist/ (scalino-dotc, scalino-linkdriver, lib/, scalino-lsp)
 # never needs to move.
 #
 # Still required on top of this, on the running machine (not bundled --
@@ -18,10 +18,10 @@
 # coursier's `cs` launcher for dependency resolution.
 set -euo pipefail
 
-repo="lolgab/snc"
-version="${SNC_VERSION:-latest}"
-install_dir="${SNC_INSTALL_DIR:-$HOME/.local/share/snc}"
-bin_dir="${SNC_BIN_DIR:-$HOME/.local/bin}"
+repo="lolgab/scalino"
+version="${SCALINO_VERSION:-latest}"
+install_dir="${SCALINO_INSTALL_DIR:-$HOME/.local/share/scalino}"
+bin_dir="${SCALINO_BIN_DIR:-$HOME/.local/bin}"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
@@ -62,7 +62,7 @@ if [ -d "$dest_dir" ]; then
 else
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
-  tarball="$work/snc.tar.gz"
+  tarball="$work/scalino.tar.gz"
 
   echo "install.sh: downloading $asset_url"
   curl -fsSL -o "$tarball" "$asset_url"
@@ -82,19 +82,19 @@ else
   mkdir -p "$extract_dir"
   tar xzf "$tarball" -C "$extract_dir"
   # The tarball's top-level directory is named after the release
-  # (scala-native-compiler-<version>-<target>); move whatever single
+  # (scalino-<version>-<target>); move whatever single
   # directory it contains into place under the tag, not that release name,
-  # so re-running with a different $SNC_VERSION doesn't collide.
+  # so re-running with a different $SCALINO_VERSION doesn't collide.
   inner="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d)"
   [ -n "$inner" ] || die "unexpected tarball layout (no top-level directory)"
   mv "$inner" "$dest_dir"
 fi
 
 mkdir -p "$bin_dir"
-ln -sf "$dest_dir/sn-cli" "$bin_dir/sn-cli"
-chmod +x "$dest_dir/sn-cli"
+ln -sf "$dest_dir/scalino" "$bin_dir/scalino"
+chmod +x "$dest_dir/scalino"
 
-echo "install.sh: installed sn-cli $tag -> $bin_dir/sn-cli (dist: $dest_dir)"
+echo "install.sh: installed scalino $tag -> $bin_dir/scalino (dist: $dest_dir)"
 
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
@@ -102,7 +102,7 @@ case ":$PATH:" in
 esac
 
 if ! command -v clang >/dev/null 2>&1; then
-  echo "install.sh: warning -- clang not found on PATH. sn-cli needs clang/clang++ to build anything, even a zero-dependency Hello World."
+  echo "install.sh: warning -- clang not found on PATH. scalino needs clang/clang++ to build anything, even a zero-dependency Hello World."
 fi
 
-echo "install.sh: try it: echo '@main def hello(): Unit = println(\"hello\")' > Hello.scala && sn-cli run Hello.scala"
+echo "install.sh: try it: echo '@main def hello(): Unit = println(\"hello\")' > Hello.scala && scalino run Hello.scala"

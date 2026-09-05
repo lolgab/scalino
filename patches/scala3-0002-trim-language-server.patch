@@ -1878,7 +1878,7 @@ index 7f269eec..9ae852f9 100644
 -import org.eclipse.lsp4j.services._
 -import org.eclipse.lsp4j.launch._
 -import org.eclipse.lsp4j.jsonrpc.Launcher
-+/** Appends a timestamped line per dispatched RPC method to `.dotty-lsp-native.log`
++/** Appends a timestamped line per dispatched RPC method to `.scalino-lsp.log`
 + *  in the server's working directory (the editor's project root -- see
 + *  `Main.runStdio`) -- a real log file the server writes itself, rather
 + *  than relying on the editor to capture/display stderr (Zed, e.g., only
@@ -1888,7 +1888,7 @@ index 7f269eec..9ae852f9 100644
 + *  rather than a reason to fail startup. */
 +object Log {
 +  private val writer =
-+    try Some(new PrintWriter(new FileWriter(".dotty-lsp-native.log", /* append = */ true), /* autoFlush = */ true))
++    try Some(new PrintWriter(new FileWriter(".scalino-lsp.log", /* append = */ true), /* autoFlush = */ true))
 +    catch { case _: Throwable => None }
  
 -/** Run the Dotty Language Server.
@@ -1982,7 +1982,7 @@ index 7f269eec..9ae852f9 100644
 +        task.run()
 +      }
 +    })
-+    worker.setName("dotty-lsp-native-worker")
++    worker.setName("scalino-lsp-worker")
 +    worker.setDaemon(false) // keep the JVM alive for as long as there's real work queued or pending
 +    worker.start()
 +

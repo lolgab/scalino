@@ -12,7 +12,7 @@ import domain.*
 // default parameters, nested case classes, or field position/count in
 // `BuildingInput` (the shape that originally surfaced this) -- those were
 // red herrings. Confirmed NOT an owner-chain/hygiene bug (unlike the
-// separate, already-tracked `x.addOne`/`LambdaLift` gap) via `SNC_INTERP
+// separate, already-tracked `x.addOne`/`LambdaLift` gap) via `SCALINO_INTERP
 // _DEBUG`-traced `[spliceOwner]`/`[newVal]` prints showing consistent
 // symbol identity across all per-case vals. Confirmed NOT a general
 // Scala Native local-implicit-lazy-val-in-a-Block codegen bug via a
