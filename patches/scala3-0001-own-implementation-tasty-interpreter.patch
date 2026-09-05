@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..3b35e626 100644
+index 04cb637b..56f602b8 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -496,7 +496,7 @@ index 04cb637b..3b35e626 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +546,4270 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4313 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -1015,7 +1015,13 @@ index 04cb637b..3b35e626 100644
 +              // instances, not a wrapper) is an instance of the target
 +              // class. Covers most `quotes.reflect` type-shape TypeTests
 +              // without needing one hand-written case per name.
-+              typeTestClass(name).map(cls => (v: Object) => if cls.isInstance(v) then Some(List(v)) else None)
++              if sys.env.contains("SNC_INTERP_DEBUG") then
++                Console.err.println(s"[genericTypeTest] name=$name resolved=${typeTestClass(name)}")
++              typeTestClass(name).map(cls => (v: Object) =>
++                val r = cls.isInstance(v)
++                if sys.env.contains("SNC_INTERP_DEBUG") then
++                  Console.err.println(s"[genericTypeTest.check] name=$name cls=$cls v=$v vClass=${if v == null then "null" else v.getClass} result=$r")
++                if r then Some(List(v)) else None)
 +      // `scala.util.matching.Regex#unapplySeq(target)` (e.g. a macro's own
 +      // `value match { case SomeRegex(_*) => ... }`, used by ip4s's own
 +      // `Hostname.fromString`, needed by its `host"..."` literal macro):
@@ -1602,6 +1608,34 @@ index 04cb637b..3b35e626 100644
 +        // `MatchError` -- reached, several calls further, through http4s's
 +        // `uri"..."` literal macro.
 +        else if !defn.isFunctionClass(cls) && isBareFunctionValue(v) then false
++        // `v` itself a genuine dotc-internal `Type`/`Tree` (never one of our
++        // own `InterpretedInstance`/`ModuleValue`/collection representations,
++        // or `receiverConcreteClass` above would already have recognized
++        // it) flowing through INTERPRETED macro code that inspects
++        // `quotes.reflect` values with a plain type-ascription pattern
++        // (`case tref: TypeRef => ...`, NOT a named-symbol `X.unapply(v)`
++        // extractor call -- that shape already goes through the correct,
++        // real-`isInstance`-based `typeTestClass` dispatch elsewhere in
++        // this file). This hits the SAME lenient fallback as any other
++        // unrecognized real host object, but here it matters: e.g. upickle's
++        // own `getSingletonImpl` (used by its `derives ReadWriter` on any
++        // `enum`), `TypeRepr.of[T] match { case tref: TypeRef => ...;
++        // case v => '{valueOf[T]} }` -- for an enum CASE's own singleton
++        // type, the real scrutinee is a `TermRef`, which should fail the
++        // `TypeRef` test and fall to the second, correct branch. Under the
++        // old blanket-true fallback it always matched the FIRST branch
++        // instead, building `Checker.Val` from the wrong companion-module
++        // reference -- silently wrong for every case except whichever one
++        // this coincidentally still lined up for, surfacing as a spurious
++        // `MatchError` several calls downstream inside upickle's own
++        // `TaggedWriter.write0`. Reuses the same real-class lookup table
++        // (`typeTestClass`) already trusted for the extractor-call shape,
++        // just keyed by the plain class name instead of its `XyzTypeTest`
++        // given-instance name; falls through to the old lenient default for
++        // any dotc-internal shape not in that table.
++        else if (v.isInstanceOf[dotty.tools.dotc.core.Types.Type] || v.isInstanceOf[dotty.tools.dotc.ast.Trees.Tree[?]])
++          && typeTestClass(cls.name.toString + "TypeTest").isDefined then
++          typeTestClass(cls.name.toString + "TypeTest").get.isInstance(v)
 +        else true
 +      if sys.env.contains("SNC_INTERP_DEBUG") then
 +        Console.err.println(s"[matchesRuntimeType] v.getClass=${if v == null then "null" else v.getClass} tpe=${tpe.show} cls=$cls cls.exists=${cls.exists} cls.isClass=${cls.isClass} actual=$actual actual.exists=${actual.exists} baseClasses=${if actual.exists && actual.isClass then actual.asClass.baseClasses else Nil} result=$result")
@@ -2610,22 +2644,7 @@ index 04cb637b..3b35e626 100644
 +    case vd: ValOrDefDef => findTemplate(vd.rhs, target)
 +    case Block(stats, expr) => (stats.iterator ++ Iterator.single(expr)).map(findTemplate(_, target)).collectFirst { case Some(t) => t }
 +    case _ => None
- 
--  private def loadClass(name: String): Class[?] =
--    try classLoader.loadClass(name)
--    catch
--      case MissingClassValidInCurrentRun(sym, origin) =>
--        suspendOnMissing(sym, origin, pos)
--
--
--  private def getMethod(clazz: Class[?], name: Name, paramClasses: List[Class[?]]): JLRMethod =
--    try clazz.getMethod(name.toString, paramClasses*)
--    catch {
--      case _: NoSuchMethodException =>
--        val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
--        throw new StopInterpretation(msg, pos)
--      case MissingClassValidInCurrentRun(sym, origin) =>
--        suspendOnMissing(sym, origin, pos)
++
 +  /** `object Foo extends Foo(a, b, ...)` (a common "default instance"
 +   *  pattern for config-like case classes, e.g. jsoniter-scala's
 +   *  `CodecMakerConfig`): the real field values live in this super
@@ -2811,7 +2830,22 @@ index 04cb637b..3b35e626 100644
 +    case inst: InterpretedInstance if inst.cls.name.toString == "::" =>
 +      inst.fields("head") :: asObjectList(inst.fields("next"))
 +    case _ => Nil
-+
+ 
+-  private def loadClass(name: String): Class[?] =
+-    try classLoader.loadClass(name)
+-    catch
+-      case MissingClassValidInCurrentRun(sym, origin) =>
+-        suspendOnMissing(sym, origin, pos)
+-
+-
+-  private def getMethod(clazz: Class[?], name: Name, paramClasses: List[Class[?]]): JLRMethod =
+-    try clazz.getMethod(name.toString, paramClasses*)
+-    catch {
+-      case _: NoSuchMethodException =>
+-        val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
+-        throw new StopInterpretation(msg, pos)
+-      case MissingClassValidInCurrentRun(sym, origin) =>
+-        suspendOnMissing(sym, origin, pos)
 +  /** Materializes anything that behaves like a collection into a real host
 +   *  `Seq[Object]` -- needed wherever downstream code (ours, e.g.
 +   *  `IterableFactory#from`, or interpreted library code) structurally
@@ -3302,7 +3336,11 @@ index 04cb637b..3b35e626 100644
 +      case "simplified" if fn.owner.name.toString == "TypeReprMethods" =>
 +        args.headOption.collect { case t: Type => t.simplified }
 +      case "classSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
-+        args.headOption.collect { case t: Type => if t.classSymbol.exists then Some(t.classSymbol) else None }
++        args.headOption.collect { case t: Type =>
++          if sys.env.contains("SNC_INTERP_DEBUG") then
++            Console.err.println(s"[classSymbol] t=${t.show} tId=${System.identityHashCode(t)} tClass=${t.getClass} classSymbol=${t.classSymbol} exists=${t.classSymbol.exists}")
++          if t.classSymbol.exists then Some(t.classSymbol) else None
++        }
 +      case "typeSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
 +        args.headOption.collect { case t: Type => t.typeSymbol }
 +      case "termSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
@@ -3363,7 +3401,12 @@ index 04cb637b..3b35e626 100644
 +      case "isNoSymbol" if fn.owner.name.toString == "SymbolMethods" =>
 +        args.headOption.collect { case s: Symbol => Boolean.box(s == NoSymbol) }
 +      case "companionModule" if fn.owner.name.toString == "SymbolMethods" =>
-+        args.headOption.collect { case s: Symbol => s.denot.companionModule }
++        args.headOption.collect { case s: Symbol =>
++          val cm = s.denot.companionModule
++          if sys.env.contains("SNC_INTERP_DEBUG") then
++            Console.err.println(s"[companionModule] s=$s id=${System.identityHashCode(s)} cm=$cm cmId=${System.identityHashCode(cm)}")
++          cm
++        }
 +      case "companionClass" if fn.owner.name.toString == "SymbolMethods" =>
 +        args.headOption.collect { case s: Symbol => s.denot.companionClass }
 +      case "children" if fn.owner.name.toString == "SymbolMethods" =>

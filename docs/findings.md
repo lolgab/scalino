@@ -523,14 +523,88 @@ its actual class/message in the log, not just that reflection was
 involved. Best-effort (silently a no-op if the file can't be opened, e.g.
 read-only cwd) — never a reason to fail startup.
 
+**`Scala (snc)` rename confirmed working live, same day:** after a dev-extension
+reinstall + fresh Zed relaunch, `metals` genuinely stopped auto-starting —
+confirmed via `Zed.log` showing `dotty-lsp-native` alone launch for a `.scala`
+buffer, no accompanying `metals` process, across multiple fresh sessions.
+
+**Sixth bug, the real one behind this whole week's "it doesn't work in
+real Zed" saga — found the same day, after the rename fix above stopped
+being confused by metals racing alongside it.** `dotty-lsp-native`, launched
+by a real, fully-quiescent, freshly-restarted Zed (no extension-reload
+churn, no sleep/wake nearby), reliably failed its *first* `initialize`
+request: **the raw request bytes are read successfully and completely
+within milliseconds** (confirmed via a temporary byte-logging `InputStream`
+wrapper — every header byte and the full JSON body logged) **but our own
+RPC dispatch (`SafeLocalEndpoint.invoke`, `Log("-> initialize")`) never
+fires** — no exception, no log line, nothing, from any thread. A temporary
+watchdog thread (periodic `Thread.getAllStackTraces` dump + a
+`Runtime.addShutdownHook`) showed every thread idle within ~3s of the
+request being read, and then, at almost *exactly* 60.0 seconds after the
+bytes were read, the JVM ran its shutdown hook and exited **cleanly, code
+0** — matching `ThreadPoolExecutor`'s/`SynchronousQueue`-backed cached pool's
+default 60s keep-alive: whatever pool thread was handling the request
+either finished (silently, without dispatching) or was abandoned, and once
+it timed out and self-terminated, `DestroyJavaVM`'s `joinAllNonDaemons()`
+had nothing left to wait for.
+
+Captured Zed's *exact* raw `initialize` bytes (byte-for-byte, via a `tee`
+wrapper substituted for `dist/dotty-lsp-native` in `.zed/settings.json`'s
+`binary.path`) and replayed them directly against the binary, completely
+offline — **100% reproducible with zero Zed involvement**, confirming this
+was never a Zed transport/spawn issue (the earlier "Zed never writes to
+stdin" read from an initial botched byte-capture attempt — a real editor's
+richer capabilities payload was the actual variable, not anything
+Zed-side). Bisection (replaying trimmed copies of the exact captured
+payload) initially isolated `capabilities.general`/`capabilities.experimental`
+as sufficient triggers in isolation — both newer `ClientCapabilities`
+fields the trace fixture never exercised — and adding them to
+`build/lsp-trace-drive.py`'s capabilities + re-running the standalone LSP
+retrace step (`build/05-regen-agent-config.sh`'s tracing block) fixed
+*those two fields in isolation*. But the **full real payload still hung
+identically after that fix** — a systematic one-field-at-a-time removal
+sweep across every top-level `workspace.*` and `textDocument.*` key (and
+`general`+`experimental` together) found **no single field whose removal
+fixes it**, meaning it isn't reducible to one missing reflection
+registration.
+
+The decisive test: replaying the *exact same captured bytes* against the
+*exact same compiled classes* under a **plain JVM** (`java -cp
+<lsp-classes>:<lsp-java-classes>:<compiler-patched.cp>:<lsp.cp>
+dotty.tools.languageserver.Main -stdio`, no native-image at all) returned a
+real response in under 1 second. **This is conclusively a GraalVM
+native-image-specific pathology** — some interaction between Gson's
+reflective `TypeAdapter` construction (many distinct nested capability
+classes touched for the first time in one large parse) and SVM's
+closed-world reflection/threading model, triggered only by a sufficiently
+rich real-editor-shaped payload, not by any single field. Matches a broader
+known category of GraalVM issues where native-image's non-daemon-thread
+lifecycle/JVM-exit timing genuinely differs from a real JVM's (e.g.
+oracle/graal#12116, #434) — not something fixable by more
+reachability-metadata tweaks alone.
+
+**Not yet fixed — real next step for whoever resumes this:** either (a)
+find the exact native-image/Gson interaction bug (would likely need
+bisecting `-H:` flags or filing upstream against oracle/graal), or (b)
+sidestep it entirely by changing `DottyLanguageServer.rpcMethods`'
+registered param type for `initialize` away from lsp4j's real
+`InitializeParams` (which forces Gson to reflectively construct every
+nested `ClientCapabilities` subtype) to something generic
+(`com.google.gson.JsonElement`/`Object`), and hand-extract just `rootUri`/
+`workspaceFolders` from the raw tree ourselves — `initialize()`'s own body
+barely touches client capabilities beyond that anyway. Not attempted this
+session (`rpcMethods`'s per-method param type currently comes straight from
+lsp4j's own reflected interface method signature via
+`ServiceEndpoints.getSupportedMethods`, not something hand-authored per
+method yet).
+
 Not yet done: deeper verification of `completion`/`references`/`rename`/
 workspace `symbol` (they reuse the same now-verified
 `InteractiveDriver`/dispatch plumbing as `hover`/diagnostics, so should
-work, but aren't individually exercised yet); the missing-`.dotty-ide.json`
-whole-process crash noted above; confirming the `Scala (snc)` rename
-actually stops `metals` from auto-starting in a real, currently-open Zed
-window (needs a fresh dev-extension reinstall + reopen to test — not yet
-done as of this writing).
+work, but aren't individually exercised yet — though given the bug above,
+worth re-checking whether a real client's richer per-request params, not
+just `initialize`'s, can trigger the same native-image pathology); the
+missing-`.dotty-ide.json` whole-process crash noted earlier.
 
 ## Remaining work
 
@@ -1067,4 +1141,20 @@ done as of this writing).
     - **Owner-chain/hygiene mismatch across the per-case `Symbol.newVal` calls** (the `[spliceOwner]`/`[newVal]` combo this session added, gated by `SNC_INTERP_DEBUG`, at the `"spliceOwner"`/`"newVal"` cases in `Interpreter.scala`'s `interpretStaticCall`-adjacent dispatch) -- traced against the minimal repro: `x0`, `x1`, `x2`'s owner symbols are the exact SAME identity (`System.identityHashCode` equal) within one `defineEnumVisitorsImpl` expansion, both for the Reader pass and the Writer pass. This is NOT a repeat of item 9's `x.addOne`/`LambdaLift` owner-chain bug -- that one is a hard `"undefined: ..."` compile-time crash from a genuinely wrong owner; this one compiles and links clean, and only misbehaves at runtime.
     - **A general Scala Native codegen bug with local `implicit lazy val`s in a `Block`, unrelated to macros** -- ruled out by a hand-written control (`Repro5.scala`: a `Block` defining `implicit lazy val x0`/`x1`/`x2` by hand, `x2` built via an explicit varargs call picking up `x0`/`x1`, matching `defineEnumVisitorsImpl`'s own shape) compiling and running CORRECTLY (`result.tag=MERGED:x0,x1`). So plain local-implicit-lazy-val-in-a-block genuinely works under this toolchain; something specific to the MACRO-SPLICED version is different.
 
-    **Not yet traced further:** the real difference between the macro-spliced version and the hand-written control is that each per-case `xN`'s initializer is itself a NESTED macro call (`prefix.macroR[CaseType]`/`prefix.macroW[CaseType]`, `CaseType` a SINGLETON type like `Motivo.A.type`) -- i.e. another macro expansion (interpreted by this same `Interpreter.scala`), not a plain user expression, and `macroR`/`macroW` themselves live in `ReadersVersionSpecific`/`WritersVersionSpecific` traits NOT published in upickle's own sources jars (`upickle_3`/`upickle-implicits_3` both lack these files -- likely built from a shared, cross-platform source directory not bundled into either sources artifact), so their exact body couldn't be inspected this session. Leading hypothesis: that NESTED macro call, when building the LEAF writer/reader for a singleton case type, needs to produce a real quoted reference to the case's own singleton VALUE (e.g. `'{ Motivo.B }`, presumably feeding `Annotator.Checker.Val(v0)`) purely from the TYPE `Motivo.B.type` (via `quotes.reflect` symbol/type machinery, not from an existing user `Ident` already in the source tree) -- if constructing that reference is where this interpreter diverges from real dotc for anything other than the FIRST case processed, that would explain the exact "ordinal 0 always works, everything else doesn't" symptom precisely. Next session should get `dotc-native`'s own decompiled/NIR output for one of these enums' derived Writer next to what real JVM scalac/dotc produces for the same source (a real JVM Scala 3 build of the same `enum ... derives ReadWriter`), OR add `SNC_INTERP_DEBUG` tracing around wherever this interpreter builds an `Ident`/term reference FROM a bare type/symbol (rather than from an already-parsed `Ident` tree) to see whether it resolves to the correct singleton for cases beyond the first. The minimal repro (`domain/{Building,WindowCatalog,AmbienteNonRiscaldato}.scala` copied verbatim + a tiny driver, ~3s compile+link+run via `dist/sn-cli run`, no `db`/`http`/porcupine/cats-effect needed) is a much better starting point than `~/scala/ape`'s full test suite for iterating on this.
+    **Same-day follow-up session, MUCH deeper trace -- corrects a wrong mid-investigation guess from earlier the same day, don't trust that guess (removed above, was: "the nested `macroR[CaseType]`/`macroW[CaseType]` call itself is the divergence point").** Got upickle's REAL, actual `ReadersVersionSpecific`/`WritersVersionSpecific`/`macros.scala` source (`src-3` variants -- NOT bundled in either published sources jar, which only ship the SHARED `src/` tree; fetched instead via `gh api repos/com-lihaoyi/upickle/contents/...?ref=4.4.3`, tree listed via `gh api repos/com-lihaoyi/upickle/git/trees/4.4.3?recursive=true`). Also got DEFINITIVE ground truth by running the identical minimal repro through real, unmodified `scala-cli` (JVM Scala 3.8.4 + real upickle 4.4.3, this project's toolchain not involved at all): **all ordinals serialize correctly** -- conclusively confirms this is a genuine bug in THIS project's toolchain, not upickle itself and not a real-dotc semantic this investigation had simply misunderstood.
+
+    Traced `getSingletonImpl` (`WritersVersionSpecific.scala`'s `macroW[T]`, singleton branch: `Annotator.Checker.Val(macros.getSingleton[T])`) down to its real body:
+    ```scala
+    TypeRepr.of[T] match
+      case tref: TypeRef => Ref(tref.classSymbol.get.companionModule).asExpr.asInstanceOf[Expr[T]]
+      case v => '{valueOf[T]}
+    ```
+    Added `SNC_INTERP_DEBUG`-gated tracing at THREE points to follow this precisely (all left in place): `[classSymbol]`/`[companionModule]` (with the scrutinee's real `getClass`, e.g. `dotty.tools.dotc.core.Types$CachedTermRef`) at the `TypeReprMethods#classSymbol`/`SymbolMethods#companionModule` interpretation sites, and `[genericTypeTest]`/`[genericTypeTest.check]` at the generic `TypeTest[TypeRepr, X]` dispatch (`typeTestClass`-based, real `cls.isInstance(v)`) used for both named-extractor patterns (`case TypeRef(prefix, name) => ...`) AND plain type-ascription binds (`case tref: TypeRef => ...`) alike.
+
+    **Result: `getSingletonImpl` is NOT the bug.** For `T = Motivo.A.type`, the real scrutinee is confirmed a genuine `CachedTermRef` (`TermRef`/`TypeRef` are real, disjoint siblings under `NamedType` in dotc's own `Types.scala` -- confirmed by reading it directly, `TermRef` does NOT extend `TypeRef`). The `TypeRefTypeTest` check on it correctly returns `false` (`[genericTypeTest.check] ... result=false`), so the interpreter correctly falls through to `case v => '{valueOf[T]}` -- exactly matching real dotc semantics, for the FIRST enum case tried in this trace. (The earlier session's `[classSymbol]`/`[companionModule]` hits that looked like they came from THIS function were a red herring from a DIFFERENT, unrelated macro helper that happens to use the identical `Ref(...companionModule(classSymbol(...)))` shape for a legitimately different reason -- distinguishable only by its bound variable's real name, `t` there vs `tref` here, once the trace was re-read carefully.)
+
+    **New prime suspect, not yet confirmed:** `valueOf[T]` (`scala.runtime.stdLibPatches.Predef.valueOf` / `Predef.valueOf`, real source: `inline def valueOf[T]: T = summonFrom { case given vt: ValueOf[T] => vt.value; ... }`) -- an `inline` construct depending on `summonFrom` (compile-time implicit search) resolving a compiler-SYNTHESIZED `ValueOf[T]` given instance for the singleton type `T`. Neither `summonFrom` nor `ValueOf` synthesis has any dedicated handling in `Interpreter.scala` (confirmed by grep -- zero hits for either name outside of unrelated identifiers). Two live possibilities, NEITHER checked yet: (a) real dotc's OWN typer/inliner resolves `summonFrom`+`ValueOf` synthesis BEFORE this interpreter ever sees the tree (in which case the retained tree should already be reduced to something else entirely by the time it's interpreted, and the bug is in how THAT reduced form gets handled), or (b) `-Yretain-trees` preserves the PRE-`summonFrom`-resolution form, and this interpreter's generic method-call interpretation genuinely walks into `summonFrom`'s own real body / `ValueOf`'s synthesis path, with a bug somewhere in there specific to non-first enum cases.
+
+    **Separately, a real (but so far NON-fixing) improvement landed this session and was kept:** `matchesRuntimeType`'s lenient "unrecognized real host object -> assume `true`" fallback now also checks whether the scrutinee is a genuine dotc-internal `Type`/`Tree` (never one of this interpreter's own `InterpretedInstance`/`ModuleValue`/collection representations) and, if so, reuses the SAME real `typeTestClass`-based `cls.isInstance(v)` lookup already trusted for the named-extractor-call pattern shape, instead of blindly returning `true`. Verified SAFE (the full real `ape` project, all 38 `src/`+`test/` files, still compiles clean with it) but does NOT fix this bug -- confirmed empirically by rerunning `examples/upickle-enum-writer-bug/Main.scala` after the change, same `MatchError`s. Kept anyway since it's a real, independently-defensible correctness fix (was previously ALWAYS true for e.g. any `case tref: TypeRef => ...` against ANY unrecognized real object, not just this specific scenario) -- just not the fix for the enum-writer bug specifically. Do not assume it's related; the actual divergence is still downstream of the correctly-taken `case v => '{valueOf[T]}` branch.
+
+    **How to continue:** the minimal repro (`domain/{Building,WindowCatalog,AmbienteNonRiscaldato}.scala` copied verbatim + `examples/upickle-enum-writer-bug/Main.scala`, ~3s compile+link+run via `dist/sn-cli run`, no `db`/`http`/porcupine/cats-effect needed) is still the right tool. Next step should be tracing `summonFrom`/`ValueOf[T]` specifically -- grep `Interpreter.scala` for how a generic `inline def ... = summonFrom { ... }` construct or a compiler-synthesized given (anything analogous to how `Mirror`/`ClassTag` synthesis is ALREADY handled, if it is) gets resolved, and add `SNC_INTERP_DEBUG` tracing there the same way this session did for `classSymbol`/`companionModule`/`genericTypeTest`. If retained trees show `summonFrom` already reduced away by the time this interpreter sees it, compare the reduced form's OWN handling between the working (ordinal 0) and failing (ordinal 1+) cases instead.
