@@ -27,6 +27,7 @@ mkdir -p "$WORK/driver-classes"
   -H:ConfigurationFileDirectories="$ROOT/agent-config/linkdriver" \
   -H:+ReportExceptionStackTraces \
   --enable-url-protocols=http,https \
+  -J--sun-misc-unsafe-memory-access=allow \
   -o "$DIST/linkdriver-native" \
   LinkDriver
 

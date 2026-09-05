@@ -50,6 +50,7 @@ echo "== native-image =="
   --no-fallback \
   -H:ConfigurationFileDirectories="$ROOT/agent-config/lsp" \
   -H:+ReportExceptionStackTraces \
+  -J--sun-misc-unsafe-memory-access=allow \
   -o "$DIST/dotty-lsp-native" \
   dotty.tools.languageserver.Main
 

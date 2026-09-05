@@ -34,6 +34,7 @@ BUILD_CP="$(cat "$WORK/compiler-patched.cp"):$(cat "$WORK/nativelibs.cp"):$(cat 
   -H:ConfigurationFileDirectories="$ROOT/agent-config/dotc" \
   -H:+ReportExceptionStackTraces \
   -R:StackSize=67108864 \
+  -J--sun-misc-unsafe-memory-access=allow \
   -o "$DIST/dotc-native" \
   dotty.tools.dotc.Main
 
