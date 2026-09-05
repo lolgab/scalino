@@ -12,10 +12,16 @@
 # single patched file: run the published (patched) scala3-compiler_3 jar's
 # own dotc.Main on the JVM to produce classfiles, then native-image those.
 #
-# One extra step dotc-native didn't need: config/ProjectConfig.java is Java,
-# and dotc (like scalac) only typechecks against .java sources, it doesn't
-# compile them to bytecode -- so a real javac pass runs first, same as any
-# sbt mixed-compilation project would do.
+# The JSON-RPC/LSP transport (Main.scala, Lsp.scala) is hand-rolled --
+# jsoniter-scala-core codecs, all hand-written (no JsonCodecMaker macro
+# derivation, no lsp4j, no Gson) -- after discovering a GraalVM
+# native-image-specific pathology where Gson's reflective TypeAdapter
+# construction for a real editor's full `initialize` payload silently never
+# completed under native-image (see docs/findings.md "JVM-free language
+# server (LSP)"). No reflection anywhere in this module now, so (unlike the
+# lsp4j/Gson-era build) no `-H:ConfigurationFileDirectories` reachability
+# trace step is needed for it -- add one back only if a real
+# MissingReflectionRegistrationError shows up at runtime.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -26,29 +32,23 @@ source ./00-env.sh
 LSP_SRC="$ROOT/vendor/scala3/language-server/src/dotty/tools/languageserver"
 [[ -f "$LSP_SRC/Main.scala" ]] || { echo "missing $LSP_SRC -- run 00b-setup-vendor.sh first" >&2; exit 1; }
 
-JAVA_CLASSES="$WORK/lsp-java-classes"
 SCALA_CLASSES="$WORK/lsp-classes"
-rm -rf "$JAVA_CLASSES" "$SCALA_CLASSES"
-mkdir -p "$JAVA_CLASSES" "$SCALA_CLASSES"
+rm -rf "$SCALA_CLASSES"
+mkdir -p "$SCALA_CLASSES"
 
 LSP_CP="$(cat "$WORK/lsp.cp")"
 COMPILER_CP="$(cat "$WORK/compiler-patched.cp")"
 
-echo "== javac: config/ProjectConfig.java =="
-"$JAVAC" -cp "$LSP_CP" -d "$JAVA_CLASSES" "$LSP_SRC/config/ProjectConfig.java"
-
 echo "== dotc (JVM mode): trimmed language-server sources =="
 "$JAVA" -cp "$COMPILER_CP:$LSP_CP" dotty.tools.dotc.Main \
-  -classpath "$COMPILER_CP:$LSP_CP:$JAVA_CLASSES" \
+  -classpath "$COMPILER_CP:$LSP_CP" \
   -d "$SCALA_CLASSES" \
-  "$LSP_SRC/Main.scala" "$LSP_SRC/DottyLanguageServer.scala" \
-  "$LSP_SRC/DottyClient.scala" "$LSP_SRC/Memory.scala"
+  "$LSP_SRC/Lsp.scala" "$LSP_SRC/Main.scala" "$LSP_SRC/DottyLanguageServer.scala" "$LSP_SRC/Memory.scala"
 
 echo "== native-image =="
 "$NATIVE_IMAGE" \
-  -cp "$SCALA_CLASSES:$JAVA_CLASSES:$COMPILER_CP:$LSP_CP" \
+  -cp "$SCALA_CLASSES:$COMPILER_CP:$LSP_CP" \
   --no-fallback \
-  -H:ConfigurationFileDirectories="$ROOT/agent-config/lsp" \
   -H:+ReportExceptionStackTraces \
   -J--sun-misc-unsafe-memory-access=allow \
   -o "$DIST/dotty-lsp-native" \

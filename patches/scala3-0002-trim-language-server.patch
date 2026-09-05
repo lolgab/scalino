@@ -1,281 +1,2153 @@
 diff --git a/language-server/src/dotty/tools/languageserver/DottyClient.scala b/language-server/src/dotty/tools/languageserver/DottyClient.scala
-index c0b7c3c1..2ae09365 100644
+deleted file mode 100644
+index c0b7c3c1..00000000
 --- a/language-server/src/dotty/tools/languageserver/DottyClient.scala
-+++ b/language-server/src/dotty/tools/languageserver/DottyClient.scala
-@@ -1,6 +1,8 @@
- package dotty.tools.languageserver
- 
-+import org.eclipse.lsp4j.services.LanguageClient
-+
- /**
-   * A `LanguageClient` that regroups all language server features
-   */
++++ /dev/null
+@@ -1,6 +0,0 @@
+-package dotty.tools.languageserver
+-
+-/**
+-  * A `LanguageClient` that regroups all language server features
+-  */
 -trait DottyClient extends worksheet.WorksheetClient
 \ No newline at end of file
-+trait DottyClient extends LanguageClient
-\ No newline at end of file
 diff --git a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
-index 78deb61b..c625c194 100644
+index 78deb61b..3ba4c9e7 100644
 --- a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
 +++ b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
-@@ -31,8 +31,6 @@ import Interactive.Include
+@@ -4,15 +4,8 @@ package languageserver
+ import java.net.URI
+ import java.io._
+ import java.nio.file._
+-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap}
+-import java.util.function.Function
+-
+-import _root_.tools.jackson.databind.json.JsonMapper
+-
+-import org.eclipse.lsp4j
+ 
+ import scala.collection._
+-import scala.jdk.CollectionConverters._
+ import scala.util.control.NonFatal
+ import scala.io.Codec
+ import scala.compiletime.uninitialized
+@@ -30,36 +23,43 @@ import decompiler.IDEDecompilerDriver
+ import Interactive.Include
  import config.Printers.interactiv
  
- import languageserver.config.ProjectConfig
+-import languageserver.config.ProjectConfig
 -import languageserver.worksheet.{Worksheet, WorksheetService}
 -import languageserver.decompiler.{TastyDecompilerService}
++import com.github.plokhotnyuk.jsoniter_scala.core._
++// `Diagnostic` and `Range` collide with dotc's own `reporting.Diagnostic`/
++// `core.Types.Range` (both already in scope via the imports above) --
++// hidden from this wildcard import and referenced fully-qualified
++// (`Lsp.Diagnostic`/`Lsp.Range`) at the handful of sites that need the
++// wire type instead of the compiler-internal one.
++import Lsp.{Diagnostic => _, Range => _, given, _}
  
- import lsp4j.services._
- 
-@@ -45,9 +43,13 @@ import lsp4j.services._
-  *  - This implementation is based on the LSP4J library: https://github.com/eclipse/lsp4j
+-import lsp4j.services._
+-
+-/** An implementation of the Language Server Protocol for Dotty.
++/** A from-scratch, hand-rolled implementation of the Language Server
++ *  Protocol for Dotty -- no lsp4j, no Gson/Jackson, no runtime reflection.
+  *
+- *  You should not have to directly this class, instead see `dotty.tools.languageserver.Main`.
++ *  You should not have to directly use this class, instead see
++ *  `dotty.tools.languageserver.Main`, which owns the actual JSON-RPC
++ *  transport (framing, dispatch, request/response encoding via `Lsp`'s
++ *  hand-written jsoniter-scala codecs) and calls into the plain methods
++ *  below synchronously.
+  *
+  *  For more information see:
+  *  - The LSP is defined at https://github.com/Microsoft/language-server-protocol
+- *  - This implementation is based on the LSP4J library: https://github.com/eclipse/lsp4j
++ *
++ *  Previously based on lsp4j (https://github.com/eclipse/lsp4j); replaced
++ *  after discovering a GraalVM native-image-specific pathology where Gson's
++ *  reflective `TypeAdapter` construction for a real editor's full-sized
++ *  `initialize` capabilities payload silently never completed under
++ *  native-image (worked fine under a real JVM with the identical bytes/
++ *  classes) -- see docs/findings.md "JVM-free language server (LSP)".
++ *
++ *  @param publishDiagnostics Callback invoked to send a
++ *    `textDocument/publishDiagnostics` notification to the client.
   */
- class DottyLanguageServer extends LanguageServer
+-class DottyLanguageServer extends LanguageServer
 -    with TextDocumentService with WorkspaceService with WorksheetService with TastyDecompilerService { thisServer =>
-+    with TextDocumentService with WorkspaceService with lsp4j.jsonrpc.json.JsonRpcMethodProvider { thisServer =>
++class DottyLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Unit) { thisServer =>
    import ast.tpd._
- 
-+  /** See `DottyLanguageServer.rpcMethods`. */
-+  override def supportedMethods(): java.util.Map[String, lsp4j.jsonrpc.json.JsonRpcMethod] =
-+    DottyLanguageServer.rpcMethods
-+
+-
    import DottyLanguageServer._
    import InteractiveDriver._
  
-@@ -251,7 +253,7 @@ class DottyLanguageServer extends LanguageServer
+-  import lsp4j.jsonrpc.{CancelChecker, CompletableFutures}
+-  import lsp4j.jsonrpc.messages.{Either => JEither}
+-  import lsp4j._
+-
+   private var rootUri: String = uninitialized
  
-     client.publishDiagnostics(new PublishDiagnosticsParams(
-       document.getUri,
--      diags.flatMap(diagnostic).asJava))
-+      diags.flatMap(toLspDiagnostic).asJava))
+-  private var myClient: DottyClient = uninitialized
+-  def client: DottyClient = myClient
+-
+   private var myDrivers: mutable.Map[ProjectConfig, InteractiveDriver] = uninitialized
+ 
+   private var myDependentProjects: mutable.Map[ProjectConfig, mutable.Set[ProjectConfig]] = uninitialized
+@@ -68,8 +68,7 @@ class DottyLanguageServer extends LanguageServer
+     if myDrivers == null then
+       assert(rootUri != null, "`drivers` cannot be called before `initialize`")
+       val configFile = new File(new URI(rootUri + '/' + IDE_CONFIG_FILE))
+-      val configs: List[ProjectConfig] =
+-        JsonMapper.builder().build().readValue(configFile, classOf[Array[ProjectConfig]]).toList
++      val configs: List[ProjectConfig] = readFromArray(Files.readAllBytes(configFile.toPath))(using projectConfigListCodec)
+ 
+       val defaultFlags = List("-color:never" /*, "-Yplain-printer","-Yprint-pos"*/)
+ 
+@@ -84,8 +83,8 @@ class DottyLanguageServer extends LanguageServer
+         }
+         val settings =
+           defaultFlags ++
+-          config.compilerArguments.toList
+-            .update("-d", config.classDirectory.getAbsolutePath)
++          config.compilerArguments
++            .update("-d", new File(config.classDirectory).getAbsolutePath)
+             .update("-classpath", (config.classDirectory +: config.dependencyClasspath).mkString(File.pathSeparator))
+             .update("-sourcepath", config.sourceDirectories.mkString(File.pathSeparator))
+         myDrivers(config) = new InteractiveDriver(settings)
+@@ -109,17 +108,18 @@ class DottyLanguageServer extends LanguageServer
+ 
+   private def checkMemory() =
+     if Memory.isCritical() then
+-      CompletableFutures.computeAsync { _ => restart() }
++      val t = new Thread(() => restart())
++      t.setDaemon(true)
++      t.start()
+ 
+   /** The configuration of the project that owns `uri`. */
+   def configFor(uri: URI): ProjectConfig = thisServer.synchronized {
+     val config =
+       drivers.keys.find(config => config.sourceDirectories.exists(sourceDir =>
+-        new File(uri.getPath).getCanonicalPath.startsWith(sourceDir.getCanonicalPath)))
++        new File(uri.getPath).getCanonicalPath.startsWith(new File(sourceDir).getCanonicalPath)))
+ 
+     config.getOrElse {
+       val config = drivers.keys.head
+-      // println(s"No configuration contains $uri as a source file, arbitrarily choosing ${config.id}")
+       config
+     }
+   }
+@@ -129,7 +129,7 @@ class DottyLanguageServer extends LanguageServer
+     drivers(configFor(uri))
    }
  
-   override def didChange(params: DidChangeTextDocumentParams): Unit = {
-@@ -278,7 +280,7 @@ class DottyLanguageServer extends LanguageServer
+-    /** The driver instance responsible for decompiling `uri` in `classPath` */
++  /** The driver instance responsible for decompiling `uri` in `classPath` */
+   def decompilerDriverFor(uri: URI, classPath: String): IDEDecompilerDriver = thisServer.synchronized {
+     val config = configFor(uri)
+     val defaultFlags = List("-color:never")
+@@ -143,7 +143,7 @@ class DottyLanguageServer extends LanguageServer
+     }
+     val settings =
+       defaultFlags ++
+-      config.compilerArguments.toList
++      config.compilerArguments
+         .update("-classpath", (classPath +: config.dependencyClasspath).mkString(File.pathSeparator))
+     new IDEDecompilerDriver(settings)
+   }
+@@ -167,96 +167,77 @@ class DottyLanguageServer extends LanguageServer
+     myDependentProjects
+   }
  
-       client.publishDiagnostics(new PublishDiagnosticsParams(
-         document.getUri,
+-  def connect(client: DottyClient): Unit = {
+-    myClient = client
+-  }
+-
+-  override def exit(): Unit = {
+-    System.exit(0)
+-  }
+-
+-  override def shutdown(): CompletableFuture[Object] = {
+-    CompletableFuture.completedFuture(new Object)
+-  }
+-
+-  def computeAsync[R](fun: CancelChecker => R, synchronize: Boolean = true): CompletableFuture[R] =
+-    CompletableFutures.computeAsync { cancelToken =>
+-      // We do not support any concurrent use of the compiler currently.
+-      def computation(): R = {
+-        cancelToken.checkCanceled()
+-        checkMemory()
+-        try {
+-          fun(cancelToken)
+-        } catch {
+-          case NonFatal(ex) =>
+-            ex.printStackTrace
+-            throw ex
+-        }
+-      }
+-      if synchronize then
+-        thisServer.synchronized { computation() }
+-      else
+-        computation()
++  /** Runs `fun` while holding this server's lock, converting a critical
++   *  memory condition into a background driver restart first (matching
++   *  the previous lsp4j-based `computeAsync`'s behavior, minus its
++   *  cancellation support -- nothing in this codebase ever checked a
++   *  cancel token, so dropping it changes nothing observable). */
++  def computeSync[R](fun: => R): R = {
++    checkMemory()
++    try
++      thisServer.synchronized { fun }
++    catch {
++      case NonFatal(ex) =>
++        ex.printStackTrace
++        throw ex
+     }
++  }
+ 
+-  override def initialize(params: InitializeParams) = computeAsync { cancelToken =>
+-    rootUri = params.getRootUri
++  def initialize(rootUri: String): InitializeResult = computeSync {
++    this.rootUri = rootUri
+     assert(rootUri != null)
+ 
+-    class DottyServerCapabilities(val worksheetRunProvider: Boolean = true,
+-                                  val tastyDecompiler: Boolean = true) extends lsp4j.ServerCapabilities
+-
+-    val c = new DottyServerCapabilities
+-    c.setTextDocumentSync(TextDocumentSyncKind.Full)
+-    c.setDocumentHighlightProvider(true)
+-    c.setDocumentSymbolProvider(true)
+-    c.setDefinitionProvider(true)
+-    c.setRenameProvider(true)
+-    c.setHoverProvider(true)
+-    c.setWorkspaceSymbolProvider(true)
+-    c.setReferencesProvider(true)
+-    c.setImplementationProvider(true)
+-    c.setCompletionProvider(new CompletionOptions(
+-      /* resolveProvider = */ false,
+-      /* triggerCharacters = */ List(".").asJava))
+-    c.setSignatureHelpProvider(new SignatureHelpOptions(
+-      /* triggerCharacters = */ List("(").asJava))
++    val capabilities = ServerCapabilities(
++      textDocumentSync = 1, // Full
++      documentHighlightProvider = true,
++      documentSymbolProvider = true,
++      definitionProvider = true,
++      renameProvider = true,
++      hoverProvider = true,
++      workspaceSymbolProvider = true,
++      referencesProvider = true,
++      implementationProvider = true,
++      completionProvider = CompletionOptions(triggerCharacters = List(".")),
++      signatureHelpProvider = SignatureHelpOptions(triggerCharacters = List("(")))
+ 
+     // Do most of the initialization asynchronously so that we can return early
+     // from this method and thus let the client know our capabilities.
+-    CompletableFuture.supplyAsync(() => drivers)
+-      .exceptionally { (ex: Throwable) =>
+-        ex.printStackTrace
+-        sys.exit(1)
++    val warmup = new Thread(() => {
++      try { drivers; () }
++      catch {
++        case NonFatal(ex) =>
++          ex.printStackTrace
++          sys.exit(1)
+       }
++    })
++    warmup.setDaemon(true)
++    warmup.start()
+ 
+-    new InitializeResult(c)
++    InitializeResult(capabilities)
+   }
+ 
+-  override def didOpen(params: DidOpenTextDocumentParams): Unit = thisServer.synchronized {
++  def didOpen(params: DidOpenTextDocumentParams): Unit = thisServer.synchronized {
+     checkMemory()
+-    val document = params.getTextDocument
+-    val uri = new URI(document.getUri)
++    val document = params.textDocument
++    val uri = new URI(document.uri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+     val worksheetMode = isWorksheet(uri)
+ 
+     val text =
+       if (worksheetMode)
+-        wrapWorksheet(document.getText)
++        wrapWorksheet(document.text)
+       else
+-        document.getText
++        document.text
+ 
+     val diags = driver.run(uri, text)
+ 
+-    client.publishDiagnostics(new PublishDiagnosticsParams(
+-      document.getUri,
+-      diags.flatMap(diagnostic).asJava))
++    publishDiagnostics(document.uri, diags.flatMap(toLspDiagnostic))
+   }
+ 
+-  override def didChange(params: DidChangeTextDocumentParams): Unit = {
+-    val document = params.getTextDocument
+-    val uri = new URI(document.getUri)
++  def didChange(params: DidChangeTextDocumentParams): Unit = {
++    val document = params.textDocument
++    val uri = new URI(document.uri)
+     val worksheetMode = isWorksheet(uri)
+ 
+     thisServer.synchronized  {
+@@ -265,47 +246,35 @@ class DottyLanguageServer extends LanguageServer
+       val driver = driverFor(uri)
+       implicit def ctx: Context = driver.currentCtx
+ 
+-      val change = params.getContentChanges.get(0)
+-      assert(change.getRange == null, "TextDocumentSyncKind.Incremental support is not implemented")
++      val change = params.contentChanges.head
++      assert(change.range.isEmpty, "TextDocumentSyncKind.Incremental support is not implemented")
+ 
+       val text =
+         if (worksheetMode)
+-          wrapWorksheet(change.getText)
++          wrapWorksheet(change.text)
+         else
+-          change.getText
++          change.text
+ 
+       val diags = driver.run(uri, text)
+ 
+-      client.publishDiagnostics(new PublishDiagnosticsParams(
+-        document.getUri,
 -        diags.flatMap(diagnostic).asJava))
-+        diags.flatMap(toLspDiagnostic).asJava))
++      publishDiagnostics(document.uri, diags.flatMap(toLspDiagnostic))
      }
    }
  
-@@ -321,7 +323,7 @@ class DottyLanguageServer extends LanguageServer
+-  override def didClose(params: DidCloseTextDocumentParams): Unit = thisServer.synchronized {
+-    val document = params.getTextDocument
+-    val uri = new URI(document.getUri)
++  def didClose(params: DidCloseTextDocumentParams): Unit = thisServer.synchronized {
++    val document = params.textDocument
++    val uri = new URI(document.uri)
+ 
+     driverFor(uri).close(uri)
+   }
+ 
+-  override def didChangeConfiguration(params: DidChangeConfigurationParams): Unit =
+-    /*thisServer.synchronized*/ {}
+-
+-  override def didChangeWatchedFiles(params: DidChangeWatchedFilesParams): Unit =
+-    /*thisServer.synchronized*/ {}
+-
+-  override def didSave(params: DidSaveTextDocumentParams): Unit = {
+-    /*thisServer.synchronized*/ {}
+-  }
+-
+   // FIXME: share code with NotAMember
+-  override def completion(params: CompletionParams) = computeAsync { cancelToken =>
+-    val uri = new URI(params.getTextDocument.getUri)
++  def completion(params: TextDocumentPositionParams): CompletionList = computeSync {
++    val uri = new URI(params.textDocument.uri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+ 
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
+     val items = driver.compilationUnits.get(uri) match {
+       case Some(unit) =>
+         val freshCtx = ctx.fresh.setCompilationUnit(unit)
+@@ -313,38 +282,37 @@ class DottyLanguageServer extends LanguageServer
+       case None => Nil
+     }
+ 
+-    JEither.forRight(new CompletionList(
+-      /*isIncomplete = */ false, items.map(completionItem).asJava))
++    CompletionList(isIncomplete = false, items = items.map(completionItem))
+   }
+ 
+   /** If cursor is on a reference, show its definition and all overriding definitions.
     *  If cursor is on a definition, show this definition together with all overridden
     *  and overriding definitions.
     */
 -  override def definition(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
-+  override def definition(params: DefinitionParams) = computeAsync { cancelToken =>
-     val uri = new URI(params.getTextDocument.getUri)
+-    val uri = new URI(params.getTextDocument.getUri)
++  def definition(params: TextDocumentPositionParams): List[Location] = computeSync {
++    val uri = new URI(params.textDocument.uri)
      val driver = driverFor(uri)
      implicit def ctx: Context = driver.currentCtx
-@@ -330,7 +332,7 @@ class DottyLanguageServer extends LanguageServer
+ 
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
      val path = Interactive.pathTo(driver.openedTrees(uri), pos)
  
      val definitions = Interactive.findDefinitions(path, pos, driver).toList
 -    definitions.flatMap(d => location(d.namePos)).asJava
-+    JEither.forLeft(definitions.flatMap(d => location(d.namePos)).asJava)
++    definitions.flatMap(d => location(d.namePos))
    }
  
-   override def references(params: ReferenceParams) = computeAsync { cancelToken =>
-@@ -439,7 +441,7 @@ class DottyLanguageServer extends LanguageServer
-     new WorkspaceEdit(changes.asJava)
+-  override def references(params: ReferenceParams) = computeAsync { cancelToken =>
+-    val uri = new URI(params.getTextDocument.getUri)
++  def references(params: ReferenceParams): List[Location] = computeSync {
++    val uri = new URI(params.textDocument.uri)
+     val driver = driverFor(uri)
+ 
+     val includes = {
+-      val includeDeclaration = params.getContext.isIncludeDeclaration
++      val includeDeclaration = params.context.includeDeclaration
+       Include.references | Include.overriding | Include.imports | Include.local |
+         (if (includeDeclaration) Include.definitions else Include.empty)
+     }
+ 
+     val uriTrees = driver.openedTrees(uri)
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
+ 
+     val (definitions, originalSymbols) = {
+       implicit def ctx: Context = driver.currentCtx
+@@ -370,22 +338,21 @@ class DottyLanguageServer extends LanguageServer
+       }
+     }.toList
+ 
+-    references.flatten.distinct.asJava
++    references.flatten.distinct
+   }
+ 
+-  override def rename(params: RenameParams) = computeAsync { cancelToken =>
+-    val uri = new URI(params.getTextDocument.getUri)
++  def rename(params: RenameParams): WorkspaceEdit = computeSync {
++    val uri = new URI(params.textDocument.uri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+ 
+     val uriTrees = driver.openedTrees(uri)
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
+     val path = Interactive.pathTo(uriTrees, pos)
+     val syms = Interactive.enclosingSourceSymbols(path, pos)
+-    val newName = params.getNewName
++    val newName = params.newName
+ 
+     def findRenamedReferences(trees: List[SourceTree], syms: List[Symbol], withName: Name): List[SourceTree] = {
+-      val includes = Include.all
+       syms.flatMap { sym =>
+         Interactive.findTreesMatching(trees, Include.all, sym, t => Interactive.sameName(t.name, withName))
+       }
+@@ -402,17 +369,17 @@ class DottyLanguageServer extends LanguageServer
+           findRenamedReferences(uriTrees, syms, nameTree.name)
+ 
+         case _ =>
++          // Previously an lsp4j `window/showMessageRequest` asked the user
++          // whether to also rename overridden/overriding members. Dropped
++          // along with the rest of lsp4j (that's a server-initiated
++          // request needing bidirectional correlation this hand-rolled
++          // transport doesn't implement) -- always include them, matching
++          // what was previously the first/default choice.
+           val (include, allSymbols) =
+-            if (syms.exists(_.allOverriddenSymbols.nonEmpty)) {
+-              showMessageRequest(MessageType.Info,
+-                RENAME_OVERRIDDEN_QUESTION,
+-                List(
+-                  RENAME_OVERRIDDEN    -> (() => (Include.all, syms.flatMap(s => s :: s.allOverriddenSymbols.toList))),
+-                  RENAME_NO_OVERRIDDEN -> (() => (Include.all.except(Include.overridden), syms)))
+-              ).get.getOrElse((Include.empty, Nil))
+-            } else {
++            if (syms.exists(_.allOverriddenSymbols.nonEmpty))
++              (Include.all, syms.flatMap(s => s :: s.allOverriddenSymbols.toList))
++            else
+               (Include.all, syms)
+-            }
+ 
+           val names = allSymbols.map(_.name.sourceModuleName).toSet
+           val definitions = Interactive.findDefinitions(allSymbols, driver, include.isOverridden, includeExternal = true)
+@@ -433,18 +400,19 @@ class DottyLanguageServer extends LanguageServer
+     val changes =
+       refs.groupBy(ref => toUriOption(ref.source))
+         .flatMap { case (uriOpt, refs) => uriOpt.map(uri => (uri.toString, refs)) }
+-        .transform((_, refs) => refs.flatMap(ref =>
+-          range(ref.namePos).map(nameRange => new TextEdit(nameRange, newName))).distinct.asJava)
++        .map((uri, refs) => (uri, refs.flatMap(ref =>
++          range(ref.namePos).map(nameRange => TextEdit(nameRange, newName))).distinct))
++        .toMap
+ 
+-    new WorkspaceEdit(changes.asJava)
++    WorkspaceEdit(changes)
    }
  
 -  override def documentHighlight(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
-+  override def documentHighlight(params: DocumentHighlightParams) = computeAsync { cancelToken =>
-     val uri = new URI(params.getTextDocument.getUri)
+-    val uri = new URI(params.getTextDocument.getUri)
++  def documentHighlight(params: TextDocumentPositionParams): List[DocumentHighlight] = computeSync {
++    val uri = new URI(params.textDocument.uri)
      val driver = driverFor(uri)
      implicit def ctx: Context = driver.currentCtx
-@@ -459,7 +461,7 @@ class DottyLanguageServer extends LanguageServer
-     }.distinct.asJava
+ 
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
+     val uriTrees = driver.openedTrees(uri)
+     val path = Interactive.pathTo(uriTrees, pos)
+     val syms = Interactive.enclosingSourceSymbols(path, pos)
+@@ -452,39 +420,39 @@ class DottyLanguageServer extends LanguageServer
+ 
+     syms.flatMap { sym =>
+       val refs = Interactive.findTreesMatching(uriTrees, includes, sym)
+-      (for {
++      for {
+         ref <- refs
+         nameRange <- range(ref.namePos)
+-      } yield new DocumentHighlight(nameRange, DocumentHighlightKind.Read))
+-    }.distinct.asJava
++      } yield DocumentHighlight(nameRange, /* Read */ 2)
++    }.distinct
    }
  
 -  override def hover(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
-+  override def hover(params: HoverParams) = computeAsync { cancelToken =>
-     val uri = new URI(params.getTextDocument.getUri)
+-    val uri = new URI(params.getTextDocument.getUri)
++  def hover(params: TextDocumentPositionParams): Option[Hover] = computeSync {
++    val uri = new URI(params.textDocument.uri)
      val driver = driverFor(uri)
      implicit def ctx: Context = driver.currentCtx
-@@ -510,16 +512,17 @@ class DottyLanguageServer extends LanguageServer
-   override def symbol(params: WorkspaceSymbolParams) = computeAsync { cancelToken =>
-     val query = params.getQuery
  
--    drivers.values.toList.flatMap { driver =>
-+    val infos = drivers.values.toList.flatMap { driver =>
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
+     val trees = driver.openedTrees(uri)
+     val path = Interactive.pathTo(trees, pos)
+     val tp = Interactive.enclosingType(trees, pos)
+     val tpw = tp.widenTermRefExpr
+ 
+-    if (tp.isError || tpw == NoType) null // null here indicates that no response should be sent
++    if (tp.isError || tpw == NoType) None
+     else {
+       Interactive.enclosingSourceSymbols(path, pos) match {
+         case Nil =>
+-          null
++          None
+         case symbols =>
+           val docComments = symbols.flatMap(ParsedComment.docOf)
+           val content = hoverContent(Some(tpw.show), docComments)
+-          new Hover(content, null)
++          content.map(Hover(_))
+       }
+     }
+   }
+ 
+-  override def documentSymbol(params: DocumentSymbolParams) = computeAsync { cancelToken =>
+-    val uri = new URI(params.getTextDocument.getUri)
++  def documentSymbol(params: DocumentSymbolParams): List[SymbolInformation] = computeSync {
++    val uri = new URI(params.textDocument.uri)
+     val driver = driverFor(uri)
+     implicit def ctx: Context = driver.currentCtx
+ 
+@@ -501,14 +469,14 @@ class DottyLanguageServer extends LanguageServer
+ 
+     val defs = Interactive.namedTrees(uriTrees, Include.local, excludeParamsFromSyntheticSymbols)
+ 
+-    (for {
++    for {
+       d <- defs if (!isWorksheetWrapper(d) && !isTopLevelWrapper(d))
+       info <- symbolInfo(d.tree.symbol, d.pos)
+-    } yield JEither.forLeft(info)).asJava
++    } yield info
+   }
+ 
+-  override def symbol(params: WorkspaceSymbolParams) = computeAsync { cancelToken =>
+-    val query = params.getQuery
++  def symbol(params: WorkspaceSymbolParams): List[SymbolInformation] = computeSync {
++    val query = params.query
+ 
+     drivers.values.toList.flatMap { driver =>
        implicit def ctx: Context = driver.currentCtx
- 
+@@ -516,14 +484,14 @@ class DottyLanguageServer extends LanguageServer
        val trees = driver.sourceTreesContaining(query)
        val defs = Interactive.namedTrees(trees, Include.empty, _.name.toString.contains(query))
        defs.flatMap(d => symbolInfo(d.tree.symbol, d.namePos))
 -    }.asJava
 +    }
-+    JEither.forLeft(infos.asJava)
    }
  
 -  override def implementation(params: TextDocumentPositionParams) = computeAsync { cancelToken =>
-+  override def implementation(params: ImplementationParams) = computeAsync { cancelToken =>
-     val uri = new URI(params.getTextDocument.getUri)
+-    val uri = new URI(params.getTextDocument.getUri)
++  def implementation(params: TextDocumentPositionParams): List[Location] = computeSync {
++    val uri = new URI(params.textDocument.uri)
      val driver = driverFor(uri)
  
-@@ -547,10 +550,10 @@ class DottyLanguageServer extends LanguageServer
+-    val pos = sourcePosition(driver, uri, params.getPosition)
++    val pos = sourcePosition(driver, uri, params.position)
+ 
+     val (definitions, originalSymbols) = {
+       implicit def ctx: Context = driver.currentCtx
+@@ -547,40 +515,26 @@ class DottyLanguageServer extends LanguageServer
        }
      }.toList
  
 -    implementations.flatten.asJava
-+    JEither.forLeft(implementations.flatten.asJava)
++    implementations.flatten
    }
  
 -  override def signatureHelp(params: TextDocumentPositionParams) = computeAsync { canceltoken =>
-+  override def signatureHelp(params: SignatureHelpParams) = computeAsync { canceltoken =>
-     val uri = new URI(params.getTextDocument.getUri)
+-    val uri = new URI(params.getTextDocument.getUri)
++  def signatureHelp(params: TextDocumentPositionParams): SignatureHelp = computeSync {
++    val uri = new URI(params.textDocument.uri)
      val driver = driverFor(uri)
  
-@@ -652,6 +655,70 @@ object DottyLanguageServer {
+     driver.compilationUnits.get(uri) match
+       case Some(unit) =>
+         given newCtx: Context = driver.currentCtx.fresh.setCompilationUnit(unit)
+-        val pos = sourcePosition(driver, uri, params.getPosition)
++        val pos = sourcePosition(driver, uri, params.position)
+         val adjustedSpan = pos.span.withEnd(pos.span.end + 1)
+-        val path = Interactive.pathTo(ctx.compilationUnit.tpdTree, adjustedSpan)
++        val path = Interactive.pathTo(newCtx.compilationUnit.tpdTree, adjustedSpan)
+         val (paramN, callableN, signatures) = Signatures.signatureHelp(path, adjustedSpan)
+ 
+-        new SignatureHelp(signatures.map(signatureToSignatureInformation).asJava, callableN, paramN)
+-
+-      case _ => new SignatureHelp()
++        SignatureHelp(signatures.map(signatureToSignatureInformation), callableN, paramN)
+ 
++      case _ => SignatureHelp(Nil, -1, -1)
+   }
+ 
+-  override def getTextDocumentService: TextDocumentService = this
+-  override def getWorkspaceService: WorkspaceService = this
+-
+-  // Unimplemented features. If you implement one of them, you may need to add a
+-  // capability in `initialize`
+-  override def codeAction(params: CodeActionParams) = null
+-  override def codeLens(params: CodeLensParams) = null
+-  override def formatting(params: DocumentFormattingParams) = null
+-  override def rangeFormatting(params: DocumentRangeFormattingParams) = null
+-  override def onTypeFormatting(params: DocumentOnTypeFormattingParams) = null
+-  override def resolveCodeLens(params: CodeLens) = null
+-  override def resolveCompletionItem(params: CompletionItem) = null
+-
+   /**
+    * Find the set of projects that have any of `definitions` on their classpath.
+    *
+@@ -620,50 +574,20 @@ class DottyLanguageServer extends LanguageServer
+       (remoteDriver, ctx, definitions)
+     }
+   }
+-
+-  /**
+-   * Send a `window/showMessageRequest` to the client, asking to choose between `choices`, and
+-   * perform the associated operation.
+-   *
+-   * @param tpe     The type of the request
+-   * @param message The message accompanying the request
+-   * @param choices The choices and their associated operation
+-   * @return A future that will complete with the result of executing the action corresponding to
+-   *         the user's response.
+-   */
+-  private def showMessageRequest[T](tpe: MessageType,
+-                                    message: String,
+-                                    choices: List[(String, () => T)]): CompletableFuture[Option[T]] = {
+-    val options = choices.map((title, _) => new MessageActionItem(title))
+-    val request = new ShowMessageRequestParams(options.asJava)
+-    request.setMessage(message)
+-    request.setType(tpe)
+-
+-    client.showMessageRequest(request).thenApply { (message: MessageActionItem) =>
+-      for {
+-        answer <- Option(message)
+-        (_, action) <- choices.find(_._1 == answer.getTitle)
+-      } yield action()
+-    }
+-  }
+ }
+ 
+ object DottyLanguageServer {
  
    final val IDE_CONFIG_FILE = ".dotty-ide.json"
  
-+  // -- Safe RPC method discovery for the standalone `-stdio` launcher -----
-+  //
-+  // lsp4j's default reflective RPC-method discovery
-+  // (`ServiceEndpoints.getSupportedMethods`/`GenericEndpoint`, used by
-+  // `org.eclipse.lsp4j.jsonrpc.Launcher.Builder`) scans `server.getClass()`.
-+  // dotc's Mixin phase materializes a concrete forwarder on
-+  // `DottyLanguageServer` for *every* default method it inherits from
-+  // `LanguageServer`/`TextDocumentService`/`WorkspaceService` -- not just
-+  // the ones this class overrides -- and each forwarder still carries the
-+  // original `@JsonNotification`/`@JsonRequest` annotation. So the same RPC
-+  // method ends up declared twice (once on the interface, once as dotc's
-+  // forwarder on the class), and lsp4j's scanner isn't dedup-aware: it
-+  // throws "Duplicate RPC method X." the first time this happens (e.g. for
-+  // `initialized`, `codeAction`, `formatting`, ... -- anything with a
-+  // default body this class doesn't override). Plain Java implementers
-+  // never hit this, since javac doesn't synthesize forwarders for
-+  // un-overridden default methods.
-+  //
-+  // Worked around by scanning the three service *interfaces* directly
-+  // (clean on their own) instead of the concrete class: `rpcMethods` feeds
-+  // the wire-protocol method table (via `JsonRpcMethodProvider`, which
-+  // `Launcher.Builder` already prefers over its own class scan when
-+  // present), and `rpcDispatch` feeds local method dispatch (a hand-rolled
-+  // `Endpoint` in `dotty.tools.languageserver.Main`, since
-+  // `GenericEndpoint`/`ServiceEndpoints.toEndpoint` has no equivalent
-+  // override hook).
-+  private val serviceInterfaces: List[Class[?]] =
-+    List(classOf[lsp4j.services.LanguageServer], classOf[lsp4j.services.TextDocumentService], classOf[lsp4j.services.WorkspaceService])
-+
-+  /** Mirrors `AnnotationUtil`'s (package-private, so not directly reusable)
-+   *  method-naming logic: `@JsonSegment` on the interface prefixes
-+   *  `@JsonRequest`/`@JsonNotification` methods unless `useSegment = false`. */
-+  private def rpcName(interf: Class[?], m: java.lang.reflect.Method): Option[String] = {
-+    val segment = {
-+      val s = interf.getAnnotation(classOf[lsp4j.jsonrpc.services.JsonSegment])
-+      if (s != null) s.value + "/" else ""
-+    }
-+    val req = m.getAnnotation(classOf[lsp4j.jsonrpc.services.JsonRequest])
-+    if (req != null)
-+      Some(if (req.useSegment) segment + (if (req.value.nonEmpty) req.value else m.getName) else req.value)
-+    else {
-+      val notif = m.getAnnotation(classOf[lsp4j.jsonrpc.services.JsonNotification])
-+      if (notif != null)
-+        Some(if (notif.useSegment) segment + (if (notif.value.nonEmpty) notif.value else m.getName) else notif.value)
-+      else None
-+    }
-+  }
-+
-+  /** RPC method name -> the interface `Method` to invoke for it. */
-+  val rpcDispatch: Map[String, java.lang.reflect.Method] =
-+    (for
-+      interf <- serviceInterfaces
-+      m <- interf.getDeclaredMethods.toList
-+      name <- rpcName(interf, m)
-+    yield name -> m).toMap
-+
-+  /** The wire-protocol method table lsp4j needs, built the same safe way. */
-+  val rpcMethods: java.util.Map[String, lsp4j.jsonrpc.json.JsonRpcMethod] = {
-+    val merged = new java.util.LinkedHashMap[String, lsp4j.jsonrpc.json.JsonRpcMethod]
-+    for (interf <- serviceInterfaces)
-+      merged.putAll(lsp4j.jsonrpc.services.ServiceEndpoints.getSupportedMethods(interf))
-+    merged
-+  }
-+
-   final val RENAME_OVERRIDDEN_QUESTION = "Do you want to rename the base member, or only this member?"
-   final val RENAME_OVERRIDDEN= "Rename the base member"
-   final val RENAME_NO_OVERRIDDEN = "Rename only this member"
-@@ -695,7 +762,7 @@ object DottyLanguageServer {
+-  final val RENAME_OVERRIDDEN_QUESTION = "Do you want to rename the base member, or only this member?"
+-  final val RENAME_OVERRIDDEN= "Rename the base member"
+-  final val RENAME_NO_OVERRIDDEN = "Rename only this member"
+-
+-  /** Convert an lsp4j.Position to a SourcePosition */
+-  def sourcePosition(driver: InteractiveDriver, uri: URI, pos: lsp4j.Position): SourcePosition = {
++  /** Convert an Lsp.Position to a SourcePosition */
++  def sourcePosition(driver: InteractiveDriver, uri: URI, pos: Position): SourcePosition = {
+     val actualPosition =
+       if (isWorksheet(uri)) toWrappedPosition(pos)
+       else pos
+     val source = driver.openedFiles(uri)
+     if (source.exists)
+-      source.lineToOffsetOpt(actualPosition.getLine).map(_ + actualPosition.getCharacter) match {
++      source.lineToOffsetOpt(actualPosition.line).map(_ + actualPosition.character) match {
+         // `<=` to allow an offset to point to the end of the file
+         case Some(offset) if offset <= source.content().length =>
+           val p = Spans.Span(offset)
+@@ -674,42 +598,37 @@ object DottyLanguageServer {
+     else NoSourcePosition
+   }
+ 
+-  /** Convert a SourcePosition to an lsp4j.Range */
+-  def range(p: SourcePosition): Option[lsp4j.Range] =
++  /** Convert a SourcePosition to an Lsp.Range */
++  def range(p: SourcePosition): Option[Lsp.Range] =
+     if (p.exists) {
+       val mappedPosition = positionMapperFor(p.source).map(_(p)).getOrElse(p)
+-      Some(new lsp4j.Range(
+-        new lsp4j.Position(mappedPosition.startLine, mappedPosition.startColumn),
+-        new lsp4j.Position(mappedPosition.endLine, mappedPosition.endColumn)
++      Some(Lsp.Range(
++        Position(mappedPosition.startLine, mappedPosition.startColumn),
++        Position(mappedPosition.endLine, mappedPosition.endColumn)
+       ))
+     } else
+       None
+ 
+-  /** Convert a SourcePosition to an lsp4.Location */
+-  def location(p: SourcePosition): Option[lsp4j.Location] =
++  /** Convert a SourcePosition to an Lsp.Location */
++  def location(p: SourcePosition): Option[Location] =
+     for {
+       uri <- toUriOption(p.source)
+       r <- range(p)
+-    } yield new lsp4j.Location(uri.toString, r)
++    } yield Location(uri.toString, r)
+ 
    /**
-    * Convert a Diagnostic to an lsp4j.Diagnostic.
+-   * Convert a Diagnostic to an lsp4j.Diagnostic.
++   * Convert a Diagnostic to an Lsp.Diagnostic.
     */
 -  def diagnostic(dia: Diagnostic)(implicit ctx: Context): Option[lsp4j.Diagnostic] =
-+  def toLspDiagnostic(dia: Diagnostic)(implicit ctx: Context): Option[lsp4j.Diagnostic] =
++  def toLspDiagnostic(dia: Diagnostic)(implicit ctx: Context): Option[Lsp.Diagnostic] =
      if (!dia.pos.exists)
        None // diagnostics without positions are not supported: https://github.com/Microsoft/language-server-protocol/issues/249
      else {
+-      def severity(level: Int): lsp4j.DiagnosticSeverity = {
++      def severity(level: Int): Int = {
+         import interfaces.{Diagnostic => D}
+-        import lsp4j.{DiagnosticSeverity => DS}
+-
+         level match {
+-          case D.INFO =>
+-            DS.Information
+-          case D.WARNING =>
+-            DS.Warning
+-          case D.ERROR =>
+-            DS.Error
++          case D.INFO => 3      // Information
++          case D.WARNING => 2   // Warning
++          case D.ERROR => 1     // Error
+         }
+       }
+ 
+@@ -717,8 +636,7 @@ object DottyLanguageServer {
+       if (displayMessage(message, dia.pos.source)) {
+         val code = message.errorId.errorNumber.toString
+         range(dia.pos).map(r =>
+-            new lsp4j.Diagnostic(
+-              r, dia.message, severity(dia.level), /*source =*/ "", code))
++            Lsp.Diagnostic(r, dia.message, severity(dia.level), /*source =*/ "", code))
+       } else {
+         None
+       }
+@@ -789,8 +707,8 @@ object DottyLanguageServer {
+    * @param position The position as seen by VSCode (before wrapping)
+    * @return The position as seen by the compiler (after wrapping)
+    */
+-  private def toWrappedPosition(position: lsp4j.Position): lsp4j.Position = {
+-    new lsp4j.Position(position.getLine + 1, position.getCharacter)
++  private def toWrappedPosition(position: Position): Position = {
++    Position(position.line + 1, position.character)
+   }
+ 
+   /**
+@@ -829,56 +747,43 @@ object DottyLanguageServer {
+     symbol.isPackageObject
+   }
+ 
+-  /** Create an lsp4j.CompletionItem from a completion result */
+-  def completionItem(completion: Completion)(implicit ctx: Context): lsp4j.CompletionItem = {
+-    def completionItemKind(sym: Symbol)(implicit ctx: Context): lsp4j.CompletionItemKind = {
+-      import lsp4j.{CompletionItemKind => CIK}
+-
++  /** Create an Lsp.CompletionItem from a completion result */
++  def completionItem(completion: Completion)(implicit ctx: Context): CompletionItem = {
++    def completionItemKind(sym: Symbol)(implicit ctx: Context): Int = {
++      // Numeric values per the LSP spec's CompletionItemKind enum.
+       if sym.is(Package) || sym.is(Module) then
+-        CIK.Module // No CompletionItemKind.Package (https://github.com/Microsoft/language-server-protocol/issues/155)
++        9 // Module -- no CompletionItemKind.Package (https://github.com/Microsoft/language-server-protocol/issues/155)
+       else if sym.isConstructor then
+-        CIK.Constructor
++        4 // Constructor
+       else if sym.isClass then
+-        CIK.Class
++        7 // Class
+       else if sym.is(Mutable) then
+-        CIK.Variable
++        6 // Variable
+       else if sym.is(Method) then
+-        CIK.Method
++        2 // Method
+       else
+-        CIK.Field
++        5 // Field
+     }
+ 
+-    val item = new lsp4j.CompletionItem(completion.label)
+-    item.setDetail(completion.description)
+-
+     val documentation = for {
+       sym <- completion.symbols
+       doc <- ParsedComment.docOf(sym)
+     } yield doc
+ 
+-    if (documentation.nonEmpty) {
+-      item.setDocumentation(hoverContent(None, documentation))
+-    }
+-
+-    item.setDeprecated(completion.symbols.forall(_.hasAnnotation(defn.DeprecatedAnnot)))
+-    completion.symbols.headOption.foreach(s => item.setKind(completionItemKind(s)))
+-    item
+-  }
++    val kind = completion.symbols.headOption.map(completionItemKind)
++    val deprecated = completion.symbols.forall(_.hasAnnotation(defn.DeprecatedAnnot))
+ 
+-  def markupContent(content: String): lsp4j.MarkupContent = {
+-    if content.isEmpty then
+-      null
+-    else {
+-      val markup = new lsp4j.MarkupContent
+-      markup.setKind("markdown")
+-      markup.setValue(content.trim)
+-      markup
+-    }
++    CompletionItem(
++      label = completion.label,
++      kind = kind,
++      detail = Some(completion.description),
++      documentation = if (documentation.nonEmpty) hoverContent(None, documentation) else None,
++      deprecated = deprecated)
+   }
+ 
+   private def hoverContent(typeInfo: Option[String],
+                            comments: List[ParsedComment]
+-                          )(implicit ctx: Context): lsp4j.MarkupContent = {
++                          )(implicit ctx: Context): Option[MarkupContent] = {
+     val buf = new StringBuilder
+     typeInfo.foreach { info =>
+       buf.append(s"""```scala
+@@ -890,52 +795,53 @@ object DottyLanguageServer {
+       buf.append(comment.renderAsMarkdown)
+     }
+ 
+-    markupContent(buf.toString)
++    val content = buf.toString
++    if content.isEmpty then None
++    else Some(MarkupContent("markdown", content.trim))
+   }
+ 
+-  /** Create an lsp4j.SymbolInfo from a Symbol and a SourcePosition */
+-  def symbolInfo(sym: Symbol, pos: SourcePosition)(implicit ctx: Context): Option[lsp4j.SymbolInformation] = {
+-    def symbolKind(sym: Symbol)(implicit ctx: Context): lsp4j.SymbolKind = {
+-      import lsp4j.{SymbolKind => SK}
+-
++  /** Create an Lsp.SymbolInformation from a Symbol and a SourcePosition */
++  def symbolInfo(sym: Symbol, pos: SourcePosition)(implicit ctx: Context): Option[SymbolInformation] = {
++    def symbolKind(sym: Symbol)(implicit ctx: Context): Int = {
++      // Numeric values per the LSP spec's SymbolKind enum.
+       if (sym.is(Package))
+-        SK.Package
++        4 // Package
+       else if (sym.isConstructor)
+-        SK.Constructor
++        9 // Constructor
+       else if (sym.is(Module))
+-        SK.Module
++        2 // Module
+       else if (sym.isAllOf(EnumCase) || sym.isAllOf(EnumValue))
+-        SK.EnumMember
++        22 // EnumMember
+       else if (sym.is(Enum))
+-        SK.Enum
++        10 // Enum
+       else if (sym.is(Trait))
+-        SK.Interface
++        11 // Interface
+       else if (sym.isClass)
+-        SK.Class
++        5 // Class
+       else if (sym.is(Mutable))
+-        SK.Variable
++        13 // Variable
+       else if (sym.is(Method))
+-        SK.Method
++        6 // Method
+       else if (sym.is(TypeParam) || sym.isAbstractOrAliasType)
+-        SK.TypeParameter
++        26 // TypeParameter
+       else
+-        SK.Field
++        8 // Field
+     }
+-    def containerName(sym: Symbol): String = {
++    def containerName(sym: Symbol): Option[String] = {
+       val owner = if (sym.owner.exists && sym.owner.isPackageObject) sym.owner.owner else sym.owner
+       if (owner.exists && !owner.isEmptyPackage) {
+-          owner.name.stripModuleClassSuffix.show
++          Some(owner.name.stripModuleClassSuffix.show)
+       } else
+-        null
++        None
+     }
+ 
+     val name = sym.name.stripModuleClassSuffix.show
+ 
+-    location(pos).map(l => new lsp4j.SymbolInformation(name, symbolKind(sym), l, containerName(sym)))
++    location(pos).map(l => SymbolInformation(name, symbolKind(sym), l, containerName(sym)))
+   }
+ 
+   /** Convert `signature` to a `SignatureInformation` */
+-  def signatureToSignatureInformation(signature: Signatures.Signature): lsp4j.SignatureInformation = {
++  def signatureToSignatureInformation(signature: Signatures.Signature): SignatureInformation = {
+     val paramInfoss =
+       (signature.paramss.flatten).map(paramToParameterInformation)
+     val paramLists =
+@@ -955,18 +861,13 @@ object DottyLanguageServer {
+         }.mkString
+     val returnTypeLabel = signature.returnType.map(t => s": $t").getOrElse("")
+     val label = s"${signature.name}$paramLists$returnTypeLabel"
+-    val documentation = signature.doc.map(DottyLanguageServer.markupContent)
+-    val sig = new lsp4j.SignatureInformation(label)
+-    sig.setParameters(paramInfoss.asJava)
+-    documentation.foreach(sig.setDocumentation(_))
+-    sig
++    val documentation = signature.doc.map(d => MarkupContent("markdown", d.trim))
++    SignatureInformation(label, documentation, paramInfoss)
+   }
+ 
+   /** Convert `param` to `ParameterInformation` */
+-  private def paramToParameterInformation(param: Signatures.Param): lsp4j.ParameterInformation = {
+-    val documentation = param.doc.map(DottyLanguageServer.markupContent)
+-    val info = new lsp4j.ParameterInformation(param.show)
+-    documentation.foreach(info.setDocumentation(_))
+-    info
++  private def paramToParameterInformation(param: Signatures.Param): ParameterInformation = {
++    val documentation = param.doc.map(d => MarkupContent("markdown", d.trim))
++    ParameterInformation(param.show, documentation)
+   }
+ }
+diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
+new file mode 100644
+index 00000000..41f99a68
+--- /dev/null
++++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
+@@ -0,0 +1,917 @@
++package dotty.tools
++package languageserver
++
++import com.github.plokhotnyuk.jsoniter_scala.core._
++
++/** Hand-rolled LSP/JSON-RPC wire model + jsoniter-scala codecs -- no lsp4j,
++ *  no Gson, no reflection anywhere (not even jsoniter-scala's own
++ *  `JsonCodecMaker` macro derivation, which would need this project's own
++ *  macro interpreter -- patches/scala3-0001 -- to expand a third-party
++ *  compile-time macro it was never built to handle). Every codec below is
++ *  a plain method calling jsoniter-scala-core's low-level `JsonReader`/
++ *  `JsonWriter` API directly, compiled like any other Scala code.
++ *
++ *  Deliberately minimal: each params type only has the fields
++ *  `DottyLanguageServer` actually reads; unknown JSON object keys are
++ *  always skipped (see `skipRestOfObject`), so a real editor's much richer
++ *  `initialize` capabilities (the payload that silently broke Gson under
++ *  native-image, see docs/findings.md) never gets modeled or parsed at all
++ *  -- there is no reflection path left for it to break.
++ */
++object Lsp {
++
++  // -- Common shapes -------------------------------------------------------
++
++  final case class Position(line: Int, character: Int)
++  final case class Range(start: Position, end: Position)
++  final case class Location(uri: String, range: Range)
++  final case class TextDocumentIdentifier(uri: String)
++  final case class TextDocumentItem(uri: String, text: String)
++  final case class TextDocumentPositionParams(textDocument: TextDocumentIdentifier, position: Position)
++  final case class MarkupContent(kind: String, value: String)
++
++  // -- Incoming (client -> server) request/notification params ------------
++
++  final case class InitializeParams(rootUri: String)
++  final case class DidOpenTextDocumentParams(textDocument: TextDocumentItem)
++  final case class TextDocumentContentChangeEvent(range: Option[Range], text: String)
++  final case class DidChangeTextDocumentParams(textDocument: TextDocumentIdentifier, contentChanges: List[TextDocumentContentChangeEvent])
++  final case class DidCloseTextDocumentParams(textDocument: TextDocumentIdentifier)
++  final case class ReferenceContext(includeDeclaration: Boolean)
++  final case class ReferenceParams(textDocument: TextDocumentIdentifier, position: Position, context: ReferenceContext)
++  final case class RenameParams(textDocument: TextDocumentIdentifier, position: Position, newName: String)
++  final case class DocumentSymbolParams(textDocument: TextDocumentIdentifier)
++  final case class WorkspaceSymbolParams(query: String)
++
++  // -- Outgoing (server -> client) result/notification payloads -----------
++
++  final case class CompletionOptions(triggerCharacters: List[String])
++  final case class SignatureHelpOptions(triggerCharacters: List[String])
++  final case class ServerCapabilities(
++    textDocumentSync: Int,
++    documentHighlightProvider: Boolean,
++    documentSymbolProvider: Boolean,
++    definitionProvider: Boolean,
++    renameProvider: Boolean,
++    hoverProvider: Boolean,
++    workspaceSymbolProvider: Boolean,
++    referencesProvider: Boolean,
++    implementationProvider: Boolean,
++    completionProvider: CompletionOptions,
++    signatureHelpProvider: SignatureHelpOptions)
++  final case class InitializeResult(capabilities: ServerCapabilities)
++
++  final case class CompletionItem(label: String, kind: Option[Int], detail: Option[String], documentation: Option[MarkupContent], deprecated: Boolean)
++  final case class CompletionList(isIncomplete: Boolean, items: List[CompletionItem])
++  final case class TextEdit(range: Range, newText: String)
++  final case class WorkspaceEdit(changes: Map[String, List[TextEdit]])
++  final case class DocumentHighlight(range: Range, kind: Int)
++  final case class Hover(contents: MarkupContent)
++  final case class SymbolInformation(name: String, kind: Int, location: Location, containerName: Option[String])
++  final case class ParameterInformation(label: String, documentation: Option[MarkupContent])
++  final case class SignatureInformation(label: String, documentation: Option[MarkupContent], parameters: List[ParameterInformation])
++  final case class SignatureHelp(signatures: List[SignatureInformation], activeParameter: Int, activeSignature: Int)
++  final case class Diagnostic(range: Range, message: String, severity: Int, source: String, code: String)
++  final case class PublishDiagnosticsParams(uri: String, diagnostics: List[Diagnostic])
++
++  // -- .dotty-ide.json (replaces config.ProjectConfig + Jackson) -----------
++
++  final case class ProjectConfig(
++    id: String,
++    compilerVersion: String,
++    compilerArguments: List[String],
++    sourceDirectories: List[String],
++    dependencyClasspath: List[String],
++    classDirectory: String,
++    projectDependencies: List[String])
++
++  // -- JSON-RPC envelopes ---------------------------------------------------
++
++  /** A decoded incoming message. `idRaw == null` means it's a notification
++   *  (no response expected); otherwise it's a request and `idRaw` holds the
++   *  exact raw JSON bytes of `id`, echoed back verbatim in the response --
++   *  we never need to know if it's a number or a string. */
++  final case class IncomingEnvelope(method: String, idRaw: Array[Byte], paramsRaw: Array[Byte])
++
++  // ==========================================================================
++  // Codecs -- one hand-written JsonValueCodec per type above, no macros.
++  // ==========================================================================
++
++  /** Skips whatever key/value pairs remain in the current JSON object --
++   *  every decode loop below falls back to this for keys it doesn't model,
++   *  which is how a rich real-editor payload with dozens of extra fields
++   *  (capabilities, clientInfo, workspaceFolders, ...) is safely ignored
++   *  without ever being parsed into a type at all. */
++  private def skipVal(in: JsonReader): Unit = in.skip()
++
++  given positionCodec: JsonValueCodec[Position] = new JsonValueCodec[Position] {
++    def nullValue: Position = null
++    def decodeValue(in: JsonReader, default: Position): Position =
++      if (in.isNextToken('{')) {
++        var line = 0
++        var character = 0
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "line" => line = in.readInt()
++              case "character" => character = in.readInt()
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        Position(line, character)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: Position, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("line"); out.writeVal(x.line)
++      out.writeNonEscapedAsciiKey("character"); out.writeVal(x.character)
++      out.writeObjectEnd()
++    }
++  }
++
++  given rangeCodec: JsonValueCodec[Range] = new JsonValueCodec[Range] {
++    def nullValue: Range = null
++    def decodeValue(in: JsonReader, default: Range): Range =
++      if (in.isNextToken('{')) {
++        var start: Position = null
++        var end: Position = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "start" => start = positionCodec.decodeValue(in, null)
++              case "end" => end = positionCodec.decodeValue(in, null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        Range(start, end)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: Range, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("start"); positionCodec.encodeValue(x.start, out)
++      out.writeNonEscapedAsciiKey("end"); positionCodec.encodeValue(x.end, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given locationCodec: JsonValueCodec[Location] = new JsonValueCodec[Location] {
++    def nullValue: Location = null
++    def decodeValue(in: JsonReader, default: Location): Location =
++      if (in.isNextToken('{')) {
++        var uri: String = null
++        var range: Range = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "uri" => uri = in.readString(null)
++              case "range" => range = rangeCodec.decodeValue(in, null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        Location(uri, range)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: Location, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("uri"); out.writeVal(x.uri)
++      out.writeNonEscapedAsciiKey("range"); rangeCodec.encodeValue(x.range, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given textDocumentIdentifierCodec: JsonValueCodec[TextDocumentIdentifier] = new JsonValueCodec[TextDocumentIdentifier] {
++    def nullValue: TextDocumentIdentifier = null
++    def decodeValue(in: JsonReader, default: TextDocumentIdentifier): TextDocumentIdentifier =
++      if (in.isNextToken('{')) {
++        var uri: String = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "uri" => uri = in.readString(null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        TextDocumentIdentifier(uri)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: TextDocumentIdentifier, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("uri"); out.writeVal(x.uri)
++      out.writeObjectEnd()
++    }
++  }
++
++  given textDocumentItemCodec: JsonValueCodec[TextDocumentItem] = new JsonValueCodec[TextDocumentItem] {
++    def nullValue: TextDocumentItem = null
++    def decodeValue(in: JsonReader, default: TextDocumentItem): TextDocumentItem =
++      if (in.isNextToken('{')) {
++        var uri: String = null
++        var text: String = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "uri" => uri = in.readString(null)
++              case "text" => text = in.readString(null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        TextDocumentItem(uri, text)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: TextDocumentItem, out: JsonWriter): Unit = ???
++  }
++
++  given textDocumentPositionParamsCodec: JsonValueCodec[TextDocumentPositionParams] = new JsonValueCodec[TextDocumentPositionParams] {
++    def nullValue: TextDocumentPositionParams = null
++    def decodeValue(in: JsonReader, default: TextDocumentPositionParams): TextDocumentPositionParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentIdentifier = null
++        var position: Position = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentIdentifierCodec.decodeValue(in, null)
++              case "position" => position = positionCodec.decodeValue(in, null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        TextDocumentPositionParams(textDocument, position)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: TextDocumentPositionParams, out: JsonWriter): Unit = ???
++  }
++
++  given markupContentCodec: JsonValueCodec[MarkupContent] = new JsonValueCodec[MarkupContent] {
++    def nullValue: MarkupContent = null
++    def decodeValue(in: JsonReader, default: MarkupContent): MarkupContent = ??? // never decoded, only encoded
++    def encodeValue(x: MarkupContent, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("kind"); out.writeVal(x.kind)
++      out.writeNonEscapedAsciiKey("value"); out.writeVal(x.value)
++      out.writeObjectEnd()
++    }
++  }
++
++  private def encodeOptionalMarkupContent(x: Option[MarkupContent], out: JsonWriter): Unit = x match {
++    case Some(m) => markupContentCodec.encodeValue(m, out)
++    case None => out.writeNull()
++  }
++
++  given initializeParamsCodec: JsonValueCodec[InitializeParams] = new JsonValueCodec[InitializeParams] {
++    def nullValue: InitializeParams = null
++    def decodeValue(in: JsonReader, default: InitializeParams): InitializeParams =
++      if (in.isNextToken('{')) {
++        var rootUri: String = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "rootUri" => rootUri = in.readString(null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        InitializeParams(rootUri)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: InitializeParams, out: JsonWriter): Unit = ???
++  }
++
++  given didOpenTextDocumentParamsCodec: JsonValueCodec[DidOpenTextDocumentParams] = new JsonValueCodec[DidOpenTextDocumentParams] {
++    def nullValue: DidOpenTextDocumentParams = null
++    def decodeValue(in: JsonReader, default: DidOpenTextDocumentParams): DidOpenTextDocumentParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentItem = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentItemCodec.decodeValue(in, null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        DidOpenTextDocumentParams(textDocument)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: DidOpenTextDocumentParams, out: JsonWriter): Unit = ???
++  }
++
++  given textDocumentContentChangeEventCodec: JsonValueCodec[TextDocumentContentChangeEvent] = new JsonValueCodec[TextDocumentContentChangeEvent] {
++    def nullValue: TextDocumentContentChangeEvent = null
++    def decodeValue(in: JsonReader, default: TextDocumentContentChangeEvent): TextDocumentContentChangeEvent =
++      if (in.isNextToken('{')) {
++        var range: Range = null
++        var text: String = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "range" => range = rangeCodec.decodeValue(in, null)
++              case "text" => text = in.readString(null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        TextDocumentContentChangeEvent(Option(range), text)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: TextDocumentContentChangeEvent, out: JsonWriter): Unit = ???
++  }
++
++  given didChangeTextDocumentParamsCodec: JsonValueCodec[DidChangeTextDocumentParams] = new JsonValueCodec[DidChangeTextDocumentParams] {
++    def nullValue: DidChangeTextDocumentParams = null
++    def decodeValue(in: JsonReader, default: DidChangeTextDocumentParams): DidChangeTextDocumentParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentIdentifier = null
++        var contentChanges: List[TextDocumentContentChangeEvent] = Nil
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentIdentifierCodec.decodeValue(in, null)
++              case "contentChanges" => contentChanges = decodeList(in, textDocumentContentChangeEventCodec)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        DidChangeTextDocumentParams(textDocument, contentChanges)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: DidChangeTextDocumentParams, out: JsonWriter): Unit = ???
++  }
++
++  given didCloseTextDocumentParamsCodec: JsonValueCodec[DidCloseTextDocumentParams] = new JsonValueCodec[DidCloseTextDocumentParams] {
++    def nullValue: DidCloseTextDocumentParams = null
++    def decodeValue(in: JsonReader, default: DidCloseTextDocumentParams): DidCloseTextDocumentParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentIdentifier = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentIdentifierCodec.decodeValue(in, null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        DidCloseTextDocumentParams(textDocument)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: DidCloseTextDocumentParams, out: JsonWriter): Unit = ???
++  }
++
++  given referenceContextCodec: JsonValueCodec[ReferenceContext] = new JsonValueCodec[ReferenceContext] {
++    def nullValue: ReferenceContext = null
++    def decodeValue(in: JsonReader, default: ReferenceContext): ReferenceContext =
++      if (in.isNextToken('{')) {
++        var includeDeclaration = false
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "includeDeclaration" => includeDeclaration = in.readBoolean()
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        ReferenceContext(includeDeclaration)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: ReferenceContext, out: JsonWriter): Unit = ???
++  }
++
++  given referenceParamsCodec: JsonValueCodec[ReferenceParams] = new JsonValueCodec[ReferenceParams] {
++    def nullValue: ReferenceParams = null
++    def decodeValue(in: JsonReader, default: ReferenceParams): ReferenceParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentIdentifier = null
++        var position: Position = null
++        var context: ReferenceContext = ReferenceContext(false)
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentIdentifierCodec.decodeValue(in, null)
++              case "position" => position = positionCodec.decodeValue(in, null)
++              case "context" => context = referenceContextCodec.decodeValue(in, ReferenceContext(false))
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        ReferenceParams(textDocument, position, context)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: ReferenceParams, out: JsonWriter): Unit = ???
++  }
++
++  given renameParamsCodec: JsonValueCodec[RenameParams] = new JsonValueCodec[RenameParams] {
++    def nullValue: RenameParams = null
++    def decodeValue(in: JsonReader, default: RenameParams): RenameParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentIdentifier = null
++        var position: Position = null
++        var newName: String = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentIdentifierCodec.decodeValue(in, null)
++              case "position" => position = positionCodec.decodeValue(in, null)
++              case "newName" => newName = in.readString(null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        RenameParams(textDocument, position, newName)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: RenameParams, out: JsonWriter): Unit = ???
++  }
++
++  given documentSymbolParamsCodec: JsonValueCodec[DocumentSymbolParams] = new JsonValueCodec[DocumentSymbolParams] {
++    def nullValue: DocumentSymbolParams = null
++    def decodeValue(in: JsonReader, default: DocumentSymbolParams): DocumentSymbolParams =
++      if (in.isNextToken('{')) {
++        var textDocument: TextDocumentIdentifier = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "textDocument" => textDocument = textDocumentIdentifierCodec.decodeValue(in, null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        DocumentSymbolParams(textDocument)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: DocumentSymbolParams, out: JsonWriter): Unit = ???
++  }
++
++  given workspaceSymbolParamsCodec: JsonValueCodec[WorkspaceSymbolParams] = new JsonValueCodec[WorkspaceSymbolParams] {
++    def nullValue: WorkspaceSymbolParams = null
++    def decodeValue(in: JsonReader, default: WorkspaceSymbolParams): WorkspaceSymbolParams =
++      if (in.isNextToken('{')) {
++        var query: String = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "query" => query = in.readString(null)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        WorkspaceSymbolParams(query)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: WorkspaceSymbolParams, out: JsonWriter): Unit = ???
++  }
++
++  // -- Outgoing codecs (encode only) ---------------------------------------
++
++  given completionOptionsCodec: JsonValueCodec[CompletionOptions] = new JsonValueCodec[CompletionOptions] {
++    def nullValue: CompletionOptions = null
++    def decodeValue(in: JsonReader, default: CompletionOptions): CompletionOptions = ???
++    def encodeValue(x: CompletionOptions, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("resolveProvider"); out.writeVal(false)
++      out.writeNonEscapedAsciiKey("triggerCharacters"); encodeStringList(x.triggerCharacters, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given signatureHelpOptionsCodec: JsonValueCodec[SignatureHelpOptions] = new JsonValueCodec[SignatureHelpOptions] {
++    def nullValue: SignatureHelpOptions = null
++    def decodeValue(in: JsonReader, default: SignatureHelpOptions): SignatureHelpOptions = ???
++    def encodeValue(x: SignatureHelpOptions, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("triggerCharacters"); encodeStringList(x.triggerCharacters, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given serverCapabilitiesCodec: JsonValueCodec[ServerCapabilities] = new JsonValueCodec[ServerCapabilities] {
++    def nullValue: ServerCapabilities = null
++    def decodeValue(in: JsonReader, default: ServerCapabilities): ServerCapabilities = ???
++    def encodeValue(x: ServerCapabilities, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("textDocumentSync"); out.writeVal(x.textDocumentSync)
++      out.writeNonEscapedAsciiKey("documentHighlightProvider"); out.writeVal(x.documentHighlightProvider)
++      out.writeNonEscapedAsciiKey("documentSymbolProvider"); out.writeVal(x.documentSymbolProvider)
++      out.writeNonEscapedAsciiKey("definitionProvider"); out.writeVal(x.definitionProvider)
++      out.writeNonEscapedAsciiKey("renameProvider"); out.writeVal(x.renameProvider)
++      out.writeNonEscapedAsciiKey("hoverProvider"); out.writeVal(x.hoverProvider)
++      out.writeNonEscapedAsciiKey("workspaceSymbolProvider"); out.writeVal(x.workspaceSymbolProvider)
++      out.writeNonEscapedAsciiKey("referencesProvider"); out.writeVal(x.referencesProvider)
++      out.writeNonEscapedAsciiKey("implementationProvider"); out.writeVal(x.implementationProvider)
++      out.writeNonEscapedAsciiKey("completionProvider"); completionOptionsCodec.encodeValue(x.completionProvider, out)
++      out.writeNonEscapedAsciiKey("signatureHelpProvider"); signatureHelpOptionsCodec.encodeValue(x.signatureHelpProvider, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given initializeResultCodec: JsonValueCodec[InitializeResult] = new JsonValueCodec[InitializeResult] {
++    def nullValue: InitializeResult = null
++    def decodeValue(in: JsonReader, default: InitializeResult): InitializeResult = ???
++    def encodeValue(x: InitializeResult, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("capabilities"); serverCapabilitiesCodec.encodeValue(x.capabilities, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given completionItemCodec: JsonValueCodec[CompletionItem] = new JsonValueCodec[CompletionItem] {
++    def nullValue: CompletionItem = null
++    def decodeValue(in: JsonReader, default: CompletionItem): CompletionItem = ???
++    def encodeValue(x: CompletionItem, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("label"); out.writeVal(x.label)
++      out.writeNonEscapedAsciiKey("kind")
++      x.kind match { case Some(k) => out.writeVal(k); case None => out.writeNull() }
++      out.writeNonEscapedAsciiKey("detail")
++      x.detail match { case Some(d) => out.writeVal(d); case None => out.writeNull() }
++      out.writeNonEscapedAsciiKey("documentation"); encodeOptionalMarkupContent(x.documentation, out)
++      out.writeNonEscapedAsciiKey("deprecated"); out.writeVal(x.deprecated)
++      out.writeObjectEnd()
++    }
++  }
++
++  given completionListCodec: JsonValueCodec[CompletionList] = new JsonValueCodec[CompletionList] {
++    def nullValue: CompletionList = null
++    def decodeValue(in: JsonReader, default: CompletionList): CompletionList = ???
++    def encodeValue(x: CompletionList, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("isIncomplete"); out.writeVal(x.isIncomplete)
++      out.writeNonEscapedAsciiKey("items")
++      out.writeArrayStart()
++      x.items.foreach(completionItemCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++      out.writeObjectEnd()
++    }
++  }
++
++  given textEditCodec: JsonValueCodec[TextEdit] = new JsonValueCodec[TextEdit] {
++    def nullValue: TextEdit = null
++    def decodeValue(in: JsonReader, default: TextEdit): TextEdit = ???
++    def encodeValue(x: TextEdit, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("range"); rangeCodec.encodeValue(x.range, out)
++      out.writeNonEscapedAsciiKey("newText"); out.writeVal(x.newText)
++      out.writeObjectEnd()
++    }
++  }
++
++  given workspaceEditCodec: JsonValueCodec[WorkspaceEdit] = new JsonValueCodec[WorkspaceEdit] {
++    def nullValue: WorkspaceEdit = null
++    def decodeValue(in: JsonReader, default: WorkspaceEdit): WorkspaceEdit = ???
++    def encodeValue(x: WorkspaceEdit, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("changes")
++      out.writeObjectStart()
++      x.changes.foreach { (uri, edits) =>
++        out.writeKey(uri)
++        out.writeArrayStart()
++        edits.foreach(textEditCodec.encodeValue(_, out))
++        out.writeArrayEnd()
++      }
++      out.writeObjectEnd()
++      out.writeObjectEnd()
++    }
++  }
++
++  given documentHighlightCodec: JsonValueCodec[DocumentHighlight] = new JsonValueCodec[DocumentHighlight] {
++    def nullValue: DocumentHighlight = null
++    def decodeValue(in: JsonReader, default: DocumentHighlight): DocumentHighlight = ???
++    def encodeValue(x: DocumentHighlight, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("range"); rangeCodec.encodeValue(x.range, out)
++      out.writeNonEscapedAsciiKey("kind"); out.writeVal(x.kind)
++      out.writeObjectEnd()
++    }
++  }
++
++  given hoverCodec: JsonValueCodec[Hover] = new JsonValueCodec[Hover] {
++    def nullValue: Hover = null
++    def decodeValue(in: JsonReader, default: Hover): Hover = ???
++    def encodeValue(x: Hover, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("contents"); markupContentCodec.encodeValue(x.contents, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given symbolInformationCodec: JsonValueCodec[SymbolInformation] = new JsonValueCodec[SymbolInformation] {
++    def nullValue: SymbolInformation = null
++    def decodeValue(in: JsonReader, default: SymbolInformation): SymbolInformation = ???
++    def encodeValue(x: SymbolInformation, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("name"); out.writeVal(x.name)
++      out.writeNonEscapedAsciiKey("kind"); out.writeVal(x.kind)
++      out.writeNonEscapedAsciiKey("location"); locationCodec.encodeValue(x.location, out)
++      out.writeNonEscapedAsciiKey("containerName")
++      x.containerName match { case Some(c) => out.writeVal(c); case None => out.writeNull() }
++      out.writeObjectEnd()
++    }
++  }
++
++  given parameterInformationCodec: JsonValueCodec[ParameterInformation] = new JsonValueCodec[ParameterInformation] {
++    def nullValue: ParameterInformation = null
++    def decodeValue(in: JsonReader, default: ParameterInformation): ParameterInformation = ???
++    def encodeValue(x: ParameterInformation, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("label"); out.writeVal(x.label)
++      out.writeNonEscapedAsciiKey("documentation"); encodeOptionalMarkupContent(x.documentation, out)
++      out.writeObjectEnd()
++    }
++  }
++
++  given signatureInformationCodec: JsonValueCodec[SignatureInformation] = new JsonValueCodec[SignatureInformation] {
++    def nullValue: SignatureInformation = null
++    def decodeValue(in: JsonReader, default: SignatureInformation): SignatureInformation = ???
++    def encodeValue(x: SignatureInformation, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("label"); out.writeVal(x.label)
++      out.writeNonEscapedAsciiKey("documentation"); encodeOptionalMarkupContent(x.documentation, out)
++      out.writeNonEscapedAsciiKey("parameters")
++      out.writeArrayStart()
++      x.parameters.foreach(parameterInformationCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++      out.writeObjectEnd()
++    }
++  }
++
++  given signatureHelpCodec: JsonValueCodec[SignatureHelp] = new JsonValueCodec[SignatureHelp] {
++    def nullValue: SignatureHelp = null
++    def decodeValue(in: JsonReader, default: SignatureHelp): SignatureHelp = ???
++    def encodeValue(x: SignatureHelp, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("signatures")
++      out.writeArrayStart()
++      x.signatures.foreach(signatureInformationCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++      out.writeNonEscapedAsciiKey("activeParameter"); out.writeVal(x.activeParameter)
++      out.writeNonEscapedAsciiKey("activeSignature"); out.writeVal(x.activeSignature)
++      out.writeObjectEnd()
++    }
++  }
++
++  given diagnosticCodec: JsonValueCodec[Diagnostic] = new JsonValueCodec[Diagnostic] {
++    def nullValue: Diagnostic = null
++    def decodeValue(in: JsonReader, default: Diagnostic): Diagnostic = ???
++    def encodeValue(x: Diagnostic, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("range"); rangeCodec.encodeValue(x.range, out)
++      out.writeNonEscapedAsciiKey("message"); out.writeVal(x.message)
++      out.writeNonEscapedAsciiKey("severity"); out.writeVal(x.severity)
++      out.writeNonEscapedAsciiKey("source"); out.writeVal(x.source)
++      out.writeNonEscapedAsciiKey("code"); out.writeVal(x.code)
++      out.writeObjectEnd()
++    }
++  }
++
++  given publishDiagnosticsParamsCodec: JsonValueCodec[PublishDiagnosticsParams] = new JsonValueCodec[PublishDiagnosticsParams] {
++    def nullValue: PublishDiagnosticsParams = null
++    def decodeValue(in: JsonReader, default: PublishDiagnosticsParams): PublishDiagnosticsParams = ???
++    def encodeValue(x: PublishDiagnosticsParams, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("uri"); out.writeVal(x.uri)
++      out.writeNonEscapedAsciiKey("diagnostics")
++      out.writeArrayStart()
++      x.diagnostics.foreach(diagnosticCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++      out.writeObjectEnd()
++    }
++  }
++
++  // -- Locations/SymbolInformation lists carry their own top-level codec
++  //    (used directly as a request's whole `result`) --------------------
++
++  given locationListCodec: JsonValueCodec[List[Location]] = new JsonValueCodec[List[Location]] {
++    def nullValue: List[Location] = null
++    def decodeValue(in: JsonReader, default: List[Location]): List[Location] = ???
++    def encodeValue(x: List[Location], out: JsonWriter): Unit = {
++      out.writeArrayStart()
++      x.foreach(locationCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++    }
++  }
++
++  given documentHighlightListCodec: JsonValueCodec[List[DocumentHighlight]] = new JsonValueCodec[List[DocumentHighlight]] {
++    def nullValue: List[DocumentHighlight] = null
++    def decodeValue(in: JsonReader, default: List[DocumentHighlight]): List[DocumentHighlight] = ???
++    def encodeValue(x: List[DocumentHighlight], out: JsonWriter): Unit = {
++      out.writeArrayStart()
++      x.foreach(documentHighlightCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++    }
++  }
++
++  given symbolInformationListCodec: JsonValueCodec[List[SymbolInformation]] = new JsonValueCodec[List[SymbolInformation]] {
++    def nullValue: List[SymbolInformation] = null
++    def decodeValue(in: JsonReader, default: List[SymbolInformation]): List[SymbolInformation] = ???
++    def encodeValue(x: List[SymbolInformation], out: JsonWriter): Unit = {
++      out.writeArrayStart()
++      x.foreach(symbolInformationCodec.encodeValue(_, out))
++      out.writeArrayEnd()
++    }
++  }
++
++  private def encodeStringList(xs: List[String], out: JsonWriter): Unit = {
++    out.writeArrayStart()
++    xs.foreach(out.writeVal(_))
++    out.writeArrayEnd()
++  }
++
++  private def decodeList[T](in: JsonReader, elemCodec: JsonValueCodec[T]): List[T] =
++    if (in.isNextToken('[')) {
++      if (in.isNextToken(']')) Nil
++      else {
++        in.rollbackToken()
++        val buf = List.newBuilder[T]
++        var continue = true
++        while (continue) {
++          buf += elemCodec.decodeValue(in, null.asInstanceOf[T])
++          continue = in.isNextToken(',')
++        }
++        if (!in.isCurrentToken(']')) in.arrayEndOrCommaError()
++        buf.result()
++      }
++    } else in.readNullOrTokenError(Nil, '[')
++
++  // -- .dotty-ide.json ------------------------------------------------------
++
++  private def decodeStringList(in: JsonReader): List[String] =
++    if (in.isNextToken('[')) {
++      if (in.isNextToken(']')) Nil
++      else {
++        in.rollbackToken()
++        val buf = List.newBuilder[String]
++        var continue = true
++        while (continue) {
++          buf += in.readString(null)
++          continue = in.isNextToken(',')
++        }
++        if (!in.isCurrentToken(']')) in.arrayEndOrCommaError()
++        buf.result()
++      }
++    } else in.readNullOrTokenError(Nil, '[')
++
++  given projectConfigCodec: JsonValueCodec[ProjectConfig] = new JsonValueCodec[ProjectConfig] {
++    def nullValue: ProjectConfig = null
++    def decodeValue(in: JsonReader, default: ProjectConfig): ProjectConfig =
++      if (in.isNextToken('{')) {
++        var id: String = null
++        var compilerVersion: String = null
++        var compilerArguments: List[String] = Nil
++        var sourceDirectories: List[String] = Nil
++        var dependencyClasspath: List[String] = Nil
++        var classDirectory: String = null
++        var projectDependencies: List[String] = Nil
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "id" => id = in.readString(null)
++              case "compilerVersion" => compilerVersion = in.readString(null)
++              case "compilerArguments" => compilerArguments = decodeStringList(in)
++              case "sourceDirectories" => sourceDirectories = decodeStringList(in)
++              case "dependencyClasspath" => dependencyClasspath = decodeStringList(in)
++              case "classDirectory" => classDirectory = in.readString(null)
++              case "projectDependencies" => projectDependencies = decodeStringList(in)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        ProjectConfig(id, compilerVersion, compilerArguments, sourceDirectories, dependencyClasspath, classDirectory, projectDependencies)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: ProjectConfig, out: JsonWriter): Unit = ???
++  }
++
++  given projectConfigListCodec: JsonValueCodec[List[ProjectConfig]] = new JsonValueCodec[List[ProjectConfig]] {
++    def nullValue: List[ProjectConfig] = Nil
++    def decodeValue(in: JsonReader, default: List[ProjectConfig]): List[ProjectConfig] = decodeList(in, projectConfigCodec)
++    def encodeValue(x: List[ProjectConfig], out: JsonWriter): Unit = ???
++  }
++
++  // -- Incoming envelope (method + raw id + raw params) --------------------
++
++  given incomingEnvelopeCodec: JsonValueCodec[IncomingEnvelope] = new JsonValueCodec[IncomingEnvelope] {
++    def nullValue: IncomingEnvelope = null
++    def decodeValue(in: JsonReader, default: IncomingEnvelope): IncomingEnvelope =
++      if (in.isNextToken('{')) {
++        var method: String = null
++        var idRaw: Array[Byte] = null
++        var paramsRaw: Array[Byte] = null
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "method" => method = in.readString(null)
++              case "id" => idRaw = in.readRawValAsBytes()
++              case "params" => paramsRaw = in.readRawValAsBytes()
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        IncomingEnvelope(method, idRaw, paramsRaw)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: IncomingEnvelope, out: JsonWriter): Unit = ???
++  }
++
++  // -- Outgoing envelopes ---------------------------------------------------
++
++  final case class ResponseEnvelope(idRaw: Array[Byte], resultRaw: Array[Byte])
++  given responseEnvelopeCodec: JsonValueCodec[ResponseEnvelope] = new JsonValueCodec[ResponseEnvelope] {
++    def nullValue: ResponseEnvelope = null
++    def decodeValue(in: JsonReader, default: ResponseEnvelope): ResponseEnvelope = ???
++    def encodeValue(x: ResponseEnvelope, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("jsonrpc"); out.writeVal("2.0")
++      out.writeNonEscapedAsciiKey("id"); out.writeRawVal(x.idRaw)
++      out.writeNonEscapedAsciiKey("result"); out.writeRawVal(x.resultRaw)
++      out.writeObjectEnd()
++    }
++  }
++
++  final case class ErrorEnvelope(idRaw: Array[Byte], code: Int, message: String)
++  given errorEnvelopeCodec: JsonValueCodec[ErrorEnvelope] = new JsonValueCodec[ErrorEnvelope] {
++    def nullValue: ErrorEnvelope = null
++    def decodeValue(in: JsonReader, default: ErrorEnvelope): ErrorEnvelope = ???
++    def encodeValue(x: ErrorEnvelope, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("jsonrpc"); out.writeVal("2.0")
++      out.writeNonEscapedAsciiKey("id"); out.writeRawVal(x.idRaw)
++      out.writeNonEscapedAsciiKey("error")
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("code"); out.writeVal(x.code)
++      out.writeNonEscapedAsciiKey("message"); out.writeVal(x.message)
++      out.writeObjectEnd()
++      out.writeObjectEnd()
++    }
++  }
++
++  final case class NotificationEnvelope(method: String, paramsRaw: Array[Byte])
++  given notificationEnvelopeCodec: JsonValueCodec[NotificationEnvelope] = new JsonValueCodec[NotificationEnvelope] {
++    def nullValue: NotificationEnvelope = null
++    def decodeValue(in: JsonReader, default: NotificationEnvelope): NotificationEnvelope = ???
++    def encodeValue(x: NotificationEnvelope, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("jsonrpc"); out.writeVal("2.0")
++      out.writeNonEscapedAsciiKey("method"); out.writeVal(x.method)
++      out.writeNonEscapedAsciiKey("params"); out.writeRawVal(x.paramsRaw)
++      out.writeObjectEnd()
++    }
++  }
++}
 diff --git a/language-server/src/dotty/tools/languageserver/Main.scala b/language-server/src/dotty/tools/languageserver/Main.scala
-index 7f269eec..f9473d54 100644
+index 7f269eec..9ae852f9 100644
 --- a/language-server/src/dotty/tools/languageserver/Main.scala
 +++ b/language-server/src/dotty/tools/languageserver/Main.scala
-@@ -6,15 +6,54 @@ import java.util.function.Consumer
- import java.io.{ File => JFile, InputStream, OutputStream, PrintWriter }
- import java.net._
- import java.nio.channels._
-+import java.util.concurrent.CompletableFuture
+@@ -1,28 +1,57 @@
+ package dotty.tools
+ package languageserver
  
- import org.eclipse.lsp4j._
- import org.eclipse.lsp4j.services._
- import org.eclipse.lsp4j.launch._
+-import java.util.function.Consumer
++import java.io.{FileWriter, InputStream, OutputStream, PrintWriter}
++import java.time.Instant
++import java.util.concurrent.LinkedBlockingQueue
+ 
+-import java.io.{ File => JFile, InputStream, OutputStream, PrintWriter }
+-import java.net._
+-import java.nio.channels._
++import com.github.plokhotnyuk.jsoniter_scala.core._
++import Lsp._
++import Lsp.given
+ 
+-import org.eclipse.lsp4j._
+-import org.eclipse.lsp4j.services._
+-import org.eclipse.lsp4j.launch._
 -import org.eclipse.lsp4j.jsonrpc.Launcher
-+import org.eclipse.lsp4j.jsonrpc.{Endpoint, Launcher, MessageConsumer, RemoteEndpoint}
-+import org.eclipse.lsp4j.jsonrpc.json.{MessageJsonHandler, StreamMessageConsumer}
++/** Appends a timestamped line per dispatched RPC method to `.dotty-lsp-native.log`
++ *  in the server's working directory (the editor's project root -- see
++ *  `Main.runStdio`) -- a real log file the server writes itself, rather
++ *  than relying on the editor to capture/display stderr (Zed, e.g., only
++ *  surfaces a truncated snapshot of stderr on connection failure, useless
++ *  for seeing what happened *before* things went wrong). Best-effort: if the
++ *  file can't be opened (read-only cwd, etc.) logging is silently a no-op
++ *  rather than a reason to fail startup. */
++object Log {
++  private val writer =
++    try Some(new PrintWriter(new FileWriter(".dotty-lsp-native.log", /* append = */ true), /* autoFlush = */ true))
++    catch { case _: Throwable => None }
  
- /** Run the Dotty Language Server.
+-/** Run the Dotty Language Server.
++  def apply(msg: String): Unit =
++    writer.foreach(w => w.println(s"[${Instant.now}] $msg"))
++}
++
++/** Run the Dotty Language Server: owns the actual JSON-RPC/LSP transport
++ *  (stdio framing, request/notification dispatch, response encoding) and
++ *  calls into the plain synchronous methods on `DottyLanguageServer`.
++ *
++ *  No lsp4j: see `Lsp.scala`'s doc comment and docs/findings.md "JVM-free
++ *  language server (LSP)" for why. The reader thread only frames messages
++ *  and decodes the (method, id, raw params) envelope (`Lsp.IncomingEnvelope`)
++ *  before handing off to a single worker thread that does the real
++ *  (potentially slow) compiler work -- so a slow request never blocks the
++ *  reader from noticing e.g. a new `didChange` or `exit`.
   */
  object Main {
 +
-+  /** Dispatches to `DottyLanguageServer.rpcDispatch` instead of lsp4j's own
-+   *  `GenericEndpoint` (which reflectively scans `server.getClass()` and
-+   *  hits the "Duplicate RPC method" bug documented on
-+   *  `DottyLanguageServer.rpcDispatch`). */
-+  private class SafeLocalEndpoint(server: DottyLanguageServer) extends Endpoint {
-+    private def invoke(method: String, parameter: Object): Object =
-+      DottyLanguageServer.rpcDispatch.get(method) match {
-+        case Some(m) =>
-+          val args: Array[Object] = if (m.getParameterCount == 0) Array.empty else Array(parameter)
-+          m.invoke(server, args*)
-+        case None =>
-+          throw new UnsupportedOperationException(s"Unsupported method: $method")
-+      }
-+
-+    override def request(method: String, parameter: Object): CompletableFuture[?] =
-+      invoke(method, parameter).asInstanceOf[CompletableFuture[?]]
-+
-+    override def notify(method: String, parameter: Object): Unit =
-+      invoke(method, parameter)
-+  }
-+
-+  /** Only overrides local-endpoint construction (see `SafeLocalEndpoint`);
-+   *  everything else (JSON handler via `JsonRpcMethodProvider`, remote
-+   *  proxy, message processor) is unchanged from `Launcher.Builder`. */
-+  private class SafeLauncherBuilder(server: DottyLanguageServer) extends Launcher.Builder[DottyClient] {
-+    override def createRemoteEndpoint(jsonHandler: MessageJsonHandler): RemoteEndpoint = {
-+      val outgoing: MessageConsumer = wrapMessageConsumer(new StreamMessageConsumer(output, jsonHandler))
-+      val localEndpoint = new SafeLocalEndpoint(server)
-+      val remoteEndpoint =
-+        if (exceptionHandler == null) new RemoteEndpoint(outgoing, localEndpoint)
-+        else new RemoteEndpoint(outgoing, localEndpoint, exceptionHandler)
-+      jsonHandler.setMethodProvider(remoteEndpoint)
-+      remoteEndpoint
-+    }
-+  }
++  private val InternalErrorCode = -32603
 +
    def main(args: Array[String]): Unit = {
      args.toList match {
        case List("-stdio") =>
-@@ -35,7 +74,7 @@ object Main {
+         val serverIn = System.in
+         val serverOut = System.out
++        // Redirect System.out/Console.out to stderr so any stray println
++        // from deep in the compiler can't corrupt the LSP wire stream,
++        // which is written directly to `serverOut` below instead.
+         System.setOut(System.err)
+         scala.Console.withOut(scala.Console.err) {
+-          startServer(serverIn, serverOut)
++          runStdio(serverIn, serverOut)
+         }
+       case _ =>
+         Console.err.println("Invalid arguments: expected \"-stdio\" or \"-client_command ...\"")
+@@ -30,22 +59,169 @@ object Main {
+     }
+   }
  
+-  def startServer(in: InputStream, out: OutputStream) = {
+-    val server = new DottyLanguageServer
+-
++  def runStdio(in: InputStream, out: OutputStream): Unit = {
      println("Starting server")
-     val launcher =
+-    val launcher =
 -      new Launcher.Builder[DottyClient]()
-+      new SafeLauncherBuilder(server)
-         .setLocalService(server)
-         .setRemoteInterface(classOf[DottyClient])
-         .setInput(in)
+-        .setLocalService(server)
+-        .setRemoteInterface(classOf[DottyClient])
+-        .setInput(in)
+-        .setOutput(out)
+-        // For debugging JSON messages:
+-        //.traceMessages(new java.io.PrintWriter(System.err, true))
+-        .create();
+-
+-    val client = launcher.getRemoteProxy()
+-    server.connect(client)
+-    launcher.startListening()
++    Log("Starting server")
++
++    val writeLock = new Object
++    def writeFramed(bytes: Array[Byte]): Unit = writeLock.synchronized {
++      val header = s"Content-Length: ${bytes.length}\r\n\r\n".getBytes("UTF-8")
++      out.write(header)
++      out.write(bytes)
++      out.flush()
++    }
++
++    def sendResult(idRaw: Array[Byte], resultBytes: Array[Byte]): Unit =
++      writeFramed(writeToArray(ResponseEnvelope(idRaw, resultBytes)))
++    def sendError(idRaw: Array[Byte], message: String): Unit =
++      writeFramed(writeToArray(ErrorEnvelope(idRaw, InternalErrorCode, message)))
++    def sendNotification(method: String, paramsBytes: Array[Byte]): Unit =
++      writeFramed(writeToArray(NotificationEnvelope(method, paramsBytes)))
++
++    val server = new DottyLanguageServer(
++      publishDiagnostics = (uri, diags) =>
++        sendNotification("textDocument/publishDiagnostics", writeToArray(PublishDiagnosticsParams(uri, diags))))
++
++    // A single worker thread does all the (potentially slow) compiler work,
++    // strictly in the order requests/notifications were received -- matches
++    // the previous implementation's own full serialization (DottyLanguageServer
++    // never supported concurrent compiler access), but keeps the reader loop
++    // itself always free to keep reading (e.g. so `exit`/`$/cancelRequest`
++    // aren't stuck behind a slow `hover`).
++    val queue = new LinkedBlockingQueue[Runnable]()
++    val worker = new Thread(() => {
++      while (true) {
++        val task = queue.take()
++        task.run()
++      }
++    })
++    worker.setName("dotty-lsp-native-worker")
++    worker.setDaemon(false) // keep the JVM alive for as long as there's real work queued or pending
++    worker.start()
++
++    def handle(env: IncomingEnvelope): Unit = {
++      val isRequest = env.idRaw != null
++      try {
++        Log(s"-> ${env.method}")
++        env.method match {
++          case "initialize" =>
++            val params = readFromArray(env.paramsRaw)(using initializeParamsCodec)
++            val result = server.initialize(params.rootUri)
++            sendResult(env.idRaw, writeToArray(result))
++          case "initialized" => // no-op notification
++          case "shutdown" =>
++            sendResult(env.idRaw, "null".getBytes("UTF-8"))
++          case "textDocument/didOpen" =>
++            server.didOpen(readFromArray(env.paramsRaw)(using didOpenTextDocumentParamsCodec))
++          case "textDocument/didChange" =>
++            server.didChange(readFromArray(env.paramsRaw)(using didChangeTextDocumentParamsCodec))
++          case "textDocument/didClose" =>
++            server.didClose(readFromArray(env.paramsRaw)(using didCloseTextDocumentParamsCodec))
++          case "textDocument/didSave" | "workspace/didChangeConfiguration" | "workspace/didChangeWatchedFiles" =>
++            () // no-op notifications, matching the previous lsp4j-based implementation
++          case "textDocument/completion" =>
++            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.completion(params)))
++          case "textDocument/definition" =>
++            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.definition(params))(using locationListCodec))
++          case "textDocument/references" =>
++            val params = readFromArray(env.paramsRaw)(using referenceParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.references(params))(using locationListCodec))
++          case "textDocument/rename" =>
++            val params = readFromArray(env.paramsRaw)(using renameParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.rename(params)))
++          case "textDocument/documentHighlight" =>
++            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.documentHighlight(params))(using documentHighlightListCodec))
++          case "textDocument/hover" =>
++            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
++            server.hover(params) match {
++              case Some(hover) => sendResult(env.idRaw, writeToArray(hover))
++              case None => sendResult(env.idRaw, "null".getBytes("UTF-8"))
++            }
++          case "textDocument/documentSymbol" =>
++            val params = readFromArray(env.paramsRaw)(using documentSymbolParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.documentSymbol(params))(using symbolInformationListCodec))
++          case "workspace/symbol" =>
++            val params = readFromArray(env.paramsRaw)(using workspaceSymbolParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.symbol(params))(using symbolInformationListCodec))
++          case "textDocument/implementation" =>
++            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.implementation(params))(using locationListCodec))
++          case "textDocument/signatureHelp" =>
++            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
++            sendResult(env.idRaw, writeToArray(server.signatureHelp(params)))
++          case "$/cancelRequest" => () // no cancellation support -- see docs/findings.md
++          case other =>
++            Log(s"<- $other UNSUPPORTED")
++            if (isRequest) sendError(env.idRaw, s"Unsupported method: $other")
++        }
++        if (env.method != "shutdown") Log(s"<- ${env.method} ok")
++      } catch {
++        case t: Throwable =>
++          Log(s"<- ${env.method} FAILED: ${t.getClass.getName}: ${t.getMessage}")
++          t.printStackTrace()
++          if (isRequest) sendError(env.idRaw, s"${t.getClass.getName}: ${t.getMessage}")
++      }
++    }
++
++    // -- Raw Content-Length-framed message reading ---------------------------
++    def readHeaderLine(): String = {
++      val sb = new StringBuilder
++      var c = in.read()
++      while (c != -1 && c != '\n') {
++        if (c != '\r') sb.append(c.toChar)
++        c = in.read()
++      }
++      if (c == -1 && sb.isEmpty) null else sb.toString
++    }
++    def readFramedBody(): Array[Byte] = {
++      var contentLength = -1
++      var line = readHeaderLine()
++      while (line != null && line.nonEmpty) {
++        val idx = line.indexOf(':')
++        if (idx >= 0 && line.substring(0, idx).trim.equalsIgnoreCase("Content-Length"))
++          contentLength = line.substring(idx + 1).trim.toInt
++        line = readHeaderLine()
++      }
++      if (line == null || contentLength < 0) null
++      else {
++        val buf = new Array[Byte](contentLength)
++        var off = 0
++        while (off < contentLength) {
++          val n = in.read(buf, off, contentLength - off)
++          if (n < 0) throw new java.io.EOFException("stdin closed mid-message")
++          off += n
++        }
++        buf
++      }
++    }
++
++    var running = true
++    while (running) {
++      val body =
++        try readFramedBody()
++        catch { case _: java.io.EOFException => null }
++      if (body == null) {
++        running = false
++      } else {
++        val env =
++          try readFromArray(body)(using incomingEnvelopeCodec)
++          catch {
++            case t: Throwable =>
++              Log(s"<- (unparseable message) FAILED: ${t.getClass.getName}: ${t.getMessage}")
++              null
++          }
++        if (env != null) {
++          if (env.method == "exit") {
++            Log("-> exit")
++            System.exit(0)
++          } else {
++            queue.put(() => handle(env))
++          }
++        }
++      }
++    }
+   }
+ }
+diff --git a/language-server/src/dotty/tools/languageserver/config/ProjectConfig.java b/language-server/src/dotty/tools/languageserver/config/ProjectConfig.java
+deleted file mode 100644
+index e1f55554..00000000
+--- a/language-server/src/dotty/tools/languageserver/config/ProjectConfig.java
++++ /dev/null
+@@ -1,33 +0,0 @@
+-package dotty.tools.languageserver.config;
+-
+-import java.io.File;
+-
+-import com.fasterxml.jackson.annotation.*;
+-
+-public class ProjectConfig {
+-  public final String id;
+-  public final String compilerVersion;
+-  public final String[] compilerArguments;
+-  public final File[] sourceDirectories;
+-  public final File[] dependencyClasspath;
+-  public final File classDirectory;
+-  public final String[] projectDependencies;
+-
+-  @JsonCreator
+-  public ProjectConfig(
+-      @JsonProperty("id") String id,
+-      @JsonProperty("compilerVersion") String compilerVersion,
+-      @JsonProperty("compilerArguments") String[] compilerArguments,
+-      @JsonProperty("sourceDirectories") File[] sourceDirectories,
+-      @JsonProperty("dependencyClasspath") File[] dependencyClasspath,
+-      @JsonProperty("classDirectory") File classDirectory,
+-      @JsonProperty("projectDependencies") String[] projectDependencies) {
+-     this.id = id;
+-     this.compilerVersion = compilerVersion;
+-     this.compilerArguments = compilerArguments;
+-     this.sourceDirectories = sourceDirectories;
+-     this.dependencyClasspath = dependencyClasspath;
+-     this.classDirectory = classDirectory;
+-     this.projectDependencies = projectDependencies;
+-  }
+-}

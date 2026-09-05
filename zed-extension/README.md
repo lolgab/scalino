@@ -1,14 +1,22 @@
 # dotty-lsp-native (Zed extension)
 
 Registers `dist/dotty-lsp-native` (`../README.md`, `../docs/findings.md`
-"JVM-free language server (LSP)") as the language server for Zed's `Scala`
-language -- no JVM required to run it. This extension defines the `Scala`
-language/grammar itself (`languages/scala/`, copied from
+"JVM-free language server (LSP)") as the language server for its own
+`Scala (snc)` language -- no JVM required to run it. This extension
+defines that language/grammar itself (`languages/scala/`, copied from
 [metals-zed](https://github.com/scalameta/metals-zed) -- see
-`languages/scala/NOTICE`), so **installing only this extension is enough**:
-no metals-zed, no JVM-backed Metals, nothing to disable. Do not also install
-metals-zed -- both extensions would define the same `Scala` language for the
-same file extensions, which Zed doesn't support cleanly.
+`languages/scala/NOTICE`), under a name deliberately *different* from
+metals-zed's own `Scala` language, and scoped to only `.scala` files (not
+`.sbt`/`.sc`/`.mill`, unlike metals-zed's own language). Earlier this reused
+the name `Scala` directly, on the theory that installing only this
+extension would be enough -- in practice, if metals-zed is *also* installed
+(even just left over from before), Zed has to arbitrarily pick one
+extension's language definition for `.scala` files, and that pick isn't
+stable across a dev extension reinstall. A distinct name sidesteps the
+collision entirely: `sn-cli setup-ide` (step 5 below) writes a `file_types`
+override pinning `.scala` to `Scala (snc)`, so metals-zed's own
+`language_servers.metals` entry (bound to `Scala`) never attaches to those
+files, whether or not metals-zed stays installed.
 
 ## Install (local dev extension -- not published to Zed's extension gallery)
 
@@ -37,9 +45,19 @@ same file extensions, which Zed doesn't support cleanly.
    ```
    dist/sn-cli setup-ide <your sources...>
    ```
-   writes `.dotty-ide.json` there (`../cli/SnCli.scala`'s `setup-ide` command).
+   writes `.dotty-ide.json` there, and -- if `.zed/settings.json` doesn't
+   already exist -- a `.zed/settings.json` pinning both the LSP binary path
+   and the `file_types` override that assigns `.scala` to this extension's
+   `Scala (snc)` language (`../cli/SnCli.scala`'s `setup-ide` command). If
+   `.zed/settings.json` already existed, `setup-ide` leaves it alone and
+   prints the JSON to add by hand -- merge in both the `lsp` and
+   `file_types` keys, or metals-zed (if also installed) keeps claiming
+   `.scala` files under the plain `Scala` language.
 6. Open the project in Zed. Check `cmd-shift-p` -> "dev: open language
-   server logs" if diagnostics/hover don't show up.
+   server logs" if diagnostics/hover don't show up, and this extension's own
+   `.dotty-lsp-native.log` (written to the project root -- see `Log` in
+   `vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala`)
+   for a full timestamped trace of every request/notification it handled.
 
 ## Scope
 

@@ -11,5 +11,6 @@
 *.tasty
 *.nir
 /zed-extension/target/
-/.dotty-ide.json
-/.zed/
+.dotty-ide.json
+.zed/
+.dotty-lsp-native.log

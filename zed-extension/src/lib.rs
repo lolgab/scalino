@@ -1,10 +1,12 @@
 // Zed extension for dotty-lsp-native (scala-native-compiler's JVM-free Scala
 // LSP -- see /README.md and /docs/findings.md "JVM-free language server
-// (LSP)"). Defines the "Scala" language/grammar itself (languages/scala/,
+// (LSP)"). Defines its own "Scala (snc)" language/grammar (languages/scala/,
 // copied from https://github.com/scalameta/metals-zed -- see
-// languages/scala/NOTICE) and registers `dotty-lsp-native` as its only
-// language server, so installing just this extension is enough: no
-// metals-zed, no JVM-backed `metals` to exclude.
+// languages/scala/NOTICE), deliberately named differently from metals-zed's
+// own "Scala" language (and scoped to just `.scala`, not
+// `.sbt`/`.sc`/`.mill`) so the two never collide over the same file
+// extensions -- see the longer comment in extension.toml. Registers
+// `dotty-lsp-native` as the only language server for it.
 //
 // No DAP support (the worksheet/decompiler modules that would need one were
 // trimmed from the server -- see patches/scala3-0002-trim-language-server.patch)

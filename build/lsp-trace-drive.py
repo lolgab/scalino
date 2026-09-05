@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 """Drives a comprehensive real-editor-shaped LSP request sequence against a
-dotty.tools.languageserver.Main process launched with the given command.
-Used by build/05-regen-agent-config.sh to trace GraalVM native-image
-reflection config against the same request shapes a real editor sends
-(notably `initialize` with `workspaceFolders`, and `workspace/symbol`) --
-see docs/findings.md "JVM-free language server (LSP)" for the bug class
-this exists to catch: lsp4j deserializes request params via Gson
-reflection, and native-image's closed-world reachability analysis only
-registers types it saw exercised during a traced run.
+dotty.tools.languageserver.Main process launched with the given command --
+a full functional smoke test exercising every endpoint DottyLanguageServer
+implements (initialize with a real editor's full capabilities+
+workspaceFolders, didOpen/didChange, hover, definition, completion,
+references, rename, documentSymbol, workspace/symbol) against real dotc
+compilation of build/lsp-trace-fixture.
+
+No longer wired into build/05-regen-agent-config.sh: the LSP module used
+to be lsp4j+Gson (reflection-based), and this script's job was tracing
+GraalVM native-image reflection config against realistic request shapes --
+Gson's reflective TypeAdapter construction only worked for types actually
+exercised during a traced run, and a real editor's rich `initialize`
+payload turned out to trigger a native-image-specific pathology no amount
+of extra tracing fixed (see docs/findings.md "JVM-free language server
+(LSP)"). The module is now a hand-rolled JSON-RPC/LSP implementation over
+hand-written jsoniter-scala codecs, zero reflection, so there's nothing
+left to trace -- this script is kept purely as an end-to-end functional
+test to run by hand after any change to Main.scala/Lsp.scala/
+DottyLanguageServer.scala.
 
 Usage: lsp-trace-drive.py <project-dir> <command...>
 <project-dir> must contain Model.scala, Greeter.scala, Main.scala (see
@@ -145,11 +156,94 @@ def main():
     client = LspClient(proc)
     ok = True
     try:
-        section("initialize (with workspaceFolders, like a real editor)")
+        # A real editor's `initialize` carries `clientInfo` and a deeply
+        # nested `capabilities` tree (workspace/*, textDocument/*, window),
+        # each level a distinct lsp4j POJO Gson must reflectively
+        # instantiate/populate on the way in -- a bare `"capabilities": {}`
+        # (this fixture's shape until 2026-09-05) never exercises any of
+        # that, so native-image's reachability trace never registers those
+        # types, and a real client's `initialize` request then dies with
+        # "Type ... was never registered" the moment Gson tries to
+        # deserialize e.g. ClientInfo or CompletionClientCapabilities --
+        # invisible to the client (just a dead connection), only visible in
+        # the server's own stderr. See docs/findings.md "JVM-free language
+        # server (LSP)" for the write-side sibling of this same bug class.
+        client_capabilities = {
+            "workspace": {
+                "applyEdit": True,
+                "workspaceEdit": {"documentChanges": True, "resourceOperations": ["create", "rename", "delete"]},
+                "didChangeConfiguration": {"dynamicRegistration": True},
+                "didChangeWatchedFiles": {"dynamicRegistration": True},
+                "symbol": {"dynamicRegistration": True, "symbolKind": {"valueSet": list(range(1, 27))}},
+                "executeCommand": {"dynamicRegistration": True},
+                "workspaceFolders": True,
+                "configuration": True,
+            },
+            "textDocument": {
+                "synchronization": {"dynamicRegistration": True, "willSave": True, "willSaveWaitUntil": True, "didSave": True},
+                "completion": {
+                    "dynamicRegistration": True,
+                    "completionItem": {
+                        "snippetSupport": True,
+                        "commitCharactersSupport": True,
+                        "documentationFormat": ["markdown", "plaintext"],
+                        "deprecatedSupport": True,
+                        "preselectSupport": True,
+                    },
+                    "completionItemKind": {"valueSet": list(range(1, 26))},
+                    "contextSupport": True,
+                },
+                "hover": {"dynamicRegistration": True, "contentFormat": ["markdown", "plaintext"]},
+                "signatureHelp": {
+                    "dynamicRegistration": True,
+                    "signatureInformation": {"documentationFormat": ["markdown", "plaintext"]},
+                },
+                "declaration": {"dynamicRegistration": True, "linkSupport": True},
+                "definition": {"dynamicRegistration": True, "linkSupport": True},
+                "typeDefinition": {"dynamicRegistration": True, "linkSupport": True},
+                "implementation": {"dynamicRegistration": True, "linkSupport": True},
+                "references": {"dynamicRegistration": True},
+                "documentHighlight": {"dynamicRegistration": True},
+                "documentSymbol": {
+                    "dynamicRegistration": True,
+                    "symbolKind": {"valueSet": list(range(1, 27))},
+                    "hierarchicalDocumentSymbolSupport": True,
+                },
+                "codeAction": {
+                    "dynamicRegistration": True,
+                    "codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["", "quickfix", "refactor", "source"]}},
+                },
+                "codeLens": {"dynamicRegistration": True},
+                "documentLink": {"dynamicRegistration": True, "tooltipSupport": True},
+                "colorProvider": {"dynamicRegistration": True},
+                "formatting": {"dynamicRegistration": True},
+                "rangeFormatting": {"dynamicRegistration": True},
+                "onTypeFormatting": {"dynamicRegistration": True},
+                "rename": {"dynamicRegistration": True, "prepareSupport": True},
+                "publishDiagnostics": {"relatedInformation": True, "tagSupport": {"valueSet": [1, 2]}},
+                "foldingRange": {"dynamicRegistration": True, "rangeLimit": 5000, "lineFoldingOnly": True},
+            },
+            "window": {"workDoneProgress": True},
+            # A real editor's `initialize` (Zed confirmed) also sends these
+            # two top-level capability groups, which this fixture never
+            # exercised until a real Zed launch silently hung for exactly
+            # ~60s then cleanly self-exited (no error printed anywhere --
+            # the read-loop's worker thread pool has a default 60s
+            # keep-alive, and once whatever silently ate the parse failure
+            # never resubmits another read, that's what's left ticking).
+            # Bisected down to these two fields independently reproducing
+            # it; see docs/findings.md "JVM-free language server (LSP)".
+            "general": {"positionEncodings": ["utf-16"]},
+            "experimental": {"serverStatusNotification": True, "localDocs": True},
+        }
+
+        section("initialize (with clientInfo + full nested capabilities + workspaceFolders, like a real editor)")
         resp, elapsed = client.request("initialize", {
             "processId": os.getpid(),
+            "clientInfo": {"name": "trace-client", "version": "0.1.0"},
             "rootUri": uri(project),
-            "capabilities": {},
+            "capabilities": client_capabilities,
+            "trace": "off",
             "workspaceFolders": [{"uri": uri(project), "name": os.path.basename(project)}],
         }, timeout=60)
         show("initialize", resp, elapsed)
