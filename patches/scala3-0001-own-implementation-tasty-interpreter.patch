@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..bb3beb50 100644
+index 04cb637b..74c97d51 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -92,7 +92,7 @@ index 04cb637b..bb3beb50 100644
    type Env = Map[Symbol, Object]
    def emptyEnv: Env = Map.empty
    inline def env(using e: Env): e.type = e
-@@ -59,43 +124,294 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -59,43 +124,318 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
    /** Returns the result of interpreting the code in the tree.
     *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
     */
@@ -115,6 +115,8 @@ index 04cb637b..bb3beb50 100644
 +          else throw new StopInterpretation(em"${tree.symbol} could not be inlined", tree.srcPos)
 +
 +    case tree: Ident if env.contains(tree.symbol) =>
++      if sys.env.contains("SNC_INTERP_DEBUG") && tree.symbol.name.toString == "x" then
++        Console.err.println(s"[identLookup] sym=${tree.symbol} id=${System.identityHashCode(tree.symbol)} boundValueClass=${env(tree.symbol).getClass} owner=${tree.symbol.owner}")
 +      env(tree.symbol) match
 +        case v: InterpretedVar => v.value
 +        // A by-name parameter (`x: => B`): re-run its captured argument
@@ -358,7 +360,30 @@ index 04cb637b..bb3beb50 100644
 +        val callEnv = bindNonErased(params, rawArgs).foldLeft(closureEnv)((e, pv) => e.updated(pv._1, pv._2))
 +        interpretTree(ddef.rhs)(using callEnv)
        else if (env.contains(fn.symbol))
-         env(fn.symbol)
+-        env(fn.symbol)
++        // `fn.symbol` is a local `val`/parameter bound to an already-
++        // interpreted function VALUE (not a real method symbol, so none of
++        // the branches above applied) -- a bare reference (`rawArgs.isEmpty`,
++        // e.g. passing the closure around as a value) just returns it
++        // unapplied, same as always. But `Call`'s own extractor also
++        // flattens a REAL, ARGUMENT-CARRYING call on such a value (e.g.
++        // `readVal('x)` where `readVal: Quotes ?=> Expr[B] => Expr[Unit]` is
++        // itself a local parameter, reached through jsoniter-scala's own
++        // `genReadCollection`) down to this exact same `(fn, rawArgs)`
++        // shape -- returning the raw closure UNAPPLIED there silently
++        // dropped every argument, leaking the closure itself as if it were
++        // the call's result. `resolveNestedSplices`'s own nested-splice
++        // fuel loop (`Splicer.scala`) then "helpfully" kept re-applying
++        // fresh dummy `QuotesImpl`s to whatever function value it got back
++        // (its own doc comment: "keep feeding a fresh `QuotesImpl` while
++        // the result is still an unapplied function") -- silently binding a
++        // REAL value-typed parameter (like `readVal`'s own `Expr[B]` arg)
++        // to a bogus `QuotesImpl` instead of the real argument, several
++        // calls downstream of where this actually went wrong. Apply
++        // `rawArgs` left-to-right instead whenever there are any.
++        val v = env(fn.symbol)
++        if rawArgs.isEmpty then v
++        else rawArgs.foldLeft(v)((acc, argTree) => applyFn1(acc, interpretTree(argTree)))
 +      else if quotedTypeGivenValue(tree.symbol).isDefined then
 +        quotedTypeGivenValue(tree.symbol).get
        else if (tree.symbol.is(InlineProxy))
@@ -395,7 +420,7 @@ index 04cb637b..bb3beb50 100644
      // Interpret `foo(j = x, i = y)` which it is expanded to
      // `val j$1 = x; val i$1 = y; foo(i = i$1, j = j$1)`
      case Block(stats, expr) => interpretBlock(stats, expr)
-@@ -113,6 +429,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -113,6 +453,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        unexpectedTree(tree)
    }
  
@@ -415,7 +440,7 @@ index 04cb637b..bb3beb50 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +470,4057 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +494,4070 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -3296,7 +3321,12 @@ index 04cb637b..bb3beb50 100644
 +          case _ => None
 +      case "apply" if fn.owner.name.toString == "BlockModule" =>
 +        args match
-+          case (stats: List[Tree @unchecked]) :: (expr: Tree) :: Nil => Some(tpd.Block(stats, expr))
++          // `stats` (e.g. jsoniter-scala's own `Block(defs.toList, codecDef)`,
++          // `defs` a real interpreted `ListBuffer[Statement]`) can arrive as
++          // our own `::`-chain `InterpretedInstance` rather than a real host
++          // `List` -- same `asObjectList` conversion `ApplyModule.apply`
++          // above already applies to its own `args` list.
++          case (stats: Object) :: (expr: Tree) :: Nil => Some(tpd.Block(asObjectList(stats).asInstanceOf[List[Tree]], expr))
 +          case _ => None
 +      // `Repeated.apply(elems, elemtpt)`: real `QuotesImpl` just constructs
 +      // a `tpd.SeqLiteral` directly (`type Repeated = tpd.SeqLiteral`).
@@ -4263,10 +4293,18 @@ index 04cb637b..bb3beb50 100644
 +      case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
 +      case (m: mutable.Map[Object, Object] @unchecked, "put", (k: Object) :: (v: Object) :: Nil) => Some(m.put(k, v))
 +      case (m: mutable.Map[Object, Object] @unchecked, "get", (k: Object) :: Nil) => Some(m.get(k))
-+      case (m: mutable.Map[Object, Object] @unchecked, "getOrElseUpdate", (k: Object) :: (default: Object) :: Nil) =>
-+        Some(m.getOrElseUpdate(k, default))
-+      case (m: mutable.Map[Object, Object] @unchecked, "getOrElse", (k: Object) :: (default: Object) :: Nil) =>
-+        Some(m.getOrElse(k, default))
++      // `default`/`op` are real by-name parameters on mutable `Map#getOrElse`/
++      // `#getOrElseUpdate` -- arrive here as our own `ByNameArg` (see
++      // `evalNonErased`), not a `Function0`; force only in the (rare) miss
++      // case, same laziness the real methods have (mirrors the immutable
++      // `Map#getOrElse` case above -- this one was passing the still-wrapped
++      // `ByNameArg` straight through as the value instead of forcing it).
++      case (m: mutable.Map[Object, Object] @unchecked, "getOrElseUpdate", (k: Object) :: (default: ByNameArg) :: Nil) =>
++        Some(m.getOrElseUpdate(k, default.force()))
++      case (m: mutable.Map[Object, Object] @unchecked, "getOrElse", (k: Object) :: (default: ByNameArg) :: Nil) =>
++        m.get(k) match
++          case Some(v) => Some(v)
++          case None => Some(default.force())
 +      case (m: mutable.Map[Object, Object] @unchecked, "contains", (k: Object) :: Nil) => Some(Boolean.box(m.contains(k)))
 +      case (m: mutable.Map[Object, Object] @unchecked, "apply", (k: Object) :: Nil) => Some(m(k))
 +      case (m: mutable.Map[Object, Object] @unchecked, "update", (k: Object) :: (v: Object) :: Nil) =>
@@ -4626,7 +4664,7 @@ index 04cb637b..bb3beb50 100644
    object Call:
      import tpd.*
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index a40db72d..8c47a1b3 100644
+index a40db72d..33ec7a7c 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 @@ -6,6 +6,7 @@ import java.io.{PrintWriter, StringWriter}
@@ -4699,7 +4737,16 @@ index a40db72d..8c47a1b3 100644
          case NonFatal(ex) =>
            val msg =
              em"""Failed to evaluate macro.
-@@ -256,14 +294,77 @@ object Splicer {
+@@ -249,6 +287,8 @@ object Splicer {
+     override protected  def interpretTree(tree: Tree)(implicit env: Env): Object = tree match {
+       // Interpret level -1 quoted code `'{...}` (assumed without level 0 splices)
+       case Apply(Select(Quote(body, _), nme.apply), _) =>
++        if sys.env.contains("SNC_INTERP_DEBUG") then
++          Console.err.println(s"[quoteApplyCase] body.show=${body.show}")
+         val body1 = body match {
+           case expr: Ident if expr.symbol.isAllOf(InlineByNameProxy) =>
+             // inline proxy for by-name parameter
+@@ -256,14 +296,83 @@ object Splicer {
            case tree: Inlined if tree.inlinedFromOuterScope => tree.expansion
            case _ => body
          }
@@ -4742,6 +4789,8 @@ index a40db72d..8c47a1b3 100644
 +        new TypeImpl(quoted.changeNonLocalOwners(ctx.owner), SpliceScope.getCurrent)
  
        case _ =>
++        if sys.env.contains("SNC_INTERP_DEBUG") && tree.isInstanceOf[tpd.Apply] && tree.show.length < 60 then
++          Console.err.println(s"[spliceFallback] treeClass=${tree.getClass.getSimpleName} show=${tree.show}")
          super.interpretTree(tree)
      }
 +
@@ -4770,8 +4819,12 @@ index a40db72d..8c47a1b3 100644
 +              case e: ExprImpl => e
 +              case f: (AnyRef => Object) @unchecked if fuel > 0 => resolve(f(QuotesImpl()), fuel - 1)
 +              case other =>
++                if sys.env.contains("SNC_INTERP_DEBUG") then
++                  Console.err.println(s"[resolveNestedSplices] FAILED expr.show=${expr.show} t.show=${t.show} envKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
 +                throw new StopInterpretation(
 +                  em"Unexpected result interpreting a nested splice: ${other.toString}", t.srcPos)
++            if sys.env.contains("SNC_INTERP_DEBUG") then
++              Console.err.println(s"[resolveNestedSplices] expr.show=${expr.show} envKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
 +            val exprImpl = resolve(interpretTree(expr), 8)
 +            transform(exprImpl.tree)
 +          case _ => super.transform(t)

@@ -434,17 +434,68 @@ Done since: `sn-cli setup-ide <sources...>` (`cli/SnCli.scala`) generates
 `buildBinary`'s own classpath/directive-parsing plumbing, instead of
 hand-writing it; and [`zed-extension/`](../zed-extension/) is a real Zed
 extension (modeled on
-[metals-zed](https://github.com/scalameta/metals-zed)) registering
-`dotty-lsp-native` as a second server on Zed's `Scala` language — its own
-`README.md` has install steps. Compiles clean (`cargo check`) against
-`zed_extension_api` 0.7.0; not yet built to wasm or run inside real Zed (no
-`rustup`/`wasm32-wasip2` target in this environment) — first thing to check
-if it doesn't load is `dev: open language server logs` in Zed.
+[metals-zed](https://github.com/scalameta/metals-zed), reusing its
+`languages/scala/` tree-sitter files under the same NOTICE) that owns the
+`Scala` language/grammar itself and registers `dotty-lsp-native` as its
+*only* language server — no metals-zed extension needed at all (superseded
+the earlier "second server on Zed's `Scala` language" design once it became
+clear Zed has no extension-to-extension dependency or override mechanism,
+so piggybacking on metals-zed's language would have meant also installing
+its bundled JVM-backed `metals` and manually excluding it per-project). Its
+own `README.md` has install steps. Compiles clean (`cargo check`) against
+`zed_extension_api` 0.7.0.
+
+**Fourth real bug, found 2026-09-05 by actually running it in a real Zed
+instance (an isolated `--user-data-dir` profile with *only* the
+`dotty-lsp-native` dev extension installed, no metals-zed) instead of just
+`cargo check`ing it:** `extension.toml` declared `[grammars.scala]` but
+never set the top-level `languages = ["languages/scala"]` key that tells
+Zed to actually load `languages/scala/config.toml` as a language
+definition — so despite the whole `languages/scala/` tree sitting right
+there in the extension, Zed's own extension index showed
+`"languages": []` for this extension. Net effect: the `Scala` language
+identity was silently owned entirely by whichever *other* extension
+happened to define it (metals-zed's `scala` extension, if installed) — the
+opposite of the design intent above. With metals-zed installed alongside,
+this was invisible (both `dotty-lsp-native` and `metals` start together,
+looks fine) — matches real usage logs where the two servers always
+launched within ~1s of each other. Without metals-zed, `.scala` files get
+no language mode at all and `dotty-lsp-native` never starts, since its
+`language_servers.dotty-lsp-native` entry is bound to a `Scala` language
+nothing defines. Fixed by adding the missing `languages = ["languages/scala"]`
+line. Needs a real Zed dev-extension reinstall (Zed doesn't rescan
+`extension.toml` on its own) to take effect in an already-running Zed.
+
+Also found via direct `-stdio` probing of `dist/dotty-lsp-native` (not yet
+fixed, lower priority — didn't block the language-registration bug above):
+a project with no `.dotty-ide.json` yet (i.e. `sn-cli setup-ide` never run
+there) crashes the *entire* native-image process on the first `didOpen` —
+`DottyLanguageServer.drivers()` (`DottyLanguageServer.scala:74`) throws
+`FileNotFoundException` reading it, uncaught, inside a `CompletableFuture`
+on a ForkJoinPool thread, which kills the whole process instead of
+surfacing an LSP error to the client.
+
+(A second suspected bug from this same round of probing — a
+`NullPointerException` at `RemoteEndpoint.handleRequest:279` that seemed to
+fire once per `didOpen`/`didChange`/`initialized` — turned out to be a false
+positive: the probe script's own `send()` helper defaulted to treating
+every call as a request (attaching a JSON-RPC `id`) unless told otherwise,
+and three call sites forgot to pass `is_notif=True`. Sent that way, they
+*are* requests as far as lsp4j is concerned, and `SafeLocalEndpoint.request`
+(`Main.scala`) reflectively invokes a void/`Unit`-returning method and casts
+the resulting `null` to `CompletableFuture` — exactly reproducing that NPE
+by construction, no server bug required. Rerunning with the notifications
+sent correctly (no `id`) against the same real project produced zero
+errors over a full 2-minute idle session. Lesson for next time: a
+hand-rolled LSP probe script is just as capable of fabricating a
+"reachability"-shaped false bug as a real one — verify by fixing the
+script and confirming the symptom disappears before writing it up.)
 
 Not yet done: deeper verification of `completion`/`references`/`rename`/
 workspace `symbol` (they reuse the same now-verified
 `InteractiveDriver`/dispatch plumbing as `hover`/diagnostics, so should
-work, but aren't individually exercised yet).
+work, but aren't individually exercised yet); the two lower-priority bugs
+just above.
 
 ## Remaining work
 
@@ -872,3 +923,89 @@ work, but aren't individually exercised yet).
    not yet traced to its exact origin. `sn-cli test .` on `~/scala/ape`
    still fails on this one file (`test/http/RoutesTest.scala`, every test
    method using the `uri"/"` literal) as a result.
+9. **Three more general interpreter bugs found + fixed (2026-09-05), via
+   `examples/macro-hello` -- switched from a plain `println` macro to a real
+   `jsoniter-scala` `JsonCodecMaker.make` derivation (a much harder, real
+   third-party macro) to give this example ongoing regression value; see
+   `examples/macro-hello/Test.scala`. Not yet passing end-to-end (see the
+   still-open gap below), so NOT wired into CI yet -- do that once it's
+   fully green.**
+   - **`mutable.Map#getOrElse`/`#getOrElseUpdate` didn't force their own
+     by-name default/`op` parameter** -- both real signatures take it
+     `=> V1` (same as immutable `Map#getOrElse`, already handled correctly
+     a few cases above), but the `mutable.Map` cases in
+     `interpretStdlibIntrinsic` matched it as a plain `Object` and passed
+     the still-wrapped `ByNameArg` straight through as if it were the
+     value, instead of calling `.force()` in the miss case. Found via
+     jsoniter's own `refs.getOrElse(refKey, { ...builds a new ref... })`
+     pattern (shared-method memoization for recursive derivations) --
+     forcing the default surfaced fine there, but the raw `ByNameArg`
+     object itself, unwrapped, then leaked into a REAL `ApplyModule.apply`
+     call downstream as its `fun: Term` argument, which doesn't type-test
+     as `Tree` and so silently fails closed with "no built-in intrinsic
+     exists" several frames away from the actual bug.
+   - **A local `val`/parameter bound to an already-interpreted function
+     VALUE (not a real method symbol), called WITH real arguments via a
+     bare symbol reference, silently dropped every argument.** The
+     `Call(fn, args)` dispatch's own generic fallback (`else if
+     (env.contains(fn.symbol)) env(fn.symbol)`, meant for a BARE value
+     reference with zero args -- `Call`'s extractor also produces this
+     shape for e.g. plain `Ident(f)`) never checked `rawArgs.isEmpty`, so
+     a genuine call on such a value (e.g. jsoniter's own
+     `genReadCollection`, whose `readVal`/`result` parameters are
+     `Quotes ?=> Expr[B] => Expr[C]` callbacks invoked later as
+     `readVal('x)`/`result('x)`) just returned the raw, unapplied closure,
+     discarding the real argument entirely. This alone produced no visible
+     error -- `resolveNestedSplices`'s own "keep feeding a fresh
+     `QuotesImpl` while the result is still an unapplied function" fuel
+     loop (see item 8's sibling fix, or the doc comment on
+     `resolveNestedSplices` in `Splicer.scala`) "helpfully" kept reducing
+     whatever unapplied closure came back by feeding it MORE dummy
+     `QuotesImpl`s -- silently binding a real value-typed parameter (e.g.
+     `genReadValForGrowable`'s own `x: Expr[G]`) to a bogus `QuotesImpl`
+     instead of the real argument, several calls downstream of where this
+     actually went wrong, surfacing as "Unexpected result interpreting a
+     nested splice: QuotesImpl@...". Traced via three rounds of targeted
+     `SNC_INTERP_DEBUG`-gated prints (now left in place, gated the same
+     way): one at `resolveNestedSplices`'s own entry/failure points, one
+     logging `Ident` lookups for symbol name `"x"` specifically, one
+     logging every `Apply` node that falls through the `SpliceInterpreter`
+     override's special cases -- confirmed the leaked value's OWN symbol
+     (not just its runtime class) really was `genReadValForGrowable`'s `x`
+     parameter, bound to a `QuotesImpl`, several calls before the crash
+     site. Fixed by applying `rawArgs` (via the existing `applyFn1`
+     single-arg-apply helper, folded left-to-right for however many
+     curried argument groups `Call` flattened) whenever `rawArgs.nonEmpty`,
+     instead of returning the closure unapplied.
+   - **`BlockModule.apply(stats, expr)` didn't convert its own `stats`
+     argument through `asObjectList`** the way the neighboring
+     `ApplyModule.apply` case already does, so a real `List[Statement]`
+     built via a `ListBuffer#toList` call (jsoniter's own
+     `Block(defs.toList, codecDef)`, `defs` a real interpreted
+     `ListBuffer[Statement]` -- see `asObjectList`'s own doc comment on why
+     `::`/`Nil` built this way stay `InterpretedInstance`s rather than
+     real host `List`s) failed to match `stats: List[Tree @unchecked]` and
+     fell through to "no built-in intrinsic exists" the same way as the
+     first two bugs above.
+
+   **Known still-open gap, found but NOT fixed this session:** with all
+   three bugs above fixed, `JsonCodecMaker.make`'s own macro expansion now
+   runs to completion (no more interpreter errors) -- but the SPLICED
+   RESULT then fails a few phases later, during inlining:
+   `undefined: x.addOne # -1: TermRef(TermRef(NoPrefix,val x),addOne) at
+   inlining`. This looks like an owner-chain/hygiene gap in the final
+   spliced tree (a reference to a generated-code local `val x` that isn't
+   reachable from its own use site's owner chain by the time a later
+   phase looks it up) rather than an interpretation gap -- in the same
+   family as the `moduleSuperCtorCall`/anonymous-class-ctor-arg owner-chain
+   fixes from an earlier session (item 8), but for `ListBuffer`-accumulated
+   `defs`/local-`val`-declaring code spliced in via `Block(defs.toList,
+   ...)` specifically. Not yet traced to its exact origin -- next session
+   should start with `SNC_INTERP_DEBUG=1` and grep for `changeOwner`/
+   `changeNonLocalOwners` call sites reachable from `BlockModule.apply`'s
+   own construction path, and check whether `defs`' individual `DefDef`
+   trees (each built via a separate `Symbol.newMethod`/`DefDef.apply` call,
+   likely at a different point in the recursive derivation than where
+   they're finally spliced into the top-level `Block`) have their owners
+   correctly rechained to the enclosing class before/during that final
+   `Block.apply` call.
