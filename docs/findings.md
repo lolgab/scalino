@@ -583,28 +583,71 @@ lifecycle/JVM-exit timing genuinely differs from a real JVM's (e.g.
 oracle/graal#12116, #434) — not something fixable by more
 reachability-metadata tweaks alone.
 
-**Not yet fixed — real next step for whoever resumes this:** either (a)
-find the exact native-image/Gson interaction bug (would likely need
-bisecting `-H:` flags or filing upstream against oracle/graal), or (b)
-sidestep it entirely by changing `DottyLanguageServer.rpcMethods`'
-registered param type for `initialize` away from lsp4j's real
-`InitializeParams` (which forces Gson to reflectively construct every
-nested `ClientCapabilities` subtype) to something generic
-(`com.google.gson.JsonElement`/`Object`), and hand-extract just `rootUri`/
-`workspaceFolders` from the raw tree ourselves — `initialize()`'s own body
-barely touches client capabilities beyond that anyway. Not attempted this
-session (`rpcMethods`'s per-method param type currently comes straight from
-lsp4j's own reflected interface method signature via
-`ServiceEndpoints.getSupportedMethods`, not something hand-authored per
-method yet).
+**FIXED, same day: lsp4j (and Gson, and Jackson for `.dotty-ide.json`)
+removed entirely.** Rather than chase the exact native-image/Gson
+interaction bug, the whole transport was rewritten from scratch:
+`Main.scala` now implements JSON-RPC/LSP framing and dispatch by hand
+(Content-Length reader, a single worker thread draining a queue so a slow
+request never blocks the reader from noticing e.g. `exit`, response/error/
+notification encoding), and a new `Lsp.scala` defines every wire type
+(`Position`/`Range`/`Location`/`Diagnostic`/`CompletionItem`/... and the
+JSON-RPC envelopes) with **hand-written** `jsoniter-scala`
+(`com.github.plokhotnyuk.jsoniter-scala:jsoniter-scala-core_3:2.37.3`)
+`JsonValueCodec` instances — no `JsonCodecMaker` macro derivation (that's a
+real Scala 3 quote/splice macro from a third-party library; expanding it
+would depend on this project's own macro interpreter, patches/scala3-0001,
+handling code it was never built to handle — sidestepped entirely by
+writing every `decodeValue`/`encodeValue` by hand against jsoniter-scala's
+low-level `JsonReader`/`JsonWriter` API). Zero reflection anywhere in the
+module now, at compile time or runtime. Each params type only models the
+handful of fields `DottyLanguageServer` actually reads (unknown JSON keys
+are always skipped), so a real editor's much richer `initialize`
+capabilities — the exact payload that broke Gson — never gets parsed into
+a type at all; there's no reflection path left for it to break.
+`DottyLanguageServer.scala` keeps 100% of its actual compiler-facing logic
+(`InteractiveDriver`, `Interactive.*`, driver-per-project management) —
+only its method signatures/return-value construction changed from lsp4j
+types to `Lsp.*` types, and the lsp4j-workaround machinery (`rpcDispatch`/
+`rpcMethods`/`CancelChecker`/`CompletableFutures`) is gone along with it.
+`.dotty-ide.json` parsing also moved off Jackson onto a hand-written
+`Lsp.ProjectConfig` codec, for the same reflection-freedom reason.
+Deliberately dropped: `window/showMessageRequest` (a server-initiated
+request needing bidirectional id correlation this transport doesn't
+implement) — only used by `rename`'s "also rename overridden members?"
+prompt, which now always says yes (matching the previous default choice);
+and any `$/cancelRequest` support (never actually checked by any handler
+even under lsp4j, so nothing observable changed).
 
-Not yet done: deeper verification of `completion`/`references`/`rename`/
-workspace `symbol` (they reuse the same now-verified
-`InteractiveDriver`/dispatch plumbing as `hover`/diagnostics, so should
-work, but aren't individually exercised yet — though given the bug above,
-worth re-checking whether a real client's richer per-request params, not
-just `initialize`'s, can trigger the same native-image pathology); the
-missing-`.dotty-ide.json` whole-process crash noted earlier.
+Verified two ways: (1) replayed the *exact* raw `initialize` bytes captured
+from real Zed (the payload that used to hang ~60s then silently exit)
+directly against the new binary — response in under a second, every time;
+(2) ran `build/lsp-trace-drive.py`'s full realistic session (real
+capabilities+clientInfo+workspaceFolders `initialize`, didOpen x3, hover,
+definition, completion, references, rename, documentSymbol,
+workspace/symbol, didChange-introduces-a-type-error) against real dotc
+compilation of `build/lsp-trace-fixture` — every step OK, diagnostics
+correct, zero errors in `.dotty-lsp-native.log`. Binary also shrank
+99MB → 81MB and native-image build time dropped (~2m30s → ~1m55s) with
+lsp4j/Gson/Jackson off the classpath. `build/08-build-lsp-native.sh` no
+longer needs a javac step (deleted `config/ProjectConfig.java`) or
+`-H:ConfigurationFileDirectories` at all (deleted the now-dead
+`agent-config/lsp/`; `build/05-regen-agent-config.sh`'s LSP tracing step
+is gone, since there's no reflection left to trace).
+
+Not yet done: deeper verification under the *native-image* binary
+specifically of `completion`/`references`/`rename`/`documentSymbol`/
+workspace `symbol` beyond the `lsp-trace-drive.py` run above (that run was
+against the native binary, so this is largely already covered — just
+noting it wasn't independently re-checked against real Zed yet, only via
+the offline harness); the pre-existing missing-`.dotty-ide.json`
+whole-process crash (`DottyLanguageServer.drivers()` still uses
+`readFromArray`/`Files.readAllBytes` uncaught, same failure shape as
+before, just Jackson's `FileNotFoundException` swapped for a plain one);
+whether `rpcDispatch`-era per-project multi-driver behavior (`references`/
+`rename`/`implementation` across dependent projects) still works
+correctly now that a single worker thread processes requests serially
+(should be equivalent to the old `thisServer.synchronized`-everywhere
+behavior, but only exercised so far by the single-project trace fixture).
 
 ## Remaining work
 
@@ -1161,4 +1204,12 @@ missing-`.dotty-ide.json` whole-process crash noted earlier.
 
     **Where this leaves it:** every layer actually checked this session -- `getSingletonImpl`'s `TypeRef`/`TermRef` runtime type test, its `valueOf[T]` type binding, real compiled `ValueOf[T]`/`summonFrom` resolution, owner-chain consistency across `defineEnumVisitorsImpl`'s per-case vals, and plain local-implicit-lazy-val-in-a-Block codegen -- is CORRECT. The bug must be in something not yet directly observed: most likely candidate now is the SPLICER's own handling of a quote's TYPE ARGUMENT when a `Expr[T]` (built by nested-macro-call interpretation, e.g. `getSingleton[T]`'s result) gets REIFIED into a real tree and spliced back into the enclosing program as literal source -- i.e. whether the tree that actually lands in the compiled program says `valueOf[Motivo.B.type]` (correct) or ends up with an unsubstituted/widened/wrong type argument that only happens to still resolve correctly for the FIRST case tried (e.g. if implicit search for a too-widely-typed argument still coincidentally finds `Motivo.A`'s own `ValueOf` first via search order, but fails or finds the wrong thing for any other case). This is a DIFFERENT area than anything instrumented so far (`Splicer.scala`'s own tree-reification path for a returned `Expr[T]`'s type argument specifically, not `Interpreter.scala`'s environment-level type bindings, which are confirmed fine). Getting the ACTUAL FINAL SPLICED SOURCE TEXT for one of the per-case vals (not just individual sub-expression traces) -- e.g. by dumping the fully-expanded tree right before it's handed to the next real compiler phase -- would settle this directly instead of continuing to infer it from fragments.
 
-    **How to continue:** the minimal repro (`domain/{Building,WindowCatalog,AmbienteNonRiscaldato}.scala` copied verbatim + `examples/upickle-enum-writer-bug/Main.scala`, ~3s compile+link+run via `dist/sn-cli run`, no `db`/`http`/porcupine/cats-effect needed) is still the right tool, as is the JVM fast loop (`compiler-patched.jar` against the REAL resolved deps classpath -- found under `~/scala/scala-native-compiler/.sn-cli-build/deps-cache/deps-com_lihaoyi__upickle__4_4_3.cp` after any `dist/sn-cli run ... upickle ...` invocation from that directory) for fast iteration without a native rebuild. Next step: find where `Splicer.scala`/`Interpreter.scala` reifies a returned `Expr[T]` (from a nested inline-macro call like `getSingleton[T]`) back into a real `Tree` for splicing, and dump/compare that ACTUAL TREE for the ordinal-0 vs ordinal-1 cases -- that's the one thing not yet directly inspected. All the `SNC_INTERP_DEBUG`-gated tracing added this session (`[spliceOwner]`, `[newVal]`, `[classSymbol]`, `[companionModule]`, `[genericTypeTest]`/`[genericTypeTest.check]`) is left in place in `Interpreter.scala` and still useful context, even though none of it pinpointed the actual bug.
+    **The `Splicer.scala` type-argument-reification suspect from the paragraph above was ALSO checked and is ALSO fine -- and checking it produced the most important correction yet, a wrong mental model of WHICH CODE ACTUALLY GETS INTERPRETED BY THIS PROJECT'S OWN INTERPRETER at all.** Added one more `SNC_INTERP_DEBUG` print, right where a quote `'{...}`'s type bindings get substituted into its body before wrapping as an `ExprImpl` (`Splicer.scala`, the `Apply(Select(Quote(body, _), nme.apply), _)` case, after `body3` is built): confirms `getSingletonImpl`'s returned `'{valueOf[T]}` DOES reify correctly per case -- `body3.show=valueOf[Motivo.A]` / `valueOf[Motivo.B]`, `body3.tpe` the correct singleton type, both times. So the ACTUAL SPLICED TREE going out of `getSingletonImpl` is right, for every case checked.
+
+    Given every one of `getSingletonImpl`'s own layers is now confirmed correct, went looking for where its CALLER (`macroW[T]`'s `isSingleton` branch, building `Checker.Val(macros.getSingleton[T])`) actually gets interpreted -- and found something that reframes the whole investigation: **`defineEnumVisitorsImpl` (`upickle-implicits/macros.scala:555-602`, this project's `Interpreter.scala` walking it) never itself interprets the `macroW[CaseType]`/`macroW[T0]` calls it builds.** Its own `handleType` constructs each one via raw `quotes.reflect` tree-builder calls (`Symbol.newVal` + `TypeApply(Select(prefix.asTerm, ...methodMember("macroW")...), ...)`), and the WHOLE THING is returned as an inert `Tree` value (`Block(allDefs, Ident(allDefs.head._2.termRef))`) -- at no point does `defineEnumVisitorsImpl` itself call `interpretTree` on any of those constructed calls. Confirmed empirically: grepping the ENTIRE debug trace for the literal text `macroW` finds exactly 3 hits, all the STRING literal `"macroW"` passed as `defineEnumWriters`'s own `macroX` argument -- zero actual `macroW[...]` Apply/Block interpretation trace lines anywhere, for EITHER the per-case calls or the whole-sum-type one.
+
+    So where did the extensively-traced `getSingletonImpl` interpretation actually come from, if not from this project's interpreter walking into `macroW[T]`'s body directly? The likely answer: once `defineEnumVisitorsImpl`'s returned Block is spliced back into the real program, `macroW[CaseType]` (still `inline`) gets expanded by REAL DOTC'S OWN INLINER as a completely ordinary part of normal compilation of the now-real source -- NOT by this project's `SpliceInterpreter` -- and real dotc's Inliner only hands control BACK to this project's interpreter at the next genuine `${...}` splice boundary it encounters while expanding (`macros.getSingleton[T]`, `macros.tagKey[T]`, etc. -- each its own fresh top-level splice). Under this model, `inline m match { case _: ProductOf[T] => ...; case _: SumOf[T] => ... }`'s branch selection (correctly landing on `ProductOf` for a payload-less singleton case like `Motivo.A.type`, and presumably `SumOf` for the whole enum `Motivo`) is real dotc's own, well-tested inline-match reduction -- not this project's interpreter at all, and `compiletime.summonAll[Tuple.Map[MirroredElemTypes, Writer]]` (the whole-enum branch's own mechanism for collecting all the per-case writers into `TaggedWriter.Node`) is ALSO real dotc's own special-cased Inliner logic (`Inlines.scala:575`, confirmed by reading it directly), needing REAL, ordinary Scala 3 implicit search to find `x0`/`x1`/... in scope -- not anything this interpreter reimplements.
+
+    **This relocates the entire remaining mystery outside `Interpreter.scala`/`Splicer.scala` and this session's own debugging tools.** If real dotc's implicit search, run against the SPLICED-IN local `implicit lazy val x0`/`x1`/... (each one's `Symbol` built via this interpreter's own `Symbol.newVal`, not written by a human), fails to find all of them -- finding only `x0` (ordinal 0) and silently treating the rest as absent, rather than erroring outright -- `TaggedWriter.Node(writers: _*)` would end up built from an INCOMPLETE writers list, `findWriterWithKey` would have nothing to try beyond the first case's `Leaf`, and `write0` would throw exactly the observed `MatchError: null` for every value beyond the first -- matching the symptom precisely. This is a genuine implicit-search/symbol-visibility question about SPLICED, interpreter-constructed `Symbol`s specifically, not a macro-interpretation-correctness question -- outside the scope of `SNC_INTERP_DEBUG` tracing (which only instruments interpretation, and this code path was JUST shown to bypass interpretation almost entirely). NOT verified directly this session -- ran out of a clean way to observe real dotc's own implicit search from outside.
+
+    **How to continue:** stop instrumenting `Interpreter.scala`/`Splicer.scala` further for this specific bug -- every layer inside them checked out clean, repeatedly, across two full investigation passes. The next productive step is almost certainly turning on `-Vimplicits`/`-explain-cyclic`-style real dotc implicit-search diagnostics (or bisecting by hand-writing the EXACT same `Block`-of-local-lazy-vals shape `defineEnumVisitorsImpl` produces, syntactically, as literal Scala source rather than via `quotes.reflect` construction, and checking whether `summonAll`/implicit search finds them THAT way) to determine whether real, ordinary Scala 3 implicit search actually sees every interpreter-constructed local symbol in a spliced macro-generated `Block`, or silently drops some. The minimal repro (`domain/{Building,WindowCatalog,AmbienteNonRiscaldato}.scala` copied verbatim + `examples/upickle-enum-writer-bug/Main.scala`, ~3s compile+link+run via `dist/sn-cli run`) and the JVM fast loop (`compiler-patched.jar` against the REAL resolved deps classpath, found under `~/scala/scala-native-compiler/.sn-cli-build/deps-cache/deps-com_lihaoyi__upickle__4_4_3.cp` after any `dist/sn-cli run ... upickle ...` invocation from that directory) remain the fastest iteration tools. All `SNC_INTERP_DEBUG`-gated tracing added across this investigation (`[spliceOwner]`, `[newVal]`, `[classSymbol]`, `[companionModule]`, `[genericTypeTest]`/`[genericTypeTest.check]`, `[quoteBody3]`) is left in place in `Interpreter.scala`/`Splicer.scala` as useful context, even though none of it pinpointed the actual bug -- the bug most likely isn't in code these traces cover at all.

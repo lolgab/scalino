@@ -4963,7 +4963,7 @@ index 04cb637b..56f602b8 100644
    object Call:
      import tpd.*
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index a40db72d..33ec7a7c 100644
+index a40db72d..86a4bb96 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 @@ -6,6 +6,7 @@ import java.io.{PrintWriter, StringWriter}
@@ -5045,7 +5045,7 @@ index a40db72d..33ec7a7c 100644
          val body1 = body match {
            case expr: Ident if expr.symbol.isAllOf(InlineByNameProxy) =>
              // inline proxy for by-name parameter
-@@ -256,14 +296,83 @@ object Splicer {
+@@ -256,14 +296,85 @@ object Splicer {
            case tree: Inlined if tree.inlinedFromOuterScope => tree.expansion
            case _ => body
          }
@@ -5080,6 +5080,8 @@ index a40db72d..33ec7a7c 100644
 +        val body3 =
 +          if typeBindings.isEmpty then body2
 +          else new TreeTypeMap(typeMap = _.subst(typeBindings.map(_._1), typeBindings.map(_._2))).transform(body2)
++        if sys.env.contains("SNC_INTERP_DEBUG") then
++          Console.err.println(s"[quoteBody3] body2.show=${body2.show} body3.show=${body3.show} body3.tpe=${body3.tpe.show}")
 +        new ExprImpl(Inlined(EmptyTree, Nil, body3.changeNonLocalOwners(ctx.owner)).withSpan(body3.span), SpliceScope.getCurrent)
  
        // Interpret level -1 `Type.of[T]`
