@@ -45,7 +45,7 @@ jar (dotc reads `plugin.properties` from it), but the classes it names are
 already resident in the image, so `Class.forName` succeeds. Reflection
 metadata for the plugin's classes is captured via the native-image tracing
 agent (`-agentlib:native-image-agent=...`) and checked into
-`agent-config/dotc/`. See `build/03-build-scalino-dotc.sh` and
+`agent-config/dotc/`. See `build/03-build-dotc-native.sh` and
 `build/05-regen-agent-config.sh`.
 
 This generalizes: any dotc plugin we want to support has to be baked in at
@@ -75,14 +75,14 @@ mistake (missing symbols during linking, or `UndefinedBehaviorError` crashes).
 
 ## Confirmed working: full pipeline, zero JVM at runtime
 
-`scalino-dotc` (dotc + nscplugin baked in) compiles `.scala` → `.nir`, and a
-second native-image binary (`scalino-linkdriver`, wrapping scala-native's
+`dotc-native` (dotc + nscplugin baked in) compiles `.scala` → `.nir`, and a
+second native-image binary (`linkdriver-native`, wrapping scala-native's
 `tools_3` link API) drives clang to turn `.nir` into a native executable —
-both steps using only standalone binaries, no `java` process anywhere. `bin/scalino-bootstrap`
+both steps using only standalone binaries, no `java` process anywhere. `bin/snc`
 wires the two together into one CLI.
 
 Verified default JVM bytecode output (GenBCode phase, i.e. plain `.class`
-files from `scalino-dotc`, unrelated to the scala-native path) has a
+files from `dotc-native`, unrelated to the scala-native path) has a
 `VerifyError` in this setup, likely from a subtlety in the jimage-extracted
 `java.base.jar`. Untested/unfixed since scala-native bypasses GenBCode
 entirely (NIR is generated straight from typed trees) — only relevant if
@@ -94,7 +94,7 @@ The upstream `tasty-interpreter` project (referenced in the original brief)
 turned out to be incomplete/unmaintained, so we wrote our own from scratch:
 `compiler/src/dotty/tools/dotc/quoted/Interpreter.scala` in `vendor/scala3`,
 patched via `patches/0001-own-implementation-tasty-interpreter.patch`
-(applied by `build/00b-setup-vendor.sh`, baked into `scalino-dotc` by
+(applied by `build/00b-setup-vendor.sh`, baked into `dotc-native` by
 `build/03a-patch-compiler.sh`).
 
 **How upstream does it, and why that can't survive native-image:** dotc
@@ -125,15 +125,15 @@ out that flag retains trees for symbols unpickled from a *dependency's*
 pickles full method bodies, not just signatures. So a macro compiled in one
 `dotc` invocation and used from a separate one (the normal real-world shape)
 interprets exactly like a same-run macro, as long as **both** invocations
-pass `-Yretain-trees` (`bin/scalino-bootstrap` always does). Verified against
+pass `-Yretain-trees` (`bin/snc` always does). Verified against
 `interpreter/test-fixtures/{i4515,i4515b,inline-varargs-1,tasty-getfile}` —
 real upstream tests, originally `Macro_1.scala`/`Test_2.scala`-style separate
 compilations.
 
 **Test fixtures**: `interpreter/test-fixtures/` holds real macro tests
 harvested from `vendor/scala3/tests/{run-macros,pos-macros}`. Of the curated
-set: 7 pass correctly end-to-end (including through the actual `scalino-dotc`
-+ `scalino-linkdriver` binaries, not just a JVM test harness — see
+set: 7 pass correctly end-to-end (including through the actual `dotc-native`
++ `linkdriver-native` binaries, not just a JVM test harness — see
 `examples/macro-hello/`), 1 (`i10863`) partially passes (resolves the right
 value but `.show` renders through dotc's own pretty-printer rather than the
 exact printer real macros get, so output differs in detail), and 2
@@ -165,7 +165,7 @@ sbt build instead (see "Remaining work").
 
 ## Toward a build-tool experience without a JVM
 
-Asked whether `scalino` could grow scala-cli-like ergonomics (single command,
+Asked whether `snc` could grow scala-cli-like ergonomics (single command,
 dependency resolution, caching, watch mode) without reintroducing a JVM.
 Conclusion: don't reuse scala-cli itself — it's deeply JVM-coupled
 (coursier-as-library, bloop, zinc). Instead reuse only the one genuinely
@@ -175,11 +175,11 @@ resolution costs no JVM despite coursier being JVM Scala under the hood),
 and hand-roll the rest (directives, an incremental-compile cache, watch mode)
 purpose-built rather than porting zinc/BSP.
 
-### `scalino`: implemented, self-hosted
+### `sn-cli`: implemented, self-hosted
 
-`cli/ScalinoCli.scala` is a mini scala-cli-style CLI (`scalino run`/`scalino compile`),
-built by `build/07-build-scalino.sh` -- itself compiled by
-`dist/scalino-dotc`+`dist/scalino-linkdriver` (bootstrapped once those exist),
+`cli/SnCli.scala` is a mini scala-cli-style CLI (`sn-cli run`/`sn-cli compile`),
+built by `build/07-build-sn-cli.sh` -- itself compiled by
+`dist/dotc-native`+`dist/linkdriver-native` (bootstrapped once those exist),
 **not** by any JVM. This closes the loop: the build tool driving the
 compiler is itself a product of that same compiler.
 
@@ -197,7 +197,7 @@ What it does:
   multi-version support, this binary only ever targets the Scala/scala-native
   version it was built for.
 - Resolves dependencies via a native `cs fetch --classpath` subprocess,
-  cached on disk (`.scalino-build/deps-cache/`) keyed by the sorted dependency
+  cached on disk (`.sn-cli-build/deps-cache/`) keyed by the sorted dependency
   list, so repeat runs skip the resolution step (and its network
   round-trip) entirely, not just the artifact download `cs` already caches
   itself. Excludes scala-native's own runtime artifacts
@@ -217,12 +217,12 @@ What it does:
   normal formatting; can misfire on deliberately adversarial code (e.g. a
   `{`/`}` inside a string or comment throws off the depth counter). Ambiguous
   or missing entry points are a clear error asking for `--main-class`, not a
-  guess. This also fixes `bin/scalino-bootstrap`'s documented "first file's basename"
+  guess. This also fixes `bin/snc`'s documented "first file's basename"
   limitation -- source file order no longer matters.
-- Drives `scalino-dotc`/`scalino-linkdriver` directly (reading the same
-  `dist/*.cp` manifests `bin/scalino-bootstrap` uses), with the resolved dependency
-  classpath folded in, into the same persistent `.scalino-build/<mainClass>/`
-  caching layout `bin/scalino-bootstrap` uses (see the C-object-cache fix above).
+- Drives `dotc-native`/`linkdriver-native` directly (reading the same
+  `dist/*.cp` manifests `bin/snc` uses), with the resolved dependency
+  classpath folded in, into the same persistent `.sn-cli-build/<mainClass>/`
+  caching layout `bin/snc` uses (see the C-object-cache fix above).
 
 Verified against `examples/Hello.scala` (plain), `examples/macro-hello/`
 (real macro, **and** confirmed order-independent -- `Foo.scala Test.scala`
@@ -236,19 +236,19 @@ cross-platform). The last one is the strongest proof: not just resolved but
 scala-native library) compiled, linked, and printed the correct working
 directory end to end.
 
-### `scalino`: closing the gap with scala-cli's CLI surface
+### `sn-cli`: closing the gap with scala-cli's CLI surface
 
 Follow-up pass specifically aimed at making the command line itself feel
 like scala-cli's, not just the directive parsing underneath:
 
-- `scalino <sources...>` with no subcommand now means `run` (scala-cli's
-  signature `scala-cli Foo.scala` UX); `scalino run`/`scalino compile` still work
+- `sn-cli <sources...>` with no subcommand now means `run` (scala-cli's
+  signature `scala-cli Foo.scala` UX); `sn-cli run`/`sn-cli compile` still work
   explicitly.
-- A source argument may be a directory (`scalino run .`): every `.scala` file
+- A source argument may be a directory (`sn-cli run .`): every `.scala` file
   under it is collected recursively, skipping hidden and build-output
-  (`.scalino-build`/`target`/`out`) directories.
+  (`.sn-cli-build`/`target`/`out`) directories.
 - New directives: `mainClass` (explicit entry point, alternative to
-  `--main-class`) and `options`/`option` (extra `scalino-dotc` flags, e.g.
+  `--main-class`) and `options`/`option` (extra `dotc-native` flags, e.g.
   `//> using options "-explain"`).
 - New flags mirroring scala-cli's: `-d`/`--dep`/`--dependency` (dependency,
   repeatable, same as the directive), `-S`/`--scala`/`--scala-version`
@@ -259,9 +259,9 @@ like scala-cli's, not just the directive parsing underneath:
   simpler and doesn't depend on that API's support in this toolchain's
   javalib port, which is unverified. Build/link/resolve failures during a
   watch iteration are caught and reported without killing the loop (see
-  `BuildFailed` in `ScalinoCli.scala`); a genuinely bad CLI invocation still exits
+  `BuildFailed` in `SnCli.scala`); a genuinely bad CLI invocation still exits
   immediately, before the loop ever starts.
-- `scalino version` and `scalino --help`/`-h`.
+- `sn-cli version` and `sn-cli --help`/`-h`.
 - Typing an unimplemented scala-cli command (`test`, `fmt`, `repl`,
   `package`, `publish`, `publish-local`, `clean`, `bsp`, `export`,
   `doctor`, `setup-ide`, `install-completions`, `dependency-update`,
@@ -270,7 +270,7 @@ like scala-cli's, not just the directive parsing underneath:
 
 Verified: implicit-run, `run` on a directory (correctly aggregates every
 `.scala` file found and still applies entry-point detection/disambiguation
-across all of them), `-O` flag passthrough to `scalino-dotc`, the
+across all of them), `-O` flag passthrough to `dotc-native`, the
 `mainClass` directive, the `-d` flag (resolution failure surfaces the same
 clean error as a directive-declared dependency), and a full watch-mode
 cycle (initial build/run, edit, detected, rebuild, rerun, all without
@@ -285,25 +285,25 @@ bodies, so code that actually *called into* it would fail at the link step
 with unreachable symbols, same as it would under real scala-cli targeting
 `--native` with a JVM-only dependency.
 
-Not implemented: watch mode, incremental Scala compilation (every `scalino`
+Not implemented: watch mode, incremental Scala compilation (every `sn-cli`
 build fully recompiles every given source file -- only the native-library
 object cache and the dependency-resolution cache are incremental),
 multi-module projects, and anything past the one directive kind above
 (no `//> using options`, `//> using resourceDir`, toolkit shortcuts, etc.).
 
-### `bin/scalino-bootstrap` created a fresh tmp dir every build — first real bug found
+### `bin/snc` created a fresh tmp dir every build — first real bug found
 
-First thing noticed trying to actually use `scalino-bootstrap` repeatedly: every dependency
+First thing noticed trying to actually use `snc` repeatedly: every dependency
 `.c` file (scala-native's own vendored runtime, ~160 files) recompiled from
 scratch on every single build, even with no source changes. Two distinct
 causes, one in each layer:
 
-1. **Our bug**: `bin/scalino-bootstrap` used `work="$(mktemp -d)"` + `trap 'rm -rf "$work"'
+1. **Our bug**: `bin/snc` used `work="$(mktemp -d)"` + `trap 'rm -rf "$work"'
    EXIT` — a fresh, deleted-on-exit directory every invocation. scala-native's
    own `Build.buildCachedAwait` (used by `LinkDriver.scala`) keeps its
    per-file `.o` cache *inside* that workDir, so deleting it every time threw
-   the cache away regardless of whether it worked. Fixed: `bin/scalino-bootstrap` now uses
-   a persistent, project-local `.scalino-bootstrap-build/<mainClass>/` (scala-cli's own
+   the cache away regardless of whether it worked. Fixed: `bin/snc` now uses
+   a persistent, project-local `.snc-build/<mainClass>/` (scala-cli's own
    `.scala-build` convention), never deleted.
 
 2. **scala-native's bug** (0.5.12): even with a persistent workDir, dependency
@@ -336,7 +336,7 @@ causes, one in each layer:
    pre-patch behavior was "almost always recompile" (safe, just wasteful),
    not "sometimes wrongly skip." Verified: cache invalidates correctly when
    source actually changes (rebuilt `examples/Hello.scala` after editing it
-   mid-`.scalino-bootstrap-build`, got the new output), and a warm rebuild of
+   mid-`.snc-build`, got the new output), and a warm rebuild of
    `examples/Hello.scala` went from 162 dependency recompiles / ~4.6s to 0
    recompiles / ~1.7s.
 
@@ -346,7 +346,7 @@ Goal: a Metals-equivalent for editors like Zed, without a JVM at runtime.
 Metals itself doesn't work here — it's an LSP *client architecture*
 (BSP + semanticdb + `mtags-interfaces`) built to bridge Scala into arbitrary
 JVM build tools, none of which this toolchain needs (it already owns
-compile/link/deps end to end via `scalino`). What's actually needed is much
+compile/link/deps end to end via `sn-cli`). What's actually needed is much
 smaller: dotc's own `interactive`/`InteractiveDriver` machinery, wired to a
 stdio LSP server.
 
@@ -355,12 +355,12 @@ pre-Metals LSP implementation (`DottyLanguageServer.scala`, ~1000 lines, on
 `org.eclipse.lsp4j`), superseded and unmaintained once Metals took over, but
 functionally complete — `didOpen`/`hover`/`definition`/`completion`/
 `references`/`rename`/`documentSymbol`/workspace `symbol`/`implementation`/
-`signatureHelp`, all thin wrappers over `InteractiveDriver`. `dist/scalino-lsp`
-(`build/08-build-scalino-lsp.sh`) native-images a trimmed version of it —
+`signatureHelp`, all thin wrappers over `InteractiveDriver`. `dist/dotty-lsp-native`
+(`build/08-build-lsp-native.sh`) native-images a trimmed version of it —
 `patches/scala3-0002-trim-language-server.patch` drops `worksheet/` (spawns
 a forked JVM REPL subprocess — genuinely JVM-shaped, out of scope) and
 `decompiler/` (TASTy-decompile-on-request, not core LSP). Unlike
-`scalino-dotc`, this module was never published as a jar (dead since ~2019),
+`dotc-native`, this module was never published as a jar (dead since ~2019),
 so it's compiled JVM-side from source first (mirroring
 `03a-patch-compiler.sh`'s pattern) rather than jar-spliced.
 
@@ -407,7 +407,7 @@ Three real bugs found and fixed, none anticipated by the initial scoping:
    method-naming logic, since the real one lives behind a package-private
    type not reachable from outside `org.eclipse.lsp4j.jsonrpc.services`).
 3. **`InteractiveDriver` needs `-javabootclasspath` explicitly under
-   native-image**, exactly like `scalino-dotc`'s own compiles already do
+   native-image**, exactly like `dotc-native`'s own compiles already do
    (`docs/findings.md` "Blocker 1") — under a real JVM, dotc happily
    resolves `java.lang.Object` etc. from the host JVM's own modules with no
    flag needed, so this was invisible testing JVM-mode first; under
@@ -418,7 +418,7 @@ Three real bugs found and fixed, none anticipated by the initial scoping:
 
 **Verified working, real native binary, zero JVM at runtime** (checked via
 process-tree inspection while running): a hand-written `.dotty-ide.json`
-fixture pointing `dist/scalino-lsp -stdio` at `examples/Hello.scala`
+fixture pointing `dist/dotty-lsp-native -stdio` at `examples/Hello.scala`
 gets a correct `initialize` response, correct (empty) diagnostics on
 `didOpen`, real Scaladoc-sourced hover text for `println`, and a correct
 compiler type-error diagnostic (`Found: String, Required: Int`, right
@@ -429,15 +429,15 @@ a 319-byte relocation stub on Maven Central, not real classfiles (same
 "decoy artifact" shape as `scalalib_native0.5_3`, documented above, but for
 an unrelated reason).
 
-Done since: `scalino setup-ide <sources...>` (`cli/ScalinoCli.scala`) generates
+Done since: `sn-cli setup-ide <sources...>` (`cli/SnCli.scala`) generates
 `.dotty-ide.json` (including `-javabootclasspath`) by reusing
 `buildBinary`'s own classpath/directive-parsing plumbing, instead of
 hand-writing it; and [`zed-extension/`](../zed-extension/) is a real Zed
 extension (modeled on
 [metals-zed](https://github.com/scalameta/metals-zed), reusing its
 `languages/scala/` tree-sitter files under the same NOTICE) that owns its
-own `Scala (scalino)` language/grammar (renamed from a same-named-as-metals-zed
-`Scala`, see below) and registers `scalino-lsp` as its *only* language
+own `Scala (snc)` language/grammar (renamed from a same-named-as-metals-zed
+`Scala`, see below) and registers `dotty-lsp-native` as its *only* language
 server — no metals-zed extension needed at all (superseded
 the earlier "second server on Zed's `Scala` language" design once it became
 clear Zed has no extension-to-extension dependency or override mechanism,
@@ -448,7 +448,7 @@ own `README.md` has install steps. Compiles clean (`cargo check`) against
 
 **Fourth real bug, found 2026-09-05 by actually running it in a real Zed
 instance (an isolated `--user-data-dir` profile with *only* the
-`scalino-lsp` dev extension installed, no metals-zed) instead of just
+`dotty-lsp-native` dev extension installed, no metals-zed) instead of just
 `cargo check`ing it:** `extension.toml` declared `[grammars.scala]` but
 never set the top-level `languages = ["languages/scala"]` key that tells
 Zed to actually load `languages/scala/config.toml` as a language
@@ -458,18 +458,18 @@ there in the extension, Zed's own extension index showed
 identity was silently owned entirely by whichever *other* extension
 happened to define it (metals-zed's `scala` extension, if installed) — the
 opposite of the design intent above. With metals-zed installed alongside,
-this was invisible (both `scalino-lsp` and `metals` start together,
+this was invisible (both `dotty-lsp-native` and `metals` start together,
 looks fine) — matches real usage logs where the two servers always
 launched within ~1s of each other. Without metals-zed, `.scala` files get
-no language mode at all and `scalino-lsp` never starts, since its
-`language_servers.scalino-lsp` entry is bound to a `Scala` language
+no language mode at all and `dotty-lsp-native` never starts, since its
+`language_servers.dotty-lsp-native` entry is bound to a `Scala` language
 nothing defines. Fixed by adding the missing `languages = ["languages/scala"]`
 line. Needs a real Zed dev-extension reinstall (Zed doesn't rescan
 `extension.toml` on its own) to take effect in an already-running Zed.
 
-Also found via direct `-stdio` probing of `dist/scalino-lsp` (not yet
+Also found via direct `-stdio` probing of `dist/dotty-lsp-native` (not yet
 fixed, lower priority — didn't block the language-registration bug above):
-a project with no `.dotty-ide.json` yet (i.e. `scalino setup-ide` never run
+a project with no `.dotty-ide.json` yet (i.e. `sn-cli setup-ide` never run
 there) crashes the *entire* native-image process on the first `didOpen` —
 `DottyLanguageServer.drivers()` (`DottyLanguageServer.scala:74`) throws
 `FileNotFoundException` reading it, uncaught, inside a `CompletableFuture`
@@ -493,26 +493,26 @@ hand-rolled LSP probe script is just as capable of fabricating a
 script and confirming the symptom disappears before writing it up.)
 
 **Fifth fix, same day: the language-registration fix above wasn't enough
-either.** Even with `scalino-lsp` correctly owning a language, giving
+either.** Even with `dotty-lsp-native` correctly owning a language, giving
 it the *same name* (`Scala`) metals-zed uses meant Zed still had to pick a
 winner between the two extensions' competing definitions for `.scala`
 files — and that pick flipped after a routine dev-extension reinstall
-(observed live: `metals` and `scalino-lsp` kept launching together
+(observed live: `metals` and `dotty-lsp-native` kept launching together
 regardless, since metals-zed's `language_servers.metals` entry is bound to
 the *name* `Scala`, not to whichever extension owns the grammar). Fixed by
-renaming the extension's language to `Scala (scalino)` — a name metals-zed
+renaming the extension's language to `Scala (snc)` — a name metals-zed
 can't also claim — and narrowing `path_suffixes` to just `.scala` (was
 `["scala", "sbt", "sc", "mill"]`, copied wholesale from metals-zed; dropped
 the rest since this LSP has no reason to claim sbt/ammonite-script/mill
-files at all). `scalino setup-ide` now also writes a `file_types` override
-into `.zed/settings.json` (`"file_types": {"Scala (scalino)": ["scala"]}`) so
+files at all). `sn-cli setup-ide` now also writes a `file_types` override
+into `.zed/settings.json` (`"file_types": {"Scala (snc)": ["scala"]}`) so
 `.scala` files resolve to this extension's language deterministically
 regardless of extension load order or whether metals-zed stays installed.
 
 **Also added, same day: a real log file, not just editor-captured
 stderr.** `Log` (`vendor/scala3/language-server/.../Main.scala`) appends a
 timestamped line per dispatched RPC method (`-> method`, then `<- method
-ok` or `<- method FAILED: <exception>`) to `.scalino-lsp.log` in the
+ok` or `<- method FAILED: <exception>`) to `.dotty-lsp-native.log` in the
 project root, written by the server itself rather than relying on Zed's
 own stderr capture — which, in practice, only ever showed a single
 truncated line ("Starting server") on every connection failure seen this
@@ -523,14 +523,14 @@ its actual class/message in the log, not just that reflection was
 involved. Best-effort (silently a no-op if the file can't be opened, e.g.
 read-only cwd) — never a reason to fail startup.
 
-**`Scala (scalino)` rename confirmed working live, same day:** after a dev-extension
+**`Scala (snc)` rename confirmed working live, same day:** after a dev-extension
 reinstall + fresh Zed relaunch, `metals` genuinely stopped auto-starting —
-confirmed via `Zed.log` showing `scalino-lsp` alone launch for a `.scala`
+confirmed via `Zed.log` showing `dotty-lsp-native` alone launch for a `.scala`
 buffer, no accompanying `metals` process, across multiple fresh sessions.
 
 **Sixth bug, the real one behind this whole week's "it doesn't work in
 real Zed" saga — found the same day, after the rename fix above stopped
-being confused by metals racing alongside it.** `scalino-lsp`, launched
+being confused by metals racing alongside it.** `dotty-lsp-native`, launched
 by a real, fully-quiescent, freshly-restarted Zed (no extension-reload
 churn, no sleep/wake nearby), reliably failed its *first* `initialize`
 request: **the raw request bytes are read successfully and completely
@@ -549,7 +549,7 @@ it timed out and self-terminated, `DestroyJavaVM`'s `joinAllNonDaemons()`
 had nothing left to wait for.
 
 Captured Zed's *exact* raw `initialize` bytes (byte-for-byte, via a `tee`
-wrapper substituted for `dist/scalino-lsp` in `.zed/settings.json`'s
+wrapper substituted for `dist/dotty-lsp-native` in `.zed/settings.json`'s
 `binary.path`) and replayed them directly against the binary, completely
 offline — **100% reproducible with zero Zed involvement**, confirming this
 was never a Zed transport/spawn issue (the earlier "Zed never writes to
@@ -626,9 +626,9 @@ capabilities+clientInfo+workspaceFolders `initialize`, didOpen x3, hover,
 definition, completion, references, rename, documentSymbol,
 workspace/symbol, didChange-introduces-a-type-error) against real dotc
 compilation of `build/lsp-trace-fixture` — every step OK, diagnostics
-correct, zero errors in `.scalino-lsp.log`. Binary also shrank
+correct, zero errors in `.dotty-lsp-native.log`. Binary also shrank
 99MB → 81MB and native-image build time dropped (~2m30s → ~1m55s) with
-lsp4j/Gson/Jackson off the classpath. `build/08-build-scalino-lsp.sh` no
+lsp4j/Gson/Jackson off the classpath. `build/08-build-lsp-native.sh` no
 longer needs a javac step (deleted `config/ProjectConfig.java`) or
 `-H:ConfigurationFileDirectories` at all (deleted the now-dead
 `agent-config/lsp/`; `build/05-regen-agent-config.sh`'s LSP tracing step
@@ -661,12 +661,12 @@ behavior, but only exercised so far by the single-project trace fixture).
    instead.
 3. ~~**Packaging/relocatability.**~~ Fixed: `build/06-package.sh` now vendors
    every jar into `dist/lib/` and rewrites `dist/*.cp` manifests to
-   dist-relative paths; `bin/scalino-bootstrap` and `scalino` resolve them against their own
-   dist root at runtime, and `scalino` locates that root via its own executable
+   dist-relative paths; `bin/snc` and `sn-cli` resolve them against their own
+   dist root at runtime, and `sn-cli` locates that root via its own executable
    path (`cli/selfexe/*.scala`, one small OS-specific native binding per
    platform) instead of a build-time-baked-in absolute path. `dist/` is now a
    self-contained, copyable/tarball-able distribution.
-4. **`scalino` follow-ups.** See "Toward a build-tool experience without a JVM"
+4. **`sn-cli` follow-ups.** See "Toward a build-tool experience without a JVM"
    above for what's implemented (including watch mode, directory/CLI-flag
    parity with scala-cli as of the "closing the gap" pass, and incremental
    compilation -- see item 7). Still missing: multi-module/multi-target
@@ -676,11 +676,11 @@ behavior, but only exercised so far by the single-project trace fixture).
    bloop), so they currently just print "not implemented" rather than being
    faked.
 
-   `scalino test` (2026-09-04) *is* now implemented, with no JVM anywhere in
+   `sn-cli test` (2026-09-04) *is* now implemented, with no JVM anywhere in
    the chain -- see the doc comment above `readAllBytes`/`ClassInfo` in
-   `cli/ScalinoCli.scala` for the full design. In short: real (JVM) sbt-scala-native
+   `cli/SnCli.scala` for the full design. In short: real (JVM) sbt-scala-native
    drives test execution from the sbt/JVM side over a ComRunner socket
-   protocol; `scalino` instead (1) structurally scans the resolved test
+   protocol; `sn-cli` instead (1) structurally scans the resolved test
    classpath's jars for a class implementing `sbt.testing.Framework` --  no
    hardcoded per-framework list, so any framework with a scala-native port
    is found the same way -- (2) compiles+links+runs a tiny throwaway "probe"
@@ -692,7 +692,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    generates a small driver source that instantiates the framework(s) by
    literal name (no reflection) and drains `Task.execute` synchronously.
    Test-object instantiation inside a discovered `Task` turned out to need
-   no bridging work at all on `scalino`'s end: scala-native's native test-port
+   no bridging work at all on `sn-cli`'s end: scala-native's native test-port
    authors already rely on `scala.scalanative.reflect.Reflect`/
    `@EnableReflectiveInstantiation` for it (confirmed both via source
    research and by a from-scratch hand-rolled `sbt.testing.Framework` smoke
@@ -708,7 +708,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    `endLine`/`startColumn`/`endColumn`/`sourceCode`) as direct real-dotc
    calls, the same pattern as every other `XMethods` extension bag. A real
    `munit.FunSuite` test (`assertEquals`, real `Location`/`Clue` macros)
-   now compiles, links, and passes via `scalino test` end to end -- see
+   now compiles, links, and passes via `sn-cli test` end to end -- see
    `patches/scala3-0001-*.patch` for the diff, applied to
    `vendor/scala3/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala`.
 
@@ -792,10 +792,10 @@ behavior, but only exercised so far by the single-project trace fixture).
    needs its own investigation (likely an owner-chain/`-Yretain-trees`
    interaction affecting how a macro-expanded closure's free variables get
    resolved). Confirmed via both the JVM fast-loop and the real native
-   `scalino test` pipeline (`scalino-dotc`), so not an artifact of either path.
+   `sn-cli test` pipeline (`dotc-native`), so not an artifact of either path.
    Repro: `//> using dep "com.lihaoyi::utest::0.8.4"` +
    `object T extends utest.TestSuite { val tests = utest.Tests { test("x")
-   { assert(1 == 1) } } }`, `scalino test .`.
+   { assert(1 == 1) } } }`, `sn-cli test .`.
 
    scalatest not retested this session (untouched since the original
    blocker note) -- likely has its own similar tail of gaps given it also
@@ -898,9 +898,9 @@ behavior, but only exercised so far by the single-project trace fixture).
    Confirming and fixing this needs actually reading a failed Windows run's
    intermediate `.build-work/*.cp` files (not currently uploaded anywhere),
    or a real Windows box -- deliberately not guessed at blind here.
-6. `bin/scalino-bootstrap`'s "first source file's basename is the main class" convention is
-   still naive (unlike `scalino`, which auto-detects) — for multi-file macro
-   examples via `bin/scalino-bootstrap` directly, the entry-point file must be listed
+6. `bin/snc`'s "first source file's basename is the main class" convention is
+   still naive (unlike `sn-cli`, which auto-detects) — for multi-file macro
+   examples via `bin/snc` directly, the entry-point file must be listed
    first (see `examples/macro-hello/` usage in the README).
 7. ~~Only compiling Scala source is incremental-cache-free.~~ **Fixed
    (2026-09-04): own zinc-style incremental compilation, no real Zinc/JVM
@@ -914,7 +914,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    same closed-world-hostile shape that's caused problems elsewhere in
    this codebase.
 
-   Instead, `compileToClasses`/`buildBinary` (`cli/ScalinoCli.scala`) reconstruct
+   Instead, `compileToClasses`/`buildBinary` (`cli/SnCli.scala`) reconstruct
    an *approximate* dependency graph purely from source text: which
    top-level names each file declares (a regex scan, same spirit as this
    file's existing directive/entry-point heuristics), and which of those
@@ -925,7 +925,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    this project's usual style for on-disk caches, no JSON parser needed)
    to get the changed set, then widen it by walking the "who textually
    mentions one of this file's declared names" graph to a fixed point.
-   Only that closure is handed to `scalino-dotc`; the classes directory is no
+   Only that closure is handed to `dotc-native`; the classes directory is no
    longer wiped before every build and is added to the compile classpath,
    so everything outside the closure resolves from its already-compiled
    `.tasty`/`.class` instead of needing its source recompiled -- the same
@@ -941,7 +941,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    signature change), so it recompiles strictly more than a real bridge
    would -- but it can never *under*-invalidate, so a stale binary isn't a
    failure mode this approach can produce. A whole-project fingerprint
-   (compile classpath, scalac options, `scalino-dotc`'s own mtime) forces a
+   (compile classpath, scalac options, `dotc-native`'s own mtime) forces a
    full rebuild whenever any of those change, since none of them are
    tracked per-file. `--no-incremental` forces a full rebuild on demand.
    Known gap: the declaration scan is top-level-only (by regex, not real
@@ -950,7 +950,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    its own changes, the gap is only in rippling to files that reference
    that nested name specifically.
 8. **Four more general interpreter bugs found + fixed (2026-09-04/05), via
-   `scalino test .` against a real large third-party project (`~/scala/ape`:
+   `sn-cli test .` against a real large third-party project (`~/scala/ape`:
    http4s/ip4s/cats-effect/upickle) instead of a curated fixture.** Fresh
    regression coverage for all four lives in `examples/interpreter-
    regressions/` (self-contained, no external deps) and runs in CI
@@ -998,7 +998,7 @@ behavior, but only exercised so far by the single-project trace fixture).
      for `object Foo extends Bar(args)`, but two more gaps stood between
      that and covering anonymous classes too: `ClassSymbol#rootTree` is
      unconditionally `EmptyTree` for anything that isn't a TOP-LEVEL class
-     (a `$anon` never is, confirmed via `SCALINO_INTERP_DEBUG` -- every lookup
+     (a `$anon` never is, confirmed via `SNC_INTERP_DEBUG` -- every lookup
      came back empty), and `findTemplate` itself only recursed into nested
      class-body members, never into a method/`val` body where a LOCAL
      anonymous class actually lives. Fixed both: `moduleSuperCtorCall` now
@@ -1067,12 +1067,12 @@ behavior, but only exercised so far by the single-project trace fixture).
    `Parser` `unmap` demands) -- a `MatchError` deep inside `cats.parse
    .Parser.Impl.unmap`. Confirmed this is NOT `matchesRuntimeType` being
    wrong again (every real `Parser`-vs-`Parser0` runtime type test observed
-   via `SCALINO_INTERP_DEBUG` across a full test run, including several
+   via `SNC_INTERP_DEBUG` across a full test run, including several
    involving `Pure` itself, returned the CORRECT answer) -- the `Pure`
    value must be reaching `unmap` through some OTHER path (likely
    `Parser.Impl.expect1`'s own `case p1: Parser[A] => p1` narrowing, or a
    `OneOf0`-simplification step upstream returning an unexpected shape),
-   not yet traced to its exact origin. `scalino test .` on `~/scala/ape`
+   not yet traced to its exact origin. `sn-cli test .` on `~/scala/ape`
    still fails on this one file (`test/http/RoutesTest.scala`, every test
    method using the `uri"/"` literal) as a result.
 9. **Three more general interpreter bugs found + fixed (2026-09-05), via
@@ -1118,7 +1118,7 @@ behavior, but only exercised so far by the single-project trace fixture).
      instead of the real argument, several calls downstream of where this
      actually went wrong, surfacing as "Unexpected result interpreting a
      nested splice: QuotesImpl@...". Traced via three rounds of targeted
-     `SCALINO_INTERP_DEBUG`-gated prints (now left in place, gated the same
+     `SNC_INTERP_DEBUG`-gated prints (now left in place, gated the same
      way): one at `resolveNestedSplices`'s own entry/failure points, one
      logging `Ident` lookups for symbol name `"x"` specifically, one
      logging every `Apply` node that falls through the `SpliceInterpreter`
@@ -1153,7 +1153,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    fixes from an earlier session (item 8), but for `ListBuffer`-accumulated
    `defs`/local-`val`-declaring code spliced in via `Block(defs.toList,
    ...)` specifically. Not yet traced to its exact origin -- next session
-   should start with `SCALINO_INTERP_DEBUG=1` and grep for `changeOwner`/
+   should start with `SNC_INTERP_DEBUG=1` and grep for `changeOwner`/
    `changeNonLocalOwners` call sites reachable from `BlockModule.apply`'s
    own construction path, and check whether `defs`' individual `DefDef`
    trees (each built via a separate `Symbol.newMethod`/`DefDef.apply` call,
@@ -1161,7 +1161,7 @@ behavior, but only exercised so far by the single-project trace fixture).
    they're finally spliced into the top-level `Block`) have their owners
    correctly rechained to the enclosing class before/during that final
    `Block.apply` call.
-10. **`scalino test .` against `~/scala/ape` fixed end-to-end (2026-09-05, real project, not a curated fixture) -- from the http4s `uri"..."` literal macro failing to compile at all, to the full real test suite actually compiling, linking, and RUNNING natively.** User asked to fix all bugs blocking this. Eight separate real bugs, spanning the interpreter, native-image reflection reachability, and dependency resolution:
+10. **`sn-cli test .` against `~/scala/ape` fixed end-to-end (2026-09-05, real project, not a curated fixture) -- from the http4s `uri"..."` literal macro failing to compile at all, to the full real test suite actually compiling, linking, and RUNNING natively.** User asked to fix all bugs blocking this. Eight separate real bugs, spanning the interpreter, native-image reflection reachability, and dependency resolution:
     - **`isInstanceOf` was unconditionally `true`** (`"best effort: we don't retain the type argument through the Call extractor"`) -- stale: `callTypeArgs(tree)` (recovered from the ORIGINAL tree for exactly this reason, already threaded through for `classOf[T]`/callee type-param binding) was sitting right there unused. Silently broke any real runtime type dispatch built on it -- cats' own `AndThen.apply`/`#andThen`, `case ref: AndThen[A, B] @unchecked => ref`, always took that branch even for a bare (never-wrapped) closure, skipping the real `Single(f)` construction a fresh `AndThen` needs. The unwrapped closure then flowed wherever a real `Single`/`Concat` was expected, and `AndThen#runLoop`'s exhaustive match over those two cases threw a spurious `MatchError`. Fixed by wiring `typeArgs.headOption` through to `matchesRuntimeType` (already used for typed *pattern* tests, just never for plain `.isInstanceOf` calls) -- with one refinement: `matchesRuntimeType`'s own lenient "unrecognized real host object -> assume true" fallback needed a matching carve-out for a BARE closure specifically (a raw `FunctionN`, never itself constructed via `interpretNew` -- any real wrapped instance would already have taken the ancestry-checked branch above), since that idiom is exactly "is this plain function value ALREADY the wrapped type."
     - **`var x: T = compiletime.uninitialized` (the 3.x replacement for `_`) wasn't recognized as an uninitialized placeholder.** The real `UninitializedDefs` MiniPhase normally rewrites this to the same `Ident(WILDCARD)` sentinel `_` already got -- but `-Yretain-trees` captures trees from before that phase runs, so this interpreter's own uninitialized-check (`vdef.rhs.isEmpty || Ident(WILDCARD)`) never saw the rewritten form, genuinely interpreting the original `compiletime.uninitialized` call instead (real body: `throw new NotImplementedError(...)`, a `@compileTimeOnly` marker never meant to run). Fixed by also recognizing a bare reference to `defn.Compiletime_uninitialized` -- the same symbol `UninitializedDefs` itself checks for.
     - **The "no initializer" fallback used a blanket `null`**, correct only for reference types -- `compiletime.uninitialized`'s whole point is covering value types `_` alone couldn't (a bare `_` initializer is invalid there), so a primitive-typed var using it (e.g. `Int`) needs a real scalar zero, not `null`. Added `defaultValueOf(tpe)`, mirroring `matchesRuntimeType`'s own `cls ==` dispatch over `defn.{Int,Long,Boolean,Double,Float,Char,Byte,Short,Unit}Class`.
@@ -1169,19 +1169,19 @@ behavior, but only exercised so far by the single-project trace fixture).
     - **A REAL host object's own uncurated method reading/writing ITS OWN private field silently went stale or crashed.** `ArrayBuffer#update` has no curated intrinsic, so its real body (`checkWithinBounds` reading `size0`, then `mutationCount = mutationCount + 1`) is genuinely tree-interpreted with `this` bound to the real host `ArrayBuffer` -- but a real object has no `.fields` map. The READ side silently replayed the field's ORIGINAL initializer forever, hiding real mutation already applied through a curated intrinsic (`ArrayBuffer#addOne`, which calls the genuine host `+=`) -- `size0` looked permanently `0` no matter how many real elements were added, so a later in-bounds `.update(0, ...)` threw a spurious `IndexOutOfBoundsException`. The WRITE side (`Assign` on a `Select` whose qualifier isn't an `InterpretedInstance`) just crashed outright (`unexpectedTree`) -- there was no case for it at all. Fixed by adding `reflectiveFieldRead`/`reflectiveFieldWrite`, reading/writing the REAL field via reflection (walking real superclasses for an inherited field) when the receiver is a genuine host object; both fall back to the old behavior on any failure. Traced to this exact root cause via cats-parse's own `DropRightIterator` (`scala.collection.View`'s `dropRight` combinator), reached through http4s's `uri"..."` literal macro validating the literal at macro-expansion time.
     - **`java.lang.String#regionMatches`** (both overloads) had no curated intrinsic -- a real JDK method, no retained source, needed by cats-parse's own literal-matching machinery.
     - **A real top-level `val`'s own JVM semantics (computed once, every read returns the SAME instance) weren't honored** -- `interpretStaticFieldAccess` re-interpreted the initializer tree on EVERY access, building a fresh value each time. Third-party library internals routinely rely on `eq` (physical identity) against a cached top-level `val` as a fast-path sentinel (cats-parse's own `Parser.unit`); a fresh instance every read always failed those checks. Fixed with a per-`Interpreter`-instance (i.e. per-macro-expansion, matching real once-per-classloading semantics closely enough) memoization cache, `staticFieldCache`.
-    - **Under native-image specifically (NOT reproducible via the unrestricted-reflection JVM iteration loop this session otherwise used), `reflectiveFieldRead`/`reflectiveFieldWrite`'s own reflective calls needed the touched classes/fields traced into `agent-config/dotc/reachability-metadata.json`, and even after retracing, an UNCAUGHT crash was still possible for the next untraced class.** `build/05-regen-agent-config.sh`'s existing dotc-tracing fixture (`interpreter/test-fixtures/macros-in-same-project1`) never exercised this new reflective-field code path at all, so `scalino-dotc` (unlike the plain-JVM fast loop) hit `org.graalvm.nativeimage.MissingReflectionRegistrationError` -- and since that's a bare `Error`, not a `ReflectiveOperationException`, it wasn't caught by either helper's existing `catch`, crashing the WHOLE COMPILER outright instead of falling back gracefully per-macro. Fixed two ways, both needed: (1) a second tracing pass in `05-regen-agent-config.sh`, MERGED via `config-merge-dir` (not `config-output-dir`, which would overwrite instead of add) against `examples/interpreter-regressions/{Foo,Test}.scala` (can't just add these files to the FIRST pass's invocation -- both fixtures independently declare top-level `object Foo`/`object Test` with no package, a duplicate-definition error if compiled together) -- this covers the specific classes/fields this session's own regression tests touch (confirmed: registered `scala.collection.mutable.ArrayBuffer`'s `array`/`mutationCount`/`size0`); (2) `isMissingReflectionRegistration`, checking the exception's class NAME (not a real `case _: MissingReflectionRegistrationError`, which would need `org.graalvm.nativeimage` on this file's own plain-Maven compile classpath -- absent, since it's a native-image-only runtime type) added alongside `ReflectiveOperationException` in both helpers' catches. This second fix is the actually load-bearing one long-term: no amount of pre-emptive tracing can cover the truly unbounded set of real host classes/fields a third-party macro might reach through this generic path, so a graceful fallback -- not a hard crash -- is the only sound general answer. Confirmed via a real regression: retracing alone fixed the originally-found `ArrayBuffer` gap, but the very next real class reached the same way (`scala.collection.immutable.NumericRange`'s own `step` field) crashed the whole compiler outright until the catch-widening fix landed too.
-    - **`cs fetch` (unlike a real build tool's own dependency management) resolves Maven `provided`-scope dependencies as excluded by default, with no CLI flag to change that** (confirmed against real `cs fetch --help`/`cs resolve --help`: neither exposes a scope/configuration override) -- NOT an interpreter bug, a `cli/ScalinoCli.scala` dependency-resolution gap. `org.typelevel:scalac-compat-annotation_3` is a `provided`-scope dependency of `org.typelevel::literally` (itself pulled in by `http4s-core` and others), needed at MACRO-EXPANSION time (an inlined reference to one of its annotation classes shows up in the retained tree literally's own macro splices), not at runtime -- so it was simply missing from the resolved classpath, and http4s's `uri"..."` literal macro failed to even TYPE (a generic dotc `"undefined: ..."` error, unrelated to macro interpretation at all) as a result. Fixed by always adding it as a ROOT `cs fetch` coordinate (`alwaysIncludedArtifacts`) -- a dependency listed explicitly as a root coordinate always resolves at ITS OWN default scope (compile) regardless of what scope it'd have as someone else's transitive dependency, so re-requesting it directly is enough to pull it in. Same "always supply this ourselves" category as the scala-native runtime libs `excludedArtifacts` already manages, just for a compile-time gap instead of a runtime duplicate-symbol one.
+    - **Under native-image specifically (NOT reproducible via the unrestricted-reflection JVM iteration loop this session otherwise used), `reflectiveFieldRead`/`reflectiveFieldWrite`'s own reflective calls needed the touched classes/fields traced into `agent-config/dotc/reachability-metadata.json`, and even after retracing, an UNCAUGHT crash was still possible for the next untraced class.** `build/05-regen-agent-config.sh`'s existing dotc-tracing fixture (`interpreter/test-fixtures/macros-in-same-project1`) never exercised this new reflective-field code path at all, so `dotc-native` (unlike the plain-JVM fast loop) hit `org.graalvm.nativeimage.MissingReflectionRegistrationError` -- and since that's a bare `Error`, not a `ReflectiveOperationException`, it wasn't caught by either helper's existing `catch`, crashing the WHOLE COMPILER outright instead of falling back gracefully per-macro. Fixed two ways, both needed: (1) a second tracing pass in `05-regen-agent-config.sh`, MERGED via `config-merge-dir` (not `config-output-dir`, which would overwrite instead of add) against `examples/interpreter-regressions/{Foo,Test}.scala` (can't just add these files to the FIRST pass's invocation -- both fixtures independently declare top-level `object Foo`/`object Test` with no package, a duplicate-definition error if compiled together) -- this covers the specific classes/fields this session's own regression tests touch (confirmed: registered `scala.collection.mutable.ArrayBuffer`'s `array`/`mutationCount`/`size0`); (2) `isMissingReflectionRegistration`, checking the exception's class NAME (not a real `case _: MissingReflectionRegistrationError`, which would need `org.graalvm.nativeimage` on this file's own plain-Maven compile classpath -- absent, since it's a native-image-only runtime type) added alongside `ReflectiveOperationException` in both helpers' catches. This second fix is the actually load-bearing one long-term: no amount of pre-emptive tracing can cover the truly unbounded set of real host classes/fields a third-party macro might reach through this generic path, so a graceful fallback -- not a hard crash -- is the only sound general answer. Confirmed via a real regression: retracing alone fixed the originally-found `ArrayBuffer` gap, but the very next real class reached the same way (`scala.collection.immutable.NumericRange`'s own `step` field) crashed the whole compiler outright until the catch-widening fix landed too.
+    - **`cs fetch` (unlike a real build tool's own dependency management) resolves Maven `provided`-scope dependencies as excluded by default, with no CLI flag to change that** (confirmed against real `cs fetch --help`/`cs resolve --help`: neither exposes a scope/configuration override) -- NOT an interpreter bug, a `cli/SnCli.scala` dependency-resolution gap. `org.typelevel:scalac-compat-annotation_3` is a `provided`-scope dependency of `org.typelevel::literally` (itself pulled in by `http4s-core` and others), needed at MACRO-EXPANSION time (an inlined reference to one of its annotation classes shows up in the retained tree literally's own macro splices), not at runtime -- so it was simply missing from the resolved classpath, and http4s's `uri"..."` literal macro failed to even TYPE (a generic dotc `"undefined: ..."` error, unrelated to macro interpretation at all) as a result. Fixed by always adding it as a ROOT `cs fetch` coordinate (`alwaysIncludedArtifacts`) -- a dependency listed explicitly as a root coordinate always resolves at ITS OWN default scope (compile) regardless of what scope it'd have as someone else's transitive dependency, so re-requesting it directly is enough to pull it in. Same "always supply this ourselves" category as the scala-native runtime libs `excludedArtifacts` already manages, just for a compile-time gap instead of a runtime duplicate-symbol one.
 
-    Regression coverage for the interpreter-side fixes (the native-image-specific one and the `ScalinoCli.scala` dependency-resolution fix have no unit-test equivalent -- covered by the `scalino test .`-against-`~/scala/ape` verification itself) added to `examples/interpreter-regressions/{Foo,Test}.scala`, alongside the existing ones. Verified: the full real `ape` project (all `src/`+`test/` files, including every `uri"..."` literal in `test/http/RoutesTest.scala`) now compiles, links, and RUNS -- 42 tests passed. `examples/interpreter-regressions` and `examples/Hello.scala` still pass; `examples/macro-hello` still fails on the SAME pre-existing, unrelated, already-documented gap (item 9's own "still-open gap" above, `undefined: x.addOne ... at inlining`) -- confirmed unrelated to this session's changes (untouched code path) and already known-broken before this session started.
+    Regression coverage for the interpreter-side fixes (the native-image-specific one and the `SnCli.scala` dependency-resolution fix have no unit-test equivalent -- covered by the `sn-cli test .`-against-`~/scala/ape` verification itself) added to `examples/interpreter-regressions/{Foo,Test}.scala`, alongside the existing ones. Verified: the full real `ape` project (all `src/`+`test/` files, including every `uri"..."` literal in `test/http/RoutesTest.scala`) now compiles, links, and RUNS -- 42 tests passed. `examples/interpreter-regressions` and `examples/Hello.scala` still pass; `examples/macro-hello` still fails on the SAME pre-existing, unrelated, already-documented gap (item 9's own "still-open gap" above, `undefined: x.addOne ... at inlining`) -- confirmed unrelated to this session's changes (untouched code path) and already known-broken before this session started.
 
-    **New still-open gap found this session (NOT a macro-interpretation bug in the sense of "interpreter gives wrong runtime value" -- happens at real, compiled, LINKED native runtime, after `scalino test .` successfully compiles and links everything), root-caused MUCH further in a same-day follow-up:** 12 of `~/scala/ape`'s 54 real tests fail with `scala.MatchError: null` inside `upickle.core.Types$TaggedWriter.write0`, reached through `db.BuildingRepo#save`'s real `upickle.default.write` call on a `domain.BuildingInput`.
+    **New still-open gap found this session (NOT a macro-interpretation bug in the sense of "interpreter gives wrong runtime value" -- happens at real, compiled, LINKED native runtime, after `sn-cli test .` successfully compiles and links everything), root-caused MUCH further in a same-day follow-up:** 12 of `~/scala/ape`'s 54 real tests fail with `scala.MatchError: null` inside `upickle.core.Types$TaggedWriter.write0`, reached through `db.BuildingRepo#save`'s real `upickle.default.write` call on a `domain.BuildingInput`.
 
     **Precise root cause, isolated via a minimal, fast (~3s) standalone repro (copying `~/scala/ape`'s real `domain/{Building,WindowCatalog,AmbienteNonRiscaldato}.scala` verbatim, no `db`/`http`/porcupine/cats-effect involved at all):** every `enum ... derives ReadWriter` in the project -- NOT specific to `BuildingInput`, NOT specific to defaulted params, NOT specific to nested case classes; the earlier hypothesis in this doc's previous revision was wrong on all three counts -- serializes ONLY its ordinal-0 case (the first one written in source) correctly; every OTHER case throws this exact `MatchError: null`. Confirmed via `TipoGenerazione.values.foreach(v => upickle.default.write(v))`: `CaldaiaStandard` (ord 0) -> `"CaldaiaStandard"`; `CaldaiaCondensazione`/`PompaDiCalore`/`Biomassa` (ord 1-3) -> `MatchError: null`, for EVERY enum tried (`ContestoUrbano`, `MetodoCalcolo`, same pattern). The earlier full-`BuildingInput` failure was really just "this object happens to reference several non-ordinal-0 enum values, and a couple of ordinal-0 ones (`raffrescamento`'s default `TipoGenerazione.PompaDiCalore`, ord 2) coincidentally never got serialized at all because upickle omits fields that equal their default value" -- a total red herring that made the failure look field-position/default-arg-related when it never was.
 
     **Mechanism, traced into upickle's own real source (`upickle-core`'s `Types.scala`, `upickle-implicits`' `macros.scala`):** `TaggedWriter.write0` does `val (tagKey, tagValue, w) = findWriterWithKey(v)` -- a tuple-pattern `val` binding, which throws exactly `MatchError: null` if `findWriterWithKey` returns `null` (`TaggedWriter.Node`'s own `findWriterWithKey` scans its per-case child `Leaf` writers and returns `null` if none match; `Leaf`'s own `findWriterWithKey` returns `null` on a checker miss). So: for every case beyond ordinal 0, NONE of the per-case Leaf writers' `Annotator.Checker` recognizes the real runtime value as a match. The per-case Leaf writers themselves are built by `defineEnumWriters[T0, T <: Tuple](prefix): T0 = ${ defineEnumVisitorsImpl[T0, T](...) }` (`upickle-implicits/macros.scala:555-602`) -- a REAL macro (interpreted by this project's own `Interpreter.scala`) that walks `T` (`Mirror.MirroredElemTypes`, a tuple of the enum's per-case singleton types) and, for each case, synthesizes a fresh `implicit lazy val xN: Reader/Writer[CaseType] = prefix.macroR/macroW[CaseType]` via `Symbol.newVal(Symbol.spliceOwner, ...)` + `ValDef.apply`, bundling ALL of them (`x0..xN-1` per case, plus one more, `xN`, for the whole sum type `T0`) into one `Block` whose OWN result expression is only `xN` -- the per-case `x0..xN-1` vals are meant to be picked up later via ordinary Scala 3 IMPLICIT SEARCH (from within `xN`'s own nested macro expansion, which needs `Writer[EachCase]` instances to build the `TaggedWriter.Node`), not referenced directly.
 
     **Ruled out, with real evidence (not just once file re-read), before landing on "not yet traced further":**
-    - **Owner-chain/hygiene mismatch across the per-case `Symbol.newVal` calls** (the `[spliceOwner]`/`[newVal]` combo this session added, gated by `SCALINO_INTERP_DEBUG`, at the `"spliceOwner"`/`"newVal"` cases in `Interpreter.scala`'s `interpretStaticCall`-adjacent dispatch) -- traced against the minimal repro: `x0`, `x1`, `x2`'s owner symbols are the exact SAME identity (`System.identityHashCode` equal) within one `defineEnumVisitorsImpl` expansion, both for the Reader pass and the Writer pass. This is NOT a repeat of item 9's `x.addOne`/`LambdaLift` owner-chain bug -- that one is a hard `"undefined: ..."` compile-time crash from a genuinely wrong owner; this one compiles and links clean, and only misbehaves at runtime.
+    - **Owner-chain/hygiene mismatch across the per-case `Symbol.newVal` calls** (the `[spliceOwner]`/`[newVal]` combo this session added, gated by `SNC_INTERP_DEBUG`, at the `"spliceOwner"`/`"newVal"` cases in `Interpreter.scala`'s `interpretStaticCall`-adjacent dispatch) -- traced against the minimal repro: `x0`, `x1`, `x2`'s owner symbols are the exact SAME identity (`System.identityHashCode` equal) within one `defineEnumVisitorsImpl` expansion, both for the Reader pass and the Writer pass. This is NOT a repeat of item 9's `x.addOne`/`LambdaLift` owner-chain bug -- that one is a hard `"undefined: ..."` compile-time crash from a genuinely wrong owner; this one compiles and links clean, and only misbehaves at runtime.
     - **A general Scala Native codegen bug with local `implicit lazy val`s in a `Block`, unrelated to macros** -- ruled out by a hand-written control (`Repro5.scala`: a `Block` defining `implicit lazy val x0`/`x1`/`x2` by hand, `x2` built via an explicit varargs call picking up `x0`/`x1`, matching `defineEnumVisitorsImpl`'s own shape) compiling and running CORRECTLY (`result.tag=MERGED:x0,x1`). So plain local-implicit-lazy-val-in-a-block genuinely works under this toolchain; something specific to the MACRO-SPLICED version is different.
 
     **Same-day follow-up session, MUCH deeper trace -- corrects a wrong mid-investigation guess from earlier the same day, don't trust that guess (removed above, was: "the nested `macroR[CaseType]`/`macroW[CaseType]` call itself is the divergence point").** Got upickle's REAL, actual `ReadersVersionSpecific`/`WritersVersionSpecific`/`macros.scala` source (`src-3` variants -- NOT bundled in either published sources jar, which only ship the SHARED `src/` tree; fetched instead via `gh api repos/com-lihaoyi/upickle/contents/...?ref=4.4.3`, tree listed via `gh api repos/com-lihaoyi/upickle/git/trees/4.4.3?recursive=true`). Also got DEFINITIVE ground truth by running the identical minimal repro through real, unmodified `scala-cli` (JVM Scala 3.8.4 + real upickle 4.4.3, this project's toolchain not involved at all): **all ordinals serialize correctly** -- conclusively confirms this is a genuine bug in THIS project's toolchain, not upickle itself and not a real-dotc semantic this investigation had simply misunderstood.
@@ -1192,7 +1192,7 @@ behavior, but only exercised so far by the single-project trace fixture).
       case tref: TypeRef => Ref(tref.classSymbol.get.companionModule).asExpr.asInstanceOf[Expr[T]]
       case v => '{valueOf[T]}
     ```
-    Added `SCALINO_INTERP_DEBUG`-gated tracing at THREE points to follow this precisely (all left in place): `[classSymbol]`/`[companionModule]` (with the scrutinee's real `getClass`, e.g. `dotty.tools.dotc.core.Types$CachedTermRef`) at the `TypeReprMethods#classSymbol`/`SymbolMethods#companionModule` interpretation sites, and `[genericTypeTest]`/`[genericTypeTest.check]` at the generic `TypeTest[TypeRepr, X]` dispatch (`typeTestClass`-based, real `cls.isInstance(v)`) used for both named-extractor patterns (`case TypeRef(prefix, name) => ...`) AND plain type-ascription binds (`case tref: TypeRef => ...`) alike.
+    Added `SNC_INTERP_DEBUG`-gated tracing at THREE points to follow this precisely (all left in place): `[classSymbol]`/`[companionModule]` (with the scrutinee's real `getClass`, e.g. `dotty.tools.dotc.core.Types$CachedTermRef`) at the `TypeReprMethods#classSymbol`/`SymbolMethods#companionModule` interpretation sites, and `[genericTypeTest]`/`[genericTypeTest.check]` at the generic `TypeTest[TypeRepr, X]` dispatch (`typeTestClass`-based, real `cls.isInstance(v)`) used for both named-extractor patterns (`case TypeRef(prefix, name) => ...`) AND plain type-ascription binds (`case tref: TypeRef => ...`) alike.
 
     **Result: `getSingletonImpl` is NOT the bug.** For `T = Motivo.A.type`, the real scrutinee is confirmed a genuine `CachedTermRef` (`TermRef`/`TypeRef` are real, disjoint siblings under `NamedType` in dotc's own `Types.scala` -- confirmed by reading it directly, `TermRef` does NOT extend `TypeRef`). The `TypeRefTypeTest` check on it correctly returns `false` (`[genericTypeTest.check] ... result=false`), so the interpreter correctly falls through to `case v => '{valueOf[T]}` -- exactly matching real dotc semantics, for the FIRST enum case tried in this trace. (The earlier session's `[classSymbol]`/`[companionModule]` hits that looked like they came from THIS function were a red herring from a DIFFERENT, unrelated macro helper that happens to use the identical `Ref(...companionModule(classSymbol(...)))` shape for a legitimately different reason -- distinguishable only by its bound variable's real name, `t` there vs `tref` here, once the trace was re-read carefully.)
 
@@ -1200,17 +1200,17 @@ behavior, but only exercised so far by the single-project trace fixture).
 
     **Separately, a real (but so far NON-fixing) improvement landed this session and was kept:** `matchesRuntimeType`'s lenient "unrecognized real host object -> assume `true`" fallback now also checks whether the scrutinee is a genuine dotc-internal `Type`/`Tree` (never one of this interpreter's own `InterpretedInstance`/`ModuleValue`/collection representations) and, if so, reuses the SAME real `typeTestClass`-based `cls.isInstance(v)` lookup already trusted for the named-extractor-call pattern shape, instead of blindly returning `true`. Verified SAFE (the full real `ape` project, all 38 `src/`+`test/` files, still compiles clean with it) but does NOT fix this bug -- confirmed empirically by rerunning `examples/upickle-enum-writer-bug/Main.scala` after the change, same `MatchError`s. Kept anyway since it's a real, independently-defensible correctness fix (was previously ALWAYS true for e.g. any `case tref: TypeRef => ...` against ANY unrecognized real object, not just this specific scenario) -- just not the fix for the enum-writer bug specifically. Do not assume it's related; the actual divergence is still downstream of the correctly-taken `case v => '{valueOf[T]}` branch.
 
-    **`summonFrom`/`ValueOf[T]` suspect ALSO ruled out, same session, immediately after writing the paragraph above -- don't re-chase it either.** Checked `summonFrom`'s real vendored definition (`library/src/scala/compiletime/package.scala`): its body is a deliberate dead stub, `error("Compiler bug: summonFrom was not evaluated by the compiler")` -- real semantics come entirely from a SPECIAL CASE in `typer/Applications.scala` (`fun1.symbol == defn.Compiletime_summonFrom`), i.e. real compile-time implicit search, not a real function body ever meant to run. Wrote a direct, non-macro, non-derives control (`getIt[T](using vt: ValueOf[T]): T = vt.value`, called for `Metodo.A/B/C.type` explicitly) and ran it through the REAL `scalino run` pipeline (compiled and linked normally, no macro interpretation involved at all): **all three cases resolve correctly** (`A: A`, `B: B`, `C: C`, all three `== ` checks `true`). So real, compiled `ValueOf[EnumCase.type]`/`summonFrom` resolution is completely correct in this toolchain, for every ordinal -- the bug cannot be there. Also traced `getSingletonImpl`'s own `quoteTypeBindings` for its `'{valueOf[T]}` result across both the Reader and Writer macro passes: `type T` is bound to the CORRECT, per-case singleton type (`(Motivo.A : Motivo)` vs `(Motivo.B : Motivo)`) both times -- so the type substitution INSIDE this interpreter's own quote-evaluation environment is also correct.
+    **`summonFrom`/`ValueOf[T]` suspect ALSO ruled out, same session, immediately after writing the paragraph above -- don't re-chase it either.** Checked `summonFrom`'s real vendored definition (`library/src/scala/compiletime/package.scala`): its body is a deliberate dead stub, `error("Compiler bug: summonFrom was not evaluated by the compiler")` -- real semantics come entirely from a SPECIAL CASE in `typer/Applications.scala` (`fun1.symbol == defn.Compiletime_summonFrom`), i.e. real compile-time implicit search, not a real function body ever meant to run. Wrote a direct, non-macro, non-derives control (`getIt[T](using vt: ValueOf[T]): T = vt.value`, called for `Metodo.A/B/C.type` explicitly) and ran it through the REAL `sn-cli run` pipeline (compiled and linked normally, no macro interpretation involved at all): **all three cases resolve correctly** (`A: A`, `B: B`, `C: C`, all three `== ` checks `true`). So real, compiled `ValueOf[EnumCase.type]`/`summonFrom` resolution is completely correct in this toolchain, for every ordinal -- the bug cannot be there. Also traced `getSingletonImpl`'s own `quoteTypeBindings` for its `'{valueOf[T]}` result across both the Reader and Writer macro passes: `type T` is bound to the CORRECT, per-case singleton type (`(Motivo.A : Motivo)` vs `(Motivo.B : Motivo)`) both times -- so the type substitution INSIDE this interpreter's own quote-evaluation environment is also correct.
 
     **Where this leaves it:** every layer actually checked this session -- `getSingletonImpl`'s `TypeRef`/`TermRef` runtime type test, its `valueOf[T]` type binding, real compiled `ValueOf[T]`/`summonFrom` resolution, owner-chain consistency across `defineEnumVisitorsImpl`'s per-case vals, and plain local-implicit-lazy-val-in-a-Block codegen -- is CORRECT. The bug must be in something not yet directly observed: most likely candidate now is the SPLICER's own handling of a quote's TYPE ARGUMENT when a `Expr[T]` (built by nested-macro-call interpretation, e.g. `getSingleton[T]`'s result) gets REIFIED into a real tree and spliced back into the enclosing program as literal source -- i.e. whether the tree that actually lands in the compiled program says `valueOf[Motivo.B.type]` (correct) or ends up with an unsubstituted/widened/wrong type argument that only happens to still resolve correctly for the FIRST case tried (e.g. if implicit search for a too-widely-typed argument still coincidentally finds `Motivo.A`'s own `ValueOf` first via search order, but fails or finds the wrong thing for any other case). This is a DIFFERENT area than anything instrumented so far (`Splicer.scala`'s own tree-reification path for a returned `Expr[T]`'s type argument specifically, not `Interpreter.scala`'s environment-level type bindings, which are confirmed fine). Getting the ACTUAL FINAL SPLICED SOURCE TEXT for one of the per-case vals (not just individual sub-expression traces) -- e.g. by dumping the fully-expanded tree right before it's handed to the next real compiler phase -- would settle this directly instead of continuing to infer it from fragments.
 
-    **The `Splicer.scala` type-argument-reification suspect from the paragraph above was ALSO checked and is ALSO fine -- and checking it produced the most important correction yet, a wrong mental model of WHICH CODE ACTUALLY GETS INTERPRETED BY THIS PROJECT'S OWN INTERPRETER at all.** Added one more `SCALINO_INTERP_DEBUG` print, right where a quote `'{...}`'s type bindings get substituted into its body before wrapping as an `ExprImpl` (`Splicer.scala`, the `Apply(Select(Quote(body, _), nme.apply), _)` case, after `body3` is built): confirms `getSingletonImpl`'s returned `'{valueOf[T]}` DOES reify correctly per case -- `body3.show=valueOf[Motivo.A]` / `valueOf[Motivo.B]`, `body3.tpe` the correct singleton type, both times. So the ACTUAL SPLICED TREE going out of `getSingletonImpl` is right, for every case checked.
+    **The `Splicer.scala` type-argument-reification suspect from the paragraph above was ALSO checked and is ALSO fine -- and checking it produced the most important correction yet, a wrong mental model of WHICH CODE ACTUALLY GETS INTERPRETED BY THIS PROJECT'S OWN INTERPRETER at all.** Added one more `SNC_INTERP_DEBUG` print, right where a quote `'{...}`'s type bindings get substituted into its body before wrapping as an `ExprImpl` (`Splicer.scala`, the `Apply(Select(Quote(body, _), nme.apply), _)` case, after `body3` is built): confirms `getSingletonImpl`'s returned `'{valueOf[T]}` DOES reify correctly per case -- `body3.show=valueOf[Motivo.A]` / `valueOf[Motivo.B]`, `body3.tpe` the correct singleton type, both times. So the ACTUAL SPLICED TREE going out of `getSingletonImpl` is right, for every case checked.
 
     Given every one of `getSingletonImpl`'s own layers is now confirmed correct, went looking for where its CALLER (`macroW[T]`'s `isSingleton` branch, building `Checker.Val(macros.getSingleton[T])`) actually gets interpreted -- and found something that reframes the whole investigation: **`defineEnumVisitorsImpl` (`upickle-implicits/macros.scala:555-602`, this project's `Interpreter.scala` walking it) never itself interprets the `macroW[CaseType]`/`macroW[T0]` calls it builds.** Its own `handleType` constructs each one via raw `quotes.reflect` tree-builder calls (`Symbol.newVal` + `TypeApply(Select(prefix.asTerm, ...methodMember("macroW")...), ...)`), and the WHOLE THING is returned as an inert `Tree` value (`Block(allDefs, Ident(allDefs.head._2.termRef))`) -- at no point does `defineEnumVisitorsImpl` itself call `interpretTree` on any of those constructed calls. Confirmed empirically: grepping the ENTIRE debug trace for the literal text `macroW` finds exactly 3 hits, all the STRING literal `"macroW"` passed as `defineEnumWriters`'s own `macroX` argument -- zero actual `macroW[...]` Apply/Block interpretation trace lines anywhere, for EITHER the per-case calls or the whole-sum-type one.
 
     So where did the extensively-traced `getSingletonImpl` interpretation actually come from, if not from this project's interpreter walking into `macroW[T]`'s body directly? The likely answer: once `defineEnumVisitorsImpl`'s returned Block is spliced back into the real program, `macroW[CaseType]` (still `inline`) gets expanded by REAL DOTC'S OWN INLINER as a completely ordinary part of normal compilation of the now-real source -- NOT by this project's `SpliceInterpreter` -- and real dotc's Inliner only hands control BACK to this project's interpreter at the next genuine `${...}` splice boundary it encounters while expanding (`macros.getSingleton[T]`, `macros.tagKey[T]`, etc. -- each its own fresh top-level splice). Under this model, `inline m match { case _: ProductOf[T] => ...; case _: SumOf[T] => ... }`'s branch selection (correctly landing on `ProductOf` for a payload-less singleton case like `Motivo.A.type`, and presumably `SumOf` for the whole enum `Motivo`) is real dotc's own, well-tested inline-match reduction -- not this project's interpreter at all, and `compiletime.summonAll[Tuple.Map[MirroredElemTypes, Writer]]` (the whole-enum branch's own mechanism for collecting all the per-case writers into `TaggedWriter.Node`) is ALSO real dotc's own special-cased Inliner logic (`Inlines.scala:575`, confirmed by reading it directly), needing REAL, ordinary Scala 3 implicit search to find `x0`/`x1`/... in scope -- not anything this interpreter reimplements.
 
-    **This relocates the entire remaining mystery outside `Interpreter.scala`/`Splicer.scala` and this session's own debugging tools.** If real dotc's implicit search, run against the SPLICED-IN local `implicit lazy val x0`/`x1`/... (each one's `Symbol` built via this interpreter's own `Symbol.newVal`, not written by a human), fails to find all of them -- finding only `x0` (ordinal 0) and silently treating the rest as absent, rather than erroring outright -- `TaggedWriter.Node(writers: _*)` would end up built from an INCOMPLETE writers list, `findWriterWithKey` would have nothing to try beyond the first case's `Leaf`, and `write0` would throw exactly the observed `MatchError: null` for every value beyond the first -- matching the symptom precisely. This is a genuine implicit-search/symbol-visibility question about SPLICED, interpreter-constructed `Symbol`s specifically, not a macro-interpretation-correctness question -- outside the scope of `SCALINO_INTERP_DEBUG` tracing (which only instruments interpretation, and this code path was JUST shown to bypass interpretation almost entirely). NOT verified directly this session -- ran out of a clean way to observe real dotc's own implicit search from outside.
+    **This relocates the entire remaining mystery outside `Interpreter.scala`/`Splicer.scala` and this session's own debugging tools.** If real dotc's implicit search, run against the SPLICED-IN local `implicit lazy val x0`/`x1`/... (each one's `Symbol` built via this interpreter's own `Symbol.newVal`, not written by a human), fails to find all of them -- finding only `x0` (ordinal 0) and silently treating the rest as absent, rather than erroring outright -- `TaggedWriter.Node(writers: _*)` would end up built from an INCOMPLETE writers list, `findWriterWithKey` would have nothing to try beyond the first case's `Leaf`, and `write0` would throw exactly the observed `MatchError: null` for every value beyond the first -- matching the symptom precisely. This is a genuine implicit-search/symbol-visibility question about SPLICED, interpreter-constructed `Symbol`s specifically, not a macro-interpretation-correctness question -- outside the scope of `SNC_INTERP_DEBUG` tracing (which only instruments interpretation, and this code path was JUST shown to bypass interpretation almost entirely). NOT verified directly this session -- ran out of a clean way to observe real dotc's own implicit search from outside.
 
     **The implicit-search-sibling-visibility hypothesis from the paragraph above was directly tested (new session, same investigation) via a from-scratch, fully faithful ISOLATED REPRO -- and is DEFINITIVELY REFUTED. Every layer works correctly; the bug remains unreproduced outside the real project.** Built (`<scratchpad>/implicit-visibility-repro/Repro8..12*.scala`, not committed -- scratch-only) an INDEPENDENT toy typeclass (`W[T]`/`Helper.macroW[T]`/`Checker`/`Leaf`/`Node`) that mirrors upickle's REAL mechanism line-for-line, confirmed against freshly-fetched real upickle 4.4.3 source (`Writers.scala:16-76`, `MacroImplicits.scala`, `Types.scala:194-300`) rather than from memory:
     - `Repro10`: exactly replicates `defineEnumVisitorsImpl`'s own `handleType`/`getDefs` `AppliedType`-destructuring + `Symbol.newVal`-built `Block` of per-case `implicit lazy val x0..xN`, PLUS a real `inline m match { case _: Mirror.ProductOf[T] => ...; case _: Mirror.SumOf[T] => compiletime.summonAll[Tuple.Map[m.MirroredElemTypes, W]] }` for a REAL 3-case enum (`enum Color { case Red, Green, Blue }`) -- i.e. the exact mechanism the previous paragraph flagged as unverified. Compiled clean and printed `sum:Red,Green,Blue len=3` -- summonAll finds ALL THREE locally-spliced siblings correctly, refuting the "implicit search doesn't see interpreter-constructed local symbols" hypothesis outright.
