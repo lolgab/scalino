@@ -27,7 +27,14 @@ setup_one() {
   cd "$vendor"
   if [[ -n "$(git status --short)" ]]; then
     echo "vendor/$name has local changes already -- resetting before reapplying patches" >&2
-    git checkout -q -- .
+    # `git checkout -q -- .` only restores MODIFIED tracked files -- it
+    # doesn't remove files a previous patch run ADDED or restore files it
+    # DELETED, so re-running this script against an already-patched clone
+    # left those half-applied and every subsequent `git apply` failed with
+    # "already exists"/"No such file or directory". A hard reset + clean
+    # actually gets back to the pristine post-clone state.
+    git reset -q --hard HEAD
+    git clean -q -fd
   fi
 
   for p in "$ROOT"/patches/"$prefix"-*.patch; do
