@@ -122,7 +122,9 @@ object ScalinoCli:
     nativeCppCompile: List[String],
     nativeTarget: Option[String],
     nativeEmbedResources: Option[Boolean],
-    nativeMultithreading: Option[Boolean]
+    nativeMultithreading: Option[Boolean],
+    jars: List[String],
+    testOptions: List[String]
   )
 
   private val quotedRe = """"([^"]*)"""".r
@@ -133,8 +135,12 @@ object ScalinoCli:
    *  scala-cli's `platform`/`jvm`/`toolkit`/`resourceDir`/`publish.*`) can be
    *  flagged instead of silently doing nothing. */
   private val recognizedDirectiveKeys = Set(
-    "dep", "deps", "compileOnly.dep", "compileOnly.deps", "test.dep", "test.deps",
-    "scala", "mainClass", "options", "option", "testFramework", "test.framework",
+    "dep", "deps", "dependency", "dependencies",
+    "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies",
+    "test.dep", "test.deps", "test.dependency", "test.dependencies",
+    "scala", "mainClass", "options", "option", "scalacOption", "scalacOptions",
+    "test.scalacOption", "test.scalacOptions",
+    "testFramework", "test.framework", "jar", "jars",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativeTarget",
     "nativeEmbedResources", "nativeMultithreading"
@@ -192,6 +198,8 @@ object ScalinoCli:
     var nativeTarget = Option.empty[String]
     var nativeEmbedResources = Option.empty[Boolean]
     var nativeMultithreading = Option.empty[Boolean]
+    var jars = List.empty[String]
+    var testOptions = List.empty[String]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must be a comment-only line, `//>` as its first
     // non-blank characters -- NOT just "contains `//>` anywhere". An
@@ -208,13 +216,15 @@ object ScalinoCli:
           if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
             System.err.println(s"scalino: warning: unsupported directive '//> using $key' in $src -- ignoring")
         }
-        directiveValues(line, "dep", "deps").foreach(vs => deps = deps ++ vs)
-        directiveValues(line, "compileOnly.dep", "compileOnly.deps").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
-        directiveValues(line, "test.dep", "test.deps").foreach(vs => testDeps = testDeps ++ vs)
+        directiveValues(line, "dep", "deps", "dependency", "dependencies").foreach(vs => deps = deps ++ vs)
+        directiveValues(line, "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
+        directiveValues(line, "test.dep", "test.deps", "test.dependency", "test.dependencies").foreach(vs => testDeps = testDeps ++ vs)
         directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
         directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
-        directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
+        directiveValues(line, "options", "option", "scalacOption", "scalacOptions").foreach(vs => options = options ++ vs)
+        directiveValues(line, "test.scalacOption", "test.scalacOptions").foreach(vs => testOptions = testOptions ++ vs)
         directiveValues(line, "testFramework", "test.framework").foreach(_.headOption.foreach(v => testFramework = Some(v)))
+        directiveValues(line, "jar", "jars").foreach(vs => jars = jars ++ vs)
         directiveValues(line, "nativeMode").foreach(_.headOption.foreach(v => nativeMode = Some(v)))
         directiveValues(line, "nativeGc").foreach(_.headOption.foreach(v => nativeGc = Some(v)))
         directiveValues(line, "nativeLto").foreach(_.headOption.foreach(v => nativeLto = Some(v)))
@@ -231,7 +241,8 @@ object ScalinoCli:
       deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile,
-      nativeTarget, nativeEmbedResources, nativeMultithreading
+      nativeTarget, nativeEmbedResources, nativeMultithreading,
+      jars.distinct, testOptions
     )
 
   /** scala-cli's three dependency formats:
@@ -1327,6 +1338,7 @@ object ScalinoCli:
          |  --main-class <name>        explicit entry point (skips auto-detection)
          |  --dep <coord>              add a dependency (repeatable; no -d short form -- real
          |                             scala-cli's -d means --output, not --dependency)
+         |  --compile-dep <coord>      add a compile-time-only dependency (repeatable)
          |  -S, --scala <version>      declare a Scala version (must match ${BuildInfo.scalaVersion})
          |  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
          |  -w, --watch                rebuild (and, for `run`, rerun) on source changes
@@ -1353,7 +1365,8 @@ object ScalinoCli:
          |  --embed-resources          embed resources into the binary (readable via the Java resources API)
          |  --native-multithreading    enable Scala Native multithreading support
          |
-         |directives (in source files), one per line:
+         |directives (in source files), one per line -- `dep`/`options`/etc also
+         |accept scala-cli's own longer spellings (`dependency`/`scalacOption`/...):
          |  //> using dep "org::name:version"
          |  //> using compileOnly.dep "org::name:version"
          |  //> using test.dep "org::name:version"    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
@@ -1361,6 +1374,8 @@ object ScalinoCli:
          |  //> using scala "3.x"
          |  //> using mainClass "Foo"
          |  //> using options "-flag1", "-flag2"
+         |  //> using test.scalacOption "-flag"        (test scope only, in addition to `options` above)
+         |  //> using jar "./lib/local.jar"            (add a local jar straight to the classpath)
          |  //> using nativeMode "release-fast"
          |  //> using nativeGc "immix"
          |  //> using nativeLto "thin"
@@ -1400,6 +1415,7 @@ object ScalinoCli:
     out: Option[String] = None,
     watch: Boolean = false,
     cliDeps: List[String] = Nil,
+    cliCompileOnlyDeps: List[String] = Nil,
     cliScala: Option[String] = None,
     cliOptions: List[String] = Nil,
     progArgs: List[String] = Nil,
@@ -1439,6 +1455,7 @@ object ScalinoCli:
         case "-w" | "--watch" => o = o.copy(watch = true)
         // no `-d` short form: real scala-cli's `-d` means `--output`, not `--dependency` -- don't collide with it.
         case "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
+        case "--compile-dep" | "--compile-only-dependency" => o = o.copy(cliCompileOnlyDeps = o.cliCompileOnlyDeps :+ args(i + 1)); i += 1
         case "-S" | "--scala" | "--scala-version" => o = o.copy(cliScala = Some(args(i + 1))); i += 1
         case "-O" | "--scalac-option" | "--scalac-opt" => o = o.copy(cliOptions = o.cliOptions :+ args(i + 1)); i += 1
         case "-v" | "--verbose" => o = o.copy(verbose = true)
@@ -1479,8 +1496,8 @@ object ScalinoCli:
     }
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = resolveDeps(allDeps, depsCache)
-    val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
+    val extraClasspath = (List(resolveDeps(allDeps, depsCache)) ++ directives.jars).filter(_.nonEmpty).mkString(":")
+    val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
     val nativeOpts = resolveNativeOpts(directives, o)
@@ -1558,9 +1575,9 @@ object ScalinoCli:
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache)
       val testOnlyClasspath = resolveDeps(directives.testDeps, depsCache)
-      val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
-      val testClasspath = List(mainClasspath, testOnlyClasspath).filter(_.nonEmpty).mkString(":")
-      val options = directives.options ++ o.cliOptions
+      val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache)
+      val testClasspath = (List(mainClasspath, testOnlyClasspath) ++ directives.jars).filter(_.nonEmpty).mkString(":")
+      val options = directives.options ++ o.cliOptions ++ directives.testOptions
       val cc = computeCompileClasspath(testClasspath, extraCompileOnlyClasspath)
 
       // Pass 1: compile the user's own sources only, to scan the result for
@@ -1643,8 +1660,8 @@ object ScalinoCli:
     val directives = parseDirectives(expanded)
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = resolveDeps(allDeps, depsCache)
-    val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
+    val extraClasspath = (List(resolveDeps(allDeps, depsCache)) ++ directives.jars).filter(_.nonEmpty).mkString(":")
+    val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache)
     val options = directives.options ++ o.cliOptions
 
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
