@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..693210a5 100644
+index 04cb637b..0e8e8d0a 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -496,7 +496,7 @@ index 04cb637b..693210a5 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +546,4315 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4335 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -2830,22 +2830,7 @@ index 04cb637b..693210a5 100644
 +    case inst: InterpretedInstance if inst.cls.name.toString == "::" =>
 +      inst.fields("head") :: asObjectList(inst.fields("next"))
 +    case _ => Nil
- 
--  private def loadClass(name: String): Class[?] =
--    try classLoader.loadClass(name)
--    catch
--      case MissingClassValidInCurrentRun(sym, origin) =>
--        suspendOnMissing(sym, origin, pos)
--
--
--  private def getMethod(clazz: Class[?], name: Name, paramClasses: List[Class[?]]): JLRMethod =
--    try clazz.getMethod(name.toString, paramClasses*)
--    catch {
--      case _: NoSuchMethodException =>
--        val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
--        throw new StopInterpretation(msg, pos)
--      case MissingClassValidInCurrentRun(sym, origin) =>
--        suspendOnMissing(sym, origin, pos)
++
 +  /** Materializes anything that behaves like a collection into a real host
 +   *  `Seq[Object]` -- needed wherever downstream code (ours, e.g.
 +   *  `IterableFactory#from`, or interpreted library code) structurally
@@ -2880,16 +2865,51 @@ index 04cb637b..693210a5 100644
 +      buf.toList
 +    case _ => Nil
 +
++  /** The TASTy name table (`DottyUnpickler#mightContain`) only indexes plain
++   *  `SimpleName`s -- a *derived* name (`NameKinds`' prefix/suffix-tagged
++   *  wrappers: `inline$foo` inline accessors, `foo$default$1` default
++   *  getters, `super$foo` superaccessors, ...) is stored as its own table
++   *  entry kind, never as a flattened literal string, so `rootTreeContaining`
++   *  called with the *displayed* name (`sym.name.toString`, which DOES
++   *  include the `inline$`/`$default$N`/etc decoration) always misses --
++   *  `mightContain` binary-searches an array of only-ever-`SimpleName`
++   *  strings and a derived name's `toString` was never one of the entries
++   *  put there. Unwrapping to the innermost real `SimpleName` (what the
++   *  pickler actually indexed) makes the pre-filter hint match again; the
++   *  actual lookup below (`findDefTree`) still matches by exact symbol
++   *  identity, so this only fixes the *hint*, not correctness of the result.
++   */
++  private def rootTreeSearchName(name: Name): String = name match
++    case n: SimpleName => n.toString
++    case n: DerivedName => rootTreeSearchName(n.underlying)
++    case n: TypeName => rootTreeSearchName(n.toTermName)
++    case _ => name.toString
++
 +  private def resolveExternalDefTree(sym: Symbol)(using Context): Tree =
 +    if !sym.defTree.isEmpty then sym.defTree
 +    else
 +      val top = sym.topLevelClass
 +      if top.exists && top.isClass then
-+        val root = top.asClass.rootTreeContaining(sym.name.toString)
++        val root = top.asClass.rootTreeContaining(rootTreeSearchName(sym.name))
 +        if root.isEmpty then tpd.EmptyTree
 +        else findDefTree(root, sym).getOrElse(tpd.EmptyTree)
 +      else tpd.EmptyTree
-+
+ 
+-  private def loadClass(name: String): Class[?] =
+-    try classLoader.loadClass(name)
+-    catch
+-      case MissingClassValidInCurrentRun(sym, origin) =>
+-        suspendOnMissing(sym, origin, pos)
+-
+-
+-  private def getMethod(clazz: Class[?], name: Name, paramClasses: List[Class[?]]): JLRMethod =
+-    try clazz.getMethod(name.toString, paramClasses*)
+-    catch {
+-      case _: NoSuchMethodException =>
+-        val msg = em"Could not find method ${clazz.getCanonicalName}.$name with parameters ($paramClasses%, %)"
+-        throw new StopInterpretation(msg, pos)
+-      case MissingClassValidInCurrentRun(sym, origin) =>
+-        suspendOnMissing(sym, origin, pos)
 +  /** Searches a whole-compilation-unit tree (from `rootTreeContaining`) for
 +   *  the `DefDef`/`ValDef` defining `target`, descending through packages,
 +   *  nested classes/objects (`Template.constr` for the primary constructor,
@@ -4965,7 +4985,7 @@ index 04cb637b..693210a5 100644
    object Call:
      import tpd.*
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index a40db72d..86a4bb96 100644
+index a40db72d..a194d598 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 @@ -6,6 +6,7 @@ import java.io.{PrintWriter, StringWriter}
