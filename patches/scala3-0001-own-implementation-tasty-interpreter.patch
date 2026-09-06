@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..80a0016e 100644
+index 04cb637b..680ef32f 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -496,7 +496,7 @@ index 04cb637b..80a0016e 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +546,4359 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4371 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -4313,6 +4313,18 @@ index 04cb637b..80a0016e 100644
 +      case (m: java.util.regex.Matcher, "appendReplacement", List(sb: java.lang.StringBuilder @unchecked, r: String)) => Some(m.appendReplacement(sb, r))
 +      case (m: java.util.regex.Matcher, "appendTail", List(sb: java.lang.StringBuilder @unchecked)) => Some(m.appendTail(sb))
 +      case (sb: java.lang.StringBuilder, "toString", Nil) => Some(sb.toString)
++      // `java.io.PrintStream` (`System.out`/`System.err`, see
++      // `javaStaticFieldConstant`'s own `"System"` case): real JDK-native
++      // methods, no retained Scala source ever. Curated by the overloads a
++      // macro debug-printing at compile time (`System.err.println(s"...")`,
++      // a completely ordinary thing to reach for) actually needs -- not
++      // exhaustive.
++      case (p: java.io.PrintStream, "println", Nil) => p.println(); Some(().asInstanceOf[Object])
++      case (p: java.io.PrintStream, "println", List(s: String)) => p.println(s); Some(().asInstanceOf[Object])
++      case (p: java.io.PrintStream, "println", List(v)) => p.println(v); Some(().asInstanceOf[Object])
++      case (p: java.io.PrintStream, "print", List(s: String)) => p.print(s); Some(().asInstanceOf[Object])
++      case (p: java.io.PrintStream, "print", List(v)) => p.print(v); Some(().asInstanceOf[Object])
++      case (p: java.io.PrintStream, "flush", Nil) => p.flush(); Some(().asInstanceOf[Object])
 +      // `scala.runtime.Statics.pfMarker`: a real `Statics` field access
 +      // (`Statics` is a Java class, so it never matches the `Ident`/`Call`
 +      // dispatch's own `fn.symbol.is(Module)`-based static-access
