@@ -743,23 +743,21 @@ longer needs a javac step (deleted `config/ProjectConfig.java`) or
 `agent-config/lsp/`; `build/05-regen-agent-config.sh`'s LSP tracing step
 is gone, since there's no reflection left to trace).
 
-Not yet done: deeper verification under the *native-image* binary
-specifically of `completion`/`references`/`rename`/`documentSymbol`/
-workspace `symbol` beyond the `lsp-trace-drive.py` run above (that run was
-against the native binary, so this is largely already covered — just
-noting it wasn't independently re-checked against real Zed yet, only via
-the offline harness); whether `rpcDispatch`-era per-project multi-driver
-behavior (`references`/`rename`/`implementation` across dependent
-projects) still works correctly now that a single worker thread processes
-requests serially (should be equivalent to the old
-`thisServer.synchronized`-everywhere behavior, but only exercised so far
-by the single-project trace fixture).
+Not yet done (see item 5 below for a follow-up pass closing most of this):
+independent re-check against real Zed specifically (only verified via the
+offline harness/ad hoc clients so far); whether `rpcDispatch`-era
+per-project multi-driver behavior (`references`/`rename`/`implementation`
+across *dependent projects*, not just multiple files in one project) still
+works correctly now that a single worker thread processes requests
+serially.
 
 4. **Fixed (2026-09-06): the missing-`.dotty-ide.json` whole-process crash flagged above.** Root cause, once actually traced (a real, minimal Python LSP client -- send `initialize`/`initialized`/`didOpen` against a project with no config file, watch whether the process survives -- settled this far faster than reasoning about it further): `DottyLanguageServer.initialize`'s "warmup" thread (`new Thread(() => { try { drivers; () } catch { case NonFatal(ex) => ex.printStackTrace; sys.exit(1) } })`) calls `sys.exit(1)` on ANY warmup failure -- faithfully ported from the *original* lsp4j-based code's `CompletableFuture(...).exceptionally { ex => ex.printStackTrace; sys.exit(1) }`, so this isn't a regression the rewrite introduced, it's real upstream dotty behavior. Under GraalVM native-image, an uncaught exception on *any* thread (not just the main one) already terminates the whole process by default -- so even without the explicit `sys.exit(1)`, this thread dying would kill the server; the original code's `sys.exit(1)` just made explicit what native-image already does implicitly. Confirmed via the same test client: with the `sys.exit(1)` removed, the exception is caught, printed to stderr/`.scalino-lsp.log` same as before, but the process stays alive -- and the *next* request that needs `drivers` (`didOpen`, `hover`, ...) hits the exact same exception again, this time inside `Main.scala`'s own per-request `try`/`catch` (already existed, unrelated to this fix), which reports it as a normal JSON-RPC error response for any real *request* (definition/hover/etc, all have an id) instead of a crash -- notifications (`didOpen`) still fail silently from the client's perspective (logged, no response channel exists for a notification), which is a known, smaller, remaining gap (no `window/showMessage` support at all currently -- would need a new outgoing-notification codec; not yet added, see "Remaining work" below).
 
    Also added a clearer error at the actual source (`drivers`, `DottyLanguageServer.scala`): checks `configFile.exists` explicitly and throws `FileNotFoundException(s"$IDE_CONFIG_FILE not found at $rootUri -- run \`scalino setup-ide <sources...>\` in the project root first")` instead of letting a bare `NoSuchFileException` propagate -- this toolchain's workflow requires a separate, explicit `scalino setup-ide` step before ever opening the editor (unlike Metals, which bootstraps this file itself via BSP), so a real user hitting this is far more likely here than it ever was for the tool this code was originally written for.
 
    Verified via the same test client both before (process dies, exit code 1, confirmed) and after (process survives `didOpen` against a config-less project, still responds correctly to a subsequent `shutdown` request) the fix. Patch: `patches/scala3-0002-trim-language-server.patch` (already the file that carries every other change to this same module).
+
+5. **Re-verified (2026-09-06): `references`/`rename`/`documentSymbol`/`workspace/symbol` against a real cross-file, multi-source single project** (the `lsp-trace-drive.py` run cited above already covered these against `build/lsp-trace-fixture`, but that fixture's exact shape wasn't re-checked cross-file at the time). Fresh two-file project (`Lib.scala`: `object Lib` with `def greet`/`case class Point`; `Main.scala`: `@main def run` calling both), driven by a small ad hoc Python client (`initialize`/`initialized`/two `didOpen`s/then each request): `references` on `greet`'s definition in `Lib.scala` correctly returned both the definition site *and* the call site in `Main.scala`; `documentSymbol` on `Lib.scala` correctly nested `Lib` → `greet`/`Point` → `Point`'s `x`/`y`/`norm`; `workspace/symbol` for `"Point"` found it; `rename` on `greet` returned a `WorkspaceEdit` with correct edits in *both* files (definition and call site). All four are real cross-file operations working correctly under the native-image binary. Still not covered: the `rpcDispatch`-era multi-*project*-driver case (two separate `.dotty-ide.json`-configured projects open in the same server, referencing each other) -- untested by both this pass and the original `lsp-trace-drive.py` run, since neither fixture sets up more than one project.
 
 ## Remaining work
 
