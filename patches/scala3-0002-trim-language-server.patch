@@ -12,7 +12,7 @@ index c0b7c3c1..00000000
 -trait DottyClient extends worksheet.WorksheetClient
 \ No newline at end of file
 diff --git a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
-index 78deb61b..3ba4c9e7 100644
+index 78deb61b..f1b5baef 100644
 --- a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
 +++ b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
 @@ -4,15 +4,8 @@ package languageserver
@@ -93,17 +93,28 @@ index 78deb61b..3ba4c9e7 100644
    private var myDrivers: mutable.Map[ProjectConfig, InteractiveDriver] = uninitialized
  
    private var myDependentProjects: mutable.Map[ProjectConfig, mutable.Set[ProjectConfig]] = uninitialized
-@@ -68,8 +68,7 @@ class DottyLanguageServer extends LanguageServer
+@@ -68,8 +68,18 @@ class DottyLanguageServer extends LanguageServer
      if myDrivers == null then
        assert(rootUri != null, "`drivers` cannot be called before `initialize`")
        val configFile = new File(new URI(rootUri + '/' + IDE_CONFIG_FILE))
 -      val configs: List[ProjectConfig] =
 -        JsonMapper.builder().build().readValue(configFile, classOf[Array[ProjectConfig]]).toList
++      // Unlike Metals (which bootstraps this file itself via BSP before the
++      // language server ever starts), scalino's workflow requires a separate,
++      // explicit `scalino setup-ide` run first -- a real user is much more
++      // likely to open a project before running that than to hit a missing/
++      // corrupt config under the original Metals-oriented flow this code was
++      // written for. A clear, actionable message here (instead of a bare
++      // `NoSuchFileException` whose stack trace only reaches a log file the
++      // user never looks at) is worth the special case.
++      if !configFile.exists then
++        throw FileNotFoundException(
++          s"$IDE_CONFIG_FILE not found at $rootUri -- run `scalino setup-ide <sources...>` in the project root first")
 +      val configs: List[ProjectConfig] = readFromArray(Files.readAllBytes(configFile.toPath))(using projectConfigListCodec)
  
        val defaultFlags = List("-color:never" /*, "-Yplain-printer","-Yprint-pos"*/)
  
-@@ -84,8 +83,8 @@ class DottyLanguageServer extends LanguageServer
+@@ -84,8 +94,8 @@ class DottyLanguageServer extends LanguageServer
          }
          val settings =
            defaultFlags ++
@@ -114,7 +125,7 @@ index 78deb61b..3ba4c9e7 100644
              .update("-classpath", (config.classDirectory +: config.dependencyClasspath).mkString(File.pathSeparator))
              .update("-sourcepath", config.sourceDirectories.mkString(File.pathSeparator))
          myDrivers(config) = new InteractiveDriver(settings)
-@@ -109,17 +108,18 @@ class DottyLanguageServer extends LanguageServer
+@@ -109,17 +119,18 @@ class DottyLanguageServer extends LanguageServer
  
    private def checkMemory() =
      if Memory.isCritical() then
@@ -136,7 +147,7 @@ index 78deb61b..3ba4c9e7 100644
        config
      }
    }
-@@ -129,7 +129,7 @@ class DottyLanguageServer extends LanguageServer
+@@ -129,7 +140,7 @@ class DottyLanguageServer extends LanguageServer
      drivers(configFor(uri))
    }
  
@@ -145,7 +156,7 @@ index 78deb61b..3ba4c9e7 100644
    def decompilerDriverFor(uri: URI, classPath: String): IDEDecompilerDriver = thisServer.synchronized {
      val config = configFor(uri)
      val defaultFlags = List("-color:never")
-@@ -143,7 +143,7 @@ class DottyLanguageServer extends LanguageServer
+@@ -143,7 +154,7 @@ class DottyLanguageServer extends LanguageServer
      }
      val settings =
        defaultFlags ++
@@ -154,7 +165,7 @@ index 78deb61b..3ba4c9e7 100644
          .update("-classpath", (classPath +: config.dependencyClasspath).mkString(File.pathSeparator))
      new IDEDecompilerDriver(settings)
    }
-@@ -167,96 +167,77 @@ class DottyLanguageServer extends LanguageServer
+@@ -167,96 +178,88 @@ class DottyLanguageServer extends LanguageServer
      myDependentProjects
    }
  
@@ -247,12 +258,23 @@ index 78deb61b..3ba4c9e7 100644
 -      .exceptionally { (ex: Throwable) =>
 -        ex.printStackTrace
 -        sys.exit(1)
++    //
++    // On failure (most commonly: no .dotty-ide.json yet, see `drivers`'s own
++    // check), just log it and return -- NOT `sys.exit`, unlike the original
++    // lsp4j-based code this was ported from (faithfully preserved through the
++    // rewrite, but wrong for scalino specifically: under GraalVM native-image,
++    // an uncaught exception on ANY thread terminates the whole process, so
++    // this used to kill the entire editor connection on a missing config
++    // instead of just failing this one request). Leaving `myDrivers` unset
++    // means the SAME exception surfaces again, cleanly, the next time
++    // anything (didOpen, hover, ...) actually needs `drivers` -- and that
++    // path already goes through `Main.scala`'s own per-request try/catch,
++    // which reports it as a normal LSP error response instead of a crash.
 +    val warmup = new Thread(() => {
 +      try { drivers; () }
 +      catch {
 +        case NonFatal(ex) =>
 +          ex.printStackTrace
-+          sys.exit(1)
        }
 +    })
 +    warmup.setDaemon(true)
@@ -298,7 +320,7 @@ index 78deb61b..3ba4c9e7 100644
      val worksheetMode = isWorksheet(uri)
  
      thisServer.synchronized  {
-@@ -265,47 +246,35 @@ class DottyLanguageServer extends LanguageServer
+@@ -265,47 +268,35 @@ class DottyLanguageServer extends LanguageServer
        val driver = driverFor(uri)
        implicit def ctx: Context = driver.currentCtx
  
@@ -357,7 +379,7 @@ index 78deb61b..3ba4c9e7 100644
      val items = driver.compilationUnits.get(uri) match {
        case Some(unit) =>
          val freshCtx = ctx.fresh.setCompilationUnit(unit)
-@@ -313,38 +282,37 @@ class DottyLanguageServer extends LanguageServer
+@@ -313,38 +304,37 @@ class DottyLanguageServer extends LanguageServer
        case None => Nil
      }
  
@@ -405,7 +427,7 @@ index 78deb61b..3ba4c9e7 100644
  
      val (definitions, originalSymbols) = {
        implicit def ctx: Context = driver.currentCtx
-@@ -370,22 +338,21 @@ class DottyLanguageServer extends LanguageServer
+@@ -370,22 +360,21 @@ class DottyLanguageServer extends LanguageServer
        }
      }.toList
  
@@ -433,7 +455,7 @@ index 78deb61b..3ba4c9e7 100644
        syms.flatMap { sym =>
          Interactive.findTreesMatching(trees, Include.all, sym, t => Interactive.sameName(t.name, withName))
        }
-@@ -402,17 +369,17 @@ class DottyLanguageServer extends LanguageServer
+@@ -402,17 +391,17 @@ class DottyLanguageServer extends LanguageServer
            findRenamedReferences(uriTrees, syms, nameTree.name)
  
          case _ =>
@@ -460,7 +482,7 @@ index 78deb61b..3ba4c9e7 100644
  
            val names = allSymbols.map(_.name.sourceModuleName).toSet
            val definitions = Interactive.findDefinitions(allSymbols, driver, include.isOverridden, includeExternal = true)
-@@ -433,18 +400,19 @@ class DottyLanguageServer extends LanguageServer
+@@ -433,18 +422,19 @@ class DottyLanguageServer extends LanguageServer
      val changes =
        refs.groupBy(ref => toUriOption(ref.source))
          .flatMap { case (uriOpt, refs) => uriOpt.map(uri => (uri.toString, refs)) }
@@ -486,7 +508,7 @@ index 78deb61b..3ba4c9e7 100644
      val uriTrees = driver.openedTrees(uri)
      val path = Interactive.pathTo(uriTrees, pos)
      val syms = Interactive.enclosingSourceSymbols(path, pos)
-@@ -452,39 +420,39 @@ class DottyLanguageServer extends LanguageServer
+@@ -452,39 +442,39 @@ class DottyLanguageServer extends LanguageServer
  
      syms.flatMap { sym =>
        val refs = Interactive.findTreesMatching(uriTrees, includes, sym)
@@ -537,7 +559,7 @@ index 78deb61b..3ba4c9e7 100644
      val driver = driverFor(uri)
      implicit def ctx: Context = driver.currentCtx
  
-@@ -501,14 +469,14 @@ class DottyLanguageServer extends LanguageServer
+@@ -501,14 +491,14 @@ class DottyLanguageServer extends LanguageServer
  
      val defs = Interactive.namedTrees(uriTrees, Include.local, excludeParamsFromSyntheticSymbols)
  
@@ -556,7 +578,7 @@ index 78deb61b..3ba4c9e7 100644
  
      drivers.values.toList.flatMap { driver =>
        implicit def ctx: Context = driver.currentCtx
-@@ -516,14 +484,14 @@ class DottyLanguageServer extends LanguageServer
+@@ -516,14 +506,14 @@ class DottyLanguageServer extends LanguageServer
        val trees = driver.sourceTreesContaining(query)
        val defs = Interactive.namedTrees(trees, Include.empty, _.name.toString.contains(query))
        defs.flatMap(d => symbolInfo(d.tree.symbol, d.namePos))
@@ -575,7 +597,7 @@ index 78deb61b..3ba4c9e7 100644
  
      val (definitions, originalSymbols) = {
        implicit def ctx: Context = driver.currentCtx
-@@ -547,40 +515,26 @@ class DottyLanguageServer extends LanguageServer
+@@ -547,40 +537,26 @@ class DottyLanguageServer extends LanguageServer
        }
      }.toList
  
@@ -623,7 +645,7 @@ index 78deb61b..3ba4c9e7 100644
    /**
     * Find the set of projects that have any of `definitions` on their classpath.
     *
-@@ -620,50 +574,20 @@ class DottyLanguageServer extends LanguageServer
+@@ -620,50 +596,20 @@ class DottyLanguageServer extends LanguageServer
        (remoteDriver, ctx, definitions)
      }
    }
@@ -677,7 +699,7 @@ index 78deb61b..3ba4c9e7 100644
          // `<=` to allow an offset to point to the end of the file
          case Some(offset) if offset <= source.content().length =>
            val p = Spans.Span(offset)
-@@ -674,42 +598,37 @@ object DottyLanguageServer {
+@@ -674,42 +620,37 @@ object DottyLanguageServer {
      else NoSourcePosition
    }
  
@@ -734,7 +756,7 @@ index 78deb61b..3ba4c9e7 100644
          }
        }
  
-@@ -717,8 +636,7 @@ object DottyLanguageServer {
+@@ -717,8 +658,7 @@ object DottyLanguageServer {
        if (displayMessage(message, dia.pos.source)) {
          val code = message.errorId.errorNumber.toString
          range(dia.pos).map(r =>
@@ -744,7 +766,7 @@ index 78deb61b..3ba4c9e7 100644
        } else {
          None
        }
-@@ -789,8 +707,8 @@ object DottyLanguageServer {
+@@ -789,8 +729,8 @@ object DottyLanguageServer {
     * @param position The position as seen by VSCode (before wrapping)
     * @return The position as seen by the compiler (after wrapping)
     */
@@ -755,7 +777,7 @@ index 78deb61b..3ba4c9e7 100644
    }
  
    /**
-@@ -829,56 +747,43 @@ object DottyLanguageServer {
+@@ -829,56 +769,43 @@ object DottyLanguageServer {
      symbol.isPackageObject
    }
  
@@ -831,7 +853,7 @@ index 78deb61b..3ba4c9e7 100644
      val buf = new StringBuilder
      typeInfo.foreach { info =>
        buf.append(s"""```scala
-@@ -890,52 +795,53 @@ object DottyLanguageServer {
+@@ -890,52 +817,53 @@ object DottyLanguageServer {
        buf.append(comment.renderAsMarkdown)
      }
  
@@ -907,7 +929,7 @@ index 78deb61b..3ba4c9e7 100644
      val paramInfoss =
        (signature.paramss.flatten).map(paramToParameterInformation)
      val paramLists =
-@@ -955,18 +861,13 @@ object DottyLanguageServer {
+@@ -955,18 +883,13 @@ object DottyLanguageServer {
          }.mkString
      val returnTypeLabel = signature.returnType.map(t => s": $t").getOrElse("")
      val label = s"${signature.name}$paramLists$returnTypeLabel"
@@ -1855,7 +1877,7 @@ index 00000000..41f99a68
 +  }
 +}
 diff --git a/language-server/src/dotty/tools/languageserver/Main.scala b/language-server/src/dotty/tools/languageserver/Main.scala
-index 7f269eec..9ae852f9 100644
+index 7f269eec..4a6380ea 100644
 --- a/language-server/src/dotty/tools/languageserver/Main.scala
 +++ b/language-server/src/dotty/tools/languageserver/Main.scala
 @@ -1,28 +1,57 @@

@@ -69,7 +69,7 @@ trimmed by `patches/scala3-0002-trim-language-server.patch`). No DAP/debug
 and out of scope) and no auto-download (`scalino-lsp` isn't published
 anywhere generic -- it's this repo's own build output).
 
-Untested against real Zed end-to-end as of this writing -- only verified via
-raw stdio process-tree inspection (see `docs/findings.md`). If `initialize`
-fails or a request hangs, `dev: open language server logs` is the first
-place to look.
+Verified against real Zed end-to-end (see `docs/findings.md`'s "JVM-free
+language server (LSP)" section for the bugs that surfaced this way and how
+they were fixed). If `initialize` fails or a request hangs, `dev: open
+language server logs` is the first place to look.

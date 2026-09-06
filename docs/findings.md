@@ -639,15 +639,18 @@ specifically of `completion`/`references`/`rename`/`documentSymbol`/
 workspace `symbol` beyond the `lsp-trace-drive.py` run above (that run was
 against the native binary, so this is largely already covered — just
 noting it wasn't independently re-checked against real Zed yet, only via
-the offline harness); the pre-existing missing-`.dotty-ide.json`
-whole-process crash (`DottyLanguageServer.drivers()` still uses
-`readFromArray`/`Files.readAllBytes` uncaught, same failure shape as
-before, just Jackson's `FileNotFoundException` swapped for a plain one);
-whether `rpcDispatch`-era per-project multi-driver behavior (`references`/
-`rename`/`implementation` across dependent projects) still works
-correctly now that a single worker thread processes requests serially
-(should be equivalent to the old `thisServer.synchronized`-everywhere
-behavior, but only exercised so far by the single-project trace fixture).
+the offline harness); whether `rpcDispatch`-era per-project multi-driver
+behavior (`references`/`rename`/`implementation` across dependent
+projects) still works correctly now that a single worker thread processes
+requests serially (should be equivalent to the old
+`thisServer.synchronized`-everywhere behavior, but only exercised so far
+by the single-project trace fixture).
+
+4. **Fixed (2026-09-06): the missing-`.dotty-ide.json` whole-process crash flagged above.** Root cause, once actually traced (a real, minimal Python LSP client -- send `initialize`/`initialized`/`didOpen` against a project with no config file, watch whether the process survives -- settled this far faster than reasoning about it further): `DottyLanguageServer.initialize`'s "warmup" thread (`new Thread(() => { try { drivers; () } catch { case NonFatal(ex) => ex.printStackTrace; sys.exit(1) } })`) calls `sys.exit(1)` on ANY warmup failure -- faithfully ported from the *original* lsp4j-based code's `CompletableFuture(...).exceptionally { ex => ex.printStackTrace; sys.exit(1) }`, so this isn't a regression the rewrite introduced, it's real upstream dotty behavior. Under GraalVM native-image, an uncaught exception on *any* thread (not just the main one) already terminates the whole process by default -- so even without the explicit `sys.exit(1)`, this thread dying would kill the server; the original code's `sys.exit(1)` just made explicit what native-image already does implicitly. Confirmed via the same test client: with the `sys.exit(1)` removed, the exception is caught, printed to stderr/`.scalino-lsp.log` same as before, but the process stays alive -- and the *next* request that needs `drivers` (`didOpen`, `hover`, ...) hits the exact same exception again, this time inside `Main.scala`'s own per-request `try`/`catch` (already existed, unrelated to this fix), which reports it as a normal JSON-RPC error response for any real *request* (definition/hover/etc, all have an id) instead of a crash -- notifications (`didOpen`) still fail silently from the client's perspective (logged, no response channel exists for a notification), which is a known, smaller, remaining gap (no `window/showMessage` support at all currently -- would need a new outgoing-notification codec; not yet added, see "Remaining work" below).
+
+   Also added a clearer error at the actual source (`drivers`, `DottyLanguageServer.scala`): checks `configFile.exists` explicitly and throws `FileNotFoundException(s"$IDE_CONFIG_FILE not found at $rootUri -- run \`scalino setup-ide <sources...>\` in the project root first")` instead of letting a bare `NoSuchFileException` propagate -- this toolchain's workflow requires a separate, explicit `scalino setup-ide` step before ever opening the editor (unlike Metals, which bootstraps this file itself via BSP), so a real user hitting this is far more likely here than it ever was for the tool this code was originally written for.
+
+   Verified via the same test client both before (process dies, exit code 1, confirmed) and after (process survives `didOpen` against a config-less project, still responds correctly to a subsequent `shutdown` request) the fix. Patch: `patches/scala3-0002-trim-language-server.patch` (already the file that carries every other change to this same module).
 
 ## Remaining work
 
