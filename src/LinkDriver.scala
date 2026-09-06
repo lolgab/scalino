@@ -19,12 +19,64 @@ object LinkDriver:
       msg => System.err.println(s"[error] $msg")
     )
 
+  /** Everything past the 6 required positional args (cp, workDir, mainClass,
+   *  clang, clang++, logLevel) is flag-style, one flag per `//> using
+   *  native*`/`--native-*` option resolved by ScalinoCli's own NativeOpts --
+   *  see cli/ScalinoCli.scala's buildBinary for the argv this is parsing. */
+  case class Opts(
+    mode: Option[String] = None,
+    gc: Option[String] = None,
+    lto: Option[String] = None,
+    target: Option[String] = None,
+    embedResources: Boolean = false,
+    multithreading: Boolean = false,
+    linking: List[String] = Nil,
+    compile: List[String] = Nil,
+    cCompile: List[String] = Nil,
+    cppCompile: List[String] = Nil
+  )
+
+  def parseOpts(rest: Array[String]): Opts =
+    var o = Opts()
+    var i = 0
+    while i < rest.length do
+      rest(i) match
+        case "--mode" => o = o.copy(mode = Some(rest(i + 1))); i += 1
+        case "--gc" => o = o.copy(gc = Some(rest(i + 1))); i += 1
+        case "--lto" => o = o.copy(lto = Some(rest(i + 1))); i += 1
+        case "--target" => o = o.copy(target = Some(rest(i + 1))); i += 1
+        case "--embed-resources" => o = o.copy(embedResources = true)
+        case "--multithreading" => o = o.copy(multithreading = true)
+        case "--linking" => o = o.copy(linking = o.linking :+ rest(i + 1)); i += 1
+        case "--compile" => o = o.copy(compile = o.compile :+ rest(i + 1)); i += 1
+        case "--c-compile" => o = o.copy(cCompile = o.cCompile :+ rest(i + 1)); i += 1
+        case "--cpp-compile" => o = o.copy(cppCompile = o.cppCompile :+ rest(i + 1)); i += 1
+        case other => System.err.println(s"scalino-linkdriver: ignoring unknown flag '$other'")
+      i += 1
+    o
+
+  def parseBuildTarget(s: String): BuildTarget = s match
+    case "app" | "application" => BuildTarget.application
+    case "static" | "library-static" => BuildTarget.libraryStatic
+    case "dynamic" | "library-dynamic" => BuildTarget.libraryDynamic
+    case other => throw new IllegalArgumentException(s"Unknown native target: '$other' (expected app|static|dynamic)")
+
   def main(args: Array[String]): Unit =
     val cp = args(0).split(":").toSeq.map(Paths.get(_))
     val workDir = Paths.get(args(1))
     val mainClass = args(2)
     val logLevel = if args.length > 5 then args(5) else "info"
     val logger = loggerFor(logLevel)
+    val opts = parseOpts(if args.length > 6 then args.drop(6) else Array.empty)
+
+    def die(msg: String): Nothing =
+      System.err.println(s"scalino-linkdriver: $msg")
+      sys.exit(1)
+
+    val mode = try opts.mode.map(Mode.apply).getOrElse(Mode.default) catch case e: IllegalArgumentException => die(e.getMessage)
+    val gc = try opts.gc.map(GC.apply).getOrElse(GC.default) catch case e: IllegalArgumentException => die(e.getMessage)
+    val lto = try opts.lto.map(LTO.apply).getOrElse(LTO.default) catch case e: IllegalArgumentException => die(e.getMessage)
+    val target = try opts.target.map(parseBuildTarget).getOrElse(BuildTarget.default) catch case e: IllegalArgumentException => die(e.getMessage)
 
     val config = Config.empty
       .withBaseDir(workDir)
@@ -42,9 +94,20 @@ object LinkDriver:
           // are actually findable; without this, linking anything that
           // needs a Homebrew-installed system lib fails with "library
           // 'x' not found" even though the same project links fine
-          // under real scala-cli on the same machine.
-          .withLinkingOptions(Discover.linkingOptions())
-          .withCompileOptions(Discover.compileOptions())
+          // under real scala-cli on the same machine. User-supplied
+          // `--linking`/`--compile` (from `//> using nativeLinking`/
+          // `nativeCompile`) are appended on top, not substituted in
+          // place of, these defaults.
+          .withLinkingOptions(Discover.linkingOptions() ++ opts.linking)
+          .withCompileOptions(Discover.compileOptions() ++ opts.compile)
+          .withCOptions(opts.cCompile)
+          .withCppOptions(opts.cppCompile)
+          .withMode(mode)
+          .withGC(gc)
+          .withLTO(lto)
+          .withBuildTarget(target)
+          .withEmbedResources(opts.embedResources)
+          .withMultithreading(if opts.multithreading then Some(true) else None)
       )
 
     val outPath = Scope.apply[java.nio.file.Path] { (s: Scope) =>

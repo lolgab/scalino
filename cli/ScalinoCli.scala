@@ -110,7 +110,19 @@ object ScalinoCli:
     scalaVersion: Option[String],
     mainClass: Option[String],
     options: List[String],
-    testFramework: Option[String]
+    testFramework: Option[String],
+    nativeMode: Option[String],
+    nativeGc: Option[String],
+    nativeLto: Option[String],
+    nativeClang: Option[String],
+    nativeClangPP: Option[String],
+    nativeLinking: List[String],
+    nativeCompile: List[String],
+    nativeCCompile: List[String],
+    nativeCppCompile: List[String],
+    nativeTarget: Option[String],
+    nativeEmbedResources: Option[Boolean],
+    nativeMultithreading: Option[Boolean]
   )
 
   private val quotedRe = """"([^"]*)"""".r
@@ -122,7 +134,15 @@ object ScalinoCli:
    *  flagged instead of silently doing nothing. */
   private val recognizedDirectiveKeys = Set(
     "dep", "deps", "compileOnly.dep", "compileOnly.deps", "test.dep", "test.deps",
-    "scala", "mainClass", "options", "option", "testFramework", "test.framework"
+    "scala", "mainClass", "options", "option", "testFramework", "test.framework",
+    "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
+    "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativeTarget",
+    "nativeEmbedResources", "nativeMultithreading"
+    // deliberately NOT "nativeVersion": this toolchain only ever targets the
+    // one pinned scala-native version it was built for (see the "scala"
+    // directive's own version-mismatch warning below for the same reason) --
+    // an unrecognized "nativeVersion" directive falls through to the generic
+    // unsupported-directive warning instead.
   )
   private val anyDirectiveKeyRe = """//>\s*using\s+(\S+)""".r
 
@@ -143,6 +163,15 @@ object ScalinoCli:
       }
     }.nextOption()
 
+  /** Same as `directiveValues`, for the handful of boolean-valued directives
+   *  (`nativeEmbedResources`/`nativeMultithreading`) -- `//> using nativeMultithreading true`
+   *  (or a bare `//> using nativeMultithreading` with no value, treated as `true`). */
+  private def directiveBool(line: String, keys: String*): Option[Boolean] =
+    directiveValues(line, keys*).map(_.headOption.map(_.trim.toLowerCase)).flatMap {
+      case Some("false") => Some(false)
+      case Some(_) | None => Some(true)
+    }
+
   def parseDirectives(sources: List[Path]): Directives =
     var deps = List.empty[String]
     var compileOnlyDeps = List.empty[String]
@@ -151,6 +180,18 @@ object ScalinoCli:
     var mainClass = Option.empty[String]
     var options = List.empty[String]
     var testFramework = Option.empty[String]
+    var nativeMode = Option.empty[String]
+    var nativeGc = Option.empty[String]
+    var nativeLto = Option.empty[String]
+    var nativeClang = Option.empty[String]
+    var nativeClangPP = Option.empty[String]
+    var nativeLinking = List.empty[String]
+    var nativeCompile = List.empty[String]
+    var nativeCCompile = List.empty[String]
+    var nativeCppCompile = List.empty[String]
+    var nativeTarget = Option.empty[String]
+    var nativeEmbedResources = Option.empty[Boolean]
+    var nativeMultithreading = Option.empty[Boolean]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must be a comment-only line, `//>` as its first
     // non-blank characters -- NOT just "contains `//>` anywhere". An
@@ -174,7 +215,24 @@ object ScalinoCli:
         directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
         directiveValues(line, "options", "option").foreach(vs => options = options ++ vs)
         directiveValues(line, "testFramework", "test.framework").foreach(_.headOption.foreach(v => testFramework = Some(v)))
-    Directives(deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework)
+        directiveValues(line, "nativeMode").foreach(_.headOption.foreach(v => nativeMode = Some(v)))
+        directiveValues(line, "nativeGc").foreach(_.headOption.foreach(v => nativeGc = Some(v)))
+        directiveValues(line, "nativeLto").foreach(_.headOption.foreach(v => nativeLto = Some(v)))
+        directiveValues(line, "nativeClang").foreach(_.headOption.foreach(v => nativeClang = Some(v)))
+        directiveValues(line, "nativeClangPP", "nativeClangPp").foreach(_.headOption.foreach(v => nativeClangPP = Some(v)))
+        directiveValues(line, "nativeLinking").foreach(vs => nativeLinking = nativeLinking ++ vs)
+        directiveValues(line, "nativeCompile").foreach(vs => nativeCompile = nativeCompile ++ vs)
+        directiveValues(line, "nativeCCompile").foreach(vs => nativeCCompile = nativeCCompile ++ vs)
+        directiveValues(line, "nativeCppCompile").foreach(vs => nativeCppCompile = nativeCppCompile ++ vs)
+        directiveValues(line, "nativeTarget").foreach(_.headOption.foreach(v => nativeTarget = Some(v)))
+        directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
+        directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
+    Directives(
+      deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
+      nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
+      nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile,
+      nativeTarget, nativeEmbedResources, nativeMultithreading
+    )
 
   /** scala-cli's three dependency formats:
    *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
@@ -1126,6 +1184,47 @@ object ScalinoCli:
     else
       Files.deleteIfExists(manifestPath)
 
+  /** User-facing Scala Native build settings, resolved from `//> using
+   *  native*` directives and/or `--native-*` CLI flags (directives win --
+   *  same precedence as `explicitMainClass`/`options` above) and forwarded to
+   *  dist/scalino-linkdriver as extra flag-style argv (see LinkDriver.scala's
+   *  own parser). No `nativeVersion`: this toolchain only ever targets the
+   *  one pinned scala-native version it was built for. */
+  case class NativeOpts(
+    mode: Option[String] = None,
+    gc: Option[String] = None,
+    lto: Option[String] = None,
+    clang: Option[String] = None,
+    clangpp: Option[String] = None,
+    target: Option[String] = None,
+    embedResources: Boolean = false,
+    multithreading: Boolean = false,
+    linking: List[String] = Nil,
+    compile: List[String] = Nil,
+    cCompile: List[String] = Nil,
+    cppCompile: List[String] = Nil
+  )
+
+  /** Directives win over the equivalent `--native-*` CLI flag for
+   *  single-valued settings (matches `explicitMainClass`'s own precedence);
+   *  list-valued and boolean settings combine both sources instead, matching
+   *  how `options`/`deps` already combine directive and CLI values above. */
+  def resolveNativeOpts(directives: Directives, o: RunOpts): NativeOpts =
+    NativeOpts(
+      mode = directives.nativeMode.orElse(o.cliNativeMode),
+      gc = directives.nativeGc.orElse(o.cliNativeGc),
+      lto = directives.nativeLto.orElse(o.cliNativeLto),
+      clang = directives.nativeClang.orElse(o.cliNativeClang),
+      clangpp = directives.nativeClangPP.orElse(o.cliNativeClangpp),
+      target = directives.nativeTarget.orElse(o.cliNativeTarget),
+      embedResources = directives.nativeEmbedResources.getOrElse(false) || o.cliEmbedResources,
+      multithreading = directives.nativeMultithreading.getOrElse(false) || o.cliNativeMultithreading,
+      linking = directives.nativeLinking ++ o.cliNativeLinking,
+      compile = directives.nativeCompile ++ o.cliNativeCompile,
+      cCompile = directives.nativeCCompile ++ o.cliNativeCCompile,
+      cppCompile = directives.nativeCppCompile ++ o.cliNativeCppCompile
+    )
+
   def buildBinary(
     sources: List[Path],
     explicitMainClass: Option[String],
@@ -1134,7 +1233,8 @@ object ScalinoCli:
     extraOptions: List[String] = Nil,
     extraCompileOnlyClasspath: String = "",
     logLevel: String = "info",
-    incremental: Boolean = true
+    incremental: Boolean = true,
+    nativeOpts: NativeOpts = NativeOpts()
   ): String =
     val classesDir = Paths.get(".scalino-build", "_scratch", "classes")
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
@@ -1146,11 +1246,23 @@ object ScalinoCli:
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir:${cc.nativelibsCp}"
       else s"$classesDir:${cc.nativelibsCp}:$extraClasspath"
-    val clang = findOnPath("clang")
-    val clangpp = findOnPath("clang++")
+    val clang = nativeOpts.clang.getOrElse(findOnPath("clang"))
+    val clangpp = nativeOpts.clangpp.getOrElse(findOnPath("clang++"))
+
+    val nativeFlags =
+      nativeOpts.mode.toList.flatMap(v => List("--mode", v)) ++
+      nativeOpts.gc.toList.flatMap(v => List("--gc", v)) ++
+      nativeOpts.lto.toList.flatMap(v => List("--lto", v)) ++
+      nativeOpts.target.toList.flatMap(v => List("--target", v)) ++
+      (if nativeOpts.embedResources then List("--embed-resources") else Nil) ++
+      (if nativeOpts.multithreading then List("--multithreading") else Nil) ++
+      nativeOpts.linking.flatMap(v => List("--linking", v)) ++
+      nativeOpts.compile.flatMap(v => List("--compile", v)) ++
+      nativeOpts.cCompile.flatMap(v => List("--c-compile", v)) ++
+      nativeOpts.cppCompile.flatMap(v => List("--cpp-compile", v))
 
     val linkExit = runInherited(
-      List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel)
+      List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel) ++ nativeFlags
     )
     if linkExit != 0 then fail("linking failed")
 
@@ -1226,6 +1338,21 @@ object ScalinoCli:
          |  -- <args...>               program args (run) or test-framework filter args (test),
          |                             e.g. `scalino test . -- "*MySuite*"` (munit/utest-style filter)
          |
+         |Scala Native options (no --native-version -- this toolchain only ever
+         |targets the one pinned scala-native version it was built for):
+         |  --native-mode <mode>       debug|release-fast|release-size|release-full (debug by default)
+         |  --native-gc <gc>           immix|commix|boehm|none (immix by default)
+         |  --native-lto <lto>         none|thin|full (none by default)
+         |  --native-clang <path>      path to the clang command (autodetected from PATH by default)
+         |  --native-clangpp <path>    path to the clang++ command (autodetected from PATH by default)
+         |  --native-linking <opt>     extra option passed to clang verbatim during linking (repeatable)
+         |  --native-compile <opt>     extra compile option, all sources (repeatable)
+         |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
+         |  --native-cpp-compile <opt> extra compile option, C++ files only (repeatable)
+         |  --native-target <target>  app|static|dynamic (app by default)
+         |  --embed-resources          embed resources into the binary (readable via the Java resources API)
+         |  --native-multithreading    enable Scala Native multithreading support
+         |
          |directives (in source files), one per line:
          |  //> using dep "org::name:version"
          |  //> using compileOnly.dep "org::name:version"
@@ -1234,6 +1361,18 @@ object ScalinoCli:
          |  //> using scala "3.x"
          |  //> using mainClass "Foo"
          |  //> using options "-flag1", "-flag2"
+         |  //> using nativeMode "release-fast"
+         |  //> using nativeGc "immix"
+         |  //> using nativeLto "thin"
+         |  //> using nativeClang "/path/to/clang"
+         |  //> using nativeClangPP "/path/to/clang++"
+         |  //> using nativeLinking "-L/opt/homebrew/lib"
+         |  //> using nativeCompile "-flag"
+         |  //> using nativeCCompile "-flag"
+         |  //> using nativeCppCompile "-flag"
+         |  //> using nativeTarget "application"   (application|library-dynamic|library-static)
+         |  //> using nativeEmbedResources true
+         |  //> using nativeMultithreading true
          |
          |`test` auto-detects the test framework structurally (scans the resolved
          |test classpath for a class implementing sbt.testing.Framework -- no
@@ -1267,7 +1406,19 @@ object ScalinoCli:
     verbose: Boolean = false,
     quiet: Boolean = false,
     testFrameworkOpt: Option[String] = None,
-    noIncremental: Boolean = false
+    noIncremental: Boolean = false,
+    cliNativeMode: Option[String] = None,
+    cliNativeGc: Option[String] = None,
+    cliNativeLto: Option[String] = None,
+    cliNativeClang: Option[String] = None,
+    cliNativeClangpp: Option[String] = None,
+    cliNativeTarget: Option[String] = None,
+    cliNativeLinking: List[String] = Nil,
+    cliNativeCompile: List[String] = Nil,
+    cliNativeCCompile: List[String] = Nil,
+    cliNativeCppCompile: List[String] = Nil,
+    cliEmbedResources: Boolean = false,
+    cliNativeMultithreading: Boolean = false
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (raw
     // clang/linker invocations, NativeConfig dumps), the default ("info")
@@ -1294,6 +1445,20 @@ object ScalinoCli:
         case "-q" | "--quiet" => o = o.copy(quiet = true)
         case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
         case "--no-incremental" => o = o.copy(noIncremental = true)
+        case "--native-version" =>
+          die("--native-version is not supported -- this toolchain only ever targets the one pinned scala-native version it was built for")
+        case "--native-mode" => o = o.copy(cliNativeMode = Some(args(i + 1))); i += 1
+        case "--native-gc" => o = o.copy(cliNativeGc = Some(args(i + 1))); i += 1
+        case "--native-lto" => o = o.copy(cliNativeLto = Some(args(i + 1))); i += 1
+        case "--native-clang" => o = o.copy(cliNativeClang = Some(args(i + 1))); i += 1
+        case "--native-clangpp" => o = o.copy(cliNativeClangpp = Some(args(i + 1))); i += 1
+        case "--native-target" => o = o.copy(cliNativeTarget = Some(args(i + 1))); i += 1
+        case "--native-linking" => o = o.copy(cliNativeLinking = o.cliNativeLinking :+ args(i + 1)); i += 1
+        case "--native-compile" => o = o.copy(cliNativeCompile = o.cliNativeCompile :+ args(i + 1)); i += 1
+        case "--native-c-compile" => o = o.copy(cliNativeCCompile = o.cliNativeCCompile :+ args(i + 1)); i += 1
+        case "--native-cpp-compile" => o = o.copy(cliNativeCppCompile = o.cliNativeCppCompile :+ args(i + 1)); i += 1
+        case "--embed-resources" => o = o.copy(cliEmbedResources = true)
+        case "--native-multithreading" => o = o.copy(cliNativeMultithreading = true)
         case f if f.startsWith("-") => die(s"unknown option: $f")
         case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
@@ -1318,15 +1483,16 @@ object ScalinoCli:
     val extraCompileOnlyClasspath = resolveDeps(directives.compileOnlyDeps, depsCache)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
+    val nativeOpts = resolveNativeOpts(directives, o)
 
     mode match
       case "run" =>
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts)
         runInherited(binPathFor(mainClass).toString :: o.progArgs)
       case "compile" =>
         val outPath = Paths.get(o.out.getOrElse(fail("-o <output> is required for `scalino compile`")))
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, _ => outPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, _ => outPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts)
         if !o.quiet then println(s"scalino: wrote $outPath (main class: $mainClass)")
         0
 
@@ -1436,7 +1602,7 @@ object ScalinoCli:
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
-        buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental)
+        buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, resolveNativeOpts(directives, o))
         runInherited(binPath.toString :: o.progArgs)
 
     if o.watch then
