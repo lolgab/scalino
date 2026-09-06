@@ -955,10 +955,10 @@ index 78deb61b..f1b5baef 100644
  }
 diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
 new file mode 100644
-index 00000000..41f99a68
+index 00000000..93654d13
 --- /dev/null
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,930 @@
 +package dotty.tools
 +package languageserver
 +
@@ -1034,6 +1034,8 @@ index 00000000..41f99a68
 +  final case class SignatureHelp(signatures: List[SignatureInformation], activeParameter: Int, activeSignature: Int)
 +  final case class Diagnostic(range: Range, message: String, severity: Int, source: String, code: String)
 +  final case class PublishDiagnosticsParams(uri: String, diagnostics: List[Diagnostic])
++  /** `window/showMessage`'s `type`: 1 = Error, 2 = Warning, 3 = Info, 4 = Log. */
++  final case class ShowMessageParams(`type`: Int, message: String)
 +
 +  // -- .dotty-ide.json (replaces config.ProjectConfig + Jackson) -----------
 +
@@ -1690,6 +1692,17 @@ index 00000000..41f99a68
 +    }
 +  }
 +
++  given showMessageParamsCodec: JsonValueCodec[ShowMessageParams] = new JsonValueCodec[ShowMessageParams] {
++    def nullValue: ShowMessageParams = null
++    def decodeValue(in: JsonReader, default: ShowMessageParams): ShowMessageParams = ???
++    def encodeValue(x: ShowMessageParams, out: JsonWriter): Unit = {
++      out.writeObjectStart()
++      out.writeNonEscapedAsciiKey("type"); out.writeVal(x.`type`)
++      out.writeNonEscapedAsciiKey("message"); out.writeVal(x.message)
++      out.writeObjectEnd()
++    }
++  }
++
 +  // -- Locations/SymbolInformation lists carry their own top-level codec
 +  //    (used directly as a request's whole `result`) --------------------
 +
@@ -1877,7 +1890,7 @@ index 00000000..41f99a68
 +  }
 +}
 diff --git a/language-server/src/dotty/tools/languageserver/Main.scala b/language-server/src/dotty/tools/languageserver/Main.scala
-index 7f269eec..4a6380ea 100644
+index 7f269eec..06535fc0 100644
 --- a/language-server/src/dotty/tools/languageserver/Main.scala
 +++ b/language-server/src/dotty/tools/languageserver/Main.scala
 @@ -1,28 +1,57 @@
@@ -1948,7 +1961,7 @@ index 7f269eec..4a6380ea 100644
          }
        case _ =>
          Console.err.println("Invalid arguments: expected \"-stdio\" or \"-client_command ...\"")
-@@ -30,22 +59,169 @@ object Main {
+@@ -30,22 +59,176 @@ object Main {
      }
    }
  
@@ -1986,6 +1999,12 @@ index 7f269eec..4a6380ea 100644
 +      writeFramed(writeToArray(ErrorEnvelope(idRaw, InternalErrorCode, message)))
 +    def sendNotification(method: String, paramsBytes: Array[Byte]): Unit =
 +      writeFramed(writeToArray(NotificationEnvelope(method, paramsBytes)))
++    // Error type = 1, see ShowMessageParams's doc comment (Lsp.scala) --
++    // used below so a failed *notification* (didOpen/didChange/didClose,
++    // none of which have a response channel to carry an error back on) is
++    // still visible in the editor, not just logged to .scalino-lsp.log.
++    def sendShowMessage(message: String): Unit =
++      sendNotification("window/showMessage", writeToArray(ShowMessageParams(1, message))(using showMessageParamsCodec))
 +
 +    val server = new DottyLanguageServer(
 +      publishDiagnostics = (uri, diags) =>
@@ -2072,6 +2091,7 @@ index 7f269eec..4a6380ea 100644
 +          Log(s"<- ${env.method} FAILED: ${t.getClass.getName}: ${t.getMessage}")
 +          t.printStackTrace()
 +          if (isRequest) sendError(env.idRaw, s"${t.getClass.getName}: ${t.getMessage}")
++          else sendShowMessage(s"scalino-lsp: ${env.method} failed: ${t.getClass.getName}: ${t.getMessage}")
 +      }
 +    }
 +
