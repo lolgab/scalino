@@ -1,0 +1,55 @@
+name: Publish apt/dnf repo
+
+# Rebuilds the static apt+dnf repo (build/11-build-apt-dnf-repo.sh) from
+# every .deb/.rpm ever published to this repo's Releases, and deploys it to
+# GitHub Pages -- so `apt install`/`dnf install` work directly, no manual
+# tarball download.
+#
+# PREREQUISITE, not yet done as of this workflow landing: GitHub Pages must
+# be enabled for this repo with "Build and deployment: GitHub Actions" as
+# the source (Settings -> Pages). That in turn needs either the repo to be
+# public, or a paid plan that supports Pages on a private repo -- GitHub
+# Free does not (confirmed via `gh api -X POST repos/OWNER/REPO/pages` ->
+# 422 "Your current plan does not support GitHub Pages for this
+# repository." while this repo is private). Until Pages is enabled, this
+# workflow's deploy step will fail -- that's expected, not a bug here.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install repo-building tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gnupg dpkg-dev apt-utils createrepo-c rpm
+
+      - name: Build apt/dnf repo tree
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: ./build/11-build-apt-dnf-repo.sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deployment

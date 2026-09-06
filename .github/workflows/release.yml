@@ -74,6 +74,37 @@ jobs:
             assets/*.tar.gz.sha256
           if-no-files-found: error
 
+      # .deb/.rpm are an alternative to the tarball for apt/dnf users --
+      # native package manager install (clang pulled in as a real dependency)
+      # instead of tarball+install.sh. Linux only: fpm's rpm backend shells
+      # out to rpmbuild, which isn't installed/tested on the macOS/Windows
+      # legs here.
+      - name: Package .deb/.rpm (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y rpm
+          gem install --no-document fpm
+          case "${{ matrix.target }}" in
+            linux-x86_64) deb_arch=amd64; rpm_arch=x86_64 ;;
+            linux-arm64)  deb_arch=arm64; rpm_arch=aarch64 ;;
+          esac
+          tag="${{ inputs.tag || github.ref_name }}"
+          ./build/09-package-linux-native.sh "$tag" "$deb_arch" "$rpm_arch"
+          ( cd assets && for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: dist-${{ matrix.target }}-native-pkgs
+          path: |
+            assets/*.deb
+            assets/*.deb.sha256
+            assets/*.rpm
+            assets/*.rpm.sha256
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub release
     needs: build
@@ -97,3 +128,7 @@ jobs:
           files: |
             assets/*.tar.gz
             assets/*.tar.gz.sha256
+            assets/*.deb
+            assets/*.deb.sha256
+            assets/*.rpm
+            assets/*.rpm.sha256

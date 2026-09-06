@@ -27,6 +27,49 @@ both x86_64 and arm64 -- download it, extract it, and use `scalino`/`dist/scalin
 as described below. Windows support is experimental/best-effort -- see
 [`docs/findings.md`](docs/findings.md).
 
+### Linux package managers
+
+Every tagged release also publishes `.deb`/`.rpm` assets (built via
+[`fpm`](https://github.com/jordansissel/fpm), see
+`build/09-package-linux-native.sh`) alongside the tarballs -- `clang` is
+declared as a real package dependency, so it's pulled in automatically:
+
+```
+# Debian/Ubuntu
+curl -fsSLO https://github.com/lolgab/scalino/releases/download/vX.Y.Z/scalino_X.Y.Z_amd64.deb
+sudo apt install ./scalino_X.Y.Z_amd64.deb
+
+# Fedora/RHEL/openSUSE
+sudo dnf install https://github.com/lolgab/scalino/releases/download/vX.Y.Z/scalino-X.Y.Z-1.x86_64.rpm
+```
+
+Both install `scalino`/`scalino-lsp` under `/usr/lib/scalino/` with symlinks
+in `/usr/bin/`, same relocatable layout as the tarball.
+
+There's also a real, GPG-signed apt/dnf repo (`.github/workflows/publish-repo.yml`
++ `build/11-build-apt-dnf-repo.sh`) so `apt install`/`dnf install` work
+without a manual download, once
+[GitHub Pages is enabled](https://github.com/lolgab/scalino/settings/pages)
+for this repo (blocked while it's private -- GitHub's free plan doesn't
+support Pages on private repos) -- see that workflow's own header comment.
+The signing key (`packaging/apt-dnf-repo/scalino-signing-key.pub.asc`) is
+already generated and stored as the `APT_GPG_PRIVATE_KEY` repo secret.
+
+Also in the repo, versioned by `build/10-update-package-metadata.sh` after
+each release (not yet published to their respective communities -- these are
+ready to submit, see each file's own header comment for what's still
+manual):
+- [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) -- `scalino-bin` for
+  the AUR, wraps the linux-x86_64/linux-arm64 tarball.
+- [`packaging/nix/flake.nix`](packaging/nix/flake.nix) -- `nix run
+  github:lolgab/scalino?dir=packaging/nix`, patches the release binaries'
+  ELF interpreter/rpath via `autoPatchelfHook` instead of rebuilding from
+  source.
+- [`packaging/homebrew/scalino.rb`](packaging/homebrew/scalino.rb) -- for a
+  future `lolgab/homebrew-scalino` tap (not homebrew-core -- that requires
+  building from source, which needs this project's own transient
+  GraalVM/native-image build step).
+
 Either way, two things are still required on the machine you *run* this on
 (not bundled -- both are pre-existing standalone binaries, not a JVM, so
 they don't compromise the "no JVM to write Scala" goal, but they're real
@@ -133,10 +176,18 @@ against the real editor as of this writing.
 
 Maintainers: push a `vX.Y.Z` tag and the [release workflow](.github/workflows/release.yml)
 builds `dist/` on every supported platform/arch and publishes a GitHub Release
-with one tarball per target. A platform that fails to build doesn't block the
-others — check the workflow run for which targets actually shipped.
+with one tarball per target, plus `.deb`/`.rpm` for the two Linux targets. A
+platform that fails to build doesn't block the others — check the workflow
+run for which targets actually shipped.
 
 ```
 git tag vX.Y.Z
 git push origin vX.Y.Z
+```
+
+Once that release has actually published its assets, refresh the third-party
+packaging metadata (Arch/Nix/Homebrew, see above) and commit the result:
+
+```
+./build/10-update-package-metadata.sh vX.Y.Z
 ```
