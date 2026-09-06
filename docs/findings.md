@@ -285,11 +285,48 @@ bodies, so code that actually *called into* it would fail at the link step
 with unreachable symbols, same as it would under real scala-cli targeting
 `--native` with a JVM-only dependency.
 
-Not implemented: watch mode, incremental Scala compilation (every `scalino`
+Not implemented: incremental Scala compilation (every `scalino`
 build fully recompiles every given source file -- only the native-library
 object cache and the dependency-resolution cache are incremental),
-multi-module projects, and anything past the one directive kind above
-(no `//> using options`, `//> using resourceDir`, toolkit shortcuts, etc.).
+multi-module projects, `--compiler-plugin`/`//> using plugin`, and
+`//> using file`/`files`/`exclude`. Watch mode is implemented (above).
+
+### `scalino`: second CLI-parity pass -- directive/flag aliases, jars, repositories (2026-09-06)
+
+Follow-up to the pass above, closing several more scala-cli directive/flag
+gaps found by direct comparison against real scala-cli's own CLI surface,
+each verified with a real end-to-end build (not just parsed):
+
+- `//> using dependency`/`dependencies` (and `compileOnly.dependency(ies)`/
+  `test.dependency(ies)`) as long-form aliases of `dep`/`deps`;
+  `//> using scalacOption`/`scalacOptions` as aliases of `options`/`option`;
+  `//> using test.scalacOption`/`test.scalacOptions` (test-scope-only extra
+  compiler flags, appended after `options` for the test compile only).
+- `--compile-dep`/`--compile-only-dependency` flag + `//> using
+  compileOnly.dep` directive (already existed) now share one
+  `extraCompileOnlyClasspath`, resolved and cached separately from the main
+  dependency set (a macro-only/annotation-only dependency needed at compile
+  time but not runtime, without polluting the link classpath).
+- `//> using jar "./local.jar"` / `jars`: adds a local jar file straight to
+  the classpath (main, test, and IDE setup), no `cs fetch` involved.
+- `//> using resourceDir "./resources"` / `resourceDirs`: adds a directory
+  to the classpath (combine with `--embed-resources`/`nativeEmbedResources`
+  to actually bake its files into the binary via scala-native's own
+  `NativeConfig#withEmbedResources` resource scan, which runs over the link
+  classpath).
+- `-r`/`--repo`/`--repository` flag + `//> using repository`/`repositories`
+  directive: extra Maven repositories threaded straight through to the
+  existing `cs fetch` call as repeated `-r <repo>` flags (`resolveDeps` in
+  `ScalinoCli.scala`), on top of the default Central-only resolution.
+  `resolveDeps`'s on-disk classpath cache key now folds the repository list
+  in alongside the sorted dependency list, so adding/removing a repository
+  correctly invalidates a stale cached classpath instead of silently
+  reusing one resolved under a different repo set. Verified against a real
+  non-Central artifact (`com.github.jitpack:gradle-simple:1.1`, hosted only
+  on `https://jitpack.io`): resolution fails with the normal "dependency
+  resolution failed" error with no `--repository` given, and succeeds full
+  end-to-end (resolve, compile, link, run) with either `--repository
+  https://jitpack.io` or the equivalent `//> using repository` directive.
 
 ### `bin/scalino-bootstrap` created a fresh tmp dir every build — first real bug found
 
