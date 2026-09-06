@@ -20,7 +20,7 @@ PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 FIXTURE="$ROOT/interpreter/test-fixtures/macros-in-same-project1"
 
 echo "== tracing dotc + nscplugin (with a real macro) =="
-rm -rf "$ROOT/agent-config/dotc" "$WORK/agent-out"
+rm -rf "$ROOT/agent-config/scalino-dotc" "$WORK/agent-out"
 mkdir -p "$WORK/agent-out" "$WORK/agent-compile-out"
 "$JAVA" -agentlib:native-image-agent=config-output-dir="$WORK/agent-out" \
   -cp "$FULL_CP:$PLUGIN_JAR" dotty.tools.dotc.Main \
@@ -56,8 +56,8 @@ mkdir -p "$WORK/agent-compile-out2"
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
   -Yretain-trees \
   -d "$WORK/agent-compile-out2" "$REGRESSIONS_FIXTURE/Foo.scala" "$REGRESSIONS_FIXTURE/Test.scala"
-mkdir -p "$ROOT/agent-config/dotc"
-cp "$WORK/agent-out/reachability-metadata.json" "$ROOT/agent-config/dotc/"
+mkdir -p "$ROOT/agent-config/scalino-dotc"
+cp "$WORK/agent-out/reachability-metadata.json" "$ROOT/agent-config/scalino-dotc/"
 
 echo "== tracing linkdriver =="
 [[ -f "$WORK/tools-patched.cp" ]] || { echo "run 04a-patch-tools.sh first" >&2; exit 1; }
@@ -66,12 +66,12 @@ mkdir -p "$WORK/driver-classes"
 "$JAVA" -cp "$DRIVER_CP" dotty.tools.dotc.Main -classpath "$DRIVER_CP" -d "$WORK/driver-classes" "$ROOT/src/LinkDriver.scala"
 
 NATIVELIBS="$(cat "$WORK/nativelibs.cp")"
-rm -rf "$ROOT/agent-config/linkdriver" "$WORK/agent-out2" "$WORK/agent-link-out"
+rm -rf "$ROOT/agent-config/scalino-linkdriver" "$WORK/agent-out2" "$WORK/agent-link-out"
 mkdir -p "$WORK/agent-out2" "$WORK/agent-link-out"
 "$JAVA" -agentlib:native-image-agent=config-output-dir="$WORK/agent-out2" \
   -cp "$DRIVER_CP" LinkDriver "$WORK/agent-compile-out:$NATIVELIBS" "$WORK/agent-link-out" Test "$CLANG" "$CLANGPP"
-mkdir -p "$ROOT/agent-config/linkdriver"
-cp "$WORK/agent-out2/reachability-metadata.json" "$ROOT/agent-config/linkdriver/"
+mkdir -p "$ROOT/agent-config/scalino-linkdriver"
+cp "$WORK/agent-out2/reachability-metadata.json" "$ROOT/agent-config/scalino-linkdriver/"
 
 # No more "tracing scalino-lsp" step here: that module (Main.scala,
 # Lsp.scala) no longer uses lsp4j/Gson at all -- it's a hand-rolled

@@ -3,7 +3,7 @@
 # tools_3 library (NIR -> LLVM IR -> clang -> native executable). All classes
 # are known at build time (no dynamic plugin loading here), so this is a
 # plain native-image build, no reflection surgery needed beyond the agent
-# trace already captured in agent-config/linkdriver.
+# trace already captured in agent-config/scalino-linkdriver.
 #
 # Uses tools-patched.cp (04a-patch-tools.sh): fixes scala-native's
 # object-file caching for vendored C/S dependencies, which was otherwise
@@ -24,7 +24,7 @@ mkdir -p "$WORK/driver-classes"
 "$NATIVE_IMAGE" \
   -cp "$DRIVER_CP" \
   --no-fallback \
-  -H:ConfigurationFileDirectories="$ROOT/agent-config/linkdriver" \
+  -H:ConfigurationFileDirectories="$ROOT/agent-config/scalino-linkdriver" \
   -H:+ReportExceptionStackTraces \
   --enable-url-protocols=http,https \
   -J--sun-misc-unsafe-memory-access=allow \

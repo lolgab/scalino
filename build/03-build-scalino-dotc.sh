@@ -31,7 +31,7 @@ BUILD_CP="$(cat "$WORK/compiler-patched.cp"):$(cat "$WORK/nativelibs.cp"):$(cat 
 "$NATIVE_IMAGE" \
   -cp "$BUILD_CP" \
   --no-fallback \
-  -H:ConfigurationFileDirectories="$ROOT/agent-config/dotc" \
+  -H:ConfigurationFileDirectories="$ROOT/agent-config/scalino-dotc" \
   -H:+ReportExceptionStackTraces \
   -R:StackSize=67108864 \
   -J--sun-misc-unsafe-memory-access=allow \
