@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..680ef32f 100644
+index 04cb637b..b9e42a0f 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -496,7 +496,7 @@ index 04cb637b..680ef32f 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +546,4371 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4386 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -4531,7 +4531,22 @@ index 04cb637b..680ef32f 100644
 +        Some(s.sortBy(f(_).toString))
 +      case (s: scala.collection.Seq[Object] @unchecked, "::" | "+:", (v: Object) :: Nil) => Some(v +: s)
 +      case (s: scala.collection.Seq[Object] @unchecked, ":+", (v: Object) :: Nil) => Some(s :+ v)
-+      case (a: scala.collection.Seq[Object] @unchecked, "++" | ":::", (b: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(a ++ b)
++      case (a: scala.collection.Seq[Object] @unchecked, "++", (b: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(a ++ b)
++      // `List#:::` is NOT `++` under a different name: `a ::: b` means "prepend
++      // b in front of a" (real signature `def :::[B >: A](prefix: List[B]):
++      // List[B]`, receiver's elements come AFTER the argument's) -- the
++      // opposite operand order from `++`. Confirmed via a real, reproducible
++      // bug this conflation caused: upickle's own `defineEnumVisitorsImpl`
++      // (upickle-implicits' macros.scala) builds `topTraitDefs.toList :::
++      // subTypeDefs` expecting the whole-type definition to land FIRST (so
++      // `allDefs.head` -- the value spliced back as the derived instance --
++      // is the merged multi-case Writer/Reader, not an arbitrary per-case
++      // one) -- with `a ++ b` computed instead of the correct `b ++ a`, the
++      // whole-type definition silently ended up LAST, and `allDefs.head`
++      // returned a per-case (ordinal-0) leaf instead, which every other
++      // case's serialization then silently used too. See docs/findings.md,
++      // "The upickle enum-writer MatchError: null bug".
++      case (a: scala.collection.Seq[Object] @unchecked, ":::", (b: scala.collection.Seq[Object] @unchecked) :: Nil) => Some(b ++ a)
 +      case (s: String, "length", Nil) => Some(Int.box(s.length))
 +      case (s: String, "+", (o: Object) :: Nil) => Some(s + String.valueOf(o))
 +      case (s: String, "isEmpty", Nil) => Some(Boolean.box(s.isEmpty))
