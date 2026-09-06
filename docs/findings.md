@@ -288,8 +288,24 @@ with unreachable symbols, same as it would under real scala-cli targeting
 Not implemented: incremental Scala compilation (every `scalino`
 build fully recompiles every given source file -- only the native-library
 object cache and the dependency-resolution cache are incremental),
-multi-module projects, `--compiler-plugin`/`//> using plugin`, and
-`//> using file`/`files`/`exclude`. Watch mode is implemented (above).
+multi-module projects, and `--compiler-plugin`/`//> using plugin` (see
+below -- not a bounded gap, an architectural one). Watch mode and
+`//> using file`/`exclude` are implemented (both below).
+
+**`--compiler-plugin`/`-P`/`//> using plugin`: not implementable as a
+CLI-level gap, deliberately skipped.** Real scala-cli loads a user-given
+plugin jar into dotc reflectively at runtime. This toolchain's dotc is
+itself a native-image binary, and native-image's closed-world AOT
+reflection means `Class.forName` only ever succeeds for classes resident
+in the image at *build* time (see "Blocker 2" above, which is the same
+constraint for the one plugin scalino already ships baked in,
+`nscplugin`). There is no code path by which a `-Xplugin:<arbitrary jar
+picked at runtime>` could ever load a class native-image didn't see when
+`scalino-dotc` itself was built -- so unlike every other item in this
+section, this one can't be closed by adding CLI/directive parsing; it
+would need a from-scratch alternative to reflective plugin loading
+(e.g. a fixed registry of known plugins baked in at image-build time,
+`kind-projector` included), which is future work, not a quick parity fix.
 
 ### `scalino`: second CLI-parity pass -- directive/flag aliases, jars, repositories (2026-09-06)
 
@@ -327,6 +343,30 @@ each verified with a real end-to-end build (not just parsed):
   resolution failed" error with no `--repository` given, and succeeds full
   end-to-end (resolve, compile, link, run) with either `--repository
   https://jitpack.io` or the equivalent `//> using repository` directive.
+- `//> using file "./Other.scala"` / `files` (extra source, resolved
+  relative to the *declaring* source file's own directory, not cwd) and
+  `//> using exclude "glob"` (drops matching sources, glob matched against
+  each collected source's path relative to cwd) -- folded straight into
+  `expandSources` (`ScalinoCli.scala`) so all three of its call sites
+  (`run`/`compile`, `test`, `setup-ide`) get both for free. Only one level
+  deep: a `file`-referenced source's own `file`/`exclude` directives aren't
+  expanded a second time, matching real scala-cli. The glob matcher is a
+  small hand-rolled `*`/`**`/`?`-to-regex translator, not
+  `java.nio.file.FileSystem#getPathMatcher("glob:...")` -- that method's
+  support in this toolchain's from-scratch javalib port is unverified, and
+  the translator is ~15 lines. **Gotcha caught by real end-to-end testing,
+  not just reading the code back**: the first cut relativized each
+  candidate path's `.toAbsolutePath` against cwd directly, but
+  `collectScalaFiles` produces paths like `./generated/Broken.scala` (a
+  literal `.` path element from walking a directory arg of `.`) --
+  `Path#relativize` doesn't strip that element on its own, so the "relative
+  to cwd" string came out as `./generated/Broken.scala` instead of
+  `generated/Broken.scala` and every exclude glob silently matched nothing.
+  Fixed by `.normalize()`-ing both sides before relativizing. Verified with
+  a real directory build: a `generated/` subtree containing a file that
+  doesn't even parse as Scala is included (and fails the build) with no
+  `exclude` directive, and cleanly skipped with `//> using exclude
+  "generated/**"` in a sibling source.
 
 ### `bin/scalino-bootstrap` created a fresh tmp dir every build — first real bug found
 

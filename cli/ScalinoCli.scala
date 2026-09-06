@@ -143,7 +143,7 @@ object ScalinoCli:
     "scala", "mainClass", "options", "option", "scalacOption", "scalacOptions",
     "test.scalacOption", "test.scalacOptions",
     "testFramework", "test.framework", "jar", "jars", "resourceDir", "resourceDirs",
-    "repository", "repositories",
+    "repository", "repositories", "file", "files", "exclude",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativeTarget",
     "nativeEmbedResources", "nativeMultithreading"
@@ -888,8 +888,59 @@ object ScalinoCli:
       else Nil
     }
 
+  /** Translates a scala-cli-style glob (`*` within a path segment, `**`
+   *  across segments, `?` a single char) to an anchored regex -- hand-rolled
+   *  rather than `java.nio.file.FileSystem#getPathMatcher("glob:...")`,
+   *  since that relies on JDK-internal glob-to-regex machinery whose support
+   *  in this toolchain's from-scratch javalib port is unverified. */
+  private def globToRegex(glob: String): scala.util.matching.Regex =
+    val sb = new StringBuilder("^")
+    var i = 0
+    while i < glob.length do
+      glob(i) match
+        case '*' =>
+          if i + 1 < glob.length && glob(i + 1) == '*' then { sb.append(".*"); i += 1 }
+          else sb.append("[^/]*")
+        case '?' => sb.append("[^/]")
+        case c if "\\.^$+{}()|[]".indexOf(c) >= 0 => sb.append('\\').append(c)
+        case c => sb.append(c)
+      i += 1
+    sb.append("$")
+    sb.toString.r
+
+  /** `//> using file`/`files` (extra source files, resolved relative to the
+   *  directory of the source that declares them -- mainly useful when a
+   *  single explicit source file needs a sibling not otherwise on the
+   *  command line) and `//> using exclude` (glob, matched against each
+   *  collected source's path relative to the current working directory,
+   *  scala-cli-style) applied over the directory-expanded source set. Only
+   *  scans directives declared by sources already in `base` -- an `exclude`
+   *  or `file` inside a `file`-referenced source is not itself expanded a
+   *  second time, matching scala-cli's own one-level (not transitive)
+   *  behavior for this directive. */
+  private def applyFileAndExcludeDirectives(base: List[Path]): List[Path] =
+    def directiveValuesOf(src: Path, keys: String*): List[String] =
+      if !Files.exists(src) then Nil
+      else readFile(src).linesIterator.filter(_.trim.startsWith("//>")).flatMap { rawLine =>
+        directiveValues(rawLine.trim, keys*).getOrElse(Nil)
+      }.toList
+    val extraFiles = base.flatMap { src =>
+      directiveValuesOf(src, "file", "files").map(f => src.toAbsolutePath.getParent.resolve(f).normalize())
+    }
+    val excludeGlobs = base.flatMap(src => directiveValuesOf(src, "exclude"))
+    val combined = (base ++ extraFiles).distinct
+    if excludeGlobs.isEmpty then combined
+    else
+      val cwd = Paths.get("").toAbsolutePath.normalize()
+      val patterns = excludeGlobs.map(globToRegex)
+      combined.filterNot { p =>
+        val rel = cwd.relativize(p.toAbsolutePath.normalize()).toString.replace(java.io.File.separatorChar, '/')
+        patterns.exists(_.matches(rel))
+      }
+
   def expandSources(paths: List[Path]): List[Path] =
-    paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p))
+    val base = paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p)).distinct
+    applyFileAndExcludeDirectives(base)
 
   // ---------------------------------------------------------------------
   // Compilation scopes, scala-cli-style: every source is "main" scope
@@ -1391,6 +1442,8 @@ object ScalinoCli:
          |                                             --embed-resources/nativeEmbedResources
          |                                             to actually bake its files into the binary)
          |  //> using repository "https://my.org/maven"   (extra Maven repo, repeatable)
+         |  //> using file "./Other.scala"             (extra source, relative to this file's dir)
+         |  //> using exclude "generated/**"            (glob; drop matching sources, cwd-relative)
          |  //> using nativeMode "release-fast"
          |  //> using nativeGc "immix"
          |  //> using nativeLto "thin"
