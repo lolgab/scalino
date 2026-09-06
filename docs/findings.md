@@ -367,6 +367,38 @@ each verified with a real end-to-end build (not just parsed):
   doesn't even parse as Scala is included (and fails the build) with no
   `exclude` directive, and cleanly skipped with `//> using exclude
   "generated/**"` in a sibling source.
+- `--args-file <path>`: forwarded to `scalino-dotc` verbatim as `@<path>`
+  rather than parsed by `scalino` itself -- dotc already has this exact
+  feature built in (`CommandLineParser.expandArg`/`CliCommand.scala:47`,
+  any raw arg starting with `@` expands to that file's contents, one
+  option per line, `#` starts a line comment, real quoting via
+  `CommandLineParser.tokenize`), so re-implementing the parsing here would
+  just be a worse copy of a mechanism the compiler already gets right.
+  Verified two ways with a real args-file: a `-Xfatal-warnings` line
+  (deliberately triggers dotc's own "deprecated alias, use -Werror"
+  warning promoted to an error, proving the line really reached dotc's
+  argument parser) and, separately, a clean file with just `-explain` and
+  a `#`-comment line building successfully.
+- `--watching`/`--watching-path <path>` (repeatable; file or directory,
+  recursive, any extension -- unlike `expandSources`/`collectScalaFiles`
+  this is not `.scala`-filtered, since these are meant to cover arbitrary
+  resource files a build depends on but doesn't compile) folds into the
+  existing `watchLoop`'s mtime-polled path set alongside the real sources.
+  Verified with a real background `scalino run -w --watching-path <dir>`:
+  editing a plain (non-`.scala`) file under the watched directory
+  triggered "change detected, rebuilding..." and a rerun, exactly as
+  editing a source file would.
+
+**Not implemented: `--restart`/`--revolver`** (background run,
+auto-kill-and-restart on change). Unlike everything else in this section,
+this isn't just directive/flag parsing over the existing synchronous
+build pipeline -- it needs real background process lifecycle management
+(spawn detached, track the child, kill and respawn on change) layered on
+top of `runInherited`'s current spawn-and-block model, and this
+toolchain's scala-native javalib port has not been verified to support
+`Process#destroy` at all. Left as a documented gap rather than risking a
+half-working implementation of process control this session didn't have
+budget to verify properly.
 
 ### `bin/scalino-bootstrap` created a fresh tmp dir every build — first real bug found
 

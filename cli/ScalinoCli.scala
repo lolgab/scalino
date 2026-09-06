@@ -942,6 +942,21 @@ object ScalinoCli:
     val base = paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p)).distinct
     applyFileAndExcludeDirectives(base)
 
+  /** `--watching`/`--watching-path`: extra paths polled for mtime changes
+   *  alongside the real sources, same recursive dir-walk as
+   *  `collectScalaFiles` but keeping every file (not just `.scala`) --
+   *  these are meant for arbitrary resources a build might depend on. */
+  def expandWatchPaths(paths: List[Path]): List[Path] =
+    def collectAll(dir: Path): List[Path] =
+      val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
+      entries.flatMap { f =>
+        val name = f.getName
+        if f.isDirectory then
+          if name.startsWith(".") || skipDirNames(name) then Nil else collectAll(f.toPath)
+        else List(f.toPath)
+      }
+    paths.flatMap(p => if Files.isDirectory(p) then collectAll(p) else List(p))
+
   // ---------------------------------------------------------------------
   // Compilation scopes, scala-cli-style: every source is "main" scope
   // except one that has a path segment literally named "test" -- covers
@@ -1404,6 +1419,11 @@ object ScalinoCli:
          |  -S, --scala <version>      declare a Scala version (must match ${BuildInfo.scalaVersion})
          |  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
          |  -w, --watch                rebuild (and, for `run`, rerun) on source changes
+         |  --watching, --watching-path <path>   extra path to watch under -w (repeatable;
+         |                             file or directory, watched recursively)
+         |  --args-file <path>         expand to the file's contents as extra scalac options
+         |                             (dotc's own native `@file` response-file expansion --
+         |                             one option per line, `#` starts a line comment)
          |  -o, --output <path>        output path (compile only)
          |  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
          |  -q, --quiet                only show warnings/errors
@@ -1482,6 +1502,7 @@ object ScalinoCli:
     mainClassOpt: Option[String] = None,
     out: Option[String] = None,
     watch: Boolean = false,
+    cliWatchingPaths: List[String] = Nil,
     cliDeps: List[String] = Nil,
     cliCompileOnlyDeps: List[String] = Nil,
     cliRepositories: List[String] = Nil,
@@ -1522,6 +1543,8 @@ object ScalinoCli:
         case "--main-class" => o = o.copy(mainClassOpt = Some(args(i + 1))); i += 1
         case "-o" | "--output" => o = o.copy(out = Some(args(i + 1))); i += 1
         case "-w" | "--watch" => o = o.copy(watch = true)
+        case "--watching" | "--watching-path" => o = o.copy(cliWatchingPaths = o.cliWatchingPaths :+ args(i + 1)); i += 1
+        case "--args-file" => o = o.copy(cliOptions = o.cliOptions :+ s"@${args(i + 1)}"); i += 1
         // no `-d` short form: real scala-cli's `-d` means `--output`, not `--dependency` -- don't collide with it.
         case "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
         case "--compile-dep" | "--compile-only-dependency" => o = o.copy(cliCompileOnlyDeps = o.cliCompileOnlyDeps :+ args(i + 1)); i += 1
@@ -1614,7 +1637,8 @@ object ScalinoCli:
     if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
 
     if o.watch then
-      watchLoop(expanded) { () =>
+      val watchPaths = expanded ++ expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)))
+      watchLoop(watchPaths) { () =>
         try buildAndMaybeRun(mode, expanded, o)
         catch case BuildFailed(msg) => System.err.println(s"scalino: $msg")
       }
