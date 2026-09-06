@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 04cb637b..0e8e8d0a 100644
+index 04cb637b..80a0016e 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -1,6 +1,7 @@
@@ -496,7 +496,7 @@ index 04cb637b..0e8e8d0a 100644
    private def interpretArgs(argss: List[List[Tree]], fnType: Type)(using Env): List[Object] = {
      def interpretArgsGroup(args: List[Tree], argTypes: List[Type]): List[Object] =
        assert(args.size == argTypes.size)
-@@ -141,189 +546,4335 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -141,189 +546,4359 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          Nil
    }
  
@@ -3106,6 +3106,30 @@ index 04cb637b..0e8e8d0a 100644
 +            case "separatorChar" => Some(Character.valueOf(java.io.File.separatorChar))
 +            case "pathSeparator" => Some(java.io.File.pathSeparator)
 +            case "pathSeparatorChar" => Some(Character.valueOf(java.io.File.pathSeparatorChar))
++            case _ => None
++        case "System" =>
++          // `System.out`/`System.err` field access alone (this doesn't yet
++          // make method calls on the resulting real `PrintStream` work --
++          // `println`/`print`/etc on it still hit their own separate "no
++          // built-in intrinsic exists for it", unlike most other real host
++          // objects elsewhere in this file -- that's a bigger, not-yet-done
++          // follow-up). Still real and worth having on its own: without even
++          // this, a macro that reads `System.err`/`System.out` at all (not
++          // necessarily to call a method on it -- e.g. passing it on to
++          // something else) hits "no built-in intrinsic exists for it" on
++          // the FIELD ACCESS ALONE -- and since that's a hard
++          // `StopInterpretation`, not a warning, the enclosing macro call
++          // fails entirely; if that failure happens to be for an
++          // `Expr[Boolean]` feeding an `inline if`, the caller sees a much
++          // more confusing cascading error ("Cannot reduce `inline if`
++          // because its condition is not a constant value: ??? :Boolean")
++          // that doesn't even mention `System.err` at all. Found while
++          // trying to add `System.err.println`-based compile-time tracing
++          // to a real macro to debug the upickle enum-writer bug (see
++          // docs/findings.md) -- the tracing attempt itself hit this gap.
++          sym.name.toString match
++            case "out" => Some(System.out)
++            case "err" => Some(System.err)
 +            case _ => None
 +        case _ => None
 +    else None
