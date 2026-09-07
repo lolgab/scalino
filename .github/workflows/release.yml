@@ -96,7 +96,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y rpm
-          gem install --no-document fpm
+          sudo gem install --no-document fpm
           case "${{ matrix.target }}" in
             linux-x86_64) deb_arch=amd64; rpm_arch=x86_64 ;;
             linux-arm64)  deb_arch=arm64; rpm_arch=aarch64 ;;
