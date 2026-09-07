@@ -16,7 +16,7 @@ mkdir -p "$DIST/lib"
 vendor_cp() {
   local src="$1" out="$2"
   local -a rel=() parts=()
-  local IFS=':'
+  local IFS="$CP_SEP"
   read -ra parts < "$src"
   for jar in "${parts[@]}"; do
     local base
@@ -25,7 +25,7 @@ vendor_cp() {
     rel+=("lib/$base")
   done
   local joined
-  joined="$(IFS=':'; echo "${rel[*]}")"
+  joined="$(IFS="$CP_SEP"; echo "${rel[*]}")"
   echo "$joined" > "$out"
 }
 
