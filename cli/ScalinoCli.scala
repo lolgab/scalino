@@ -1373,6 +1373,10 @@ object ScalinoCli:
         purgeArtifactsFor(classesDir, r.pkg, r.declaredNames)
 
     if toCompile.nonEmpty then
+      // scala-cli/sbt both print a line before a real compile -- scalino-dotc
+      // itself stays silent on success (no "compiling..." banner of its own),
+      // so without this a multi-second compile looks like scalino hung.
+      System.err.println(s"scalino: compiling ${toCompile.size} source(s) to $classesDir")
       // classesDir on the compile classpath (harmless on a full rebuild --
       // it's freshly emptied above) is what lets scalino-dotc resolve
       // symbols from files it isn't recompiling this round out of their
