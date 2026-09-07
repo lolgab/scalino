@@ -98,8 +98,12 @@ mkdir -p "$LINK_WORK"
 # release-fast null-guard-elimination pass against dotc's unusually large,
 # heavily-branching methods -- see docs/findings.md's release-fast section.
 # release-fast itself is needed for the `definition` endpoint's latency
-# (~40s debug-mode, ~10s release-fast, driven by lsp-trace-drive.py's 25s
-# client timeout).
+# (~40s debug-mode, ~10s release-fast on a fast runner -- confirmed as high
+# as ~25s on GitHub's own macos-x86_64 runners, which are meaningfully
+# slower than the linux/macos-arm64/windows ones this same job also runs
+# on; lsp-trace-drive.py's client timeout was bumped from 25s to 60s after
+# that runner's serial single-worker-thread backlog pushed even unrelated,
+# previously-fast requests like `rename` right up against the old ceiling).
 "$DIST/scalino-linkdriver" -Xss64m \
   "$NIR_OUT$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
   "$LINK_WORK" \
