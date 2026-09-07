@@ -88,6 +88,21 @@ to_native_path_list() {
 
 CLANG="$(command -v clang)"
 CLANGPP="$(command -v clang++)"
+# Confirmed via Windows CI: scala-native's own Validator rejected this
+# runner's real, working clang/clang++ with "does not exist" -- same root
+# cause resolve_tool above already exists for GraalVM's tools. `command -v`
+# resolves "clang" fine (git-bash/PATHEXT-style implicit ".exe"), but
+# returns the bare name with no extension; scala-native's own Java-side
+# Files.exists check on that literal string finds nothing, since the real
+# file on disk is "clang.exe". CLANG/CLANGPP get handed to scalino-linkdriver
+# as plain CLI args (not run directly through bash), so bash's own tolerance
+# for the missing extension doesn't help there.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    [[ -e "$CLANG" ]] || CLANG="$CLANG.exe"
+    [[ -e "$CLANGPP" ]] || CLANGPP="$CLANGPP.exe"
+    ;;
+esac
 
 # For a bare name, PATH-search via `command -v`. For a full path (as
 # resolve_tool above returns), check existence directly instead -- under
