@@ -159,3 +159,11 @@ the result:
 ```
 ./build/10-update-package-metadata.sh vX.Y.Z
 ```
+
+## License
+
+Apache License 2.0, see [`LICENSE`](LICENSE). scalino's binaries are built
+from patched checkouts of the [Scala 3](https://github.com/scala/scala3) and
+[Scala Native](https://github.com/scala-native/scala-native) toolchains
+(both Apache-2.0; scalino's changes are in [`patches/`](patches/)) — their
+NOTICE/attribution content is reproduced in full in [`NOTICE`](NOTICE).

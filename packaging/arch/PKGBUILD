@@ -34,11 +34,12 @@ package() {
 
   install -dm755 "$pkgdir/usr/lib/scalino"
   cp -a "$_srcdir/." "$pkgdir/usr/lib/scalino/"
-  rm -f "$pkgdir/usr/lib/scalino/LICENSE"
+  rm -f "$pkgdir/usr/lib/scalino/LICENSE" "$pkgdir/usr/lib/scalino/NOTICE"
 
   install -dm755 "$pkgdir/usr/bin"
   ln -s /usr/lib/scalino/scalino "$pkgdir/usr/bin/scalino"
   ln -s /usr/lib/scalino/scalino-lsp "$pkgdir/usr/bin/scalino-lsp"
 
   install -Dm644 "$_srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$_srcdir/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
 }

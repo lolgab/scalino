@@ -11,7 +11,7 @@
 # of /usr/lib/scalino/ never needs to move):
 #   /usr/lib/scalino/{scalino,scalino-dotc,scalino-linkdriver,scalino-lsp,
 #                     java.base.jar,compiler.cp,nativelibs.cp,
-#                     nscplugin.jar.txt,lib/,README.md,LICENSE}
+#                     nscplugin.jar.txt,lib/,README.md,LICENSE,NOTICE}
 #   /usr/bin/scalino     -> /usr/lib/scalino/scalino     (symlink)
 #   /usr/bin/scalino-lsp -> /usr/lib/scalino/scalino-lsp (symlink)
 set -euo pipefail
@@ -38,7 +38,7 @@ prefix="usr/lib/scalino"
 staging="$work/staging"
 mkdir -p "$staging/$prefix" "$staging/usr/bin"
 cp -a dist/. "$staging/$prefix/"
-cp README.md LICENSE "$staging/$prefix/"
+cp README.md LICENSE NOTICE "$staging/$prefix/"
 
 ln -s "/$prefix/scalino" "$staging/usr/bin/scalino"
 ln -s "/$prefix/scalino-lsp" "$staging/usr/bin/scalino-lsp"

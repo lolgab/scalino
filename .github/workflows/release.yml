@@ -62,7 +62,7 @@ jobs:
           pkg="scalino-${version}-${{ matrix.target }}"
           mkdir -p "out/$pkg"
           cp -a dist/. "out/$pkg/"
-          cp README.md LICENSE "out/$pkg/"
+          cp README.md LICENSE NOTICE "out/$pkg/"
           mkdir -p assets
           tar czf "assets/$pkg.tar.gz" -C out "$pkg"
           ( cd assets && (sha256sum "$pkg.tar.gz" 2>/dev/null || shasum -a 256 "$pkg.tar.gz") > "$pkg.tar.gz.sha256" )
