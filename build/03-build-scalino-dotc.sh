@@ -79,13 +79,22 @@ mkdir -p "$LINK_WORK"
 # scalino-linkdriver's classpath needs both the just-compiled NIR AND the
 # Scala-Native-cross-compiled stdlib the compiled code links against --
 # NIR_OUT alone has no java.lang.Object etc.
-"$DIST/scalino-linkdriver" \
+#
+# --mode release-size: this was the released scalino-dotc binary's actual
+# shipped build (v0.0.1 shipped scala-native's *default* Mode -- debug --
+# since no --mode flag was passed at all). -Xss64m defensively, same as
+# 08-build-scalino-lsp.sh's identical dotc-based link: release-fast's own
+# null-guard-elimination pass StackOverflowed there against dotc's
+# unusually large, heavily-branching methods (see docs/findings.md); this
+# entry point compiles the exact same dotc, so the same risk applies here.
+"$DIST/scalino-linkdriver" -Xss64m \
   "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
   "$(to_native_path "$LINK_WORK")" \
   dotty.tools.dotc.Main \
   "$CLANG" \
   "$CLANGPP" \
   info \
+  --mode release-size \
   --embed-resources
 
 BUILT="$LINK_WORK/dotty.tools.dotc.Main"

@@ -77,7 +77,12 @@ COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP
   "$ROOT/cli/ScalinoCli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
 LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP$NIR_NATIVE_CP"
-"$DIST/scalino-linkdriver" "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP"
+# --mode release-size: v0.0.1 shipped scala-native's *default* Mode (debug --
+# no --mode flag was passed at all). -Xss64m defensively -- see
+# 03-build-scalino-dotc.sh's identical note (release-fast/-size's own
+# optimizer StackOverflowed there against dotc's large methods; ScalinoCli
+# itself is much smaller, but this is cheap insurance either way).
+"$DIST/scalino-linkdriver" -Xss64m "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP" info --mode release-size
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"
 chmod +x "$DIST/scalino"
