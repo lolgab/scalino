@@ -69,7 +69,7 @@ LSP_NATIVE_JARS=(
 )
 LSP_NATIVE_CP=""
 for artifact in "${LSP_NATIVE_JARS[@]}"; do
-  jar="$(cs fetch --intransitive "$artifact" --classpath)"
+  jar="$(cs fetch --intransitive "$artifact" --classpath | tr -d '\r')"
   LSP_NATIVE_CP="${LSP_NATIVE_CP:+$LSP_NATIVE_CP$CP_SEP}$jar"
 done
 

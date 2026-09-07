@@ -6,12 +6,20 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
 
 echo "== dotc compiler classpath =="
+# `| tr -d '\r'` on every `cs fetch --classpath` below: `cs` is a JVM app, and
+# on Windows its stdout line separator is "\r\n" -- a plain `> file` redirect
+# leaves a trailing \r glued to the last classpath entry, invisible to most
+# consumers (java -cp seems to tolerate it) until something reads the file
+# byte-strictly, like `cp` in 06-package.sh's vendor_cp (confirmed via CI:
+# "cp: cannot stat '...util-interface-1.10.7.jar'$'\r'': No such file or
+# directory"). Stripped once here so every downstream consumer of these
+# files gets clean content regardless of how it reads them.
 cs fetch "org.scala-lang:scala3-compiler_3:$SCALA_VERSION" "org.scala-lang:scala3-library_3:$SCALA_VERSION" \
-  --classpath > "$WORK/compiler.cp"
+  --classpath | tr -d '\r' > "$WORK/compiler.cp"
 
 echo "== scala-native compiler plugin =="
 cs fetch "org.scala-native:nscplugin_$SCALA_VERSION:$SCALA_NATIVE_VERSION" \
-  --classpath > "$WORK/nscplugin.cp"
+  --classpath | tr -d '\r' > "$WORK/nscplugin.cp"
 # jar path alone, for -Xplugin:
 tr "$CP_SEP" '\n' < "$WORK/nscplugin.cp" | grep "nscplugin_$SCALA_VERSION" > "$WORK/nscplugin.jar.txt"
 
@@ -26,12 +34,12 @@ cs fetch \
   "org.scala-native:posixlib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:clib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:scala3lib_native0.5_3:$SN_COMBINED_VERSION" \
-  --classpath > "$WORK/nativelibs.cp"
+  --classpath | tr -d '\r' > "$WORK/nativelibs.cp"
 
 echo "== scala-native JVM-side build/link tool (tools_3, NOT tools_native0.5_3) =="
 # tools_native0.5_3 is the self-hosted variant meant to run AS a native binary;
 # it uses link-time intrinsics that throw UndefinedBehaviorError on a plain JVM.
-cs fetch "org.scala-native:tools_3:$SCALA_NATIVE_VERSION" --classpath > "$WORK/tools.cp"
+cs fetch "org.scala-native:tools_3:$SCALA_NATIVE_VERSION" --classpath | tr -d '\r' > "$WORK/tools.cp"
 
 echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) =="
 # Previously lsp4j + Gson (reflection-based) -- replaced after discovering a
@@ -47,6 +55,6 @@ echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) 
 # sidesteps that risk entirely) -- compile-time-generated-equivalent, fully
 # reflection-free parsing, both at runtime and under native-image.
 cs fetch "com.github.plokhotnyuk.jsoniter-scala:jsoniter-scala-core_3:2.37.3" \
-  --classpath > "$WORK/lsp.cp"
+  --classpath | tr -d '\r' > "$WORK/lsp.cp"
 
 echo "OK: classpaths written to $WORK/*.cp"

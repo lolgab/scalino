@@ -61,7 +61,7 @@ NIR_NATIVE_JARS=(
 )
 NIR_NATIVE_CP=""
 for artifact in "${NIR_NATIVE_JARS[@]}"; do
-  jar="$(cs fetch --intransitive "$artifact" --classpath)"
+  jar="$(cs fetch --intransitive "$artifact" --classpath | tr -d '\r')"
   NIR_NATIVE_CP="${NIR_NATIVE_CP:+$NIR_NATIVE_CP$CP_SEP}$jar"
 done
 
