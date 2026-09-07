@@ -76,7 +76,7 @@ done
   done
 
 echo "compiling with dist/scalino-dotc (the real compiler scalino itself runs)..."
-# `-javabootclasspath`: scalino-dotc is a native-image build with no real JDK
+# `-javabootclasspath`: scalino-dotc is a self-hosted build with no real JDK
 # rt.jar/module-path of its own to fall back on (unlike a plain `$JAVA -cp
 # ... dotty.tools.dotc.Main` invocation) -- without it, even
 # `Definitions#init` itself fails (`ObjectClass`/`AnyRefAlias` can't resolve

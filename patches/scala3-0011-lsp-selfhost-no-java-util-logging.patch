@@ -1,0 +1,28 @@
+diff --git a/compiler/src/dotty/tools/dotc/interactive/Completion.scala b/compiler/src/dotty/tools/dotc/interactive/Completion.scala
+index e3570795..ff3887b3 100644
+--- a/compiler/src/dotty/tools/dotc/interactive/Completion.scala
++++ b/compiler/src/dotty/tools/dotc/interactive/Completion.scala
+@@ -35,8 +35,6 @@ import dotty.tools.dotc.core.Constants
+ import dotty.tools.dotc.core.TypeOps
+ import dotty.tools.dotc.core.StdNames
+ 
+-import java.util.logging.Logger
+-
+ /**
+  * One of the results of a completion query.
+  *
+@@ -50,7 +48,13 @@ case class Completion(label: String, description: String, symbols: List[Symbol])
+ 
+ object Completion:
+ 
+-  private val logger = Logger.getLogger(this.getClass.getName)
++  // `java.util.logging` has no Scala Native port at all (unlike java.time,
++  // there's no polyfill artifact either) -- these two call sites are both
++  // best-effort diagnostic warnings on a caught, already-swallowed
++  // exception, not load-bearing behavior, so a plain stderr line is a
++  // correct substitute on every backend, not just a Scala-Native workaround.
++  private object logger:
++    def warning(msg: String): Unit = System.err.println(s"[warning] $msg")
+ 
+   def scopeContext(pos: SourcePosition)(using Context): CompletionResult =
+     val tpdPath = Interactive.pathTo(ctx.compilationUnit.tpdTree, pos.span)

@@ -1,0 +1,34 @@
+diff --git a/compiler/src/dotty/tools/dotc/plugins/Plugins.scala b/compiler/src/dotty/tools/dotc/plugins/Plugins.scala
+index 0000000..0000000 100644
+--- a/compiler/src/dotty/tools/dotc/plugins/Plugins.scala
++++ b/compiler/src/dotty/tools/dotc/plugins/Plugins.scala
+@@ -36,8 +36,28 @@
+   // is baked in: scala-native's own `nscplugin` (`ScalaNativePlugin`,
+   // `-Xplugin-require:scalanative`'s target), matching the existing
+   // GraalVM-built `scalino-dotc`'s one-plugin-baked-in design.
++  //
++  // Still gated on `-Xplugin-require:scalanative` actually being passed,
++  // same as real dotc gates dynamic plugin loading on `-Xplugin`: some
++  // `Context`s built by this same binary run a deliberately-reduced,
++  // non-batch phase list that never reaches the phases nscplugin's own
++  // phases declare `runsAfter`/`runsBefore` against (e.g.
++  // `InteractiveCompiler`'s frontend-only `Parser/TyperPhase/SetRootTree/
++  // CookComments`, used by `scalino-lsp`'s presentation-compiler driver --
++  // no `PostTyper` phase at all). Unconditionally returning the plugin
++  // regardless of that flag made `Plugins.schedule` try to resolve
++  // `PrepNativeInterop.runsAfter = Set(transform.PostTyper.name)` against a
++  // phase plan with no such phase, crashing every `InteractiveDriver`
++  // construction with `NoSuchElementException: key not found: posttyper`
++  // (and, downstream, `DottyLanguageServer.configFor`'s `drivers.keys.head`
++  // fallback throwing on the resulting empty `myDrivers` map for every
++  // request). Checking `ctx.settings.require.value` restores real dotc's
++  // opt-in gating while keeping the no-jar-scanning simplification.
+   protected def loadRoughPluginsList(using Context): List[Plugin] =
+-    List(new scala.scalanative.nscplugin.ScalaNativePlugin())
++    if ctx.settings.require.value.contains("scalanative") then
++      List(new scala.scalanative.nscplugin.ScalaNativePlugin())
++    else
++      Nil
+ 
+   private var _roughPluginsList: List[Plugin] | Null = null
+   protected def roughPluginsList(using Context): List[Plugin] =

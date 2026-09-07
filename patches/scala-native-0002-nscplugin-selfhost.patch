@@ -1,0 +1,64 @@
+diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala
+index 86664bc..69174a0 100644
+--- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala
++++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala
+@@ -13,7 +13,11 @@ class GenNIR(settings: GenNIR.Settings) extends PluginPhase {
+   val phaseName = GenNIR.name
+ 
+   override val runsAfter = Set(transform.MoveStatics.name)
+-  override val runsBefore = Set(backend.jvm.GenBCode.name)
++  // `backend.jvm.GenBCode` is excluded from this self-hosted build entirely (its
++  // `org.scala-lang.modules:scala-asm` dependency has no Scala Native cross-build --
++  // see docs/findings.md's "frontend-only smoke test"/self-hosting milestone scoping),
++  // so there is no such phase to ever run before.
++  override val runsBefore = Set.empty[String]
+ 
+   override def run(using Context): Unit = {
+     NirCodeGen(settings).run()
+diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
+index 15e3078..80dde68 100644
+--- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
++++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
+@@ -123,8 +123,15 @@ class NirCodeGen(val settings: GenNIR.Settings)(using ctx: Context)
+        * conflicting top-level classes. However, it uses `toLowerCase()`
+        * without argument, which is not deterministic.
+        */
++      // `java.util.Locale` doesn't exist on Scala Native at all (no Scala Native port
++      // confirmed absent from vendor/scala-native's own javalib) -- self-hosting dotc onto
++      // Scala Native means this heuristic itself now runs *on* Scala Native, not just targets
++      // it. The whole point of passing `Locale.ENGLISH` here was avoiding the OS default
++      // locale for determinism (see this method's own doc above) -- the argument-less
++      // `toLowerCase()` is the closest available equivalent and is itself deterministic on
++      // this toolchain (no real per-locale case-conversion tables exist to vary by OS locale).
+       def caseInsensitiveNameOf(classDef: nir.Defn.Class): String =
+-        classDef.name.mangle.toLowerCase(java.util.Locale.ENGLISH)
++        classDef.name.mangle.toLowerCase()
+ 
+       val generatedCaseInsensitiveNames =
+         generatedDefns.collect {
+diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
+index 553e5c8..d68f699 100644
+--- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
++++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
+@@ -3,7 +3,7 @@ package nscplugin
+ 
+ import dotty.tools.FatalError
+ import dotty.tools.backend.ScalaPrimitivesOps._
+-import dotty.tools.backend.jvm.DottyBackendInterface.symExtensions
++import dotty.tools.dotc.core.SymExtensions.symExtensions
+ import dotty.tools.dotc.ast.desugar
+ import dotty.tools.dotc.util.Property
+ import dotty.tools.dotc.util.Spans.*
+diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala
+index c48adb4..52347d2 100644
+--- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala
++++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala
+@@ -1,7 +1,7 @@
+ package scala.scalanative
+ package nscplugin
+ 
+-import dotty.tools.backend.jvm.DottyBackendInterface.symExtensions
++import dotty.tools.dotc.core.SymExtensions.symExtensions
+ import dotty.tools.dotc.ast.tpd._
+ import dotty.tools.dotc.core
+ import scala.language.implicitConversions

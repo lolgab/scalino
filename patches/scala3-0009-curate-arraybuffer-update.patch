@@ -1,0 +1,32 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 10895529..ee9eed65 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -4488,6 +4488,27 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (a: Array[Object] @unchecked, "update", (i: Integer) :: (v: Object) :: Nil) =>
+         a(i) = v; Some(().asInstanceOf[Object])
+       case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
++      // `mutable.IndexedSeq#update` (e.g. `ArrayBuffer#update`): unlike
++      // `.apply`/`.size` (already curated above via the generic real-`Seq`
++      // cases, which read the real host object's public API and never touch
++      // its internals), `update`'s own retained SOURCE body
++      // (`checkWithinBounds` reading the private `size0` field, then
++      // `mutationCount += 1`, then the private `array`) genuinely needs
++      // `reflectiveFieldRead`/`reflectiveFieldWrite` if tree-interpreted --
++      // both of which are unconditionally unavailable on this toolchain
++      // (Scala Native's javalib has no `java.lang.reflect.Field`/
++      // `Class#getDeclaredField` at all, unlike JVM/native-image where the
++      // java.lang.reflect-based implementation genuinely works). Tree-
++      // interpreting `update` there silently replays `size0`'s stale
++      // ORIGINAL value (always the initial capacity, never the real current
++      // size), so any in-bounds `update` after a real mutation wrongly
++      // throws a spurious `IndexOutOfBoundsException`. Calling the real
++      // host method directly sidesteps the internals entirely -- correct on
++      // every backend (not just a Scala-Native workaround), and consistent
++      // with how `.apply`/`.size` are already handled for the exact same
++      // reason.
++      case (b: mutable.IndexedSeq[Object] @unchecked, "update", (i: Integer) :: (v: Object) :: Nil) =>
++        b(i) = v; Some(().asInstanceOf[Object])
+       case (m: mutable.Map[Object, Object] @unchecked, "put", (k: Object) :: (v: Object) :: Nil) => Some(m.put(k, v))
+       case (m: mutable.Map[Object, Object] @unchecked, "get", (k: Object) :: Nil) => Some(m.get(k))
+       // `default`/`op` are real by-name parameters on mutable `Map#getOrElse`/

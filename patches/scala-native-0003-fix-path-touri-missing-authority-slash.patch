@@ -1,0 +1,34 @@
+diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/unix/UnixPath.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/unix/UnixPath.scala
+index 0d10479..29e427e 100644
+--- a/javalib/src/main/scala/scala/scalanative/nio/fs/unix/UnixPath.scala
++++ b/javalib/src/main/scala/scala/scalanative/nio/fs/unix/UnixPath.scala
+@@ -64,7 +64,12 @@ class UnixPath(private val fs: UnixFileSystem, rawPath: String) extends Path {
+     new URI(
+       scheme = "file",
+       userInfo = null,
+-      host = null,
++      // Empty string, not null: URI's authority component (and thus the
++      // "//" that precedes it) is only emitted when host/userInfo/port are
++      // non-default -- host = null means "no authority at all", producing
++      // "file:/abs/path" instead of the standard "file:///abs/path" real
++      // JDK's Path#toUri() always returns for a local file with no host.
++      host = "",
+       port = -1,
+       path = toFile().getAbsolutePath(),
+       query = null,
+diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/windows/WindowsPath.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/windows/WindowsPath.scala
+index 0420c8e..89915d2 100644
+--- a/javalib/src/main/scala/scala/scalanative/nio/fs/windows/WindowsPath.scala
++++ b/javalib/src/main/scala/scala/scalanative/nio/fs/windows/WindowsPath.scala
+@@ -216,7 +216,10 @@ class WindowsPath private[windows] (
+     new URI(
+       scheme = "file",
+       userInfo = null,
+-      host = null,
++      // See UnixPath's identical fix: host = "" (not null) is required to
++      // make URI emit the "//" authority marker, matching real JDK's
++      // Path#toUri() ("file:///C:/...", not "file:/C:/...").
++      host = "",
+       port = -1,
+       path = absPath.path,
+       query = null,

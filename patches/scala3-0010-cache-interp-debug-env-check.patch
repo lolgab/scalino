@@ -1,0 +1,301 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -146,7 +146,7 @@
+    *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
+    */
+   protected def interpretTree(tree: Tree)(using Env): Object = {
+-    if sys.env.contains("SCALINO_INTERP_DEBUG") then
++    if debugEnabled then
+       Console.err.println(s"[interp] ${tree.getClass.getSimpleName}: ${tree.show}")
+     interpretTree0(tree)
+   }
+@@ -162,7 +162,7 @@
+           else throw new StopInterpretation(em"${tree.symbol} could not be inlined", tree.srcPos)
+ 
+     case tree: Ident if env.contains(tree.symbol) =>
+-      if sys.env.contains("SCALINO_INTERP_DEBUG") && tree.symbol.name.toString == "x" then
++      if debugEnabled && tree.symbol.name.toString == "x" then
+         Console.err.println(s"[identLookup] sym=${tree.symbol} id=${System.identityHashCode(tree.symbol)} boundValueClass=${env(tree.symbol).getClass} owner=${tree.symbol.owner}")
+       env(tree.symbol) match
+         case v: InterpretedVar => v.value
+@@ -189,7 +189,7 @@
+     // isn't currently bound (e.g. reached via a static call) falls back to
+     // its `ModuleValue`, same as an explicit module access would produce.
+     case tree: This =>
+-      if sys.env.contains("SCALINO_INTERP_DEBUG") then
++      if debugEnabled then
+         Console.err.println(s"[interpThis] sym=${tree.symbol} id=${System.identityHashCode(tree.symbol)} envKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
+       env.get(tree.symbol) match
+         case Some(v) => v
+@@ -277,7 +277,7 @@
+       // sites (native Scala code in this very file) needs the genuine
+       // exception type to actually match, not our wrapper's.
+       interpretCases(cases, scrutinee).getOrElse {
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if debugEnabled then
+           try Console.err.println(s"[unmatchedMatch] at ${tree.sourcePos} selector=${selector.show} cases=${cases.map(_.pat.show)} scrutinee=$scrutinee")
+           catch case scala.util.control.NonFatal(e) => Console.err.println(s"[unmatchedMatch] (show failed: $e) scrutinee=$scrutinee")
+         throw new MatchError(scrutinee)
+@@ -402,7 +402,7 @@
+         interpretPrimitiveOp(fn.symbol.name.toString, interpretTree(fn.qualifier), evalNonErased(rawArgs))
+       else if fn.symbol == defn.throwMethod then
+         val thrown = interpretTree(rawArgs.head)
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if debugEnabled then
+           Console.err.println(s"[interpThrow] at ${tree.sourcePos} value=$thrown")
+         throw InterpretedThrow(thrown)
+       else if (fn.symbol.isConstructor)
+@@ -629,7 +629,7 @@
+ 
+   private def matchCase(c: CaseDef, scrutinee: Object)(using Env): Option[Object] =
+     val r0 = matchPattern(c.pat, scrutinee)
+-    if sys.env.contains("SCALINO_INTERP_DEBUG_MATCH") then
++    if debugMatchEnabled then
+       Console.err.println(s"[matchCase] pat=${c.pat.show} matched=${r0.isDefined}")
+     r0.flatMap { newEnv =>
+       if c.guard.isEmpty || asBoolean(interpretTree(c.guard)(using newEnv))
+@@ -717,7 +717,7 @@
+         case _ => patValue == scrutinee
+       if matches then Some(env) else None
+     case UnApply(fun, _, patterns) =>
+-      if sys.env.contains("SCALINO_INTERP_DEBUG") then
++      if debugEnabled then
+         Console.err.println(s"[matchPattern UnApply] fun.getClass=${fun.getClass.getSimpleName} fun.symbol=${fun.symbol} fun.symbol.owner=${fun.symbol.owner} fun=${fun.show}")
+       // Not general case-class/quote-pattern deconstruction (still
+       // unsupported) -- just the common `TypeTest`-style shape (`case
+@@ -1056,11 +1056,11 @@
+               // instances, not a wrapper) is an instance of the target
+               // class. Covers most `quotes.reflect` type-shape TypeTests
+               // without needing one hand-written case per name.
+-              if sys.env.contains("SCALINO_INTERP_DEBUG") then
++              if debugEnabled then
+                 Console.err.println(s"[genericTypeTest] name=$name resolved=${typeTestClass(name)}")
+               typeTestClass(name).map(cls => (v: Object) =>
+                 val r = cls.isInstance(v)
+-                if sys.env.contains("SCALINO_INTERP_DEBUG") then
++                if debugEnabled then
+                   Console.err.println(s"[genericTypeTest.check] name=$name cls=$cls v=$v vClass=${if v == null then "null" else v.getClass} result=$r")
+                 if r then Some(List(v)) else None)
+       // `scala.util.matching.Regex#unapplySeq(target)` (e.g. a macro's own
+@@ -1088,16 +1088,16 @@
+               val groupNames = asObjectList(inst.fields("groupNames")).map(_.toString)
+               new scala.util.matching.Regex(inst.fields("pattern").toString, groupNames*)
+           val qualValue = interpretTree(qual)
+-          if sys.env.contains("SCALINO_INTERP_DEBUG") then
++          if debugEnabled then
+             Console.err.println(s"[regexReceiver] qualValue.getClass=${if qualValue == null then "null" else qualValue.getClass} isDefinedAt asRegex=${asRegex.isDefinedAt(qualValue)}")
+           qualValue match
+             case asRegex(r) =>
+-              if sys.env.contains("SCALINO_INTERP_DEBUG") then
++              if debugEnabled then
+                 Console.err.println(s"[regexReceiver] real regex pattern=${r.pattern}")
+               Some {
+                 case s: CharSequence =>
+                   val res = r.unapplySeq(s)
+-                  if sys.env.contains("SCALINO_INTERP_DEBUG") then
++                  if debugEnabled then
+                     Console.err.println(s"[regexReceiver] unapplySeq(${s}) = $res")
+                   res.map(_.asInstanceOf[List[Object]])
+                 case _ => None
+@@ -1434,7 +1434,7 @@
+         // `=:=` rejected every literal/singleton-typed scrutinee outright
+         // (breaking even the already-working `case '{ $acc: String } =>`).
+         if scrutType <:< patType then Some(Map.empty) else None
+-    if sys.env.contains("SCALINO_INTERP_DEBUG_MATCH") then
++    if debugMatchEnabled then
+       Console.err.println(s"[unifyPatternType] patType=${patType.show} scrutType=${scrutType.show} bindingSyms=${bindingSyms.mkString(",")} result=$result")
+     result
+ 
+@@ -1613,7 +1613,7 @@
+           && typeTestClass(cls.name.toString + "TypeTest").isDefined then
+           typeTestClass(cls.name.toString + "TypeTest").get.isInstance(v)
+         else true
+-      if sys.env.contains("SCALINO_INTERP_DEBUG") then
++      if debugEnabled then
+         Console.err.println(s"[matchesRuntimeType] v.getClass=${if v == null then "null" else v.getClass} tpe=${tpe.show} cls=$cls cls.exists=${cls.exists} cls.isClass=${cls.isClass} actual=$actual actual.exists=${actual.exists} baseClasses=${if actual.exists && actual.isClass then actual.asClass.baseClasses else Nil} result=$result")
+       result
+ 
+@@ -2213,7 +2213,7 @@
+       // `unexpectedTree` for a `This` nothing here ever bound.
+       case _ => receiverConcreteClass(value)
+     val withOwner = env.updated(owner, value)
+-    if sys.env.contains("SCALINO_INTERP_DEBUG") then
++    if debugEnabled then
+       Console.err.println(s"[bindThis] owner=$owner value.getClass=${value.getClass} cls=$cls clsExists=${cls.exists} clsIsClass=${cls.exists && cls.isClass} baseClasses=${if cls.exists && cls.isClass then cls.asClass.baseClasses else Nil}")
+     if cls.exists && cls.isClass then
+       // Fill in gaps only -- never clobber a base-class key `env` already
+@@ -2362,7 +2362,7 @@
+       case _ => None
+ 
+   private def interpretNew(fn: Symbol, rawArgs: List[Tree])(using Env): Object =
+-    if sys.env.contains("SCALINO_INTERP_DEBUG") then
++    if debugEnabled then
+       val dt = fn.owner.primaryConstructor.defTree
+       Console.err.println(s"[interpretNew] cls=${fn.owner} ctorDefTreeEmpty=${dt.isEmpty} ctorDefTreeClass=${dt.getClass.getSimpleName} rawArgs=${rawArgs.map(t => s"${t.getClass.getSimpleName}(isEmpty=${t.isEmpty})")}")
+     // `new Array[T](len)`: `Array` is compiler-magic (erasure/the backend
+@@ -2456,7 +2456,7 @@
+         // must match that shape or later clauses get silently dropped by
+         // `bindNonErased`'s size-mismatch fallback.
+         val params = ddef.termParamss.flatten.map(_.symbol)
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if debugEnabled then
+           Console.err.println(s"[interpretNew] params=$params ddef.rhs=${ddef.rhs.show}")
+         val bound = bindNonErased(params, rawArgs)
+         // Start from the *ambient* env (not `emptyEnv`) only for a genuinely
+@@ -2512,7 +2512,7 @@
+         // instantiation never reaches this branch at all.
+         if fn.owner.isAnonymousClass then
+           val superCall = moduleSuperCtorCall(fn.owner)
+-          if sys.env.contains("SCALINO_INTERP_DEBUG") then
++          if debugEnabled then
+             Console.err.println(s"[anonSuperCtor] cls=${fn.owner} superCall=${superCall.map(_.show)}")
+           superCall.foreach { parent =>
+             val (leadingStats, callTree) = parent match
+@@ -2529,11 +2529,11 @@
+                 val superParams = superFn.symbol.denot.paramSymss.flatten.filter(_.isTerm)
+                 val superRawArgs = superArgss.flatten
+                 val superBound = bindNonErased(superParams, superRawArgs)(using withParams)
+-                if sys.env.contains("SCALINO_INTERP_DEBUG") then
++                if debugEnabled then
+                   Console.err.println(s"[anonSuperCtor] superParams=$superParams superRawArgs=$superRawArgs superBound=$superBound")
+                 superBound.foreach((p, v) => instance.fields.getOrElseUpdate(p.name.toString, v))
+               case _ =>
+-                if sys.env.contains("SCALINO_INTERP_DEBUG") then
++                if debugEnabled then
+                   Console.err.println(s"[anonSuperCtor] callTree did not match Call-with-constructor: ${callTree.getClass} ${callTree.show}")
+           }
+         instance
+@@ -2624,12 +2624,12 @@
+     // `TypeDef` inside that. A no-op for the original module-class use case
+     // (already top-level, so `topLevelClass` returns the same symbol).
+     val root = moduleClass.topLevelClass.asClass.rootTree
+-    if sys.env.contains("SCALINO_INTERP_DEBUG") then
++    if debugEnabled then
+       Console.err.println(s"[moduleSuperCtorCall] cls=$moduleClass topLevelClass=${moduleClass.topLevelClass} root.isEmpty=${root.isEmpty} root.getClass=${root.getClass.getSimpleName}")
+     if root.isEmpty then None
+     else
+       val found = findTemplate(root, moduleClass)
+-      if sys.env.contains("SCALINO_INTERP_DEBUG") then
++      if debugEnabled then
+         Console.err.println(s"[moduleSuperCtorCall] findTemplate found=${found.isDefined}")
+       found.flatMap(_.parents.find(constructorCallParent))
+ 
+@@ -3236,7 +3236,7 @@
+         args.headOption.collect { case t: Type => t.simplified }
+       case "classSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type =>
+-          if sys.env.contains("SCALINO_INTERP_DEBUG") then
++          if debugEnabled then
+             Console.err.println(s"[classSymbol] t=${t.show} tId=${System.identityHashCode(t)} tClass=${t.getClass} classSymbol=${t.classSymbol} exists=${t.classSymbol.exists}")
+           if t.classSymbol.exists then Some(t.classSymbol) else None
+         }
+@@ -3302,7 +3302,7 @@
+       case "companionModule" if fn.owner.name.toString == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+           val cm = s.denot.companionModule
+-          if sys.env.contains("SCALINO_INTERP_DEBUG") then
++          if debugEnabled then
+             Console.err.println(s"[companionModule] s=$s id=${System.identityHashCode(s)} cm=$cm cmId=${System.identityHashCode(cm)}")
+           cm
+         }
+@@ -3420,7 +3420,7 @@
+       case "requiredMethod" if fn.owner.name.toString == "SymbolModule" =>
+         args match { case (path: String) :: Nil => Some(requiredMethod(path)); case _ => None }
+       case "spliceOwner" if fn.owner.name.toString == "SymbolModule" =>
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if debugEnabled then
+           Console.err.println(s"[spliceOwner] ctx.owner=${ctx.owner} id=${System.identityHashCode(ctx.owner)}")
+         Some(ctx.owner)
+       case "noSymbol" if fn.owner.name.toString == "SymbolModule" =>
+@@ -3430,7 +3430,7 @@
+           case (owner: Symbol) :: (name: String) :: (tpe: Type) :: flags :: (privateWithin: Symbol) :: Nil =>
+             val pw = if privateWithin.isTerm then NoSymbol else privateWithin
+             val newSym = newSymbol(owner, name.toTermName, flags.asInstanceOf[FlagSet], tpe, pw)
+-            if sys.env.contains("SCALINO_INTERP_DEBUG") then
++            if debugEnabled then
+               Console.err.println(s"[newVal] owner=$owner ownerId=${System.identityHashCode(owner)} name=$name tpe=${tpe.show} newSym=$newSym newSymId=${System.identityHashCode(newSym)} newSym.owner=${newSym.owner} newSym.owner.id=${System.identityHashCode(newSym.owner)}")
+             Some(newSym)
+           case _ => None
+@@ -4119,7 +4119,7 @@
+       case _ => throw new StopInterpretation(em"Interpreter (own implementation): cannot call $methodName directly on ${inst.toString}", pos)
+ 
+   private def interpretStdlibIntrinsic(receiver: Object, fn: Symbol, args: List[Object])(using Env): Option[Object] =
+-    if sys.env.contains("SCALINO_INTERP_DEBUG") then
++    if debugEnabled then
+       Console.err.println(s"[interpretStdlibIntrinsic] receiver.getClass=${if receiver == null then "null" else receiver.getClass} fn.name=${fn.name} args=${args.map(a => if a == null then "null" else a.getClass)}")
+     (receiver, fn.name.toString, args) match
+       // `RichInt`/`RichChar`/`RichLong`/etc (e.g. `65.toChar.to(90.toChar)`,
+@@ -4863,6 +4863,22 @@
+   def unapply(ex: Throwable): Option[Throwable] = scala.util.control.NonFatal.unapply(ex)
+ 
+ object Interpreter:
++  // Cached once, not re-queried on every recursive interpretation step: `sys.env`
++  // rebuilds a whole `Map` from the process environment on every call, and while
++  // that's cheap enough on a real JVM (`System.getenv()` returns an already-parsed,
++  // cached `java.util.Map`) not to matter even hit millions of times, Scala
++  // Native's `System.getenv()`/`sys.env` is measured ~7x more expensive per call
++  // (a 2,000,000-iteration microbenchmark: ~4.8s on JVM vs ~34.8s on Scala Native) --
++  // and this debug gate is checked from ~35 call sites across `interpretTree0`'s own
++  // recursive descent, hit on every node of every macro interpretation. Against a
++  // real, macro-derivation-heavy project (`~/scala/ape`), re-querying `sys.env` on
++  // every step (rather than once here) was severe enough to turn a ~2 minute real
++  // compile into one that hadn't finished after 15+ minutes. The env var can't
++  // change mid-run, so computing this once is always correct, not just a
++  // Scala-Native-specific workaround.
++  private[dotc] val debugEnabled: Boolean = sys.env.contains("SCALINO_INTERP_DEBUG")
++  private[dotc] val debugMatchEnabled: Boolean = sys.env.contains("SCALINO_INTERP_DEBUG_MATCH")
++
+   /** Exception that stops interpretation if some issue is found */
+   // `ControlThrowable`, not a plain `Exception`: this is a control-flow
+   // signal ("give up interpreting, report this and abort"), never a real
+diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+--- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+@@ -286,7 +286,7 @@
+     override protected  def interpretTree(tree: Tree)(implicit env: Env): Object = tree match {
+       // Interpret level -1 quoted code `'{...}` (assumed without level 0 splices)
+       case Apply(Select(Quote(body, _), nme.apply), _) =>
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if Interpreter.debugEnabled then
+           Console.err.println(s"[quoteApplyCase] body.show=${body.show}")
+         val body1 = body match {
+           case expr: Ident if expr.symbol.isAllOf(InlineByNameProxy) =>
+@@ -320,12 +320,12 @@
+         // the same way inlining substitutes a type parameter for its
+         // argument.
+         val typeBindings = env.iterator.collect { case (sym, tp: Type) => (sym, tp) }.toList
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if Interpreter.debugEnabled then
+           Console.err.println(s"[quoteTypeBindings] body2=${body2.show} typeBindings=${typeBindings.map((s, t) => s"$s(${System.identityHashCode(s)})->${t.show}")} fullEnvKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
+         val body3 =
+           if typeBindings.isEmpty then body2
+           else new TreeTypeMap(typeMap = _.subst(typeBindings.map(_._1), typeBindings.map(_._2))).transform(body2)
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") then
++        if Interpreter.debugEnabled then
+           Console.err.println(s"[quoteBody3] body2.show=${body2.show} body3.show=${body3.show} body3.tpe=${body3.tpe.show}")
+         new ExprImpl(Inlined(EmptyTree, Nil, body3.changeNonLocalOwners(ctx.owner)).withSpan(body3.span), SpliceScope.getCurrent)
+ 
+@@ -334,7 +334,7 @@
+         new TypeImpl(quoted.changeNonLocalOwners(ctx.owner), SpliceScope.getCurrent)
+ 
+       case _ =>
+-        if sys.env.contains("SCALINO_INTERP_DEBUG") && tree.isInstanceOf[tpd.Apply] && tree.show.length < 60 then
++        if Interpreter.debugEnabled && tree.isInstanceOf[tpd.Apply] && tree.show.length < 60 then
+           Console.err.println(s"[spliceFallback] treeClass=${tree.getClass.getSimpleName} show=${tree.show}")
+         super.interpretTree(tree)
+     }
+@@ -364,11 +364,11 @@
+               case e: ExprImpl => e
+               case f: (AnyRef => Object) @unchecked if fuel > 0 => resolve(f(QuotesImpl()), fuel - 1)
+               case other =>
+-                if sys.env.contains("SCALINO_INTERP_DEBUG") then
++                if Interpreter.debugEnabled then
+                   Console.err.println(s"[resolveNestedSplices] FAILED expr.show=${expr.show} t.show=${t.show} envKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
+                 throw new StopInterpretation(
+                   em"Unexpected result interpreting a nested splice: ${other.toString}", t.srcPos)
+-            if sys.env.contains("SCALINO_INTERP_DEBUG") then
++            if Interpreter.debugEnabled then
+               Console.err.println(s"[resolveNestedSplices] expr.show=${expr.show} envKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
+             val exprImpl = resolve(interpretTree(expr), 8)
+             transform(exprImpl.tree)

@@ -44,8 +44,31 @@ mkdir -p "$CLASSES_DIR"
 # (see 06-package.sh) so dist/ stays relocatable -- resolve to absolute here.
 resolve_cp() { echo "$DIST/${1//:/:$DIST/}"; }
 
+# ScalinoCli.scala's own entry-point/test-discovery scanner needs a real NIR
+# reader (see cli/ScalinoCli.scala's "Entry-point detection" section): on a
+# self-hosted scalino-dotc, the compiled user project's classesDir never gets
+# real JVM .class files (no backend/jvm/ASM in that toolchain at all), only
+# .nir -- so the classfile-based scanner alone can't ever find a main class
+# or test class there. nir_native0.5_3/util_native0.5_3 are scala-native's
+# own NIR data model + binary (de)serializer, published as real Scala Native
+# cross-build artifacts -- --intransitive (one artifact per `cs fetch` call,
+# not one call with both) for the same reason build/08-build-scalino-lsp.sh's
+# LSP_NATIVE_JARS are fetched that way: resolving them together pulls in
+# their own transitive javalib/nativelib/clib copy, which conflicts with
+# nativelibs.cp's pinned $SCALA_NATIVE_VERSION build (duplicate-symbol link
+# errors) -- fetched one at a time, --intransitive correctly suppresses that.
+NIR_NATIVE_JARS=(
+  "org.scala-native:nir_native0.5_3:$SCALA_NATIVE_VERSION"
+  "org.scala-native:util_native0.5_3:$SCALA_NATIVE_VERSION"
+)
+NIR_NATIVE_CP=""
+for artifact in "${NIR_NATIVE_JARS[@]}"; do
+  jar="$(cs fetch --intransitive "$artifact" --classpath)"
+  NIR_NATIVE_CP="${NIR_NATIVE_CP:+$NIR_NATIVE_CP:}$jar"
+done
+
 PLUGIN_JAR="$DIST/$(cat "$DIST/nscplugin.jar.txt")"
-COMPILE_CP="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIST/nativelibs.cp")")"
+COMPILE_CP="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIST/nativelibs.cp")"):$NIR_NATIVE_CP"
 
 "$DIST/scalino-dotc" \
   -javabootclasspath "$DIST/java.base.jar" \
@@ -55,7 +78,7 @@ COMPILE_CP="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIS
   -d "$CLASSES_DIR" \
   "$ROOT/cli/ScalinoCli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
-LINK_CP="$CLASSES_DIR:$(resolve_cp "$(cat "$DIST/nativelibs.cp")")"
+LINK_CP="$CLASSES_DIR:$(resolve_cp "$(cat "$DIST/nativelibs.cp")"):$NIR_NATIVE_CP"
 "$DIST/scalino-linkdriver" "$LINK_CP" "$LINK_DIR" ScalinoCli "$CLANG" "$CLANGPP"
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"

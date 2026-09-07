@@ -1,0 +1,63 @@
+diff --git a/language-server/src/dotty/tools/languageserver/Memory.scala b/language-server/src/dotty/tools/languageserver/Memory.scala
+index 5de6ddbc..78d53737 100644
+--- a/language-server/src/dotty/tools/languageserver/Memory.scala
++++ b/language-server/src/dotty/tools/languageserver/Memory.scala
+@@ -1,6 +1,8 @@
+ package dotty.tools
+ package languageserver
+ 
++import java.lang.management.ManagementFactory
++
+ object Memory {
+ 
+   /** Memory is judged to be critical if after a GC the amount of used memory
+@@ -19,29 +21,38 @@ object Memory {
+   private final val stressTest = false
+   private var stressTestCounter = 0
+ 
++  // `Runtime#{maxMemory,totalMemory,freeMemory}` are real JDK-only methods --
++  // absent from Scala Native's own same-named `java.lang.Runtime` stub, which
++  // only declares `gc()`. `java.lang.management.ManagementFactory`/
++  // `MemoryMXBean`/`MemoryUsage`, by contrast, are standard JDK API that Scala
++  // Native's javalib also implements for real (backed by `GC.get{Used,Max}HeapSize`),
++  // so using them here is a single, unconditional, correct-on-every-backend fix
++  // rather than a platform-specific workaround.
++  private def heapUsage() = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
++
+   /** Is memory critically low? */
+   def isCritical(): Boolean = {
+     if (stressTest) {
+       stressTestCounter += 1
+       if (stressTestCounter % 10 == 0) return true
+     }
+-    val runtime = Runtime.getRuntime
+-    def total = runtime.totalMemory
+-    def maximal = runtime.maxMemory
+-    def free = runtime.freeMemory
+-    def used = total - free
++    val bean = ManagementFactory.getMemoryMXBean()
++    def usage = bean.getHeapMemoryUsage()
++    def used = usage.getUsed
++    def maximal = usage.getMax
++    def free = usage.getCommitted - used
+     def usedIsCloseToMax =
+-      if maximal == Long.MaxValue then free.toDouble / used < FreeThreshold
++      if maximal < 0 then free.toDouble / used < FreeThreshold
+       else used.toDouble / maximal > UsedThreshold
+-    usedIsCloseToMax && { runtime.gc(); usedIsCloseToMax }
++    usedIsCloseToMax && { bean.gc(); usedIsCloseToMax }
+   }
+ 
+   def stats(): String = {
+     val M = 2 << 20
+-    val runtime = Runtime.getRuntime
+-    def total = runtime.totalMemory / M
+-    def maximal = runtime.maxMemory / M
+-    def free = runtime.freeMemory / M
++    val usage = heapUsage()
++    def total = usage.getCommitted / M
++    def maximal = usage.getMax / M
++    def free = (usage.getCommitted - usage.getUsed) / M
+     s"total used memory: $total MB, free: $free MB, maximal available = $maximal MB"
+   }
+ }

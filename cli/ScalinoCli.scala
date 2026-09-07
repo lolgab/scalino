@@ -21,6 +21,9 @@ import java.io.{ByteArrayOutputStream, InputStream}
 import java.lang.{ProcessBuilder => JProcessBuilder}
 import java.nio.file.{Files, Path, Paths}
 import scala.jdk.CollectionConverters.*
+import scala.scalanative.{nir => snir}
+import scala.scalanative.nir.serialization.deserializeBinary
+import scala.scalanative.io.VirtualDirectory
 
 object ScalinoCli:
 
@@ -477,9 +480,75 @@ object ScalinoCli:
       scanClassFile(Files.readAllBytes(f)).foreach(found.+=)
     found.toList
 
+  // ---------------------------------------------------------------------
+  // NIR-based fallback for the entry-point/test-discovery scan above: a
+  // self-hosted scalino-dotc (no backend/jvm/ASM baked in at all -- see
+  // docs/findings.md's self-hosting arc) never writes real .class files
+  // alongside .nir, so `findMainClasses`/`discoverTestClasses`'s classfile
+  // scanner finds nothing there, ever -- not a bug in the scanner, just a
+  // format it was never given. NIR is scala-native's own binary IR, already
+  // produced by every compile regardless of backend, and it's flat and
+  // post-erasure (structurally close to a JVM classfile) rather than
+  // TASTy's pickled tree shape, so this ports the *exact same* heuristic
+  // the classfile scanner uses -- same field names below, same semantics --
+  // just reading `nir.Defn`/`nir.Sig` instead of raw bytecode. Used ONLY
+  // when `classesDir` has no `.class` files at all (see call sites below);
+  // real GraalVM-built scalino-dotc always emits `.class`, so its behavior
+  // is completely unchanged by any of this.
+  // ---------------------------------------------------------------------
+
+  private def walkNirFiles(dir: Path): List[Path] =
+    val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
+    entries.flatMap(f => if f.isDirectory then walkNirFiles(f.toPath) else if f.getName.endsWith(".nir") then List(f.toPath) else Nil)
+
+  /** Deserializes one `.nir` file. Same fault-tolerance posture as the
+   *  classfile reader: a stale/corrupt/unreadable file is skipped (empty
+   *  result), not fatal -- one bad file under `classesDir` shouldn't break
+   *  discovery for everything else in it. */
+  private def readNirDefns(f: Path): Seq[snir.Defn] =
+    try
+      val dir = VirtualDirectory.local(f.getParent)
+      deserializeBinary(dir, Paths.get(f.getFileName.toString))
+    catch case _: Exception => Nil
+
+  /** Does this `Defn.Define` declare `main(Array[String]): Unit` with no
+   *  receiver -- i.e. the same "public static `main(String[])`" shape the
+   *  classfile scanner looks for, which is exactly how nscplugin lowers an
+   *  object's `@main def`/`extends App`/hand-written `def main`: a
+   *  synthetic top-level *class* (not the module itself) declaring `main`
+   *  with a plain `(Array[String]) => Unit` signature and no `this`
+   *  parameter (the module's own instance `main` -- two args, `this` first
+   *  -- is a different, uninteresting definition in a separate `.nir`
+   *  file). */
+  private def isNirMainDefine(d: snir.Defn.Define): Boolean =
+    (d.ty.args match
+      case Seq(snir.Type.Array(snir.Type.Ref(snir.Global.Top("java.lang.String"), _, _), _)) => d.ty.ret == snir.Type.Unit
+      case _ => false)
+    && (try
+      d.name.sig.unmangled match
+        case snir.Sig.Method(id, _, _) => id == "main"
+        case _                         => false
+      catch case _: Exception => false)
+
+  /** NIR equivalent of `findMainClasses` -- one real top-level *class*
+   *  (never a module: see `isNirMainDefine`'s doc) per `.nir` file declaring
+   *  a matching `main`, keyed by that class's own name (dollar-free, same
+   *  as the classfile scanner's `this_class`). */
+  def findMainClassesNir(classesDir: Path): List[String] =
+    val found = scala.collection.mutable.LinkedHashSet.empty[String]
+    for f <- walkNirFiles(classesDir) do
+      val defns = readNirDefns(f)
+      defns.collectFirst { case c: snir.Defn.Class => c }.foreach { c =>
+        if defns.exists { case d: snir.Defn.Define => isNirMainDefine(d); case _ => false } then found += c.name.id
+      }
+    found.toList
+
   def detectMainClass(classesDir: Path, explicit: Option[String]): String =
     explicit.getOrElse {
-      findMainClasses(classesDir) match
+      val candidates =
+        if walkClassFiles(classesDir).nonEmpty then findMainClasses(classesDir)
+        else findMainClassesNir(classesDir)
+      candidates match
         case List(one) => one
         case Nil => fail("no entry point found (looked for a compiled `public static void main(String[])`) -- pass --main-class")
         case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one")
@@ -651,16 +720,52 @@ object ScalinoCli:
       finally zf.close()
     catch case _: Exception => None
 
-  /** Resolves a (dotted) class name to its bytes, checking the local
-   *  compiled-output directory first, then every jar on the classpath in
-   *  order -- used by `isAssignable`'s ancestry walk, which needs to follow
-   *  a chain that starts in user code and typically ends inside a
-   *  dependency jar (e.g. `MySuite extends munit.FunSuite extends
-   *  munit.Suite`). */
-  def findClassBytes(name: String, classesDir: Path, jars: List[String]): Option[Array[Byte]] =
-    val local = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".class")
-    if Files.exists(local) then Some(Files.readAllBytes(local))
-    else jars.iterator.flatMap(j => readClassFromJar(j, name).iterator).nextOption()
+  /** NIR equivalent of `analyzeClassFile` -- same `ClassInfo` shape, sourced
+   *  from a `Defn.Class`/`Defn.Module`'s own `parent`/`traits` fields
+   *  directly (no ancestry reconstruction needed at all: unlike bytecode,
+   *  NIR already carries them as real fields, not something to re-derive
+   *  from a constant pool) plus a same-file scan for a public no-arg
+   *  constructor (`isCtor`, `!isPrivate`, and exactly one NIR-level arg --
+   *  the implicit receiver, since NIR method signatures always include
+   *  `this` explicitly, unlike a JVM descriptor). `accessFlags` is left `0`
+   *  (unused by any LOCAL-classesDir caller below; only the jar-based
+   *  `findFrameworkClasses` reads it, and that path stays classfile-only,
+   *  real dependency jars always have `.class`). */
+  private def hasPublicNoArgCtorNir(selfTop: snir.Global.Top, defns: Seq[snir.Defn]): Boolean =
+    defns.exists {
+      case d: snir.Defn.Define =>
+        d.name match
+          case snir.Global.Member(owner, sig) if owner == selfTop =>
+            (try sig.isCtor && !sig.isPrivate catch case _: Exception => false) && d.ty.args.size == 1
+          case _ => false
+      case _ => false
+    }
+
+  private def nirClassInfoOf(defns: Seq[snir.Defn]): Option[ClassInfo] =
+    defns.collectFirst {
+      case c: snir.Defn.Class =>
+        ClassInfo(c.name.id, c.parent.map(_.id), c.traits.map(_.id).toList, accessFlags = 0, isModule = false, hasPublicNoArgCtorNir(c.name, defns))
+      case m: snir.Defn.Module =>
+        ClassInfo(m.name.id, m.parent.map(_.id), m.traits.map(_.id).toList, accessFlags = 0, isModule = true, hasPublicNoArgCtorNir(m.name, defns))
+    }
+
+  /** Resolves a (dotted) class name to its `ClassInfo`, checking the local
+   *  compiled-output directory first (`.class` if present -- real
+   *  GraalVM-built scalino-dotc always has it; else `.nir`, the only format
+   *  a self-hosted scalino-dotc ever produces), then every jar on the
+   *  classpath in order -- used by `isAssignable`'s ancestry walk, which
+   *  needs to follow a chain that starts in user code and typically ends
+   *  inside a dependency jar (e.g. `MySuite extends munit.FunSuite extends
+   *  munit.Suite`); dependency jars are always real `.class`-bearing JVM
+   *  artifacts regardless of which toolchain built scalino-dotc, so that
+   *  half is untouched. */
+  def findClassInfo(name: String, classesDir: Path, jars: List[String]): Option[ClassInfo] =
+    val localClass = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".class")
+    if Files.exists(localClass) then analyzeClassFile(Files.readAllBytes(localClass))
+    else
+      val localNir = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".nir")
+      if Files.exists(localNir) then nirClassInfoOf(readNirDefns(localNir))
+      else jars.iterator.flatMap(j => readClassFromJar(j, name).iterator).nextOption().flatMap(analyzeClassFile)
 
   /** Does `startClass`'s ancestry (superclass chain and, at every step,
    *  every implemented interface -- since Scala traits compile to
@@ -673,7 +778,7 @@ object ScalinoCli:
       if name == target then true
       else if name == "java.lang.Object" || !visited.add(name) then false
       else
-        findClassBytes(name, classesDir, jars).flatMap(analyzeClassFile) match
+        findClassInfo(name, classesDir, jars) match
           case None => false
           case Some(info) => info.superClass.exists(go) || info.interfaces.exists(go)
     go(startClass)
@@ -786,17 +891,24 @@ object ScalinoCli:
    *  fullyQualifiedName excludes it). */
   def discoverTestClasses(classesDir: Path, specs: List[SubclassSpec], jars: List[String]): List[TestMatch] =
     val found = scala.collection.mutable.LinkedHashMap.empty[String, TestMatch]
-    for f <- walkClassFiles(classesDir) do
-      analyzeClassFile(Files.readAllBytes(f)).foreach { info =>
-        val isModuleClass = info.thisClass.endsWith("$") && info.isModule
-        val reportedName = if isModuleClass then info.thisClass.stripSuffix("$") else info.thisClass
-        if !found.contains(reportedName) then
-          specs
-            .find(s => s.isModule == isModuleClass
-                       && (s.isModule || !s.requireNoArgConstructor || info.hasPublicNoArgCtor)
-                       && isAssignable(info.thisClass, s.superclassName, classesDir, jars))
-            .foreach(s => found(reportedName) = TestMatch(reportedName, isModuleClass, s.frameworkFqcn, s.superclassName))
-      }
+    // Same NIR fallback as `detectMainClass`: only reached when `classesDir`
+    // has no `.class` files at all (a self-hosted scalino-dotc). Every
+    // `.nir` file's single top-level `Defn.Class`/`Defn.Module` is scanned
+    // the same way a `.class` file would be -- see `nirClassInfoOf`.
+    val localInfos: List[ClassInfo] =
+      if walkClassFiles(classesDir).nonEmpty then
+        walkClassFiles(classesDir).flatMap(f => analyzeClassFile(Files.readAllBytes(f)))
+      else
+        walkNirFiles(classesDir).flatMap(f => nirClassInfoOf(readNirDefns(f)))
+    for info <- localInfos do
+      val isModuleClass = info.thisClass.endsWith("$") && info.isModule
+      val reportedName = if isModuleClass then info.thisClass.stripSuffix("$") else info.thisClass
+      if !found.contains(reportedName) then
+        specs
+          .find(s => s.isModule == isModuleClass
+                     && (s.isModule || !s.requireNoArgConstructor || info.hasPublicNoArgCtor)
+                     && isAssignable(info.thisClass, s.superclassName, classesDir, jars))
+          .foreach(s => found(reportedName) = TestMatch(reportedName, isModuleClass, s.frameworkFqcn, s.superclassName))
     found.values.toList
 
   /** Generates `ScalinoCliTestMain.scala`: one real (statically instantiated, no

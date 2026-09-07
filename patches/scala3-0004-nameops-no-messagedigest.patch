@@ -1,0 +1,80 @@
+diff --git a/compiler/src/dotty/tools/dotc/core/NameOps.scala b/compiler/src/dotty/tools/dotc/core/NameOps.scala
+index f157da84..22f6fd0a 100644
+--- a/compiler/src/dotty/tools/dotc/core/NameOps.scala
++++ b/compiler/src/dotty/tools/dotc/core/NameOps.scala
+@@ -2,9 +2,6 @@ package dotty.tools
+ package dotc
+ package core
+ 
+-import java.security.MessageDigest
+-import java.nio.CharBuffer
+-import scala.io.Codec
+ import Int.MaxValue
+ import Names.*, StdNames.*, Contexts.*, Symbols.*, Flags.*, NameKinds.*, Types.*
+ import util.Chars.{isOperatorPart, isIdentifierPart, digit2int}
+@@ -15,21 +12,29 @@ import nme.*
+ object NameOps {
+ 
+   object compactify {
+-    lazy val md5: MessageDigest = MessageDigest.getInstance("MD5")
+ 
+     inline val CLASSFILE_NAME_CHAR_LIMIT = 240
+ 
+     /** COMPACTIFY
+      *
+-     *  The hashed name has the form (prefix + marker + md5 + marker + suffix), where
++     *  The hashed name has the form (prefix + marker + hash + marker + suffix), where
+      *   - prefix/suffix.length = MaxNameLength / 4
+-     *   - md5.length = 32
++     *   - hash.length = 32
+      *
+      *  We obtain the formula:
+      *
+      *   FileNameLength = 2*(MaxNameLength / 4) + 2.marker.length + 32 + 6
+      *
+      *  (+6 for ".class"). MaxNameLength can therefore be computed as follows:
++     *
++     *  The hash itself doesn't need cryptographic properties, only to be a
++     *  stable, well-distributed name-shortening digest -- so it's built from
++     *  `scala.util.hashing.MurmurHash3` (plain Scala, cross-builds for Scala
++     *  Native) instead of `java.security.MessageDigest` (no Scala Native
++     *  port). Four independent 32-bit hashes, each rendered as 8 hex chars
++     *  via `Integer.toHexString` (no `java.util.Formatter`, also unported),
++     *  give the same 32-hex-char length MD5 produced, so the surrounding
++     *  length budget above is unchanged.
+      */
+     def apply(s: String): String = {
+       val marker = "$$$$"
+@@ -38,19 +43,25 @@ object NameOps {
+         2 * (CLASSFILE_NAME_CHAR_LIMIT - 6 - 2 * marker.length - 32)
+       )
+ 
+-      def toMD5(s: String, edge: Int): String = {
++      def hex8(h: Int): String = {
++        val hex = Integer.toHexString(h)
++        "0" * (8 - hex.length) + hex
++      }
++
++      def toHashedName(s: String, edge: Int): String = {
+         val prefix = s.take(edge)
+         val suffix = s.takeRight(edge)
+ 
+-        val cs = s.toArray
+-        val bytes = Codec.toUTF8(CharBuffer.wrap(cs))
+-        md5.update(bytes)
+-        val md5chars = md5.digest().map(b => (b & 0xFF).toHexString).mkString
++        val hashChars =
++          hex8(_root_.scala.util.hashing.MurmurHash3.stringHash(s, 0)) +
++          hex8(_root_.scala.util.hashing.MurmurHash3.stringHash(s, 1)) +
++          hex8(_root_.scala.util.hashing.MurmurHash3.stringHash(s, 2)) +
++          hex8(_root_.scala.util.hashing.MurmurHash3.stringHash(s, 3))
+ 
+-        prefix + marker + md5chars + marker + suffix
++        prefix + marker + hashChars + marker + suffix
+       }
+ 
+-      if (s.length <= MaxNameLength) s else toMD5(s, MaxNameLength / 4)
++      if (s.length <= MaxNameLength) s else toHashedName(s, MaxNameLength / 4)
+     }
+   }
+ 

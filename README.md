@@ -3,10 +3,16 @@
 [![CI](https://github.com/lolgab/scalino/actions/workflows/ci.yml/badge.svg)](https://github.com/lolgab/scalino/actions/workflows/ci.yml)
 
 Goal: a complete Scala 3 toolchain that never needs a JVM installed, at any
-step -- compile, link, build, and (in progress) IDE tooling. A JVM is only
-ever needed once, transiently, at *this project's own* build time, to run
-GraalVM's native-image; nothing it produces touches a JVM again. People
-should be able to write, build, and run Scala without installing Java.
+step -- compile, link, build, and IDE tooling. A JVM is only ever needed
+transiently, at *this project's own* build time, as a bootstrap compiler
+(`scalino-dotc`/`scalino-lsp` are self-hosted -- compiled by dotc from their
+own patched source, targeting Scala Native directly, no native-image AOT
+step involved) and, for the one remaining GraalVM-native-image binary
+(`scalino-linkdriver`, the NIR→native linker -- see
+[`docs/findings.md`](docs/findings.md) for why that one hasn't been
+self-hosted yet, and what a from-source self-hosting attempt found). Nothing
+any of this produces touches a JVM again. People should be able to write,
+build, and run Scala without installing Java.
 
 Today this covers the compiler + linker + build tool (`scalino`). Next up: a
 JVM-free language server (LSP), so editors like Zed can get Scala IntelliSense
@@ -84,8 +90,11 @@ prerequisites a fresh machine may not have):
 
 ## Build from source
 
-Requires: GraalVM JDK 21+ (with `native-image`), `clang`, `coursier` (`cs`),
-`git`.
+Requires: GraalVM JDK 21+ (with `native-image` -- still needed to build
+`scalino-linkdriver`, and used as the bootstrap JVM that compiles
+`scalino-dotc`/`scalino-lsp` from source), `sbt` (builds a small javalib
+patch via scala-native's own build -- see `build/01b-build-patched-javalib.sh`),
+`clang`, `coursier` (`cs`), `git`.
 
 ```
 ./build/all.sh
@@ -93,10 +102,13 @@ Requires: GraalVM JDK 21+ (with `native-image`), `clang`, `coursier` (`cs`),
 
 This clones `scala/scala3` and `scala-native/scala-native` into `vendor/`
 (pinned versions, see `versions.env`), applies our patches from `patches/`,
-and produces `dist/scalino-dotc` (standalone compiler + scala-native plugin,
-our patched macro interpreter baked in), `dist/scalino-linkdriver` (standalone
-NIR→native linker), and `dist/scalino` (see below) -- plus the classpath
-manifests `bin/scalino-bootstrap`/`scalino` need.
+and produces `dist/scalino-dotc` (self-hosted: dotc + scala-native's compiler
+plugin + our patched macro interpreter, all compiled to NIR and linked into a
+real Scala Native executable -- no JVM/GraalVM native-image in the binary
+itself), `dist/scalino-lsp` (self-hosted the same way), `dist/scalino-linkdriver`
+(standalone NIR→native linker -- still a GraalVM-native-image build, see
+[`docs/findings.md`](docs/findings.md)), and `dist/scalino` (see below) --
+plus the classpath manifests `bin/scalino-bootstrap`/`scalino` need.
 
 ## Use
 
@@ -162,11 +174,14 @@ verified/blocked/remaining breakdown.
 **Also proven working, fully JVM-free: an LSP server** (`dist/scalino-lsp`,
 `build/08-build-scalino-lsp.sh`) for editors like Zed, so Scala gets
 diagnostics/hover without Metals' JVM dependency. Built by trimming and
-patching dotty's own pre-Metals `language-server/` module (see
-`docs/findings.md` "JVM-free language server (LSP)" for the three real bugs
-found and fixed along the way). Verified against a real native binary:
-correct diagnostics and real Scaladoc-sourced hover for a hand-written
-project config. `dist/scalino setup-ide <sources...>` generates that project
+patching dotty's own pre-Metals `language-server/` module, and, since
+2026-09-07, self-hosted the same way as `scalino-dotc` -- compiled to NIR
+and linked into a real Scala Native executable, no GraalVM native-image
+anywhere in the binary (see `docs/findings.md`'s "Self-hosting scalino-lsp"
+section for the real bugs found and fixed along the way). Verified against a
+real native binary: correct diagnostics/hover/definition/references/rename
+for both a hand-written project config and a real multi-package third-party
+project. `dist/scalino setup-ide <sources...>` generates that project
 config (`.dotty-ide.json`) instead of hand-writing it, and
 [`zed-extension/`](zed-extension/) wires the server into Zed as a real
 extension (`README.md` there for install steps) — untested end-to-end

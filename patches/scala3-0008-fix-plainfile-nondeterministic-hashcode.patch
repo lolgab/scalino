@@ -1,0 +1,31 @@
+diff --git a/compiler/src/dotty/tools/io/PlainFile.scala b/compiler/src/dotty/tools/io/PlainFile.scala
+index ff637c91..90f0ca68 100644
+--- a/compiler/src/dotty/tools/io/PlainFile.scala
++++ b/compiler/src/dotty/tools/io/PlainFile.scala
+@@ -67,9 +67,24 @@ class PlainFile(val givenPath: Path) extends AbstractFile {
+   override def output: OutputStream = givenPath.toFile.outputStream()
+   override def sizeOption: Option[Int] = Some(givenPath.length.toInt)
+ 
+-  override def hashCode(): Int = System.identityHashCode(absolutePath)
++  // Upstream used `System.identityHashCode(absolutePath)` + `eq`, relying on
++  // `String#intern()` to canonicalize equal paths to the same object. That
++  // invariant doesn't hold on Scala Native, whose `String.intern()` is a
++  // no-op stub (`def intern(): _String = this`, javalib/.../String.scala) --
++  // it never deduplicates, so two `PlainFile`s built from equal paths get
++  // non-`eq` "interned" strings and (via the raw-address-based default
++  // identityHashCode, runtime/Object.scala's `__hashCode`) effectively random
++  // hash codes. That broke `NirCodeGen.scala`'s
++  // `generatedDefns.groupBy(defn => getFileFor(...))`: instead of one group
++  // per output file, every `Defn` landed in its own spurious singleton group,
++  // and only whichever group a `Map` happened to iterate last actually got
++  // written -- silently truncating/overwriting every other group's content,
++  // non-deterministically per process run. Plain value equality on
++  // `absolutePath` is correct on every backend and isn't hostage to
++  // `intern()` semantics at all.
++  override def hashCode(): Int = absolutePath.hashCode()
+   override def equals(that: Any): Boolean = that match {
+-    case x: PlainFile => absolutePath `eq` x.absolutePath
++    case x: PlainFile => absolutePath == x.absolutePath
+     case _            => false
+   }
+ 

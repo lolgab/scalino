@@ -1,0 +1,50 @@
+diff --git a/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala b/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala
+index 871cab52..840b4cd4 100644
+--- a/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala
++++ b/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala
+@@ -494,22 +494,36 @@ class MegaPhase(val miniPhases: Array[MiniPhase]) extends Phase {
+ 
+   // Initialization code
+ 
+-  /** Class#getDeclaredMethods is slow, so we cache its output */
+-  private val clsMethodsCache = new java.util.IdentityHashMap[Class[?], Array[java.lang.reflect.Method | Null]]
+-
+   /** Does `phase` contain a redefinition of method `name`?
+    *  (which is a method of MiniPhase)
++   *
++   *  Reflection-free by design: unlike GraalVM native-image (which can
++   *  register arbitrary classes for reflection at build time via a tracing
++   *  agent), Scala Native has no general `Class#getDeclaredMethods` --
++   *  only the narrow, per-class, opt-in `@EnableReflectiveInstantiation`
++   *  mechanism, which doesn't cover this open-ended "every MiniPhase
++   *  subtype" pattern (see docs/findings.md, "Blocker A"). `cls.getName`/
++   *  `cls.getSuperclass` are ordinary Scala Native-supported Class
++   *  operations (real metadata, not reflection over members) and stay
++   *  unchanged; only the one unsupported call (`getDeclaredMethods`) is
++   *  replaced by a lookup into `MiniPhaseOverrides.declaredMethodNames`, a
++   *  build-time-generated table (see build/tools/GenMiniPhaseOverrides.java
++   *  and build/02b-gen-megaphase-overrides.sh) computed once, offline, via
++   *  real JVM reflection over the exact compiled classes this binary bakes
++   *  in -- functionally identical to the old runtime-reflective answer,
++   *  just computed ahead of time instead of on every compiler run.
+    */
+   private def defines(phase: MiniPhase, name: String) = {
+     def hasRedefinedMethod(cls: Class[?]): Boolean =
+       if (cls.eq(classOf[MiniPhase])) false
+       else {
+-        var clsMethods = clsMethodsCache.get(cls)
+-        if (clsMethods == null) {
+-          clsMethods = cls.getDeclaredMethods
+-          clsMethodsCache.put(cls, clsMethods)
+-        }
+-        clsMethods.nn.exists(_.nn.getName == name) ||
++        val declared = MiniPhaseOverrides.declaredMethodNames.getOrElse(cls.getName, null)
++        if (declared == null)
++          throw new MatchError(
++            s"MiniPhaseOverrides has no entry for ${cls.getName} -- " +
++            "GenMiniPhaseOverrides.java must be re-run (it's out of date " +
++            "with the compiler/nscplugin classes this binary was built from)")
++        declared.contains(name) ||
+         hasRedefinedMethod(cls.getSuperclass.nn)
+       }
+     hasRedefinedMethod(phase.getClass)
