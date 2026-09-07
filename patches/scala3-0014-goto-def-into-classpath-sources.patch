@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/core/Symbols.scala b/compiler/src/dotty/tools/dotc/core/Symbols.scala
-index e2b2ec80..fe29ad3e 100644
+index e2b2ec80..13c52638 100644
 --- a/compiler/src/dotty/tools/dotc/core/Symbols.scala
 +++ b/compiler/src/dotty/tools/dotc/core/Symbols.scala
 @@ -40,6 +40,25 @@ object Symbols extends SymUtils {
@@ -10,7 +10,7 @@ index e2b2ec80..fe29ad3e 100644
 +   *  jar exist? `Symbol#upgradedSource`'s own per-symbol latch
 +   *  (`mySourcesJarTried`) only avoids redoing this lookup for the SAME
 +   *  symbol -- every other distinct top-level `ClassSymbol` backed by the
-+   *  same jar (e.g. every scala.*/java.* symbol touched during ordinary
++   *  same jar (e.g. every scala/java standard-library symbol touched during ordinary
 +   *  interactive typechecking shares one scala3-library_3.jar/java.base.jar)
 +   *  still did its own real `Files.exists` filesystem stat for an identical
 +   *  answer. Confirmed via CI (macos-x86_64 specifically -- GitHub's hosted
