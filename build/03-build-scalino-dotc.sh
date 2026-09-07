@@ -51,7 +51,7 @@ else
 fi
 
 echo "== generating self-hosted source file list =="
-./selfhost/gen-file-list.sh > "$FILE_LIST"
+./selfhost/gen-file-list.sh | to_native_path_list > "$FILE_LIST"
 echo "  $(wc -l < "$FILE_LIST" | tr -d ' ') files"
 
 echo "== compiling dotc+nscplugin to NIR (bootstrap JVM dotc, real nscplugin jar as -Xplugin) =="

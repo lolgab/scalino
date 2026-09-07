@@ -66,6 +66,26 @@ to_native_path() {
   esac
 }
 
+# Same idea as to_native_path, but as a stream filter for a one-path-per-line
+# file: build/selfhost/gen-*-file-list.sh build their whole 500+-file source
+# list from raw `find $ROOT/...`/`echo $ROOT/...` (MSYS-style on Windows,
+# since gen-file-list.sh never sources 00-env.sh -- it's meant to be
+# reproducible standalone), then 03-build-scalino-dotc.sh/
+# 08-build-scalino-lsp.sh feed the whole list to a real Windows dotc process
+# via `@file-list.txt`. Confirmed via CI: dotc reported all ~550 files as
+# "source file not found", each shown mangled to "\d\a\scalino\..." -- real
+# Windows Java normalizes "/" to "\" but doesn't understand "/d" as a drive
+# letter the way it understands "D:", so every path silently became relative
+# to the current drive's root instead of absolute.
+to_native_path_list() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      while IFS= read -r line; do to_native_path "$line"; echo; done
+      ;;
+    *) cat ;;
+  esac
+}
+
 CLANG="$(command -v clang)"
 CLANGPP="$(command -v clang++)"
 

@@ -47,7 +47,7 @@ else
 fi
 
 echo "== generating self-hosted source file list (dotc + LSP + decompiler-support) =="
-./selfhost/gen-lsp-file-list.sh > "$FILE_LIST"
+./selfhost/gen-lsp-file-list.sh | to_native_path_list > "$FILE_LIST"
 echo "  $(wc -l < "$FILE_LIST" | tr -d ' ') files"
 
 echo "== fetching link-only Scala-Native cross-build jars (jsoniter-scala-core, java.time/Locale polyfills) =="
