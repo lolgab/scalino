@@ -62,7 +62,11 @@ object LinkDriver:
     case other => throw new IllegalArgumentException(s"Unknown native target: '$other' (expected app|static|dynamic)")
 
   def main(args: Array[String]): Unit =
-    val cp = args(0).split(":").toSeq.map(Paths.get(_))
+    // File.pathSeparator, not a hardcoded ":" -- confirmed via Windows CI:
+    // a hardcoded ":" shatters a real Windows path at its own drive-letter
+    // colon ("C:\..."), producing garbage entries and "Discovered 0 classes"
+    // no matter how correct each individual path string already is.
+    val cp = args(0).split(java.io.File.pathSeparator).toSeq.map(Paths.get(_))
     val workDir = Paths.get(args(1))
     val mainClass = args(2)
     val logLevel = if args.length > 5 then args(5) else "info"

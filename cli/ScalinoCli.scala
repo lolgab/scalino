@@ -41,6 +41,14 @@ object ScalinoCli:
     val exe = selfexe.SelfExe.path()
     Paths.get(exe).toRealPath().getParent.toString
 
+  // Every classpath string this file builds/parses uses the platform's real
+  // path separator (";" on Windows, ":" elsewhere) -- confirmed via CI: a
+  // hardcoded ":" shatters a real Windows path at its own drive-letter
+  // colon ("C:\..."), the same bug found and fixed in src/LinkDriver.scala.
+  // dist/*.cp itself is already written with this same separator (see
+  // build/06-package.sh's vendor_cp), so this just has to match it.
+  val CP_SEP: String = java.io.File.pathSeparator
+
   def die(msg: String): Nothing =
     System.err.println(s"scalino: $msg")
     sys.exit(1)
@@ -357,7 +365,7 @@ object ScalinoCli:
    *  scalino-dotc a classpath full of dangling paths and watching it
    *  report every symbol from those jars as "not found". */
   def cachedClasspathStillValid(cp: String): Boolean =
-    cp.split(":").filter(_.nonEmpty).forall(e => Files.exists(Paths.get(e)))
+    cp.split(CP_SEP).filter(_.nonEmpty).forall(e => Files.exists(Paths.get(e)))
 
   def resolveDeps(deps: List[String], cacheDir: Path, repositories: List[String] = Nil): String =
     if deps.isEmpty then ""
@@ -893,10 +901,10 @@ object ScalinoCli:
       val probeSrc = scratch.resolve("ScalinoCliProbeMain.scala")
       Files.write(probeSrc, probeSourceFor(frameworkFqcns).getBytes("UTF-8"))
       val probeClasses = scratch.resolve("classes")
-      val ccWithUserClasses = cc.copy(compileCp = s"$userClassesDir:${cc.compileCp}")
+      val ccWithUserClasses = cc.copy(compileCp = s"$userClassesDir$CP_SEP${cc.compileCp}")
       compileToClasses(List(probeSrc), probeClasses, ccWithUserClasses)
       val linkDir = scratch.resolve("link")
-      val linkCp = s"$probeClasses:$userClassesDir:${cc.nativelibsCp}:$testClasspath"
+      val linkCp = s"$probeClasses$CP_SEP$userClassesDir$CP_SEP${cc.nativelibsCp}$CP_SEP$testClasspath"
       val clang = findOnPath("clang")
       val clangpp = findOnPath("clang++")
       val linkExit = runInherited(List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, "ScalinoCliProbeMain", clang, clangpp, logLevel))
@@ -1125,7 +1133,7 @@ object ScalinoCli:
 
   // compiler.cp/nativelibs.cp/nscplugin.jar.txt store dist-relative paths
   // (e.g. "lib/foo.jar") so dist/ stays relocatable -- resolve to absolute.
-  def resolveCp(raw: String): String = raw.split(":").map(e => s"$dist/$e").mkString(":")
+  def resolveCp(raw: String): String = raw.split(CP_SEP).map(e => s"$dist/$e").mkString(CP_SEP)
 
   /** Compiles `sources`, then detects (or takes, if `explicitMainClass` is
    *  set) the entry point from the *compiled* classfiles -- see
@@ -1182,11 +1190,11 @@ object ScalinoCli:
     // Dropping it unconditionally removes essential Scala 3 stdlib content,
     // not just a redundant duplicate.
     def dropPlainScalaLibrary(cp: String): String =
-      cp.split(":").filterNot(j => j.matches(""".*/scala-library-[0-9.]+\.jar""") && !j.endsWith(s"/scala-library-${BuildInfo.scalaVersion}.jar")).mkString(":")
+      cp.split(CP_SEP).filterNot(j => j.matches(""".*/scala-library-[0-9.]+\.jar""") && !j.endsWith(s"/scala-library-${BuildInfo.scalaVersion}.jar")).mkString(CP_SEP)
 
     val compileCp =
       List(scalalibRetained, dropPlainScalaLibrary(compilerCp), dropPlainScalaLibrary(nativelibsCp), extraClasspath, extraCompileOnlyClasspath)
-        .filter(_.nonEmpty).mkString(":")
+        .filter(_.nonEmpty).mkString(CP_SEP)
 
     CompileClasspath(javaBase, pluginJar, compileCp, nativelibsCp)
 
@@ -1381,7 +1389,7 @@ object ScalinoCli:
       // it's freshly emptied above) is what lets scalino-dotc resolve
       // symbols from files it isn't recompiling this round out of their
       // already-compiled .tasty/.class instead of needing their source.
-      val compileCp = s"$classesDir:${cc.compileCp}"
+      val compileCp = s"$classesDir$CP_SEP${cc.compileCp}"
       val compileCmd = List(
         s"$dist/scalino-dotc",
         "-javabootclasspath", cc.javaBase,
@@ -1473,8 +1481,8 @@ object ScalinoCli:
     val linkDir = Paths.get(".scalino-build").resolve(mainClass).resolve("link")
 
     val linkCp =
-      if extraClasspath.isEmpty then s"$classesDir:${cc.nativelibsCp}"
-      else s"$classesDir:${cc.nativelibsCp}:$extraClasspath"
+      if extraClasspath.isEmpty then s"$classesDir$CP_SEP${cc.nativelibsCp}"
+      else s"$classesDir$CP_SEP${cc.nativelibsCp}$CP_SEP$extraClasspath"
     val clang = nativeOpts.clang.getOrElse(findOnPath("clang"))
     val clangpp = nativeOpts.clangpp.getOrElse(findOnPath("clang++"))
 
@@ -1734,7 +1742,7 @@ object ScalinoCli:
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(":")
+    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
@@ -1816,7 +1824,7 @@ object ScalinoCli:
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)
       val testOnlyClasspath = resolveDeps(directives.testDeps, depsCache, repos)
       val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
-      val testClasspath = (List(mainClasspath, testOnlyClasspath) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(":")
+      val testClasspath = (List(mainClasspath, testOnlyClasspath) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
       val options = directives.options ++ o.cliOptions ++ directives.testOptions
       val cc = computeCompileClasspath(testClasspath, extraCompileOnlyClasspath)
 
@@ -1826,7 +1834,7 @@ object ScalinoCli:
       val classesDir = Paths.get(".scalino-build", "_scratch", "test-classes")
       compileToClasses(expanded, classesDir, cc, options, !o.noIncremental)
 
-      val testJars = testClasspath.split(":").filter(_.nonEmpty).toList
+      val testJars = testClasspath.split(CP_SEP).filter(_.nonEmpty).toList
       val explicitFramework = o.testFrameworkOpt.orElse(directives.testFramework)
       val frameworkFqcns = explicitFramework match
         case Some(fqcn) => List(fqcn)
@@ -1901,7 +1909,7 @@ object ScalinoCli:
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(":")
+    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
     val compileOnlyDeps = (directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
     val extraCompileOnlyClasspath = resolveDeps(compileOnlyDeps, depsCache, repos)
     fetchSourcesBestEffort((allDeps ++ compileOnlyDeps).distinct, depsCache, repos)
@@ -1919,7 +1927,7 @@ object ScalinoCli:
       List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ options
 
     val sourceDirectories = expanded.map(_.toAbsolutePath.getParent.toString).distinct.sorted
-    val dependencyClasspath = cc.compileCp.split(":").filter(_.nonEmpty).toList
+    val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
     val classDirectory = Paths.get(".scalino-build", ".dotty-ide-classes").toAbsolutePath
     Files.createDirectories(classDirectory)
     val projectId = Option(Paths.get(".").toAbsolutePath.normalize.getFileName).map(_.toString).getOrElse("root")
