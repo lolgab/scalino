@@ -7,9 +7,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
 
-for f in "$DIST/scalino-dotc" "$DIST/scalino-linkdriver" "$DIST/java.base.jar" \
-         "$DIST/compiler.cp" "$DIST/nativelibs.cp" "$DIST/nscplugin.jar.txt"; do
+for f in "$DIST/scalino-dotc" "$DIST/scalino-linkdriver" "$DIST/java.base.jar"; do
   [[ -e "$f" ]] || { echo "missing $f -- run build/all.sh first" >&2; exit 1; }
+done
+for f in "$WORK/compiler.cp" "$WORK/nativelibs.cp" "$WORK/nscplugin.jar.txt"; do
+  [[ -e "$f" ]] || { echo "missing $f -- run build/01-fetch-deps.sh first" >&2; exit 1; }
 done
 
 SRC_DIR="$WORK/scalino-src"
@@ -40,10 +42,6 @@ LINK_DIR="$WORK/scalino-link"
 rm -rf "$CLASSES_DIR" "$LINK_DIR"
 mkdir -p "$CLASSES_DIR"
 
-# compiler.cp/nativelibs.cp/nscplugin.jar.txt hold dist-relative paths
-# (see 06-package.sh) so dist/ stays relocatable -- resolve to absolute here.
-resolve_cp() { echo "$DIST/${1//:/:$DIST/}"; }
-
 # ScalinoCli.scala's own entry-point/test-discovery scanner needs a real NIR
 # reader (see cli/ScalinoCli.scala's "Entry-point detection" section): on a
 # self-hosted scalino-dotc, the compiled user project's classesDir never gets
@@ -67,8 +65,8 @@ for artifact in "${NIR_NATIVE_JARS[@]}"; do
   NIR_NATIVE_CP="${NIR_NATIVE_CP:+$NIR_NATIVE_CP:}$jar"
 done
 
-PLUGIN_JAR="$DIST/$(cat "$DIST/nscplugin.jar.txt")"
-COMPILE_CP="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIST/nativelibs.cp")"):$NIR_NATIVE_CP"
+PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
+COMPILE_CP="$(cat "$WORK/compiler.cp"):$(cat "$WORK/nativelibs.cp"):$NIR_NATIVE_CP"
 
 "$DIST/scalino-dotc" \
   -javabootclasspath "$DIST/java.base.jar" \
@@ -78,7 +76,7 @@ COMPILE_CP="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIS
   -d "$CLASSES_DIR" \
   "$ROOT/cli/ScalinoCli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
-LINK_CP="$CLASSES_DIR:$(resolve_cp "$(cat "$DIST/nativelibs.cp")"):$NIR_NATIVE_CP"
+LINK_CP="$CLASSES_DIR:$(cat "$WORK/nativelibs.cp"):$NIR_NATIVE_CP"
 "$DIST/scalino-linkdriver" "$LINK_CP" "$LINK_DIR" ScalinoCli "$CLANG" "$CLANGPP"
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"

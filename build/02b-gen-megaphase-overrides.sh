@@ -26,7 +26,7 @@ mkdir -p "$GEN_DIR" "$TOOL_CLASSES"
 
 "$JAVAC" -d "$TOOL_CLASSES" tools/GenMiniPhaseOverrides.java
 "$JAVA" -cp "$TOOL_CLASSES" GenMiniPhaseOverrides \
-  "$(cat "$WORK/compiler.cp"):$(cat "$WORK/nscplugin.cp")" \
+  "$(cat "$WORK/compiler.cp")" "$(cat "$WORK/nscplugin.cp")" \
   "$GEN_DIR/MiniPhaseOverrides.scala"
 
 echo "OK: $GEN_DIR/MiniPhaseOverrides.scala"

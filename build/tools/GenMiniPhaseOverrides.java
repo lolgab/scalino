@@ -11,7 +11,12 @@
 // "Blocker A"), so we compute it here instead and bake it into a generated
 // Scala source file consumed as a plain, reflection-free Map.
 //
-// Usage: GenMiniPhaseOverrides <colon-separated-classpath> <output-.scala-path>
+// Usage: GenMiniPhaseOverrides <classpath>... <output-.scala-path>
+// Each <classpath> is split on the platform's own File.pathSeparator (":" on
+// Linux/macOS, ";" on Windows) -- taken as multiple args, not pre-joined by
+// the caller, so the caller never has to guess which separator a given
+// classpath string already uses (a naive caller-side join with a hardcoded
+// ":" would shatter "C:\..." Windows paths at their drive-letter colon).
 import java.io.File;
 import java.io.PrintWriter;
 import java.lang.reflect.Method;
@@ -51,29 +56,29 @@ public class GenMiniPhaseOverrides {
   static final String MINI_PHASE = "dotty.tools.dotc.transform.MegaPhase$MiniPhase";
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 2) {
-      System.err.println("usage: GenMiniPhaseOverrides <classpath> <out.scala>");
+    if (args.length < 2) {
+      System.err.println("usage: GenMiniPhaseOverrides <classpath>... <out.scala>");
       System.exit(1);
     }
-    String cp = args[0];
-    File outFile = new File(args[1]);
+    File outFile = new File(args[args.length - 1]);
 
-    String[] jarPaths = cp.split(":");
     List<URL> urls = new ArrayList<>();
     List<String> classNames = new ArrayList<>();
-    for (String p : jarPaths) {
-      if (p.isEmpty()) continue;
-      File f = new File(p);
-      if (!f.exists() || !p.endsWith(".jar")) continue;
-      urls.add(f.toURI().toURL());
-      try (JarFile jar = new JarFile(f)) {
-        Enumeration<JarEntry> entries = jar.entries();
-        while (entries.hasMoreElements()) {
-          JarEntry e = entries.nextElement();
-          String name = e.getName();
-          if (!name.endsWith(".class")) continue;
-          if (name.equals("module-info.class") || name.endsWith("/module-info.class")) continue;
-          classNames.add(name.substring(0, name.length() - ".class".length()).replace('/', '.'));
+    for (int i = 0; i < args.length - 1; i++) {
+      for (String p : args[i].split(File.pathSeparator)) {
+        if (p.isEmpty()) continue;
+        File f = new File(p);
+        if (!f.exists() || !p.endsWith(".jar")) continue;
+        urls.add(f.toURI().toURL());
+        try (JarFile jar = new JarFile(f)) {
+          Enumeration<JarEntry> entries = jar.entries();
+          while (entries.hasMoreElements()) {
+            JarEntry e = entries.nextElement();
+            String name = e.getName();
+            if (!name.endsWith(".class")) continue;
+            if (name.equals("module-info.class") || name.endsWith("/module-info.class")) continue;
+            classNames.add(name.substring(0, name.length() - ".class".length()).replace('/', '.'));
+          }
         }
       }
     }
