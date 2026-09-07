@@ -379,6 +379,34 @@ object ScalinoCli:
           Files.write(cacheFile, cp.getBytes("UTF-8"))
           cp
 
+  /** Best-effort: also fetches `-sources.jar` classifiers for `deps`
+   *  (transitively, so a click into a transitive dependency's symbols works
+   *  too) into the coursier cache, as siblings of the classes jars
+   *  `resolveDeps` already resolved -- that's where scalino-lsp's
+   *  go-to-definition-into-library-sources (patches/scala3-0014) looks for
+   *  them. Never fails the caller: a dependency that doesn't publish
+   *  sources, or a network hiccup, just means go-to-def won't resolve into
+   *  that one library, same as before this existed. Only called from
+   *  `setup-ide` (sources are otherwise dead weight for `run`/`compile`/
+   *  `test`), and only attempted once per dependency set -- a marker file,
+   *  not the classpath cache file itself, since this is a separate network
+   *  round-trip from `resolveDeps`'s own `cs fetch --classpath` and
+   *  shouldn't block or duplicate it. */
+  def fetchSourcesBestEffort(deps: List[String], cacheDir: Path, repositories: List[String] = Nil): Unit =
+    if deps.nonEmpty then
+      try
+        Files.createDirectories(cacheDir)
+        val key = sanitizeKey((deps.sorted ::: repositories.sorted).mkString(","))
+        val marker = cacheDir.resolve(s"deps-$key.sources-fetched")
+        if !Files.exists(marker) then
+          val cs = findOnPath("cs")
+          val coords = deps.map(toCoursierCoord)
+          val repoFlags = repositories.flatMap(r => List("-r", r))
+          System.err.println(s"scalino: fetching sources for ${deps.mkString(", ")} (best-effort, for go-to-definition)")
+          runCaptureStdout(cs :: "fetch" :: coords ::: repoFlags ::: List("--classifier", "sources"))
+          Files.write(marker, Array.emptyByteArray)
+      catch case scala.util.control.NonFatal(_) => ()
+
   // ---------------------------------------------------------------------
   // Entry-point detection, scala-cli/Mill-style: not a source-text
   // heuristic, but a scan of the *compiled* .class files for a real
@@ -1870,7 +1898,9 @@ object ScalinoCli:
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
     val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(":")
-    val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
+    val compileOnlyDeps = (directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
+    val extraCompileOnlyClasspath = resolveDeps(compileOnlyDeps, depsCache, repos)
+    fetchSourcesBestEffort((allDeps ++ compileOnlyDeps).distinct, depsCache, repos)
     val options = directives.options ++ o.cliOptions
 
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)

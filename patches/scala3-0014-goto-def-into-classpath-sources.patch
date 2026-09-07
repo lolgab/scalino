@@ -1,0 +1,138 @@
+diff --git a/compiler/src/dotty/tools/dotc/core/Symbols.scala b/compiler/src/dotty/tools/dotc/core/Symbols.scala
+index e2b2ec80..fca8a934 100644
+--- a/compiler/src/dotty/tools/dotc/core/Symbols.scala
++++ b/compiler/src/dotty/tools/dotc/core/Symbols.scala
+@@ -320,19 +320,35 @@ object Symbols extends SymUtils {
+ 
+       if (!denot.exists) NoSource
+       else
+-        valid(defTree.source) match {
+-          case NoSource =>
+-            valid(denot.owner.source) match {
+-              case NoSource =>
+-                this match {
+-                  case cls: ClassSymbol      => valid(cls.sourceOfClass)
+-                  case _ if denot.is(Module) => valid(denot.moduleClass.source)
+-                  case _ => NoSource
+-                }
+-              case src => src
+-            }
+-          case src => src
+-        }
++        val resolved =
++          valid(defTree.source) match {
++            case NoSource =>
++              valid(denot.owner.source) match {
++                case NoSource =>
++                  this match {
++                    case cls: ClassSymbol      => valid(cls.sourceOfClass)
++                    case _ if denot.is(Module) => valid(denot.moduleClass.source)
++                    case _ => NoSource
++                  }
++                case src => src
++              }
++            case src => src
++          }
++        // `resolved` can be a classpath symbol's pickled, library-build-time-
++        // relative source path -- almost always non-existent on this machine,
++        // but `SourceFile#exists` is hardcoded `true` (see `sourceOfClass`),
++        // so `valid()` above can't tell it apart from a real one; most
++        // classpath symbols reach this via `defTree.source` (interactive mode
++        // forces `-Yretain-trees`, InteractiveDriver.scala:57, so trees --
++        // and the pickled source path baked into them -- are retained even
++        // for library symbols), not via `cls.sourceOfClass`. Try to upgrade
++        // to the real file in the jar's sibling `-sources.jar` here, once,
++        // covering all three branches above uniformly.
++        if resolved.exists && !resolved.file.exists then
++          denot.topLevelClass match
++            case cls: ClassSymbol => cls.upgradedSource(resolved)
++            case _                => resolved
++        else resolved
+     }
+ 
+     /** A symbol related to `sym` that is defined in source code.
+@@ -514,6 +530,84 @@ object Symbols extends SymUtils {
+ 
+     private var mySource: SourceFile = NoSource
+ 
++    // One-shot latch for `upgradedSource`, kept separate from `mySource`'s
++    // own memoization: `SourceFile#exists` is hardcoded `true` for any
++    // non-`NoSource` instance (util/SourceFile.scala), so a `SourceFile`
++    // can't tell "resolved" from "resolved to a bogus path" by itself --
++    // without this latch, a symbol whose sources jar is never going to be
++    // found would redo the sources-jar lookup on every single `.source` call
++    // on any of its members instead of once.
++    private var mySourcesJarTried: Boolean = false
++    private var myUpgradedSource: SourceFile = NoSource
++
++    /** `resolved` is a classpath symbol's pickled source path (relative to
++     *  the *library's own* build-time source root, essentially never real on
++     *  this machine, but real enough to pass `Symbol.source`'s `valid()`
++     *  check since `SourceFile#exists` doesn't look at the filesystem).
++     *  Derive the sibling `-sources.jar` of the binary jar backing this
++     *  class and lazily extract the matching entry to a disk cache,
++     *  upgrading to that real file so go-to-definition/hover can resolve
++     *  into library sources instead of the bogus path silently dropping out
++     *  at `toUriOption` (`AbstractFile#exists` is a real filesystem check).
++     *  Best-effort and tried at most once per top-level class: any miss (no
++     *  such jar, no such entry, I/O failure) just keeps returning `resolved`
++     *  unchanged, same as today.
++     */
++    private[Symbols] def upgradedSource(resolved: SourceFile)(using Context): SourceFile =
++      if !mySourcesJarTried then
++        mySourcesJarTried = true
++        val upgraded = sourceFromSourcesJar(resolved.path, associatedFile)
++        if upgraded.exists then myUpgradedSource = upgraded
++      if myUpgradedSource.exists then myUpgradedSource else resolved
++
++    private def sourceFromSourcesJar(relPath: String, file: AbstractFile | Null)(using Context): SourceFile =
++      try
++        val jarPath: java.nio.file.Path | Null = file match
++          case null => null
++          case f => f.underlyingSource match
++            case Some(zip: io.ZipArchive) => zip.jpath
++            case _ => null
++        if jarPath == null then NoSource
++        else
++          val jarFileName = jarPath.getFileName.toString
++          if !jarFileName.endsWith(".jar") || jarFileName.endsWith("-sources.jar") then NoSource
++          else
++            val sourcesJarPath = jarPath.resolveSibling(jarFileName.stripSuffix(".jar") + "-sources.jar")
++            if !java.nio.file.Files.exists(sourcesJarPath) then NoSource
++            else
++              // The path pickled into TASTY is relative to wherever the
++              // library was built (e.g. Mill's "<module>/src/<pkg>/X.scala"),
++              // which usually has extra leading segments a source jar's entry
++              // names don't (typically just "<pkg>/X.scala", package-relative)
++              // -- an exact match only works when the build happened to be
++              // invoked from its own source root. Try the full path first,
++              // then progressively drop leading segments (module dir(s)) down
++              // to a 2-segment package-relative suffix, and take the first
++              // that's actually in the jar.
++              val segments = relPath.stripPrefix("./").replace('\\', '/').split("/").toList
++              val candidates = segments.tails.filter(_.sizeIs >= 2).map(_.mkString("/")).toList
++              val cacheRoot = java.nio.file.Paths.get(System.getProperty("user.home"), ".cache", "scalino", "lsp-deps-src")
++              val jarHash = java.lang.Integer.toHexString(sourcesJarPath.toString.hashCode)
++              val zf = new java.util.zip.ZipFile(sourcesJarPath.toFile)
++              try
++                val found = candidates.iterator.map(c => (c, zf.getEntry(c))).find(_._2 != null)
++                found match
++                  case None => NoSource
++                  case Some((entryName, entry)) =>
++                    val cachedFile = cacheRoot.resolve(jarHash).resolve(entryName)
++                    if !java.nio.file.Files.exists(cachedFile) then
++                      java.nio.file.Files.createDirectories(cachedFile.getParent)
++                      val tmp = java.nio.file.Files.createTempFile(cachedFile.getParent, cachedFile.getFileName.toString, ".tmp")
++                      try
++                        val in = zf.getInputStream(entry)
++                        try java.nio.file.Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
++                        finally in.close()
++                        java.nio.file.Files.move(tmp, cachedFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
++                      finally java.nio.file.Files.deleteIfExists(tmp)
++                    if java.nio.file.Files.exists(cachedFile) then ctx.getSource(cachedFile.toString) else NoSource
++              finally zf.close()
++      catch case scala.util.control.NonFatal(_) => NoSource
++
+     final def sourceOfClass(using Context): SourceFile = {
+       if !mySource.exists && !denot.is(Package) then
+         // this allows sources to be added in annotations after `sourceOfClass` is first called
