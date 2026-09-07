@@ -41,6 +41,31 @@ case "$(uname -s)" in
   *) CP_SEP=':' ;;
 esac
 
+# $ROOT/$WORK/$DIST are bash/MSYS-style on Windows (e.g. "/d/a/scalino/...",
+# from git-bash's own `pwd`) -- fine for bash's own builtins, but a raw path
+# in that style, embedded directly (not via a coursier-written *.cp file --
+# those are already native-Windows-style) into a classpath string passed to
+# a real native Windows .exe, silently fails to resolve. Confirmed via CI:
+# 04-build-scalino-linkdriver.sh's native-image invocation couldn't find
+# "LinkDriver" at all despite it compiling cleanly one step earlier -- the
+# compile step only ever WROTE to that same raw path (via `-d`), never had
+# to actually read a classpath entry back from it, so it never surfaced
+# there. Use this wherever a raw $WORK/$DIST-derived directory (not a
+# coursier .cp file's already-correct content) is embedded in a classpath
+# string a native .exe will actually read from.
+to_native_path() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if [[ "$1" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+        printf '%s:/%s' "${BASH_REMATCH[1]^^}" "${BASH_REMATCH[2]}"
+      else
+        printf '%s' "$1"
+      fi
+      ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 CLANG="$(command -v clang)"
 CLANGPP="$(command -v clang++)"
 

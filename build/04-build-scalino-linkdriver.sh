@@ -15,7 +15,7 @@ source ./00-env.sh
 
 [[ -f "$WORK/tools-patched.cp" ]] || { echo "run 04a-patch-tools.sh first" >&2; exit 1; }
 
-DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched.cp")$CP_SEP$WORK/driver-classes"
+DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
 
 rm -rf "$WORK/driver-classes"
 mkdir -p "$WORK/driver-classes"
