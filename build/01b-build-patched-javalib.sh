@@ -43,7 +43,15 @@ restore() {
 }
 trap restore EXIT
 
-sbt javalib3/publishLocal
+# Confirmed via CI (only ever on a real tag push, e.g. our own release.yml):
+# scala-native's own project/ScalaNativeBuildInfo.scala reads GITHUB_REF_TYPE/
+# GITHUB_REF_NAME (meant for THEIR OWN release CI, asserting the pushed tag
+# equals their own pinned version) -- sbt inherits our full environment, so
+# our own tag ("v0.0.1") leaks in and trips their assertion ("tag does not
+# match expected version") even though we're only vendoring their source, not
+# cutting a scala-native release ourselves. Unset for this subprocess only,
+# falling their version logic through to the ordinary CI-snapshot branch.
+env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF sbt javalib3/publishLocal
 cd - > /dev/null
 
 echo "OK: patched javalib published to ~/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/"
