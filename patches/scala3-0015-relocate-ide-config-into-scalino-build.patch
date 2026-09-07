@@ -1,0 +1,35 @@
+diff --git a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
+index 0000000..0000000 100644
+--- a/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
++++ b/language-server/src/dotty/tools/languageserver/DottyLanguageServer.scala
+@@ -101,7 +101,7 @@
+         // One misconfigured project (e.g. a `dependencyClasspath` missing a
+         // real Scala library, which makes `InteractiveDriver`'s own
+         // `Definitions.init` throw `MissingCoreLibraryException`) must not
+-        // take every *other* project in the same `.dotty-ide.json` down
++        // take every *other* project in the same `.scalino-build/scalino-lsp.json` down
+         // with it: this whole loop runs from the async `initialize` warmup
+         // thread (see the crash fix above), so an uncaught exception here
+         // used to abort the loop after `myDrivers` was already assigned
+@@ -228,7 +228,7 @@
+     // Do most of the initialization asynchronously so that we can return early
+     // from this method and thus let the client know our capabilities.
+     //
+-    // On failure (most commonly: no .dotty-ide.json yet, see `drivers`'s own
++    // On failure (most commonly: no scalino-lsp.json yet, see `drivers`'s own
+     // check), just log it and return -- NOT `sys.exit`, unlike the original
+     // lsp4j-based code this was ported from (faithfully preserved through the
+     // rewrite, but wrong for scalino specifically: under GraalVM native-image,
+@@ -614,7 +614,11 @@
+
+ object DottyLanguageServer {
+
+-  final val IDE_CONFIG_FILE = ".dotty-ide.json"
++  // Was ".dotty-ide.json" at the project root -- moved inside the build
++  // tool's own `.scalino-build/` dir (alongside `classDirectory`, see
++  // `cli/ScalinoCli.scala`'s handleSetupIde) so a project's .gitignore only
++  // needs one entry for scalino's build output, not a second one for this.
++  final val IDE_CONFIG_FILE = ".scalino-build/scalino-lsp.json"
+
+   /** Convert an Lsp.Position to a SourcePosition */
+   def sourcePosition(driver: InteractiveDriver, uri: URI, pos: Position): SourcePosition = {

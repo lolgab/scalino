@@ -183,7 +183,7 @@ section for the real bugs found and fixed along the way). Verified against a
 real native binary: correct diagnostics/hover/definition/references/rename
 for both a hand-written project config and a real multi-package third-party
 project. `dist/scalino setup-ide <sources...>` generates that project
-config (`.dotty-ide.json`) instead of hand-writing it, and
+config (`.scalino-build/scalino-lsp.json`) instead of hand-writing it, and
 [`zed-extension/`](zed-extension/) wires the server into Zed as a real
 extension, published to Zed's extension gallery as "Scalino LSP"
 (`README.md` there for install steps) — verified end-to-end against real

@@ -1533,7 +1533,7 @@ object ScalinoCli:
          |                                     (alias: package -- unlike real scala-cli,
          |                                     there's no separate typecheck-only mode)
          |  scalino test <sources...> [options] [-- <framework args>]   compile and run tests
-         |  scalino setup-ide <sources...> [options]   write .dotty-ide.json for editor LSP support
+         |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
          |  scalino version                        print version info
          |  scalino --help                         this message
          |
@@ -1626,12 +1626,12 @@ object ScalinoCli:
          |selected (no per-test-method filtering) -- use `-- <pattern>` to filter,
          |forwarded to the framework's own runner untouched.
          |
-         |`setup-ide` writes `.dotty-ide.json` at the project root -- dotty's
-         |own pre-Metals IDE config format (compilerArguments/
-         |sourceDirectories/dependencyClasspath/classDirectory), read by
-         |dist/scalino-lsp on startup. Same command name as scala-cli's
-         |`setup-ide`, but a different output file: this toolchain's LSP
-         |speaks that format directly, no BSP layer needed.
+         |`setup-ide` writes `.scalino-build/scalino-lsp.json` -- dotty's own
+         |pre-Metals IDE config format (compilerArguments/sourceDirectories/
+         |dependencyClasspath/classDirectory), read by dist/scalino-lsp on
+         |startup. Same command name as scala-cli's `setup-ide`, but a
+         |different output file: this toolchain's LSP speaks that format
+         |directly, no BSP layer needed.
          |
          |not implemented (this is a minimal scala-cli-alike): ${unsupportedCommands.toList.sorted.mkString(", ")}.
          |""".stripMargin
@@ -1867,7 +1867,7 @@ object ScalinoCli:
       try sys.exit(attempt())
       catch case BuildFailed(msg) => die(msg)
 
-  /** JSON string/array literals for `.dotty-ide.json` -- hand-rolled rather
+  /** JSON string/array literals for `.scalino-build/scalino-lsp.json` -- hand-rolled rather
    *  than pulling in a JSON library: the shape is fixed (see ProjectConfig
    *  below) and every value here is either a plain path string or a flag
    *  list, so escaping quotes/backslashes is all that's needed. */
@@ -1875,7 +1875,7 @@ object ScalinoCli:
   def jsonArr(xs: List[String]): String = xs.map(jsonStr).mkString("[", ", ", "]")
 
   /** `scalino setup-ide` -- same command name as scala-cli's own `setup-ide`,
-   *  but writes `.dotty-ide.json` (dotty's pre-Metals IDE config format --
+   *  but writes `.scalino-build/scalino-lsp.json` (dotty's pre-Metals IDE config format --
    *  `ProjectConfig.java`, read by dist/scalino-lsp on `initialize`,
    *  see DottyLanguageServer.IDE_CONFIG_FILE) instead of scala-cli's BSP
    *  connection file: this toolchain's LSP speaks that format directly, no
@@ -1934,7 +1934,12 @@ object ScalinoCli:
          |]
          |""".stripMargin
 
-    val configPath = Paths.get(".dotty-ide.json")
+    // Lives inside .scalino-build/ (patches/scala3-0015 moves scalino-lsp's
+    // own DottyLanguageServer.IDE_CONFIG_FILE to match) rather than at the
+    // project root as dotty's original ".dotty-ide.json" did, so a project's
+    // .gitignore only needs one entry (.scalino-build/) to cover both this
+    // and classDirectory, not a second one just for this file.
+    val configPath = Paths.get(".scalino-build", "scalino-lsp.json")
     Files.write(configPath, json.getBytes("UTF-8"))
     println(s"scalino: wrote ${configPath.toAbsolutePath} -- point dist/scalino-lsp (or an editor's LSP binary override) at this project")
 

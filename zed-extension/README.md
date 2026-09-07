@@ -53,7 +53,7 @@ pick this directory (`zed-extension/`).
    ```
    dist/scalino setup-ide <your sources...>
    ```
-   writes `.dotty-ide.json` there, and -- if `.zed/settings.json` doesn't
+   writes `.scalino-build/scalino-lsp.json` there, and -- if `.zed/settings.json` doesn't
    already exist -- a `.zed/settings.json` pinning both the LSP binary path
    and the `file_types` override that assigns `.scala` to this extension's
    `Scala (scalino)` language (`../cli/ScalinoCli.scala`'s `setup-ide` command). If
