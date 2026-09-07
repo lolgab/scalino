@@ -86,21 +86,25 @@ to_native_path_list() {
   esac
 }
 
-CLANG="$(command -v clang)"
-CLANGPP="$(command -v clang++)"
 # Confirmed via Windows CI: scala-native's own Validator rejected this
 # runner's real, working clang/clang++ with "does not exist" -- same root
-# cause resolve_tool above already exists for GraalVM's tools. `command -v`
-# resolves "clang" fine (git-bash/PATHEXT-style implicit ".exe"), but
-# returns the bare name with no extension; scala-native's own Java-side
-# Files.exists check on that literal string finds nothing, since the real
-# file on disk is "clang.exe". CLANG/CLANGPP get handed to scalino-linkdriver
-# as plain CLI args (not run directly through bash), so bash's own tolerance
-# for the missing extension doesn't help there.
+# cause resolve_tool above already exists for GraalVM's tools, but a
+# `[[ -e "$CLANG" ]] || CLANG="$CLANG.exe"` fallback (checking the bare
+# `command -v clang` result first) did NOT fix it, confirmed via a second
+# CI run with that exact fix in place -- whatever git-bash/MSYS resolves
+# for the bare name "clang" apparently satisfies bash's own `-e` test even
+# though it isn't what scala-native's Java-side Files.exists (a real Win32
+# GetFileAttributes-style check) accepts as the same file. Sidestep the
+# ambiguity entirely: ask `command -v` for the real, unambiguous ".exe" name
+# directly on Windows, instead of inferring it after the fact.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    [[ -e "$CLANG" ]] || CLANG="$CLANG.exe"
-    [[ -e "$CLANGPP" ]] || CLANGPP="$CLANGPP.exe"
+    CLANG="$(command -v clang.exe || command -v clang)"
+    CLANGPP="$(command -v clang++.exe || command -v clang++)"
+    ;;
+  *)
+    CLANG="$(command -v clang)"
+    CLANGPP="$(command -v clang++)"
     ;;
 esac
 
