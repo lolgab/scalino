@@ -80,8 +80,8 @@ mkdir -p "$LINK_WORK"
 # Scala-Native-cross-compiled stdlib the compiled code links against --
 # NIR_OUT alone has no java.lang.Object etc.
 "$DIST/scalino-linkdriver" \
-  "$NIR_OUT$CP_SEP$(cat "$NATIVELIBS_CP")" \
-  "$LINK_WORK" \
+  "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
+  "$(to_native_path "$LINK_WORK")" \
   dotty.tools.dotc.Main \
   "$CLANG" \
   "$CLANGPP" \
@@ -106,8 +106,8 @@ mkdir -p "$SMOKE_DIR/out" "$SMOKE_DIR/link"
   -d "$SMOKE_DIR/out" \
   "$ROOT/examples/Hello.scala"
 "$DIST/scalino-linkdriver" \
-  "$SMOKE_DIR/out$CP_SEP$(cat "$NATIVELIBS_CP")" \
-  "$SMOKE_DIR/link" \
+  "$(to_native_path "$SMOKE_DIR/out")$CP_SEP$(cat "$NATIVELIBS_CP")" \
+  "$(to_native_path "$SMOKE_DIR/link")" \
   Hello \
   "$CLANG" \
   "$CLANGPP" \

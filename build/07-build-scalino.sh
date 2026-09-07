@@ -76,8 +76,8 @@ COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP
   -d "$CLASSES_DIR" \
   "$ROOT/cli/ScalinoCli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
-LINK_CP="$CLASSES_DIR$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP$NIR_NATIVE_CP"
-"$DIST/scalino-linkdriver" "$LINK_CP" "$LINK_DIR" ScalinoCli "$CLANG" "$CLANGPP"
+LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP$NIR_NATIVE_CP"
+"$DIST/scalino-linkdriver" "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP"
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"
 chmod +x "$DIST/scalino"

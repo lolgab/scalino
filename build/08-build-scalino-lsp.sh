@@ -112,8 +112,8 @@ mkdir -p "$LINK_WORK"
 # lsp-trace-drive.py's client timeout: 25s -> 60s -> 150s, each bump driven
 # by an actual observed run on that runner, not guessed headroom.
 "$DIST/scalino-linkdriver" -Xss64m \
-  "$NIR_OUT$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
-  "$LINK_WORK" \
+  "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
+  "$(to_native_path "$LINK_WORK")" \
   dotty.tools.languageserver.Main \
   "$CLANG" \
   "$CLANGPP" \
