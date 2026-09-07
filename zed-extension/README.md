@@ -13,23 +13,31 @@ extension would be enough -- in practice, if metals-zed is *also* installed
 (even just left over from before), Zed has to arbitrarily pick one
 extension's language definition for `.scala` files, and that pick isn't
 stable across a dev extension reinstall. A distinct name sidesteps the
-collision entirely: `scalino setup-ide` (step 5 below) writes a `file_types`
+collision entirely: `scalino setup-ide` (step 3 below) writes a `file_types`
 override pinning `.scala` to `Scala (scalino)`, so metals-zed's own
 `language_servers.metals` entry (bound to `Scala`) never attaches to those
 files, whether or not metals-zed stays installed.
 
-## Install (local dev extension -- not published to Zed's extension gallery)
+## Install
 
-1. `rustup target add wasm32-wasip2` if you haven't already -- Zed builds
-   extensions to a wasm component, and needs that target regardless of which
-   extension you're installing. (This repo's own rustc, via Homebrew, does
-   not ship it -- use `rustup`.)
-2. Build `dist/scalino-lsp` (`../build/08-build-scalino-lsp.sh`, or
+Published to Zed's extension gallery as **Scalino LSP**: `cmd-shift-p` ->
+"zed: extensions" -> search "Scalino LSP" -> install. This only installs the
+extension (grammar + language server wiring) -- `scalino-lsp` itself is
+still your own build, not auto-downloaded (see "Scope" below), so steps 1-4
+below are still required either way.
+
+To instead install as a local dev extension (e.g. to test a change to this
+extension itself before it lands in the gallery): `rustup target add
+wasm32-wasip2` if you haven't already -- Zed builds a dev extension's wasm
+locally, and needs that target regardless of which extension you're
+installing (this repo's own rustc, via Homebrew, does not ship it -- use
+`rustup`) -- then in Zed: `cmd-shift-p` -> "zed: install dev extension" ->
+pick this directory (`zed-extension/`).
+
+1. Build `dist/scalino-lsp` (`../build/08-build-scalino-lsp.sh`, or
    extract a release tarball) and either put `dist/` on your `PATH`, or set
-   an explicit path in Zed's `settings.json` (step 4).
-3. In Zed: `cmd-shift-p` -> "zed: install dev extension" -> pick this
-   directory (`zed-extension/`).
-4. Optionally, in Zed's `settings.json`, pin the binary path if it's not on
+   an explicit path in Zed's `settings.json` (step 2).
+2. Optionally, in Zed's `settings.json`, pin the binary path if it's not on
    `PATH`:
    ```json
    {
@@ -40,7 +48,7 @@ files, whether or not metals-zed stays installed.
      }
    }
    ```
-5. In your Scala project's root, generate the IDE config the server reads on
+3. In your Scala project's root, generate the IDE config the server reads on
    `initialize` (`dotty.tools.languageserver.DottyLanguageServer.IDE_CONFIG_FILE`):
    ```
    dist/scalino setup-ide <your sources...>
@@ -53,7 +61,7 @@ files, whether or not metals-zed stays installed.
    prints the JSON to add by hand -- merge in both the `lsp` and
    `file_types` keys, or metals-zed (if also installed) keeps claiming
    `.scala` files under the plain `Scala` language.
-6. Open the project in Zed. Check `cmd-shift-p` -> "dev: open language
+4. Open the project in Zed. Check `cmd-shift-p` -> "dev: open language
    server logs" if diagnostics/hover don't show up, and this extension's own
    `.scalino-lsp.log` (written to the project root -- see `Log` in
    `vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala`)
@@ -66,8 +74,8 @@ documentSymbol, workspace symbol, implementation, signatureHelp -- whatever
 `DottyLanguageServer` itself implements (`vendor/scala3/language-server/`,
 trimmed by `patches/scala3-0002-trim-language-server.patch`). No DAP/debug
 (the worksheet module that would back it was trimmed as JVM-subprocess-shaped
-and out of scope) and no auto-download (`scalino-lsp` isn't published
-anywhere generic -- it's this repo's own build output).
+and out of scope) and no auto-download of `scalino-lsp` itself -- unlike the extension, it
+isn't published anywhere generic, it's this repo's own build output.
 
 Verified against real Zed end-to-end (see `docs/findings.md`'s "JVM-free
 language server (LSP)" section for the bugs that surfaced this way and how

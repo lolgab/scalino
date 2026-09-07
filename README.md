@@ -184,8 +184,9 @@ for both a hand-written project config and a real multi-package third-party
 project. `dist/scalino setup-ide <sources...>` generates that project
 config (`.dotty-ide.json`) instead of hand-writing it, and
 [`zed-extension/`](zed-extension/) wires the server into Zed as a real
-extension (`README.md` there for install steps) — untested end-to-end
-against the real editor as of this writing.
+extension, published to Zed's extension gallery as "Scalino LSP"
+(`README.md` there for install steps) — verified end-to-end against real
+Zed (see `docs/findings.md`'s "JVM-free language server (LSP)" section).
 
 ## Releasing
 
