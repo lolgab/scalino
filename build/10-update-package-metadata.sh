@@ -21,7 +21,8 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 sha256_of() {
-  local target="$1" out="$work/scalino-$tag-$target.tar.gz"
+  local target="$1"
+  local out="$work/scalino-$tag-$target.tar.gz"
   curl -fsSL "$base_url/scalino-$tag-$target.tar.gz" -o "$out" >&2
   (sha256sum "$out" 2>/dev/null || shasum -a 256 "$out") | cut -d' ' -f1
 }
