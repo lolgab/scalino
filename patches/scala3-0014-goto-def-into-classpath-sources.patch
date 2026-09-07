@@ -1,8 +1,34 @@
 diff --git a/compiler/src/dotty/tools/dotc/core/Symbols.scala b/compiler/src/dotty/tools/dotc/core/Symbols.scala
-index e2b2ec80..fca8a934 100644
+index e2b2ec80..fe29ad3e 100644
 --- a/compiler/src/dotty/tools/dotc/core/Symbols.scala
 +++ b/compiler/src/dotty/tools/dotc/core/Symbols.scala
-@@ -320,19 +320,35 @@ object Symbols extends SymUtils {
+@@ -40,6 +40,25 @@ object Symbols extends SymUtils {
+   /** Tree attachment containing the identifiers in a tree as a sorted array */
+   val Ids: Property.Key[Array[String]] = new Property.Key
+ 
++  /** Process-wide cache: does the sibling `-sources.jar` of a given binary
++   *  jar exist? `Symbol#upgradedSource`'s own per-symbol latch
++   *  (`mySourcesJarTried`) only avoids redoing this lookup for the SAME
++   *  symbol -- every other distinct top-level `ClassSymbol` backed by the
++   *  same jar (e.g. every scala.*/java.* symbol touched during ordinary
++   *  interactive typechecking shares one scala3-library_3.jar/java.base.jar)
++   *  still did its own real `Files.exists` filesystem stat for an identical
++   *  answer. Confirmed via CI (macos-x86_64 specifically -- GitHub's hosted
++   *  Intel Mac runners have dramatically slower syscalls than Linux/arm64
++   *  ones) that this redundancy alone was enough to push definition()/
++   *  completion() -- which touch many library symbols -- well past a 60s
++   *  smoke-test timeout, even though the underlying interactive session was
++   *  otherwise healthy (every other request stayed fast). Shared across all
++   *  symbols/threads for the process lifetime: a jar's sibling-sources-jar
++   *  existence can't change during a run.
++   */
++  @sharable private val sourcesJarExistsCache: java.util.concurrent.ConcurrentHashMap[java.nio.file.Path, Boolean] =
++    new java.util.concurrent.ConcurrentHashMap()
++
+   /** A Symbol represents a Scala definition/declaration or a package.
+    *  @param myCoord The coordinates of the symbol (a position or an index)
+    *  @param id     A unique identifier of the symbol (unique per ContextBase)
+@@ -320,19 +339,35 @@ object Symbols extends SymUtils {
  
        if (!denot.exists) NoSource
        else
@@ -51,7 +77,7 @@ index e2b2ec80..fca8a934 100644
      }
  
      /** A symbol related to `sym` that is defined in source code.
-@@ -514,6 +530,84 @@ object Symbols extends SymUtils {
+@@ -514,6 +549,85 @@ object Symbols extends SymUtils {
  
      private var mySource: SourceFile = NoSource
  
@@ -98,7 +124,8 @@ index e2b2ec80..fca8a934 100644
 +          if !jarFileName.endsWith(".jar") || jarFileName.endsWith("-sources.jar") then NoSource
 +          else
 +            val sourcesJarPath = jarPath.resolveSibling(jarFileName.stripSuffix(".jar") + "-sources.jar")
-+            if !java.nio.file.Files.exists(sourcesJarPath) then NoSource
++            val sourcesJarExists = sourcesJarExistsCache.computeIfAbsent(sourcesJarPath, p => java.nio.file.Files.exists(p))
++            if !sourcesJarExists then NoSource
 +            else
 +              // The path pickled into TASTY is relative to wherever the
 +              // library was built (e.g. Mill's "<module>/src/<pkg>/X.scala"),
