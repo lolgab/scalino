@@ -1,7 +1,7 @@
 name: Setup build dependencies
 description: >
   Installs everything build/*.sh needs (GraalVM + native-image, coursier,
-  clang) and exports GRAAL_HOME, on Linux/macOS/Windows alike.
+  sbt, clang) and exports GRAAL_HOME, on Linux/macOS/Windows alike.
 
 runs:
   using: composite
@@ -21,7 +21,7 @@ runs:
     - name: Set up coursier
       uses: coursier/setup-action@v1
       with:
-        apps: cs
+        apps: cs sbt
 
     - name: Install clang (Linux)
       if: runner.os == 'Linux'
