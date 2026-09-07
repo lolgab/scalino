@@ -98,12 +98,19 @@ mkdir -p "$LINK_WORK"
 # release-fast null-guard-elimination pass against dotc's unusually large,
 # heavily-branching methods -- see docs/findings.md's release-fast section.
 # release-fast itself is needed for the `definition` endpoint's latency
-# (~40s debug-mode, ~10s release-fast on a fast runner -- confirmed as high
-# as ~25s on GitHub's own macos-x86_64 runners, which are meaningfully
-# slower than the linux/macos-arm64/windows ones this same job also runs
-# on; lsp-trace-drive.py's client timeout was bumped from 25s to 60s after
-# that runner's serial single-worker-thread backlog pushed even unrelated,
-# previously-fast requests like `rename` right up against the old ceiling).
+# (~40s debug-mode, ~10s release-fast on a fast runner). GitHub's own
+# macos-x86_64 runners are dramatically slower for this specific
+# interactive-compiler workload than every other platform this same job
+# runs on (linux-x86_64/linux-arm64/macos-arm64 all stay comfortably fast) --
+# confirmed NOT to be a fixable algorithmic issue: a real redundant-work bug
+# in Symbol#upgradedSource's sources-jar lookup was found and fixed
+# (patches/scala3-0014's sourcesJarExistsCache) and measurably helped
+# (completion() went from a hard timeout to succeeding), but definition()
+# alone still took on the order of 90-100s of real server time there
+# afterward -- an inherent hardware/virtualization speed ceiling on that
+# runner class for this workload, not something more code can fix.
+# lsp-trace-drive.py's client timeout: 25s -> 60s -> 150s, each bump driven
+# by an actual observed run on that runner, not guessed headroom.
 "$DIST/scalino-linkdriver" -Xss64m \
   "$NIR_OUT$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
   "$LINK_WORK" \

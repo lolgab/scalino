@@ -92,7 +92,7 @@ class LspClient:
         self.proc.stdin.flush()
         return msg_id
 
-    def request(self, method, params, timeout=60):
+    def request(self, method, params, timeout=150):
         start = time.time()
         msg_id = self.send(method, params, is_notification=False)
         with self.cond:
