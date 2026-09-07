@@ -98,6 +98,9 @@
             "fields": [
                 {
                     "name": "msysExtras$lzy1"
+                },
+                {
+                    "name": "0bitmap$1"
                 }
             ]
         },
