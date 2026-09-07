@@ -36,7 +36,7 @@ runs:
       if: runner.os == 'Windows'
       shell: bash
       run: |
-        # windows-latest/windows-11-arm images ship LLVM under this prefix;
+        # windows-latest images ship LLVM under this prefix;
         # scala-native's C toolchain on Windows is experimental/best-effort
         # (see docs/findings.md) -- this step just makes sure clang/clang++
         # resolve, it doesn't guarantee scala-native links successfully.

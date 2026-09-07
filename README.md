@@ -28,9 +28,10 @@ Downloads the latest [release](https://github.com/lolgab/scalino/releases) for
 your OS/arch, verifies its checksum, and installs `scalino` to `~/.local/bin`
 (override with `$SCALINO_INSTALL_DIR`/`$SCALINO_BIN_DIR`/`$SCALINO_VERSION`). Or do it by
 hand: each release ships a self-contained `dist/` tarball (compiler + linker
-+ `scalino`, no JVM needed to run any of it) for Linux, macOS, and Windows, on
-both x86_64 and arm64 -- download it, extract it, and use `scalino`/`dist/scalino`
-as described below. Windows support is experimental/best-effort -- see
++ `scalino`, no JVM needed to run any of it) for Linux (x86_64/arm64), macOS
+(x86_64/arm64), and Windows (x86_64 only -- GraalVM has no Windows ARM64
+build) -- download it, extract it, and use `scalino`/`dist/scalino` as
+described below. Windows support is experimental/best-effort -- see
 [`docs/findings.md`](docs/findings.md).
 
 ### Linux package managers

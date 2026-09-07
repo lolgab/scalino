@@ -30,14 +30,17 @@ jobs:
             os: macos-15-intel
           - target: macos-arm64
             os: macos-14
-          # Windows support is untested/experimental (see docs/findings.md) --
-          # scala-native's C toolchain story there is the main unknown, so
-          # these are best-effort and don't fail the required CI signal.
+          # Windows x86_64 support is untested/experimental (see
+          # docs/findings.md) -- scala-native's C toolchain story there is
+          # the main unknown, so this is best-effort and doesn't fail the
+          # required CI signal. No windows-arm64 leg: GraalVM ships no
+          # Windows ARM64 build at all (confirmed against graalvm.org's own
+          # download matrix -- linux x64/aarch64, macOS aarch64, windows
+          # x64, nothing for windows-aarch64), so setup-graalvm can never
+          # succeed there -- not a bug to work around, a platform this
+          # toolchain cannot target until GraalVM adds that build.
           - target: windows-x86_64
             os: windows-latest
-            experimental: true
-          - target: windows-arm64
-            os: windows-11-arm
             experimental: true
 
     steps:
