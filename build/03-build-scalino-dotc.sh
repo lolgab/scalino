@@ -43,7 +43,7 @@ LINK_WORK="$SELFHOST_DIR/link-work"
 NATIVELIBS_CP="$SELFHOST_DIR/nativelibs.cp"
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  { tr ':' '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-'; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd: - > "$NATIVELIBS_CP"
+  { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-'; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
   cp "$WORK/nativelibs.cp" "$NATIVELIBS_CP"
@@ -80,7 +80,7 @@ mkdir -p "$LINK_WORK"
 # Scala-Native-cross-compiled stdlib the compiled code links against --
 # NIR_OUT alone has no java.lang.Object etc.
 "$DIST/scalino-linkdriver" \
-  "$NIR_OUT:$(cat "$NATIVELIBS_CP")" \
+  "$NIR_OUT$CP_SEP$(cat "$NATIVELIBS_CP")" \
   "$LINK_WORK" \
   dotty.tools.dotc.Main \
   "$CLANG" \
@@ -106,7 +106,7 @@ mkdir -p "$SMOKE_DIR/out" "$SMOKE_DIR/link"
   -d "$SMOKE_DIR/out" \
   "$ROOT/examples/Hello.scala"
 "$DIST/scalino-linkdriver" \
-  "$SMOKE_DIR/out:$(cat "$NATIVELIBS_CP")" \
+  "$SMOKE_DIR/out$CP_SEP$(cat "$NATIVELIBS_CP")" \
   "$SMOKE_DIR/link" \
   Hello \
   "$CLANG" \

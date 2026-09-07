@@ -15,7 +15,7 @@ VENDOR="$ROOT/vendor/scala-native"
 [[ -f "$WORK/tools.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 [[ -f "$WORK/compiler.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 
-ORIG_JAR="$(tr ':' '\n' < "$WORK/tools.cp" | grep "tools_3-$SCALA_NATIVE_VERSION.jar$")"
+ORIG_JAR="$(tr "$CP_SEP" '\n' < "$WORK/tools.cp" | grep "tools_3-$SCALA_NATIVE_VERSION.jar$")"
 [[ -n "$ORIG_JAR" ]] || { echo "could not find tools_3-$SCALA_NATIVE_VERSION.jar on tools.cp" >&2; exit 1; }
 
 PATCHED_DIR="$WORK/patched-tools-classes"
@@ -28,7 +28,7 @@ PATCHED_JAR="$DIST/tools-patched.jar"
 # split caused a scala.runtime.LazyVals TASTy/binary mismatch. A single
 # unified classpath for both flags avoids it (same pattern LinkDriver.scala's
 # own build step already uses).
-FULL_CP="$(cat "$WORK/compiler.cp"):$(cat "$WORK/tools.cp")"
+FULL_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")"
 
 rm -rf "$PATCHED_DIR"
 mkdir -p "$PATCHED_DIR"

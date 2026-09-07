@@ -13,7 +13,7 @@ echo "== scala-native compiler plugin =="
 cs fetch "org.scala-native:nscplugin_$SCALA_VERSION:$SCALA_NATIVE_VERSION" \
   --classpath > "$WORK/nscplugin.cp"
 # jar path alone, for -Xplugin:
-tr ':' '\n' < "$WORK/nscplugin.cp" | grep "nscplugin_$SCALA_VERSION" > "$WORK/nscplugin.jar.txt"
+tr "$CP_SEP" '\n' < "$WORK/nscplugin.cp" | grep "nscplugin_$SCALA_VERSION" > "$WORK/nscplugin.jar.txt"
 
 echo "== scala-native target runtime libs (java.base-for-native, stdlib port, etc) =="
 # NOTE: scalalib_native0.5_3 is an empty/decoy artifact for this version line.

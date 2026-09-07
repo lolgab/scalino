@@ -28,6 +28,19 @@ DIST="$ROOT/dist"
 WORK="$ROOT/.build-work"
 mkdir -p "$DIST" "$WORK"
 
+# Real java -cp on Windows takes ";"-separated paths, and coursier's own
+# --classpath output already uses it there (confirmed via CI: switching
+# GenMiniPhaseOverrides's own classpath split from a hardcoded ":" to
+# File.pathSeparator is what made it find any jars at all on Windows) --
+# every *.cp manifest under $WORK/$DIST already uses this separator. Any
+# build script joining/splitting them must use $CP_SEP too: a hardcoded
+# ":" shatters a real Windows path at its own drive-letter colon
+# ("C:\...") instead of finding a real separator.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) CP_SEP=';' ;;
+  *) CP_SEP=':' ;;
+esac
+
 CLANG="$(command -v clang)"
 CLANGPP="$(command -v clang++)"
 

@@ -39,7 +39,7 @@ LINK_WORK="$SELFHOST_DIR/lsp-link-work"
 NATIVELIBS_CP="$SELFHOST_DIR/lsp-nativelibs.cp"
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  { tr ':' '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-'; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd: - > "$NATIVELIBS_CP"
+  { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-'; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
   cp "$WORK/nativelibs.cp" "$NATIVELIBS_CP"
@@ -70,18 +70,18 @@ LSP_NATIVE_JARS=(
 LSP_NATIVE_CP=""
 for artifact in "${LSP_NATIVE_JARS[@]}"; do
   jar="$(cs fetch --intransitive "$artifact" --classpath)"
-  LSP_NATIVE_CP="${LSP_NATIVE_CP:+$LSP_NATIVE_CP:}$jar"
+  LSP_NATIVE_CP="${LSP_NATIVE_CP:+$LSP_NATIVE_CP$CP_SEP}$jar"
 done
 
 echo "== compiling dotc+nscplugin+lsp to NIR (bootstrap JVM dotc, real nscplugin jar as -Xplugin) =="
 rm -rf "$NIR_OUT"
 mkdir -p "$NIR_OUT"
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
-"$JAVA" -cp "$(cat "$WORK/compiler.cp"):$(cat "$WORK/lsp.cp")" dotty.tools.dotc.Main \
+"$JAVA" -cp "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/lsp.cp")" dotty.tools.dotc.Main \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
   -Yretain-trees \
-  -classpath "$(cat "$NATIVELIBS_CP"):$(cat "$WORK/lsp.cp")" \
+  -classpath "$(cat "$NATIVELIBS_CP")$CP_SEP$(cat "$WORK/lsp.cp")" \
   -d "$NIR_OUT" \
   "@$FILE_LIST"
 
@@ -101,7 +101,7 @@ mkdir -p "$LINK_WORK"
 # (~40s debug-mode, ~10s release-fast, driven by lsp-trace-drive.py's 25s
 # client timeout).
 "$DIST/scalino-linkdriver" -Xss64m \
-  "$NIR_OUT:$(cat "$NATIVELIBS_CP"):$LSP_NATIVE_CP" \
+  "$NIR_OUT$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
   "$LINK_WORK" \
   dotty.tools.languageserver.Main \
   "$CLANG" \

@@ -62,11 +62,11 @@ NIR_NATIVE_JARS=(
 NIR_NATIVE_CP=""
 for artifact in "${NIR_NATIVE_JARS[@]}"; do
   jar="$(cs fetch --intransitive "$artifact" --classpath)"
-  NIR_NATIVE_CP="${NIR_NATIVE_CP:+$NIR_NATIVE_CP:}$jar"
+  NIR_NATIVE_CP="${NIR_NATIVE_CP:+$NIR_NATIVE_CP$CP_SEP}$jar"
 done
 
 PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
-COMPILE_CP="$(cat "$WORK/compiler.cp"):$(cat "$WORK/nativelibs.cp"):$NIR_NATIVE_CP"
+COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP$NIR_NATIVE_CP"
 
 "$DIST/scalino-dotc" \
   -javabootclasspath "$DIST/java.base.jar" \
@@ -76,7 +76,7 @@ COMPILE_CP="$(cat "$WORK/compiler.cp"):$(cat "$WORK/nativelibs.cp"):$NIR_NATIVE_
   -d "$CLASSES_DIR" \
   "$ROOT/cli/ScalinoCli.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
-LINK_CP="$CLASSES_DIR:$(cat "$WORK/nativelibs.cp"):$NIR_NATIVE_CP"
+LINK_CP="$CLASSES_DIR$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_SEP$NIR_NATIVE_CP"
 "$DIST/scalino-linkdriver" "$LINK_CP" "$LINK_DIR" ScalinoCli "$CLANG" "$CLANGPP"
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"

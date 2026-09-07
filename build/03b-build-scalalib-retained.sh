@@ -45,7 +45,7 @@ if [[ ! -d "$VENDOR/scala2-library-bootstrapped/src" ]]; then
   exit 0
 fi
 
-STDLIB_JAR="$(tr ':' '\n' < "$WORK/nativelibs.cp" | grep -E '/scala-library-[0-9.]+\.jar$')"
+STDLIB_JAR="$(tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -E '/scala-library-[0-9.]+\.jar$')"
 [[ -n "$STDLIB_JAR" ]] || { echo "could not find scala-library jar on nativelibs.cp" >&2; exit 1; }
 STDLIB_VERSION="$(basename "$STDLIB_JAR" .jar | sed 's/^scala-library-//')"
 
