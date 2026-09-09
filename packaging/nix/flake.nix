@@ -38,7 +38,7 @@
           # (glibc + libc/libm/libpthread), just not built against Nix's own
           # glibc -- autoPatchelfHook rewrites their interpreter/rpath instead
           # of needing a static build.
-          buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+          buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.zlib ];
 
           dontConfigure = true;
           dontBuild = true;
