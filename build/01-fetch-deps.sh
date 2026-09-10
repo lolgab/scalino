@@ -41,6 +41,18 @@ echo "== scala-native JVM-side build/link tool (tools_3, NOT tools_native0.5_3) 
 # it uses link-time intrinsics that throw UndefinedBehaviorError on a plain JVM.
 cs fetch "org.scala-native:tools_3:$SCALA_NATIVE_VERSION" --classpath | tr -d '\r' > "$WORK/tools.cp"
 
+echo "== scala-native Native-side build/link tool (tools_native0.5_3) =="
+# it includes the classpath for nativelibs since in the scalino-linkdriver we need a classpath with both
+# tools and nativelibs and if we merge two separate classpaths we end up with duplicates.
+cs fetch \
+  "org.scala-native:nativelib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:javalib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:auxlib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:posixlib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:clib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:scala3lib_native0.5_3:$SN_COMBINED_VERSION" \
+  "org.scala-native:tools_native0.5_3:$SCALA_NATIVE_VERSION" --classpath | tr -d '\r' > "$WORK/tools-native.cp"
+
 echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) =="
 # Previously lsp4j + Gson (reflection-based) -- replaced after discovering a
 # GraalVM native-image-specific pathology where Gson's reflective TypeAdapter

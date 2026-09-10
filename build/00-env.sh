@@ -5,11 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/versions.env"
 
-GRAAL_HOME="${GRAAL_HOME:-/Library/Java/JavaVirtualMachines/graalvm-25.jdk/Contents/Home}"
-
-# On Windows GraalVM's bin/ tools are .exe/.cmd, not extension-less -- and
+# On Windows OpenJDK's bin/ tools are .exe/.cmd, not extension-less -- and
 # unlike a bare `command -v name` (which the shell's own PATHEXT-style
-# lookup resolves), a full literal path like "$GRAAL_HOME/bin/java" is
+# lookup resolves), a full literal path like "$JAVA_HOME/bin/java" is
 # checked as-is, so the extension has to be found here explicitly.
 resolve_tool() {
   local base="$1"
@@ -18,11 +16,10 @@ resolve_tool() {
   done
   echo "$base"
 }
-JAVA="$(resolve_tool "$GRAAL_HOME/bin/java")"
-JAVAC="$(resolve_tool "$GRAAL_HOME/bin/javac")"
-NATIVE_IMAGE="$(resolve_tool "$GRAAL_HOME/bin/native-image")"
-JIMAGE="$(resolve_tool "$GRAAL_HOME/bin/jimage")"
-JAR="$(resolve_tool "$GRAAL_HOME/bin/jar")"
+JAVA="$(resolve_tool "$JAVA_HOME/bin/java")"
+JAVAC="$(resolve_tool "$JAVA_HOME/bin/javac")"
+JIMAGE="$(resolve_tool "$JAVA_HOME/bin/jimage")"
+JAR="$(resolve_tool "$JAVA_HOME/bin/jar")"
 
 DIST="$ROOT/dist"
 WORK="$ROOT/.build-work"
@@ -122,5 +119,4 @@ require() {
 require cs
 require "$JAVA"
 require "$JAVAC"
-require "$NATIVE_IMAGE"
 require "$CLANG"

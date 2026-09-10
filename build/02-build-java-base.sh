@@ -15,6 +15,6 @@ if [[ -f "$OUT" ]]; then
 fi
 
 rm -rf "$WORK/jrt-extract"
-"$JIMAGE" extract --dir="$WORK/jrt-extract" "$GRAAL_HOME/lib/modules"
+"$JIMAGE" extract --dir="$WORK/jrt-extract" "$JAVA_HOME/lib/modules"
 (cd "$WORK/jrt-extract/java.base" && "$JAR" cf "$OUT" .)
 echo "OK: $OUT"

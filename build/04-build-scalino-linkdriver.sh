@@ -15,20 +15,29 @@ source ./00-env.sh
 
 [[ -f "$WORK/tools-patched.cp" ]] || { echo "run 04a-patch-tools.sh first" >&2; exit 1; }
 
-DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
+DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
+NATIVE_DRIVER_CP="$(to_native_path "$WORK/driver-classes")$CP_SEP$(cat "$WORK/tools-patched.cp")"
+
+NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 
 rm -rf "$WORK/driver-classes"
 mkdir -p "$WORK/driver-classes"
-"$JAVA" -cp "$DRIVER_CP" dotty.tools.dotc.Main -classpath "$DRIVER_CP" -d "$WORK/driver-classes" "$ROOT/src/LinkDriver.scala"
+"$JAVA" -cp "$DRIVER_CP" dotty.tools.dotc.Main \
+  -Xplugin:"$NSCPLUGIN_JAR" \
+  -Xplugin-require:scalanative \
+  -classpath "$NATIVE_DRIVER_CP" \
+  -d "$WORK/driver-classes" \
+  "$ROOT/src/LinkDriver.scala"
 
-"$NATIVE_IMAGE" \
+"$JAVA" \
   -cp "$DRIVER_CP" \
-  --no-fallback \
-  -H:ConfigurationFileDirectories="$ROOT/agent-config/scalino-linkdriver" \
-  -H:+ReportExceptionStackTraces \
-  --enable-url-protocols=http,https \
-  -J--sun-misc-unsafe-memory-access=allow \
-  -o "$DIST/scalino-linkdriver" \
-  LinkDriver
+    LinkDriver \
+    "$(to_native_path "$NATIVE_DRIVER_CP")" \
+    "$(to_native_path "$DIST")" \
+    LinkDriver \
+    "$CLANG" \
+    "$CLANGPP" \
+    info \
+    --mode release-size
 
 echo "OK: $DIST/scalino-linkdriver"

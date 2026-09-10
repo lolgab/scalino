@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# Patches scala-native's tools_3 (the JVM-side build/link API LinkDriver.scala
+# Patches scala-native's tools_native0.5_3 (the JVM-side build/link API LinkDriver.scala
 # drives) to fix inert object-file caching for vendored C/S dependency
 # sources -- see docs/findings.md "Native-library object-file caching was
 # inert". Same splice-not-full-rebuild approach as 03a-patch-compiler.sh.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
-
 VENDOR="$ROOT/vendor/scala-native"
 [[ -f "$VENDOR/tools/src/main/scala/scala/scalanative/build/Build.scala" ]] || {
   echo "missing $VENDOR -- run 00b-setup-vendor.sh first" >&2
   exit 1
 }
-[[ -f "$WORK/tools.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
+[[ -f "$WORK/tools-native.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 [[ -f "$WORK/compiler.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 
-ORIG_JAR="$(tr "$CP_SEP" '\n' < "$WORK/tools.cp" | grep "tools_3-$SCALA_NATIVE_VERSION.jar$")"
-[[ -n "$ORIG_JAR" ]] || { echo "could not find tools_3-$SCALA_NATIVE_VERSION.jar on tools.cp" >&2; exit 1; }
+ORIG_JAR="$(tr "$CP_SEP" '\n' < "$WORK/tools-native.cp" | grep "tools_native0.5_3-$SCALA_NATIVE_VERSION.jar$")"
+[[ -n "$ORIG_JAR" ]] || { echo "could not find tools_native0.5_3-$SCALA_NATIVE_VERSION.jar on tools-native.cp" >&2; exit 1; }
 
 PATCHED_DIR="$WORK/patched-tools-classes"
 PATCHED_JAR="$DIST/tools-patched.jar"
@@ -28,11 +27,14 @@ PATCHED_JAR="$DIST/tools-patched.jar"
 # split caused a scala.runtime.LazyVals TASTy/binary mismatch. A single
 # unified classpath for both flags avoids it (same pattern LinkDriver.scala's
 # own build step already uses).
-FULL_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")"
+FULL_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-native.cp")"
+NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 
 rm -rf "$PATCHED_DIR"
 mkdir -p "$PATCHED_DIR"
-"$JAVA" -cp "$FULL_CP" dotty.tools.dotc.Main \
+"$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+  -Xplugin:"$NSCPLUGIN_JAR" \
+  -Xplugin-require:scalanative \
   -classpath "$FULL_CP" \
   -d "$PATCHED_DIR" \
   "$VENDOR/tools/src/main/scala/scala/scalanative/build/Build.scala" \
@@ -44,6 +46,6 @@ mkdir -p "$PATCHED_DIR"
 cp "$ORIG_JAR" "$PATCHED_JAR"
 (cd "$PATCHED_DIR" && "$JAR" uf "$PATCHED_JAR" $(find scala -type f))
 
-sed "s#$ORIG_JAR#$PATCHED_JAR#" "$WORK/tools.cp" > "$WORK/tools-patched.cp"
+sed "s#$ORIG_JAR#$PATCHED_JAR#" "$WORK/tools-native.cp" > "$WORK/tools-patched.cp"
 
 echo "OK: $PATCHED_JAR"
