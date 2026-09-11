@@ -29,15 +29,25 @@ mkdir -p "$WORK/driver-classes"
   -d "$WORK/driver-classes" \
   "$ROOT/src/LinkDriver.scala"
 
+LINK_WORK="$WORK/driver-link"
+rm -rf "$LINK_WORK"
+mkdir -p "$LINK_WORK"
+
 "$JAVA" \
   -cp "$DRIVER_CP" \
     LinkDriver \
     "$(to_native_path "$NATIVE_DRIVER_CP")" \
-    "$(to_native_path "$DIST")" \
+    "$(to_native_path "$LINK_WORK")" \
     LinkDriver \
     "$CLANG" \
     "$CLANGPP" \
     info \
     --mode release-size
+
+BUILT="$LINK_WORK/LinkDriver"
+[[ -f "$BUILT" ]] || BUILT="$LINK_WORK/LinkDriver.exe"
+[[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
+cp "$BUILT" "$DIST/scalino-linkdriver"
+chmod +x "$DIST/scalino-linkdriver"
 
 echo "OK: $DIST/scalino-linkdriver"

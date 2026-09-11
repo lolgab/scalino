@@ -40,8 +40,10 @@ mkdir -p "$PATCHED_DIR"
   "$VENDOR/tools/src/main/scala/scala/scalanative/build/Build.scala" \
   "$VENDOR/tools/src/main/scala/scala/scalanative/build/LLVM.scala" \
   "$VENDOR/tools/src/main/scala/scala/scalanative/build/NativeLib.scala" \
+  "$VENDOR/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala" \
   "$VENDOR/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala" \
-  "$VENDOR/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala"
+  "$VENDOR/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala" \
+  "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala"
 
 cp "$ORIG_JAR" "$PATCHED_JAR"
 (cd "$PATCHED_DIR" && "$JAR" uf "$PATCHED_JAR" $(find scala -type f))

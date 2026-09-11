@@ -111,7 +111,7 @@ mkdir -p "$LINK_WORK"
 # runner class for this workload, not something more code can fix.
 # lsp-trace-drive.py's client timeout: 25s -> 60s -> 150s, each bump driven
 # by an actual observed run on that runner, not guessed headroom.
-"$DIST/scalino-linkdriver" -Xss64m \
+"$DIST/scalino-linkdriver" \
   "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
   "$(to_native_path "$LINK_WORK")" \
   dotty.tools.languageserver.Main \

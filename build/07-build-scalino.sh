@@ -82,7 +82,7 @@ LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$WORK/nativelibs.cp")$CP_
 # 03-build-scalino-dotc.sh's identical note (release-fast/-size's own
 # optimizer StackOverflowed there against dotc's large methods; ScalinoCli
 # itself is much smaller, but this is cheap insurance either way).
-"$DIST/scalino-linkdriver" -Xss64m "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP" info --mode release-size
+"$DIST/scalino-linkdriver" "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP" info --mode release-size
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"
 chmod +x "$DIST/scalino"

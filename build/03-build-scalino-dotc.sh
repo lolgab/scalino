@@ -87,7 +87,7 @@ mkdir -p "$LINK_WORK"
 # null-guard-elimination pass StackOverflowed there against dotc's
 # unusually large, heavily-branching methods (see docs/findings.md); this
 # entry point compiles the exact same dotc, so the same risk applies here.
-"$DIST/scalino-linkdriver" -Xss64m \
+"$DIST/scalino-linkdriver" \
   "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
   "$(to_native_path "$LINK_WORK")" \
   dotty.tools.dotc.Main \

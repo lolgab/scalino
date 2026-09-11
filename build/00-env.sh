@@ -16,7 +16,13 @@ resolve_tool() {
   done
   echo "$base"
 }
-JAVA="$(resolve_tool "$JAVA_HOME/bin/java")"
+
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  if command -v /usr/libexec/java_home >/dev/null 2>&1; then
+    JAVA_HOME="$(/usr/libexec/java_home 2>/dev/null || true)"
+  fi
+fi
+JAVA="$(resolve_tool "${JAVA_HOME:-}/bin/java")"
 JAVAC="$(resolve_tool "$JAVA_HOME/bin/javac")"
 JIMAGE="$(resolve_tool "$JAVA_HOME/bin/jimage")"
 JAR="$(resolve_tool "$JAVA_HOME/bin/jar")"
