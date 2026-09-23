@@ -1,0 +1,186 @@
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
+index 078d676..e9d4c45 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
+@@ -35,21 +35,6 @@ package object runtime {
+       getMonitor(obj).exit(obj)
+     }
+ 
+-  /** Shared, coarse-grained monitor target for every SMI-tagged `AnyRef`
+-   *  (`Boolean`/`Byte`/`Short`/`Char`/`Int`/`Float`/`UByte`/`UShort`/`UInt`
+-   *  boxed via tagged-pointer boxing on 64-bit targets, see
+-   *  `nir.Type.Smi`). A tagged value has no
+-   *  header and no lock word of its own, so `synchronized(taggedValue)`
+-   *  can't lock on the value itself the way it locks on a real object -
+-   *  instead it locks on this single fixed sentinel object, same as every
+-   *  other tagged value. This is coarser than JVM semantics (unrelated
+-   *  tagged values now contend on the same monitor), but consistent with
+-   *  the identity/`eq` relaxation this boxing scheme already accepts, and
+-   *  it never deadlocks or crashes, which the alternative (dereferencing a
+-   *  tagged pointer's non-existent header) would.
+-   */
+-  private lazy val taggedValueMonitorSentinel: _Object = new _Object
+-
+   /** Is `obj`'s bit pattern a tagged immediate (bit 0 set) rather than a
+    *  real, aligned heap pointer? Safe to call unconditionally on every
+    *  platform/object: real pointers are always aligned (bit 0 clear, see
+@@ -63,12 +48,20 @@ package object runtime {
+   /** Get monitor for given object. */
+   @alwaysinline
+   def getMonitor(obj: _Object) = {
+-    if (isMultithreadingEnabled) {
+-      val target =
+-        if (isSmiTagged(obj)) taggedValueMonitorSentinel else obj
++    if (isSmiTagged(obj))
++      // A tagged immediate (Boolean/Byte/Short/Char/Int/Float/UByte/UShort/
++      // UInt boxed via tagged-pointer boxing, see nir.Type.Smi) has no
++      // header and no lock word of its own - `synchronized(taggedValue)` /
++      // `.wait()`/`.notify()` on one is unsupported, not silently
++      // coarsened onto a shared sentinel monitor.
++      throw new RuntimeException(
++        "Monitor operations (synchronized/wait/notify) are not supported " +
++          "on SMI-tagged boxed primitives"
++      )
++    else if (isMultithreadingEnabled) {
+       new BasicMonitor(
+         elemRawPtr(
+-          castObjectToRawPtr(target),
++          castObjectToRawPtr(obj),
+           castIntToRawSize(MemoryLayout.Object.LockWordOffset)
+         )
+       )
+diff --git a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+index d5d265a..e1bcbd7 100644
+--- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
++++ b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+@@ -45,7 +45,26 @@ private[scalanative] object ScalaNative {
+       .getOrElse("detect")
+     val linkingMsg = s"Linking (multithreadingEnabled=${mtSupport})"
+     config.logger.time(linkingMsg) {
+-      Link(config, entries)
++      // SmiAllocRewrite must run here, on the raw linked NIR, before
++      // Interflow (the optimizer) ever sees it - see its own doc comment
++      // for why this specific point in the pipeline is the only one where
++      // its `Classalloc`+`Call` pattern match is reliable.
++      Link(config, entries) match {
++        case result: ReachabilityAnalysis.Result =>
++          new ReachabilityAnalysis.Result(
++            result.infos,
++            result.entries,
++            result.links,
++            result.linkCppRuntime,
++            result.preprocessorDefinitions,
++            SmiAllocRewrite(result.defns),
++            result.dynsigs,
++            result.dynimpls,
++            result.resolvedVals,
++            result.foundServiceProviders
++          )
++        case failure => failure
++      }
+     }
+   })
+ 
+@@ -328,3 +347,102 @@ private[scalanative] object ScalaNative {
+       nir.Global.Top(encoded)
+     }
+ }
++
++/** Rewrites `new java.lang.Integer(5)` (and the other 8 SMI-eligible box
++ *  types, see `nir.Type.Smi`) from a real `Classalloc` + constructor `Call`
++ *  into the same zero-allocation `Op.Box` autoboxing already uses on 64-bit
++ *  targets - so these 9 types can never be allocated through `new` either,
++ *  not just through implicit boxing.
++ *
++ *  Lives here, in `ScalaNative.scala` (rather than its own file under
++ *  `linker`, which is architecturally where it belongs), because this
++ *  project's own `build/04a-patch-tools.sh` splices an explicit whitelist
++ *  of source files into the prebuilt `tools` jar rather than recompiling
++ *  the whole module - a new file silently never gets compiled in unless
++ *  that list is also updated. `ScalaNative.scala` is already on it.
++ *
++ *  Applied by `ScalaNative.link`, right after linking (`Reach`), on the
++ *  raw, unoptimized NIR every compiler (this project's own patched
++ *  `nscplugin`, or an unpatched/vanilla one used to bootstrap javalib/
++ *  nativelib/the Scala standard library) emits for `new X(v)`: `Classalloc`
++ *  immediately followed by a `Call` to `X`'s constructor with the alloc'd
++ *  receiver and `v`. That Classalloc+Call adjacency is a *frontend*
++ *  invariant, not one this rewrite can rely on later in the pipeline -
++ *  `Interflow` (the optimizer) routinely inlines these one-line
++ *  constructors (`this._rawValue = v`) away entirely, replacing the `Call`
++ *  with a direct field store before `Lower` (which used to host this
++ *  rewrite, in an earlier version of this patch) ever sees it. Rewriting
++ *  here, before `Interflow` runs, is the only point where the pattern is
++ *  guaranteed to still look like what the frontend produced.
++ */
++private[scalanative] object SmiAllocRewrite {
++
++  /** Constructor of one of the 9 SMI-eligible box types, keyed by its NIR
++   *  global, mapped to the box type it constructs.
++   */
++  private val ctors: Map[nir.Global, nir.Type] =
++    nir.Type.Smi.discriminantOfBox.keys.map { boxTy =>
++      val nir.Type.Ref(name, _, _) = boxTy: @unchecked
++      val ctor = name.member(nir.Sig.Ctor(Seq(nir.Type.unbox(boxTy))))
++      ctor -> boxTy
++    }.toMap
++
++  def apply(defns: collection.Seq[nir.Defn]): collection.Seq[nir.Defn] =
++    defns.map {
++      case defn: nir.Defn.Define =>
++        nir.Defn.Define(
++          defn.attrs,
++          defn.name,
++          defn.ty,
++          rewrite(defn.name, defn.insts),
++          defn.debugInfo
++        )(defn.pos)
++      case other => other
++    }
++
++  private def rewrite(
++      defnName: nir.Global,
++      insts: Seq[nir.Inst]
++  ): Seq[nir.Inst] = {
++    // Classalloc locals (of this Defn only) deferred so far, waiting to be
++    // resolved by their matching constructor Call.
++    val pending = mutable.Map.empty[nir.Local, nir.Type]
++    val out = Vector.newBuilder[nir.Inst]
++    out.sizeHint(insts.size)
++
++    insts.foreach {
++      case nir.Inst.Let(n, nir.Op.Classalloc(clsName, None), _)
++          if nir.Type.Smi.isEligibleBoxType(nir.Type.Ref(clsName)) =>
++        // Dropped, not appended - the matching Call case below emits the
++        // real replacement (an Op.Box `Let` bound to this same local) once
++        // it's found.
++        pending(n) = nir.Type.Ref(clsName)
++
++      case inst @ nir.Inst.Let(
++            _,
++            nir.Op.Call(_, nir.Val.Global(ctorGlobal, _), Seq(nir.Val.Local(recv, _), arg)),
++            unwind
++          ) if ctors.get(ctorGlobal).exists(pending.get(recv).contains) =>
++        val boxTy = pending.remove(recv).get
++        out += nir.Inst.Let(recv, nir.Op.Box(boxTy, arg), unwind)(inst.pos, inst.scopeId)
++
++      case inst =>
++        out += inst
++    }
++
++    // Correctness net: every deferred Classalloc is expected to be resolved
++    // by exactly one matching constructor Call. If one is still pending
++    // here, this `new X(...)` didn't have the shape every compiler's
++    // frontend is known to always emit (e.g. the receiver escaped before
++    // its constructor ran) - fail loud rather than silently miscompile a
++    // box object that never got initialized.
++    if (pending.nonEmpty) {
++      util.unsupported(
++        s"SMI box allocation in $defnName never reached its constructor " +
++          s"call: ${pending.keys.mkString(", ")}"
++      )
++    }
++
++    out.result()
++  }
++}
