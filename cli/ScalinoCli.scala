@@ -2186,7 +2186,10 @@ object ScalinoCli:
     val compilerArguments =
       List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ options
 
-    val sourceDirectories = expanded.map(_.toAbsolutePath.getParent.toString).distinct.sorted
+    // Unlike buildBinary/run (main-scope only), the IDE config also covers
+    // testSources -- an editor should get diagnostics/completion in test/ code too,
+    // even though `partitionSources` keeps it out of the actual build.
+    val sourceDirectories = (expanded ++ testSources).map(_.toAbsolutePath.getParent.toString).distinct.sorted
     val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
     val classDirectory = Paths.get(".scalino-build", ".dotty-ide-classes").toAbsolutePath
     Files.createDirectories(classDirectory)

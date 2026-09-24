@@ -9,9 +9,11 @@ import scala.meta.internal.jdk.CollectionConverters._
 import scala.meta.pc.ContentType
 import scala.meta.pc.PresentationCompilerConfig
 import scala.meta.pc.PresentationCompilerConfig.OverrideDefFormat
+import scala.meta.pc.SourcePathMode
 
 case class PresentationCompilerConfigImpl(
     debug: Boolean = false,
+    _sourcePathMode: SourcePathMode = SourcePathMode.DISABLED,
     _parameterHintsCommand: Option[String] = None,
     _completionCommand: Option[String] = None,
     _symbolPrefixes: collection.Map[String, String] =
@@ -35,6 +37,7 @@ case class PresentationCompilerConfigImpl(
 
   override def isStripMarginOnTypeFormattingEnabled(): Boolean =
     _isStripMarginOnTypeFormattingEnabled()
+  override def sourcePathMode(): SourcePathMode = _sourcePathMode
   override def symbolPrefixes(): util.Map[String, String] =
     _symbolPrefixes.asJava
   override def parameterHintsCommand: Optional[String] =

@@ -106,6 +106,15 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
           buildTargetIdentifier = "scalino",
           classpath = classpath,
           options = compilerArgs,
+          // Without this, sourcePathMode defaults to DISABLED and sourceDirs
+          // below is plumbed through but never used: the InteractiveDriver
+          // only ever typechecks files the editor explicitly opens
+          // (didOpen/didChange), so a symbol defined in a sibling source file
+          // that hasn't been opened yet fails to resolve -- looks exactly
+          // like "not all files in the source dirs get compiled".
+          config = scala.meta.internal.pc.PresentationCompilerConfigImpl(
+            _sourcePathMode = scala.meta.pc.SourcePathMode.FULL
+          ),
           sourcePath = () => sourceDirs.asJava
         )
         thisServer.synchronized {
