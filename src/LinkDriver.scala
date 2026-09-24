@@ -34,6 +34,7 @@ object LinkDriver:
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
     incrementalCompilation: Boolean = false,
+    optimize: Boolean = true,
     linking: List[String] = Nil,
     compile: List[String] = Nil,
     cCompile: List[String] = Nil,
@@ -55,6 +56,7 @@ object LinkDriver:
         case "--gc-stw-sweep" => o = o.copy(gcStwSweep = true)
         case "--heap-histogram" => o = o.copy(heapHistogram = true)
         case "--incremental-compilation" => o = o.copy(incrementalCompilation = true)
+        case "--no-opt" => o = o.copy(optimize = false)
         case "--linking" => o = o.copy(linking = o.linking :+ rest(i + 1)); i += 1
         case "--compile" => o = o.copy(compile = o.compile :+ rest(i + 1)); i += 1
         case "--c-compile" => o = o.copy(cCompile = o.cCompile :+ rest(i + 1)); i += 1
@@ -135,6 +137,7 @@ object LinkDriver:
           // path, regardless of the direct-codegen flag.
           .withSourceLevelDebuggingConfig(SourceLevelDebuggingConfig.enabled)
           .withIncrementalCompilation(opts.incrementalCompilation)
+          .withOptimize(opts.optimize)
       )
 
     val outPath = Scope.apply[java.nio.file.Path] { (s: Scope) =>
