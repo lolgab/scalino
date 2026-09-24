@@ -9,7 +9,7 @@
 # after every tagged release -- don't hand-edit pkgver/source/sha256sums,
 # rerun that script instead.
 pkgname=scalino-bin
-pkgver=0.0.13
+pkgver=0.0.14
 pkgrel=1
 pkgdesc="Scala 3 toolchain that compiles straight to native binaries -- no JVM at any step"
 arch=('x86_64' 'aarch64')
@@ -21,8 +21,8 @@ conflicts=('scalino')
 
 source_x86_64=("https://github.com/lolgab/scalino/releases/download/v$pkgver/scalino-v$pkgver-linux-x86_64.tar.gz")
 source_aarch64=("https://github.com/lolgab/scalino/releases/download/v$pkgver/scalino-v$pkgver-linux-arm64.tar.gz")
-sha256sums_x86_64=('793b212be0a7138d69faff6f7f50da834eacd87f64293320b91b67290970b82f')
-sha256sums_aarch64=('bc6dead22a3e7205edce8f5304e669ee2645026079e198b60eef832d42abc5f6')
+sha256sums_x86_64=('94006b66fd481e2a42393af11206d7f6adbca135188f2a63b711815a662a445e')
+sha256sums_aarch64=('b44385a9e6f0781284cf15c674ca62192d536d22eeb97924809aea51bbf35183')
 
 package() {
   case "$CARCH" in
