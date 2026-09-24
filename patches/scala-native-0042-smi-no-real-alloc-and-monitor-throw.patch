@@ -49,6 +49,28 @@ index 078d676..e9d4c45 100644
            castIntToRawSize(MemoryLayout.Object.LockWordOffset)
          )
        )
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+index 99792bb..cf8388f 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -735,7 +735,16 @@ private[scalanative] object Lower {
+         )
+         caseLabels.foreach { case (d, l) =>
+           label(l)
+-          jump(mergeL, Seq(smiBoxRttiConst(d)))
++          // Materialize into a local first - every other jump argument in
++          // this codebase is an SSA local, never a raw Val.Global constant.
++          // A bare `@Global` used directly as a phi incoming value (which
++          // is what this jump argument becomes in genBlockPrologue) is the
++          // one narrow shape here that isn't exercised anywhere else, and
++          // it's what a plain-textual (non-direct-codegen) LLVM emission of
++          // this merge point tripped over in practice once the tagged path
++          // became load-bearing for every instance of these 9 types.
++          val rttiLocal = let(nir.Op.Copy(smiBoxRttiConst(d)), unwind)
++          jump(mergeL, Seq(rttiLocal))
+         }
+ 
+         // Unreachable: `smiBoxRttiConst` is total over all 9 discriminants
 diff --git a/tools/src/main/scala/scala/scalanative/linker/Reach.scala b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
 index 7e8f320..a66742d 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/Reach.scala
