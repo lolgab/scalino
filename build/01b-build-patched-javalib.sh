@@ -99,5 +99,30 @@ TMP="$(mktemp)"
 { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-' | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$TMP"
 mv "$TMP" "$WORK/nativelibs.cp"
 
+# publishLocal above also publishes a sources jar (sbt's default packageSrc
+# task, part of the publish graph) -- already named exactly
+# "javalib_native0.5_3-sources.jar", matching $LOCAL_JAVALIB_JAR's own
+# unversioned basename ("javalib_native0.5_3.jar") with ".jar" swapped for
+# "-sources.jar". That's the exact sibling-naming convention
+# sourceFromSourcesJar (scala3/compiler/.../Symbols.scala) looks for, and
+# 06-package.sh's vendor_sources relies on that same convention to know
+# which sources jar belongs to which main jar -- so go-to-definition into
+# javalib in scalino-lsp resolves into the REAL patched source, not
+# upstream's unpatched code (or nothing at all, if left to a best-effort
+# runtime fetch that could never find a "-SNAPSHOT" this project never
+# publishes anywhere but ~/.ivy2/local).
+LOCAL_JAVALIB_SOURCES_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/srcs/javalib_native0.5_3-sources.jar"
+[[ -f "$LOCAL_JAVALIB_SOURCES_JAR" ]] || { echo "publishLocal succeeded but $LOCAL_JAVALIB_SOURCES_JAR is missing" >&2; exit 1; }
+
+[[ -f "$WORK/nativelibs-sources.cp" ]] || : > "$WORK/nativelibs-sources.cp"
+TMP="$(mktemp)"
+# "|| true" on the grep: an empty (or fully-filtered) nativelibs-sources.cp
+# -- e.g. 01-fetch-deps.sh's own sources fetch came up empty -- makes grep
+# exit 1 on zero matches, which "set -e"+pipefail would otherwise treat as
+# this whole pipeline failing and abort the script.
+{ tr "$CP_SEP" '\n' < "$WORK/nativelibs-sources.cp" | grep -Fxv "$LOCAL_JAVALIB_SOURCES_JAR" || true; echo "$LOCAL_JAVALIB_SOURCES_JAR"; } | paste -sd"$CP_SEP" - > "$TMP"
+mv "$TMP" "$WORK/nativelibs-sources.cp"
+
 echo "OK: patched javalib published to ~/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/"
 echo "OK: $WORK/nativelibs.cp now points at locally-built, patched javalib: $LOCAL_JAVALIB_JAR"
+echo "OK: $WORK/nativelibs-sources.cp now includes its matching patched sources: $LOCAL_JAVALIB_SOURCES_JAR"

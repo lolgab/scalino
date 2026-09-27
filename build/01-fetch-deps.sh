@@ -70,4 +70,13 @@ echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) 
 cs fetch "com.github.plokhotnyuk.jsoniter-scala:jsoniter-scala-core_3:2.37.3" \
   --classpath | tr -d '\r' > "$WORK/lsp.cp"
 
+echo "== scala-native target runtime libs sources (unmodified upstream artifacts only -- javalib/nativelib are patched, so 01b/01c supply their sources instead, built from vendor/scala-native+patches) =="
+cs fetch \
+  "org.scala-native:auxlib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:posixlib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:clib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:scala3lib_native0.5_3:$SN_COMBINED_VERSION" \
+  --classifier sources --classpath 2>/dev/null | tr -d '\r' > "$WORK/nativelibs-sources.cp" \
+  || : > "$WORK/nativelibs-sources.cp"
+
 echo "OK: classpaths written to $WORK/*.cp"

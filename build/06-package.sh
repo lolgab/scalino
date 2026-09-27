@@ -32,6 +32,43 @@ vendor_cp() {
 vendor_cp "$WORK/compiler.cp" "$DIST/compiler.cp"
 vendor_cp "$WORK/nativelibs.cp" "$DIST/nativelibs.cp"
 
+# Vendors each nativelib's matching sources jar (built from vendor/scala-
+# native+patches for javalib/nativelib by 01b/01c, fetched upstream as-is
+# for the rest by 01-fetch-deps.sh) as a sibling of its main jar in dist/lib
+# -- the exact "<jar>-sources.jar" sibling layout scalino-dotc's
+# sourceFromSourcesJar (patches/scala3-0014) looks for, so scalino-lsp's
+# go-to-definition into any of these resolves into the REAL code the
+# compiler just linked against, not a best-effort runtime fetch that (for
+# javalib/nativelib specifically) could only ever find unpatched upstream
+# source, or nothing at all for a "-SNAPSHOT" this project never publishes
+# anywhere fetchable.
+#
+# Matched by name, not order: a sources jar's basename with "-sources.jar"
+# swapped for ".jar" must equal some already-vendored main jar's basename
+# (true both for coursier's own "<artifact>-<version>-sources.jar" alongside
+# "<artifact>-<version>.jar", and for 01b/01c's locally-published
+# "<artifact>-sources.jar" alongside their unversioned "<artifact>.jar"
+# substitution) -- so an entry with no matching main jar in dist/lib (e.g.
+# a lib that got excluded on this platform, like windowslib off-Windows)
+# is silently skipped instead of vendored as dead weight.
+vendor_sources() {
+  local src="$1"
+  [[ -f "$src" ]] || return 0
+  local -a parts=()
+  local IFS="$CP_SEP"
+  read -ra parts < "$src" || true
+  for jar in "${parts[@]:-}"; do
+    [[ -n "$jar" && -f "$jar" ]] || continue
+    local base main
+    base="$(basename "$jar")"
+    main="${base%-sources.jar}.jar"
+    if [[ -f "$DIST/lib/$main" ]]; then
+      cp -p "$jar" "$DIST/lib/$base"
+    fi
+  done
+}
+vendor_sources "$WORK/nativelibs-sources.cp"
+
 PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 PLUGIN_BASE="$(basename "$PLUGIN_JAR")"
 cp -p "$PLUGIN_JAR" "$DIST/lib/$PLUGIN_BASE"

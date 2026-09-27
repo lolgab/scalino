@@ -1,0 +1,110 @@
+diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+index c3707701..c910245d 100644
+--- a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
++++ b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+@@ -23,6 +23,7 @@ import dotty.tools.dotc.util.SourcePosition
+ import dotty.tools.pc.utils.InteractiveEnrichments.*
+ 
+ import org.eclipse.lsp4j.Location
++import org.eclipse.lsp4j.{Position, Range}
+ 
+ class PcDefinitionProvider(
+     driver: InteractiveDriver,
+@@ -165,7 +166,96 @@ class PcDefinitionProvider(
+             case _ => Nil
+         else Nil
+       if fromJarSources.nonEmpty then fromJarSources
+-      else search.definition(semanticdbSymbol, uri).asScala.toList
++      else
++        val fromJavalibNative = javalibNativeSourceFallback(symbol)
++        if fromJavalibNative.nonEmpty then fromJavalibNative
++        else search.definition(semanticdbSymbol, uri).asScala.toList
++
++  /** `java.*` symbols (java.lang.Object, java.util.ArrayList, ...) typecheck
++   *  against `dist/java.base.jar` -- real OpenJDK-compiled classfiles fed to
++   *  dotc via `-javabootclasspath` so it has *something* to bootstrap its
++   *  core symbol table from (see build/02-build-java-base.sh). Those
++   *  classfiles carry no TASTY/Scala pickling at all, so `symbol.source`
++   *  (the `fromJarSources` case above, patches/scala3-0014/0018) never finds
++   *  anything for them -- there is no pickled path to upgrade from in the
++   *  first place. Scala Native's own real reimplementation of these classes
++   *  (source for what actually gets linked into a native binary, NOT what
++   *  dotc typechecks against -- that's javalib_native0.5_3.jar, .nir-only,
++   *  never consulted by the frontend either) DOES ship real .scala sources
++   *  in its own sibling `-sources.jar`, keyed by the exact same
++   *  package/top-level-class-name scheme as java.base.jar's own class
++   *  files, just with a ".scala" extension instead of ".java" -- so for a
++   *  `java.*` symbol specifically, look there instead.
++   *
++   *  Deliberately NOT implemented via `Symbol.source`/`CompilationUnitInfo`
++   *  (unlike the TASTY case): that machinery runs on every single symbol
++   *  touched by the compiler, including during `Definitions.init`'s
++   *  performance-critical, very-early bootstrap of `java.lang.Object`/
++   *  `Class`/`String`/etc, which self-hosted `scalino-dotc`'s docs already
++   *  flag as EXTREMELY hot (see `Symbol.source`'s own profiling comment).
++   *  This lives entirely in the LSP request path instead -- it only ever
++   *  runs once, lazily, when an editor actually asks for a `java.*`
++   *  symbol's definition, never during ordinary compilation.
++   */
++  private def javalibNativeSourceFallback(symbol: Symbol)(using ctx: Context): List[Location] =
++    try
++      val file = symbol.associatedFile
++      val backedByJavaBase =
++        file != null && file.underlyingSource.exists(_.name == "java.base.jar")
++      if !backedByJavaBase then Nil
++      else
++        val cp = ctx.settings.classpath.value
++        val javalibJarPath = cp.split(java.io.File.pathSeparatorChar).find { p =>
++          val n = new java.io.File(p).getName
++          n.startsWith("javalib_native") && n.endsWith(".jar") && !n.endsWith("-sources.jar")
++        }
++        javalibJarPath match
++          case None => Nil
++          case Some(jarPathStr) =>
++            val jarPath = java.nio.file.Paths.get(jarPathStr)
++            val sourcesJarPath = jarPath.resolveSibling(
++              jarPath.getFileName.toString.stripSuffix(".jar") + "-sources.jar"
++            )
++            if !java.nio.file.Files.exists(sourcesJarPath) then Nil
++            else
++              val top = symbol.topLevelClass
++              val pkg = top.owner.fullName.toString
++              val entryName =
++                (if pkg.isEmpty then "" else pkg.replace('.', '/') + "/") + top.name.toString + ".scala"
++              val zf = new java.util.zip.ZipFile(sourcesJarPath.toFile)
++              try
++                Option(zf.getEntry(entryName)) match
++                  case None => Nil
++                  case Some(entry) =>
++                    val cacheRoot = java.nio.file.Paths.get(
++                      System.getProperty("user.home"), ".cache", "scalino", "lsp-deps-src"
++                    )
++                    val jarHash = java.lang.Integer.toHexString(sourcesJarPath.toString.hashCode)
++                    val cachedFile = cacheRoot.resolve(jarHash).resolve(entryName)
++                    if !java.nio.file.Files.exists(cachedFile) then
++                      java.nio.file.Files.createDirectories(cachedFile.getParent)
++                      val tmp = java.nio.file.Files.createTempFile(
++                        cachedFile.getParent, cachedFile.getFileName.toString, ".tmp"
++                      )
++                      try
++                        val in = zf.getInputStream(entry)
++                        try java.nio.file.Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
++                        finally in.close()
++                        java.nio.file.Files.move(
++                          tmp, cachedFile,
++                          java.nio.file.StandardCopyOption.REPLACE_EXISTING,
++                          java.nio.file.StandardCopyOption.ATOMIC_MOVE
++                        )
++                      finally java.nio.file.Files.deleteIfExists(tmp)
++                    // No pickled/classfile position to point at (see the
++                    // doc comment above) -- opening the right file at its
++                    // top beats not opening anything.
++                    List(new Location(
++                      cachedFile.toUri.toString,
++                      new Range(new Position(0, 0), new Position(0, 0))
++                    ))
++              finally zf.close()
++    catch case scala.util.control.NonFatal(_) => Nil
+ 
+   def semanticSymbolsSorted(
+       syms: List[Symbol]

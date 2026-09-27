@@ -75,4 +75,18 @@ TMP="$(mktemp)"
 { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/nativelib_native0\.5_3-' | grep -Fxv "$LOCAL_NATIVELIB_JAR"; echo "$LOCAL_NATIVELIB_JAR"; } | paste -sd"$CP_SEP" - > "$TMP"
 mv "$TMP" "$WORK/nativelibs.cp"
 
+# Same "publishLocal also publishes a sources jar" fact 01b relies on for
+# javalib -- see its comment for the full sourceFromSourcesJar/vendor_sources
+# naming-convention rationale, identical here for nativelib.
+LOCAL_NATIVELIB_SOURCES_JAR="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/srcs/nativelib_native0.5_3-sources.jar"
+[[ -f "$LOCAL_NATIVELIB_SOURCES_JAR" ]] || { echo "publishLocal succeeded but $LOCAL_NATIVELIB_SOURCES_JAR is missing" >&2; exit 1; }
+
+[[ -f "$WORK/nativelibs-sources.cp" ]] || : > "$WORK/nativelibs-sources.cp"
+TMP="$(mktemp)"
+# "|| true" on the grep: same empty-file/set-e/pipefail concern 01b's
+# comment explains.
+{ tr "$CP_SEP" '\n' < "$WORK/nativelibs-sources.cp" | grep -Fxv "$LOCAL_NATIVELIB_SOURCES_JAR" || true; echo "$LOCAL_NATIVELIB_SOURCES_JAR"; } | paste -sd"$CP_SEP" - > "$TMP"
+mv "$TMP" "$WORK/nativelibs-sources.cp"
+
 echo "OK: $WORK/nativelibs.cp now points at locally-built, patched nativelib: $LOCAL_NATIVELIB_JAR"
+echo "OK: $WORK/nativelibs-sources.cp now includes its matching patched sources: $LOCAL_NATIVELIB_SOURCES_JAR"
