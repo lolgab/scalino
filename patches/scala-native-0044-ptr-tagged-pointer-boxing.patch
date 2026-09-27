@@ -1,0 +1,785 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/commix/Marker.c b/nativelib/src/main/resources/scala-native/gc/commix/Marker.c
+index 408f614..13b5f0f 100644
+--- a/nativelib/src/main/resources/scala-native/gc/commix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/commix/Marker.c
+@@ -141,15 +141,45 @@ void Marker_markObject(Heap *heap, Stats *stats, GreyPacket **outHolder,
+     }
+ }
+ 
++// Mirrors nir.Type.Smi/PtrTag's bit layout (see their doc comments) - kept
++// in sync by hand, same reasoning as SmiBox.scala/PtrBox's runtime mirror.
++#define SMI_TAG_MASK (((word_t)1) << 63)
++#define PTR_TAG_MASK ((word_t)0x7)
++
++// Defined later in this file; forward-declared so Marker_markField (which
++// needs it for the PtrTag case below) can call it.
++void Marker_markConservative(Heap *heap, Stats *stats, GreyPacket **outHolder,
++                             GreyPacket **outWeakRefHolder, word_t *address);
++
+ static inline bool Marker_markField(Heap *heap, Stats *stats,
+                                     GreyPacket **outHolder,
+                                     GreyPacket **outWeakRefHolder,
+                                     Field_t field) {
+-    // SMI-style tagged pointers (bit 0 set) are never real heap pointers -
+-    // reject them before the numeric heap-range check, which alone can't
+-    // tell a tagged immediate from a real pointer (Heap_IsWordInHeap is a
+-    // pure range check, not an alignment check).
+-    if (((word_t)field & 1) == 0 && Heap_IsWordInHeap(heap, field)) {
++    const word_t asWord = (word_t)field;
++
++    if ((asWord & SMI_TAG_MASK) != 0) {
++        // SMI-tagged immediate: not a pointer at all, nothing to mark.
++        return false;
++    }
++
++    if ((asWord & PTR_TAG_MASK) != 0) {
++        // PtrTag-tagged pointer (e.g. an inline-boxed Ptr[T], see
++        // nir.Type.PtrTag): the low 3 bits are a kind tag, not part of the
++        // address - mask them off first, then conservatively mark whatever
++        // it points at. Same treatment a real (allocated) boxed-Ptr
++        // object's rawptr field gets below via __boxed_ptr_id - needed
++        // since this word may be the *only* reference keeping an
++        // interior-pointer target alive (e.g. a Ptr into an Array's data).
++        word_t *untagged = (word_t *)(asWord & ~PTR_TAG_MASK);
++        if (Heap_IsWordInHeap(heap, untagged)) {
++            Marker_markConservative(heap, stats, outHolder, outWeakRefHolder,
++                                    untagged);
++            return true;
++        }
++        return false;
++    }
++
++    if (Heap_IsWordInHeap(heap, field)) {
+         ObjectMeta *fieldMeta = Bytemap_Get(heap->bytemap, field);
+         if (ObjectMeta_IsAllocated(fieldMeta)) {
+             Marker_markObject(heap, stats, outHolder, outWeakRefHolder,
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+index 83cc3cf..13c9b71 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -994,12 +994,39 @@ void Marker_markObject(Heap *heap, Stack *stack, Bytemap *bytemap,
+     Stack_Push(stack, object);
+ }
+ 
++// Mirrors nir.Type.Smi/PtrTag's bit layout (see their doc comments) - kept
++// in sync by hand, same reasoning as SmiBox.scala/PtrBox's runtime mirror.
++#define SMI_TAG_MASK (((word_t)1) << 63)
++#define PTR_TAG_MASK ((word_t)0x7)
++
++// Defined later in this file; forward-declared so Marker_markField (which
++// needs it for the PtrTag case below) can call it.
++void Marker_markConservative(Heap *heap, Stack *stack, word_t *address);
++
+ static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
+-    // SMI-style tagged pointers (bit 0 set) are never real heap pointers -
+-    // reject them before the numeric heap-range check, which alone can't
+-    // tell a tagged immediate from a real pointer (Heap_IsWordInHeap is a
+-    // pure range check, not an alignment check).
+-    if (((word_t)field & 1) == 0 && Heap_IsWordInHeap(heap, field)) {
++    const word_t asWord = (word_t)field;
++
++    if ((asWord & SMI_TAG_MASK) != 0) {
++        // SMI-tagged immediate: not a pointer at all, nothing to mark.
++        return;
++    }
++
++    if ((asWord & PTR_TAG_MASK) != 0) {
++        // PtrTag-tagged pointer (e.g. an inline-boxed Ptr[T], see
++        // nir.Type.PtrTag): the low 3 bits are a kind tag, not part of the
++        // address - mask them off first, then conservatively mark whatever
++        // it points at. Same treatment a real (allocated) boxed-Ptr
++        // object's rawptr field gets below via __boxed_ptr_id - needed
++        // since this word may be the *only* reference keeping an
++        // interior-pointer target alive (e.g. a Ptr into an Array's data).
++        word_t *untagged = (word_t *)(asWord & ~PTR_TAG_MASK);
++        if (Heap_IsWordInHeap(heap, untagged)) {
++            Marker_markConservative(heap, stack, untagged);
++        }
++        return;
++    }
++
++    if (Heap_IsWordInHeap(heap, field)) {
+         ObjectMeta *fieldMeta = Bytemap_Get(heap->bytemap, field);
+         // Widened vs. the plain om_allocated check below: an already-
+         // marked target (om_marked) is still a live object, and every
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala b/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
+index 3042c3f..a3fdcc2 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
+@@ -9,18 +9,18 @@ import scala.scalanative.runtime.Intrinsics._
+  *  compiled *into* the target program - the encoding is mirrored here by
+  *  value instead).
+  *
+- *  Word layout (64-bit, LSB-first):
++ *  Word layout (64-bit, MSB-first):
+  *  {{{
+- *  bit 0       : tag           0 = real pointer, 1 = tagged immediate
+- *  bits 1-5    : discriminant  5 bits, 9 of 32 values used currently
+- *  bits 6-63   : payload       58 bits, value stored left-justified
++ *  bit 63      : tag           1 = tagged immediate, 0 = real pointer
++ *  bits 58-62  : discriminant  5 bits, 9 of 32 values used currently
++ *  bits 0-57   : payload       stored unshifted/right-justified
+  *  }}}
+  */
+ object SmiBox {
+-  private final val PayloadShift = 6
+-  private final val DiscriminantShift = 1
++  private final val TagBit = 63
++  private final val DiscriminantShift = TagBit - 5 // 58
+   private final val DiscriminantMask = 0x1FL
+-  private final val TagMask = 1L
++  private final val TagMask = 1L << TagBit
+ 
+   // Mirrors nir.Type.Smi's discriminant assignment - compiler-side and
+   // runtime-side can't share the constant by reference (see class doc), so
+@@ -36,13 +36,10 @@ object SmiBox {
+   private final val UIntDiscriminant = 8
+ 
+   @inline def isTagged(obj: RawPtr): Boolean =
+-    (castRawPtrToLong(obj) & 1L) != 0L
++    (castRawPtrToLong(obj) & TagMask) != 0L
+ 
+   @inline def discriminant(obj: RawPtr): Int =
+-    ((castRawPtrToLong(obj) >>> 1) & DiscriminantMask).toInt
+-
+-  @inline private def payloadOf(obj: RawPtr): Long =
+-    castRawPtrToLong(obj) >> PayloadShift // arithmetic shift: sign-preserving
++    ((castRawPtrToLong(obj) >>> DiscriminantShift) & DiscriminantMask).toInt
+ 
+   // Per-type payload decoders. Used directly by the 6 box classes' own
+   // `_value` accessors (java.lang.{Boolean,Byte,Short,Character,Integer,
+@@ -50,26 +47,29 @@ object SmiBox {
+   // in `codegen.Lower` - which doesn't inspect the receiver at all - still
+   // works correctly when handed a tagged `this`: the field access inside
+   // the method body decodes the tag itself instead of assuming a real,
+-  // allocated object.
+-  @inline def decodeBoolean(obj: RawPtr): scala.Boolean = payloadOf(obj) != 0L
+-  @inline def decodeByte(obj: RawPtr): scala.Byte = payloadOf(obj).toByte
+-  @inline def decodeShort(obj: RawPtr): scala.Short = payloadOf(obj).toShort
++  // allocated object. The payload sits unshifted in the low bits, so
++  // decoding a fixed-width primitive is just a truncating cast - no shift.
++  @inline def decodeBoolean(obj: RawPtr): scala.Boolean =
++    (castRawPtrToLong(obj) & 0x1L) != 0L
++  @inline def decodeByte(obj: RawPtr): scala.Byte = castRawPtrToLong(obj).toByte
++  @inline def decodeShort(obj: RawPtr): scala.Short = castRawPtrToLong(obj).toShort
+   @inline def decodeChar(obj: RawPtr): scala.Char =
+-    (payloadOf(obj) & 0xFFFFL).toChar
+-  @inline def decodeInt(obj: RawPtr): scala.Int = payloadOf(obj).toInt
++    (castRawPtrToLong(obj) & 0xFFFFL).toChar
++  @inline def decodeInt(obj: RawPtr): scala.Int = castRawPtrToLong(obj).toInt
+   @inline def decodeFloat(obj: RawPtr): scala.Float =
+-    java.lang.Float.intBitsToFloat(payloadOf(obj).toInt)
++    java.lang.Float.intBitsToFloat(castRawPtrToLong(obj).toInt)
+   // Unsigned types: the payload holds the raw bit pattern (produced by a
+-  // zero-extend on encode, see nir.Type.Smi/codegen.Lower.genSmiBoxOp), so
+-  // `payloadOf`'s arithmetic (sign-preserving) shift would be wrong here if
+-  // used directly - mask to the field's own bit width instead of relying on
+-  // sign, matching decodeChar's shape.
++  // zero-extend-then-mask on encode, see nir.Type.Smi/
++  // codegen.Lower.genSmiBoxOp) - mask to the field's own bit width instead
++  // of relying on sign, matching decodeChar's shape (a plain `.toByte`/
++  // `.toShort` truncation alone would sign-extend on the *next* read, since
++  // these decode to scala.Byte/scala.Short which are themselves signed).
+   @inline def decodeUByte(obj: RawPtr): scala.Byte =
+-    (payloadOf(obj) & 0xFFL).toByte
++    (castRawPtrToLong(obj) & 0xFFL).toByte
+   @inline def decodeUShort(obj: RawPtr): scala.Short =
+-    (payloadOf(obj) & 0xFFFFL).toShort
++    (castRawPtrToLong(obj) & 0xFFFFL).toShort
+   @inline def decodeUInt(obj: RawPtr): scala.Int =
+-    (payloadOf(obj) & 0xFFFFFFFFL).toInt
++    (castRawPtrToLong(obj) & 0xFFFFFFFFL).toInt
+ 
+   // Encode direction: given a primitive value, construct the tagged AnyRef
+   // bit pattern directly - the mirror image of `codegen.Lower`'s
+@@ -79,35 +79,57 @@ object SmiBox {
+   // mandated cache, Long is out of scope for SMI entirely) on 64-bit, so an
+   // *explicit* `Integer.valueOf(x)`-style call gets the same zero-allocation,
+   // tagged-identity treatment as implicit autoboxing already does.
+-  @inline private def encode(discriminant: Int, payload: Long): AnyRef = {
++  //
++  // `payloadMask` clears any bits the widened payload has above its own
++  // type width (in particular, sign-extension from a negative Byte/Short/
++  // Int) - those bits would otherwise collide with the discriminant/tag
++  // bits living above the payload region now that the payload isn't
++  // shifted out of their way.
++  @inline private def encode(discriminant: Int, payload: Long, payloadMask: Long): AnyRef = {
+     val encoded =
+-      (payload << PayloadShift) | (discriminant.toLong << DiscriminantShift) | TagMask
++      (payload & payloadMask) | (discriminant.toLong << DiscriminantShift) | TagMask
+     castRawPtrToObject(castLongToRawPtr(encoded))
+   }
+ 
+   @inline def encodeBoolean(value: scala.Boolean): AnyRef =
+-    encode(BooleanDiscriminant, if (value) 1L else 0L)
++    encode(BooleanDiscriminant, if (value) 1L else 0L, 0x1L)
+   @inline def encodeByte(value: scala.Byte): AnyRef =
+-    encode(ByteDiscriminant, value.toLong) // toLong sign-extends, matches decode
++    encode(ByteDiscriminant, value.toLong, 0xFFL) // toLong sign-extends, mask strips it
+   @inline def encodeShort(value: scala.Short): AnyRef =
+-    encode(ShortDiscriminant, value.toLong)
++    encode(ShortDiscriminant, value.toLong, 0xFFFFL)
+   @inline def encodeChar(value: scala.Char): AnyRef =
+-    encode(CharDiscriminant, value.toLong & 0xFFFFL) // zero-extend: Char is unsigned
++    encode(CharDiscriminant, value.toLong & 0xFFFFL, 0xFFFFL) // zero-extend: Char is unsigned
+   @inline def encodeInt(value: scala.Int): AnyRef =
+-    encode(IntDiscriminant, value.toLong)
++    encode(IntDiscriminant, value.toLong, 0xFFFFFFFFL)
+   // UByte/UShort/UInt: no JLS-style valueOf cache exists for these (they're
+   // Scala Native's own types, not java.lang wrappers), so these encoders
+   // aren't currently called from a valueOf-style entry point the way the 5
+   // java.lang.X ones above are - added for symmetry with `decodeUX` and in
+-  // case a future caching/construction path wants them. The payload
+-  // is the type's own raw bit pattern (already unsigned), no extra masking
+-  // needed on encode - `value.toLong` zero-fills for these widths since
+-  // `scala.Byte`/`scala.Short`/`scala.Int`'s `.toLong` sign-extends, so mask
+-  // down to the field's own width first, matching encodeChar's shape.
++  // case a future caching/construction path wants them.
+   @inline def encodeUByte(value: scala.Byte): AnyRef =
+-    encode(UByteDiscriminant, value.toLong & 0xFFL)
++    encode(UByteDiscriminant, value.toLong & 0xFFL, 0xFFL)
+   @inline def encodeUShort(value: scala.Short): AnyRef =
+-    encode(UShortDiscriminant, value.toLong & 0xFFFFL)
++    encode(UShortDiscriminant, value.toLong & 0xFFFFL, 0xFFFFL)
+   @inline def encodeUInt(value: scala.Int): AnyRef =
+-    encode(UIntDiscriminant, value.toLong & 0xFFFFFFFFL)
++    encode(UIntDiscriminant, value.toLong & 0xFFFFFFFFL, 0xFFFFFFFFL)
++}
++
++/** Runtime-side counterpart of the compiler's `PtrTag` low-3-bit pointer
++ *  tagging (see `nir.Type.PtrTag` for the bit-layout single source of
++ *  truth; mirrored here by value, same reasoning as `SmiBox`). Orthogonal
++ *  to `SmiBox` above - see `nir.Type.PtrTag`'s doc comment for why the two
++ *  schemes never collide.
++ */
++object PtrBox {
++  private final val Mask = 0x7L
++  private final val PtrDiscriminant = 1L
++
++  @inline def isTagged(obj: RawPtr): Boolean =
++    (castRawPtrToLong(obj) & Mask) == PtrDiscriminant
++
++  @inline def decodeRawPtr(obj: RawPtr): RawPtr =
++    castLongToRawPtr(castRawPtrToLong(obj) & ~Mask)
++
++  @inline def encode(rawptr: RawPtr): AnyRef =
++    castRawPtrToObject(castLongToRawPtr(castRawPtrToLong(rawptr) | PtrDiscriminant))
+ }
+diff --git a/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala b/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
+index e77bb9a..4910e50 100644
+--- a/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
++++ b/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
+@@ -10,8 +10,21 @@ import scala.scalanative.runtime._
+ import scala.scalanative.unsigned._
+ 
+ final class Ptr[T] private[scalanative] (
+-    private[scalanative] val rawptr: RawPtr
++    _rawptr: RawPtr
+ ) {
++  // Not just a `val`: `this` may be a `PtrTag`-tagged immediate reached via
++  // static dispatch (see `runtime.PtrBox`/`nir.Type.PtrTag`), same reasoning
++  // as `java.lang.Integer._value`. Every access - inside this class and via
++  // the `private[scalanative]` visibility used elsewhere in this codebase
++  // (Tag.scala, CStruct.scala, CArray.scala, Boxes.scala, ...) - goes
++  // through this check instead of trusting `_rawptr` is real memory.
++  private[scalanative] def rawptr: RawPtr = {
++    val self = Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.PtrBox.isTagged(self))
++      scala.scalanative.runtime.PtrBox.decodeRawPtr(self)
++    else _rawptr
++  }
++
+   @alwaysinline override def hashCode: Int =
+     java.lang.Long.hashCode(toLong)
+ 
+diff --git a/nir/src/main/scala/scala/scalanative/nir/Types.scala b/nir/src/main/scala/scala/scalanative/nir/Types.scala
+index 6e74d94..baaeefc 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/Types.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/Types.scala
+@@ -251,27 +251,41 @@ object Type {
+    *  value, not by reference - different compilation universe) in the
+    *  runtime-side helpers under `nativelib` and in the GC's `Marker.c`.
+    *
+-   *  Word layout (64-bit, LSB-first):
++   *  Word layout (64-bit, MSB-first):
+    *  {{{
+-   *  bit 0       : tag           0 = real pointer, 1 = tagged immediate
+-   *  bits 1-5    : discriminant  5 bits, 6 of 32 values used currently
+-   *  bits 6-63   : payload       58 bits, value stored left-justified
++   *  bit 63      : tag           1 = tagged immediate, 0 = real pointer
++   *  bits 58-62  : discriminant  5 bits, 9 of 32 values used currently
++   *  bits 0-57   : payload       stored unshifted/right-justified - decoding
++   *                a fixed-width primitive (e.g. Int) is a plain truncating
++   *                cast to that width, no shift needed
+    *  }}}
+    *
+-   *  Encode: `tagged = (payloadBits << PayloadShift) | (discriminant <<
+-   *  DiscriminantShift) | 1`. Decode: `discriminant = (tagged >>>
+-   *  DiscriminantShift) & DiscriminantMask`; `payloadBits = tagged >>
+-   *  PayloadShift` (arithmetic shift for sign-extending types, logical
+-   *  shift + mask for the others - see per-type notes below).
++   *  Tag lives at the *top* of the word, deliberately disjoint from
++   *  `PtrTag` below, which uses the *bottom* 3 bits of a real (8-byte
++   *  aligned) pointer - the two schemes never collide, so a blind bit-test
++   *  on an arbitrary `AnyRef` can tell "Smi" from "real pointer or
++   *  PtrTag-tagged pointer" from bit 63 alone, no type context needed.
++   *
++   *  Encode: `tagged = (payloadBits & <type's own width mask>) |
++   *  (discriminant << DiscriminantShift) | TagMask`. Decode: `discriminant =
++   *  (tagged >>> DiscriminantShift) & DiscriminantMask`; `payloadBits` is
++   *  just a truncating cast of `tagged` to the primitive's own width (no
++   *  shift) - sign-extending types (Byte/Short/Int) get the sign back for
++   *  free from the cast, unsigned-width types (Char + the 3 unsigned box
++   *  types) additionally mask to their width since a narrowing cast alone
++   *  doesn't clear high bits for those.
+    */
+   object Smi {
+     // Bit positions/widths - single source of truth for the encoding.
+-    final val TagBit: Int = 0
+-    final val TagMask: Long = 1L
++    final val TagBit: Int = 63
++    final val TagMask: Long = 1L << TagBit
+     final val DiscriminantBits: Int = 5
+-    final val DiscriminantShift: Int = 1
++    final val DiscriminantShift: Int = TagBit - DiscriminantBits // 58
+     final val DiscriminantMask: Long = (1L << DiscriminantBits) - 1L // 0x1F
+-    final val PayloadShift: Int = DiscriminantShift + DiscriminantBits // 6
++    // Mask over the payload region (bits 0-57): protects the discriminant
++    // and tag bits above it from a sign-extended negative payload (e.g. a
++    // negative Byte/Short/Int widened to Long) leaking upward on encode.
++    final val PayloadMask: Long = (1L << DiscriminantShift) - 1L
+ 
+     // Discriminant values. 9 of 32 possible values used today; 9-31 remain
+     // reserved for further follow-ups (Double - see design doc for why it
+@@ -370,6 +384,46 @@ object Type {
+       discriminantOfBox.get(normalize(ty))
+   }
+ 
++  /** Low-3-bit pointer-kind tagging, orthogonal to `Smi` above (`Smi`'s tag
++   *  lives at bit 63 of the word; this scheme lives at bits 0-2 - a single
++   *  word can never satisfy both, so a blind `TagBit`-then-`PtrTag.Mask`
++   *  check tells the three cases apart with no type context: bit 63 set =>
++   *  Smi; bit 63 clear and low 3 bits all zero => real (8-byte aligned)
++   *  pointer; bit 63 clear and low 3 bits non-zero => `PtrTag`).
++   *
++   *  Exploits the same alignment fact `Smi` avoids relying on: a real,
++   *  untagged heap/native pointer is always 8-byte aligned, so its low 3
++   *  bits are always zero. Overwriting just those 3 (otherwise-wasted) bits
++   *  with a small kind tag needs no shift at all - the payload *is* the
++   *  original pointer value, bits 3-63 untouched.
++   *
++   *  Word layout: `tagged = rawptr | kind` (kind in bits 0-2, rawptr's own
++   *  low 3 bits are 0 going in, so `|` is exact - no information lost).
++   *  Decode: `rawptr = tagged & ~Mask`.
++   *
++   *  Currently only `Ptr[T]` (kind 1) is wired up end to end - kinds 2-7
++   *  are reserved for future boxed reference-ish types whose payload is
++   *  itself pointer-shaped/aligned (`Some`, `Right`, `Success`, ...).
++   */
++  object PtrTag {
++    final val Bits: Int = 3
++    final val Mask: Long = (1L << Bits) - 1L // 0x7
++
++    final val RealPointer: Int = 0
++    final val PtrDiscriminant: Int = 1
++    // 2-7 reserved for future boxed reference kinds.
++
++    val discriminantOfBox: Map[Type, Int] = Map(
++      Type.Ref(Global.Top("scala.scalanative.unsafe.Ptr")) -> PtrDiscriminant
++    )
++
++    def isEligibleBoxType(ty: Type): Boolean =
++      discriminantOfBox.contains(normalize(ty))
++
++    def discriminantOfBoxType(ty: Type): Option[Int] =
++      discriminantOfBox.get(normalize(ty))
++  }
++
+   object NothingType {
+     def unapply(v: nir.Type): Option[nir.Type] =
+       if (isNothing(v)) Some(v) else None
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+index cf8388f..c6659f3 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -677,6 +677,15 @@ private[scalanative] object Lower {
+       ).flatMap { case (d, name) => constOf(name).map(d -> _) }.toMap
+     }
+ 
++    /** Same idea as `smiBoxRttiConst`, for `PtrTag`'s box types (currently
++     *  just `Ptr[T]`, discriminant 1). See `nir.Type.PtrTag`.
++     */
++    private val ptrTagBoxRttiConst: Option[nir.Val] =
++      analysis.infos
++        .get(nir.Global.Top("scala.scalanative.unsafe.Ptr"))
++        .flatMap(rtti.get)
++        .map(_.const)
++
+     /** Computes the RTTI/vtable pointer for `obj`, whether `obj` is a real
+      *  heap object or a SMI-tagged immediate (see `nir.Type.Smi`). Used
+      *  wherever code needs a value's type-info pointer for a static
+@@ -700,16 +709,21 @@ private[scalanative] object Lower {
+       import buf._
+       if (platform.is32Bit) let(nir.Op.Load(nir.Type.Ptr, obj), unwind)
+       else {
+-        val taggedL, realL, mergeL = fresh()
++        // 3-way branch: Smi (bit 63 set) / PtrTag-tagged pointer (bit 63
++        // clear, low 3 bits non-zero) / real object (bit 63 clear, low 3
++        // bits zero) - see nir.Type.Smi/PtrTag's doc comments for why these
++        // never collide.
++        val smiL, notSmiL, mergeL = fresh()
+         val result = fresh()
+ 
+         val asLong = conv(nir.Conv.Ptrtoint, nir.Type.Long, obj, unwind)
+-        val tagBit = bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(1L), unwind)
+-        val isTagged =
++        val tagBit =
++          bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(nir.Type.Smi.TagMask), unwind)
++        val isSmiTagged =
+           comp(nir.Comp.Ine, nir.Type.Long, tagBit, nir.Val.Long(0L), unwind)
+-        branch(isTagged, nir.Next(taggedL), nir.Next(realL))
++        branch(isSmiTagged, nir.Next(smiL), nir.Next(notSmiL))
+ 
+-        label(taggedL)
++        label(smiL)
+         val discBits = bin(
+           nir.Bin.Lshr,
+           nir.Type.Long,
+@@ -754,6 +768,22 @@ private[scalanative] object Lower {
+         label(fallbackL)
+         unreachable(nir.Next.None)
+ 
++        label(notSmiL)
++        val low3 =
++          bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(nir.Type.PtrTag.Mask), unwind)
++        val isPtrTagged =
++          comp(nir.Comp.Ine, nir.Type.Long, low3, nir.Val.Long(0L), unwind)
++        val ptrTaggedL, realL = fresh()
++        branch(isPtrTagged, nir.Next(ptrTaggedL), nir.Next(realL))
++
++        label(ptrTaggedL)
++        // Only one PtrTag kind is wired up today (Ptr[T], discriminant 1) -
++        // every non-zero low3 pattern the compiler currently emits is that
++        // one, so no switch needed yet (add one here alongside `genBoxOp`
++        // when a second kind lands).
++        val ptrBoxRtti = ptrTagBoxRttiConst.getOrElse(util.unreachable)
++        jump(mergeL, Seq(ptrBoxRtti))
++
+         label(realL)
+         val realTypeptr = let(nir.Op.Load(nir.Type.Ptr, obj), unwind)
+         jump(mergeL, Seq(realTypeptr))
+@@ -1863,30 +1893,48 @@ private[scalanative] object Lower {
+       val nir.Op.Box(ty, v) = op
+       val from = genVal(buf, v)
+ 
+-      // SMI-style tagged-pointer boxing: on 64-bit targets, the 6 eligible
+-      // primitive types get inlined tag/untag sequences instead of a real
+-      // allocation via BoxesRunTime. 32-bit and every other boxable type
+-      // (Long, Double, unsigned types, Ptr, CArray, CFuncPtrN, ...) keep the
+-      // existing call-based path unconditionally - see nir.Type.Smi.
++      // SMI-style tagged-pointer boxing: on 64-bit targets, the 9 eligible
++      // primitive/unsigned types get inlined tag/untag sequences instead of
++      // a real allocation via BoxesRunTime - see nir.Type.Smi. `Ptr[T]` gets
++      // the sibling PtrTag scheme instead (payload is pointer-shaped, so no
++      // shift is needed/possible - see nir.Type.PtrTag). 32-bit and every
++      // other boxable type (Long, Double, CArray, CFuncPtrN, ...) keep the
++      // existing call-based path unconditionally.
+       if (!platform.is32Bit && nir.Type.Smi.isEligibleBoxType(ty)) {
+         genSmiBoxOp(buf, n, ty, from)
++      } else if (!platform.is32Bit && nir.Type.PtrTag.isEligibleBoxType(ty)) {
++        genPtrTagBoxOp(buf, n, ty, from)
+       } else {
+-        val methodName = BoxTo(ty)
+-        val moduleName = methodName.top
++        genRealBoxCall(buf, n, ty, from)
++      }
++    }
+ 
+-        val boxTy =
+-          nir.Type.Function(Seq(nir.Type.Ref(moduleName), nir.Type.unbox(ty)), ty)
++    /** Unconditional call-based box path (`BoxesRunTime`/`Boxes` `boxToX`).
++     *  Used directly for every box type that's never eligible for inline
++     *  tagging, and as the runtime fallback from `genPtrTagBoxOp` for a
++     *  `Ptr[T]` value that turns out not to be 8-byte aligned.
++     */
++    private def genRealBoxCall(
++        buf: nir.InstructionBuilder,
++        n: nir.Local,
++        ty: nir.Type,
++        from: nir.Val
++    )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
++      val methodName = BoxTo(ty)
++      val moduleName = methodName.top
+ 
+-        buf.let(
+-          n,
+-          nir.Op.Call(
+-            boxTy,
+-            nir.Val.Global(methodName, nir.Type.Ptr),
+-            Seq(nir.Val.Null, from)
+-          ),
+-          unwind
+-        )
+-      }
++      val boxTy =
++        nir.Type.Function(Seq(nir.Type.Ref(moduleName), nir.Type.unbox(ty)), ty)
++
++      buf.let(
++        n,
++        nir.Op.Call(
++          boxTy,
++          nir.Val.Global(methodName, nir.Type.Ptr),
++          Seq(nir.Val.Null, from)
++        ),
++        unwind
++      )
+     }
+ 
+     /** Widens a `Type.Bool` value to `Type.Long` (0L/1L) via branch+phi,
+@@ -1938,36 +1986,97 @@ private[scalanative] object Lower {
+       // primitive type alone can't tell a signed value from an unsigned one
+       // sharing the same representation width, only the box type
+       // (equivalently, the discriminant) can.
+-      val widened: nir.Val = discriminant match {
++      // Widen to a 64-bit integer, then mask down to the type's own width -
++      // the mask matters even for the sign-extended cases (Byte/Short/Int):
++      // a negative value's sign-extension would otherwise leak into the
++      // discriminant/tag bits living above the payload region now that the
++      // payload is no longer shifted out of their way. The masked bit
++      // pattern in the low N bits is exactly the value's own two's-
++      // complement (or, for the unsigned-ish cases, zero-extended)
++      // representation - decode recovers it with a plain truncating cast,
++      // no shift.
++      val (widened, payloadMask): (nir.Val, Long) = discriminant match {
+         case Smi.BooleanDiscriminant =>
+           // Bool (LLVM i1) is not a `FixedSizeI` in NIR's type hierarchy, so
+           // it can't go through Zext/Trunc - widen via branch+phi instead,
+           // same shape as every other Bool-to-integer conversion in this
+           // codebase's frontend.
+-          genBoolToLong(buf, from)
+-        case Smi.ByteDiscriminant | Smi.ShortDiscriminant | Smi.IntDiscriminant =>
+-          conv(nir.Conv.Sext, nir.Type.Long, from, unwind)
+-        case Smi.CharDiscriminant | Smi.UByteDiscriminant | Smi.UShortDiscriminant |
+-            Smi.UIntDiscriminant =>
+-          conv(nir.Conv.Zext, nir.Type.Long, from, unwind)
++          (genBoolToLong(buf, from), 0x1L)
++        case Smi.ByteDiscriminant =>
++          (conv(nir.Conv.Sext, nir.Type.Long, from, unwind), 0xFFL)
++        case Smi.ShortDiscriminant =>
++          (conv(nir.Conv.Sext, nir.Type.Long, from, unwind), 0xFFFFL)
++        case Smi.IntDiscriminant =>
++          (conv(nir.Conv.Sext, nir.Type.Long, from, unwind), 0xFFFFFFFFL)
++        case Smi.CharDiscriminant | Smi.UByteDiscriminant | Smi.UShortDiscriminant =>
++          val mask = discriminant match {
++            case Smi.UByteDiscriminant => 0xFFL
++            case _                     => 0xFFFFL
++          }
++          (conv(nir.Conv.Zext, nir.Type.Long, from, unwind), mask)
++        case Smi.UIntDiscriminant =>
++          (conv(nir.Conv.Zext, nir.Type.Long, from, unwind), 0xFFFFFFFFL)
+         case Smi.FloatDiscriminant =>
+           val bits = conv(nir.Conv.Bitcast, nir.Type.Int, from, unwind)
+-          conv(nir.Conv.Zext, nir.Type.Long, bits, unwind)
++          (conv(nir.Conv.Zext, nir.Type.Long, bits, unwind), 0xFFFFFFFFL)
+         case other =>
+           util.unsupported(s"genSmiBoxOp: unexpected discriminant $other")
+       }
+ 
+-      val payloadShifted =
+-        bin(nir.Bin.Shl, nir.Type.Long, widened, nir.Val.Long(Smi.PayloadShift.toLong), unwind)
++      val payload =
++        bin(nir.Bin.And, nir.Type.Long, widened, nir.Val.Long(payloadMask), unwind)
+       val discTagged = nir.Val.Long(
+         (discriminant.toLong << Smi.DiscriminantShift) | Smi.TagMask
+       )
+       val encoded =
+-        bin(nir.Bin.Or, nir.Type.Long, payloadShifted, discTagged, unwind)
++        bin(nir.Bin.Or, nir.Type.Long, payload, discTagged, unwind)
+ 
+       let(n, nir.Op.Conv(nir.Conv.Inttoptr, ty, encoded), unwind)
+     }
+ 
++    /** Inline encode of a real pointer (`from`, of `Type.Ptr`) into a
++     *  `PtrTag`-tagged pointer of box type `ty` (`Ptr[T]`'s box class). No
++     *  allocation, no call, if `from` is 8-byte aligned (setting the kind
++     *  tag is then a plain `Or`, no shift). `Ptr[T]` supports byte-level
++     *  arithmetic (`ptr + 1`, casts, C interop), so - unlike Smi's fixed-
++     *  width primitives - alignment can't be assumed from the static type
++     *  alone: checked at runtime, falling back to the real allocating path
++     *  (`genRealBoxCall`) for a misaligned pointer instead of corrupting its
++     *  low bits.
++     */
++    private def genPtrTagBoxOp(
++        buf: nir.InstructionBuilder,
++        n: nir.Local,
++        ty: nir.Type,
++        from: nir.Val
++    )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
++      import buf._
++      import nir.Type.PtrTag
++
++      val discriminant =
++        PtrTag.discriminantOfBoxType(ty).getOrElse(util.unreachable)
++      val asLong = conv(nir.Conv.Ptrtoint, nir.Type.Long, from, unwind)
++      val low3 = bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(PtrTag.Mask), unwind)
++      val isAligned =
++        comp(nir.Comp.Ieq, nir.Type.Long, low3, nir.Val.Long(0L), unwind)
++
++      val alignedL, unalignedL, resultL = fresh()
++      branch(isAligned, nir.Next(alignedL), nir.Next(unalignedL))
++
++      label(alignedL)
++      val tagged =
++        bin(nir.Bin.Or, nir.Type.Long, asLong, nir.Val.Long(discriminant.toLong), unwind)
++      val taggedPtr = conv(nir.Conv.Inttoptr, ty, tagged, unwind)
++      jump(resultL, Seq(taggedPtr))
++
++      label(unalignedL)
++      val real = fresh()
++      genRealBoxCall(buf, real, ty, from)
++      jump(resultL, Seq(nir.Val.Local(real, ty)))
++
++      label(resultL, Seq(nir.Val.Local(n, ty)))
++    }
++
+     def genUnboxOp(
+         buf: nir.InstructionBuilder,
+         n: nir.Local,
+@@ -1978,6 +2087,8 @@ private[scalanative] object Lower {
+ 
+       if (!platform.is32Bit && nir.Type.Smi.isEligibleBoxType(ty)) {
+         genSmiUnboxOp(buf, n, ty, from)
++      } else if (!platform.is32Bit && nir.Type.PtrTag.isEligibleBoxType(ty)) {
++        genPtrTagUnboxOp(buf, n, ty, from)
+       } else {
+         val methodName = UnboxTo(ty)
+         val moduleName = methodName.top
+@@ -1998,10 +2109,12 @@ private[scalanative] object Lower {
+     }
+ 
+     /** Inline decode: branch on the tag bit of `from` (a `ty`-typed
+-     *  reference). If untagged (bit 0 clear), fall through to the existing
++     *  reference). If untagged (bit 63 clear), fall through to the existing
+      *  real-object unbox path (load the field the box class stores its
+-     *  primitive in). If tagged, shift/mask out the payload inline - no
+-     *  call, no dereference.
++     *  primitive in). If tagged, truncate out the payload inline - no
++     *  shift, no call, no dereference: the payload sits unshifted in the
++     *  word's low bits (see `nir.Type.Smi`), so recovering a fixed-width
++     *  primitive is just a narrowing cast to that width.
+      */
+     private def genSmiUnboxOp(
+         buf: nir.InstructionBuilder,
+@@ -2023,38 +2136,32 @@ private[scalanative] object Lower {
+         comp(nir.Comp.Ine, nir.Type.Long, tagBit, nir.Val.Long(0L), unwind)
+       branch(isTagged, nir.Next(taggedL), nir.Next(realL))
+ 
+-      // Tagged: shift/mask out the payload inline. Dispatch on
++      // Tagged: truncate out the payload inline, no shift. Dispatch on
+       // `discriminant`, not `primTy` - see the matching comment in
+       // `genSmiBoxOp`: UByte/UShort/UInt share their primitive
+       // representation type with signed Byte/Short/Int, only the
+       // discriminant distinguishes "zero-extended on encode" from
+-      // "sign-extended on encode".
++      // "sign-extended on encode" (irrelevant here since Trunc doesn't
++      // care, but kept for symmetry/clarity with genSmiBoxOp).
+       label(taggedL)
+       val taggedResult: nir.Val = discriminant match {
+         case Smi.BooleanDiscriminant =>
+-          val shifted =
+-            bin(nir.Bin.Lshr, nir.Type.Long, asLong, nir.Val.Long(Smi.PayloadShift.toLong), unwind)
+           // Comp always yields Type.Bool - no Trunc needed (Bool isn't a
+-          // FixedSizeI, see genSmiBoxOp).
+-          comp(nir.Comp.Ine, nir.Type.Long, shifted, nir.Val.Long(0L), unwind)
++          // FixedSizeI, see genSmiBoxOp). Payload is bit 0.
++          val bit0 = bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(0x1L), unwind)
++          comp(nir.Comp.Ine, nir.Type.Long, bit0, nir.Val.Long(0L), unwind)
+         case Smi.ByteDiscriminant | Smi.ShortDiscriminant | Smi.IntDiscriminant =>
+-          // Arithmetic shift restores the sign that was sign-extended on
+-          // encode.
+-          val shifted =
+-            bin(nir.Bin.Ashr, nir.Type.Long, asLong, nir.Val.Long(Smi.PayloadShift.toLong), unwind)
+-          conv(nir.Conv.Trunc, primTy, shifted, unwind)
++          // A plain narrowing cast reproduces the original signed value:
++          // the low N bits are its exact two's-complement pattern, sign
++          // bit included (see genSmiBoxOp's masking).
++          conv(nir.Conv.Trunc, primTy, asLong, unwind)
+         case Smi.CharDiscriminant | Smi.UByteDiscriminant | Smi.UShortDiscriminant |
+             Smi.UIntDiscriminant =>
+-          // Logically unsigned: logical shift, no sign extension.
+-          val shifted =
+-            bin(nir.Bin.Lshr, nir.Type.Long, asLong, nir.Val.Long(Smi.PayloadShift.toLong), unwind)
+-          conv(nir.Conv.Trunc, primTy, shifted, unwind)
++          conv(nir.Conv.Trunc, primTy, asLong, unwind)
+         case Smi.FloatDiscriminant =>
+-          // Raw bit pattern, not a two's-complement value: logical shift,
+-          // then reinterpret (not convert) the low 32 bits as Float.
+-          val shifted =
+-            bin(nir.Bin.Lshr, nir.Type.Long, asLong, nir.Val.Long(Smi.PayloadShift.toLong), unwind)
+-          val bits = conv(nir.Conv.Trunc, nir.Type.Int, shifted, unwind)
++          // Raw bit pattern, not a two's-complement value: truncate, then
++          // reinterpret (not convert) the low 32 bits as Float.
++          val bits = conv(nir.Conv.Trunc, nir.Type.Int, asLong, unwind)
+           conv(nir.Conv.Bitcast, nir.Type.Float, bits, unwind)
+         case other =>
+           util.unsupported(s"genSmiUnboxOp: unexpected discriminant $other")
+@@ -2070,6 +2177,49 @@ private[scalanative] object Lower {
+       label(resultL, Seq(nir.Val.Local(n, primTy)))
+     }
+ 
++    /** Inline decode: branch on the low 3 bits of `from` (a `Ptr[T]` box
++     *  reference). If tagged (low 3 bits == `PtrDiscriminant`), mask them
++     *  off inline - no shift, no call, no dereference. Otherwise (low 3
++     *  bits zero) fall through to the existing real-object unbox path.
++     */
++    private def genPtrTagUnboxOp(
++        buf: nir.InstructionBuilder,
++        n: nir.Local,
++        ty: nir.Type,
++        from: nir.Val
++    )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
++      import buf._
++      import nir.Type.PtrTag
++
++      val primTy = nir.Type.Ptr
++      val taggedL, realL, resultL = fresh()
++
++      val asLong = conv(nir.Conv.Ptrtoint, nir.Type.Long, from, unwind)
++      val low3 = bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(PtrTag.Mask), unwind)
++      val isTagged = comp(
++        nir.Comp.Ieq,
++        nir.Type.Long,
++        low3,
++        nir.Val.Long(PtrTag.PtrDiscriminant.toLong),
++        unwind
++      )
++      branch(isTagged, nir.Next(taggedL), nir.Next(realL))
++
++      label(taggedL)
++      val untagged =
++        bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(~PtrTag.Mask), unwind)
++      val taggedResult = conv(nir.Conv.Inttoptr, primTy, untagged, unwind)
++      jump(resultL, Seq(taggedResult))
++
++      // Untagged: existing real-object path - load the field the box class
++      // stores its raw pointer in.
++      label(realL)
++      val realResult = genUnboxRealFieldOp(buf, ty, primTy, from)
++      jump(resultL, Seq(realResult))
++
++      label(resultL, Seq(nir.Val.Local(n, primTy)))
++    }
++
+     /** Untagged fallback: same as today's unconditional path - call through
+      *  to `scala.runtime.BoxesRunTime.unboxToX`, which loads the primitive
+      *  out of the real box object's field.
+@@ -2812,6 +2962,9 @@ private[scalanative] object Lower {
+     // path), so list them here explicitly, exactly like the other
+     // entry-point roots in this method.
+     buf ++= nir.Type.Smi.discriminantOfBox.keys.collect { case nir.Type.Ref(name, _, _) => name }
++    // Same reasoning for PtrTag's box types (currently just Ptr[T]) - see
++    // typeptrOf's ptrTagBoxRttiConst.
++    buf ++= nir.Type.PtrTag.discriminantOfBox.keys.collect { case nir.Type.Ref(name, _, _) => name }
+     buf += unitName
+     buf ++= BoxTo.values
+     buf ++= UnboxTo.values
