@@ -1,0 +1,48 @@
+diff --git a/javalib/src/main/scala/java/lang/management/ThreadMXBean.scala b/javalib/src/main/scala/java/lang/management/ThreadMXBean.scala
+index 846e26011d0..ee15f9673b9 100644
+--- a/javalib/src/main/scala/java/lang/management/ThreadMXBean.scala
++++ b/javalib/src/main/scala/java/lang/management/ThreadMXBean.scala
+@@ -2,6 +2,8 @@ package java.lang.management
+
+ import java.util.ScalaOps._
+
++import scala.collection.mutable
++
+ import scala.scalanative.runtime.NativeThread
+
+ trait ThreadMXBean {
+@@ -117,7 +119,7 @@ object ThreadMXBean {
+
+     @annotation.nowarn // Thread.getId is deprecated since JDK 19
+     def getAllThreadIds(): Array[Long] = {
+-      val builder = Array.newBuilder[Long]
++      val builder = new mutable.ArrayBuilder.ofLong()
+       builder.sizeHint(NativeThread.Registry.aliveThreadsCount)
+       NativeThread.Registry.aliveThreadsIterator.scalaOps.foreach(
+         nativeThread => builder += nativeThread.thread.getId()
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/StackTrace.scala b/nativelib/src/main/scala/scala/scalanative/runtime/StackTrace.scala
+index 0951529be17..f03947b8441 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/StackTrace.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/StackTrace.scala
+@@ -64,7 +64,7 @@ private[runtime] object StackTrace {
+     try {
+       thread.isFillingStackTrace = true
+
+-      val buffer = scala.Array.newBuilder[Long]
++      val buffer = new mutable.ArrayBuilder.ofLong()
+       buffer.sizeHint(32) // at least
+
+       // JVM limit stack trace to 1024 entries
+diff --git a/util/src/main/scala/scala/scalanative/util/StringUtils.scala b/util/src/main/scala/scala/scalanative/util/StringUtils.scala
+index 2924628dbca..813e1c2e7e2 100644
+--- a/util/src/main/scala/scala/scalanative/util/StringUtils.scala
++++ b/util/src/main/scala/scala/scalanative/util/StringUtils.scala
+@@ -15,7 +15,7 @@ object StringUtils {
+    */
+   def processEscapes(str: String): Array[Byte] = {
+     val len = str.length
+-    val b = Array.newBuilder[Byte]
++    val b = new ArrayBuilder.ofByte()
+
+     def append(str: String): ArrayBuilder[Byte] = b ++= str.getBytes
+
