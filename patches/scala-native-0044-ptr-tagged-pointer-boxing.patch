@@ -399,7 +399,7 @@ index 6e74d94..baaeefc 100644
      def unapply(v: nir.Type): Option[nir.Type] =
        if (isNothing(v)) Some(v) else None
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
-index cf8388f..c6659f3 100644
+index cf8388f..c815cf6 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 @@ -677,6 +677,15 @@ private[scalanative] object Lower {
@@ -536,7 +536,7 @@ index cf8388f..c6659f3 100644
      }
  
      /** Widens a `Type.Bool` value to `Type.Long` (0L/1L) via branch+phi,
-@@ -1938,36 +1986,97 @@ private[scalanative] object Lower {
+@@ -1938,36 +1986,112 @@ private[scalanative] object Lower {
        // primitive type alone can't tell a signed value from an unsigned one
        // sharing the same representation width, only the box type
        // (equivalently, the discriminant) can.
@@ -620,12 +620,27 @@ index cf8388f..c6659f3 100644
 +
 +      val discriminant =
 +        PtrTag.discriminantOfBoxType(ty).getOrElse(util.unreachable)
++
++      // Null guard, matching Boxes.boxToPtr's own `if (v == null) null else
++      // ...`: a null RawPtr has every bit 0, including the low 3 - which
++      // looks "aligned" to the check below and would otherwise get OR'd
++      // with the discriminant into a non-null tagged value (e.g. `1` for
++      // Ptr[T]), silently turning every null Ptr[T] into a distinct,
++      // non-null garbage pointer the moment it's boxed into Any.
++      val isNull = comp(nir.Comp.Ieq, nir.Type.Ptr, from, nir.Val.Null, unwind)
++      val nullL, notNullL, resultL = fresh()
++      branch(isNull, nir.Next(nullL), nir.Next(notNullL))
++
++      label(nullL)
++      jump(resultL, Seq(nir.Val.Null))
++
++      label(notNullL)
 +      val asLong = conv(nir.Conv.Ptrtoint, nir.Type.Long, from, unwind)
 +      val low3 = bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(PtrTag.Mask), unwind)
 +      val isAligned =
 +        comp(nir.Comp.Ieq, nir.Type.Long, low3, nir.Val.Long(0L), unwind)
 +
-+      val alignedL, unalignedL, resultL = fresh()
++      val alignedL, unalignedL = fresh()
 +      branch(isAligned, nir.Next(alignedL), nir.Next(unalignedL))
 +
 +      label(alignedL)
@@ -645,7 +660,7 @@ index cf8388f..c6659f3 100644
      def genUnboxOp(
          buf: nir.InstructionBuilder,
          n: nir.Local,
-@@ -1978,6 +2087,8 @@ private[scalanative] object Lower {
+@@ -1978,6 +2102,8 @@ private[scalanative] object Lower {
  
        if (!platform.is32Bit && nir.Type.Smi.isEligibleBoxType(ty)) {
          genSmiUnboxOp(buf, n, ty, from)
@@ -654,7 +669,7 @@ index cf8388f..c6659f3 100644
        } else {
          val methodName = UnboxTo(ty)
          val moduleName = methodName.top
-@@ -1998,10 +2109,12 @@ private[scalanative] object Lower {
+@@ -1998,10 +2124,12 @@ private[scalanative] object Lower {
      }
  
      /** Inline decode: branch on the tag bit of `from` (a `ty`-typed
@@ -670,7 +685,7 @@ index cf8388f..c6659f3 100644
       */
      private def genSmiUnboxOp(
          buf: nir.InstructionBuilder,
-@@ -2023,38 +2136,32 @@ private[scalanative] object Lower {
+@@ -2023,38 +2151,32 @@ private[scalanative] object Lower {
          comp(nir.Comp.Ine, nir.Type.Long, tagBit, nir.Val.Long(0L), unwind)
        branch(isTagged, nir.Next(taggedL), nir.Next(realL))
  
@@ -723,7 +738,7 @@ index cf8388f..c6659f3 100644
            conv(nir.Conv.Bitcast, nir.Type.Float, bits, unwind)
          case other =>
            util.unsupported(s"genSmiUnboxOp: unexpected discriminant $other")
-@@ -2070,6 +2177,49 @@ private[scalanative] object Lower {
+@@ -2070,6 +2192,49 @@ private[scalanative] object Lower {
        label(resultL, Seq(nir.Val.Local(n, primTy)))
      }
  
@@ -773,7 +788,7 @@ index cf8388f..c6659f3 100644
      /** Untagged fallback: same as today's unconditional path - call through
       *  to `scala.runtime.BoxesRunTime.unboxToX`, which loads the primitive
       *  out of the real box object's field.
-@@ -2812,6 +2962,9 @@ private[scalanative] object Lower {
+@@ -2812,6 +2977,9 @@ private[scalanative] object Lower {
      // path), so list them here explicitly, exactly like the other
      // entry-point roots in this method.
      buf ++= nir.Type.Smi.discriminantOfBox.keys.collect { case nir.Type.Ref(name, _, _) => name }
