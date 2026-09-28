@@ -19,5 +19,38 @@
 +           (4 * unavailableBlockCount > blockCount &&
 +            20 * freeBlockCount < 13 * blockCount);
  }
- 
+
  void Heap_Recycle(Heap *heap) {
+--- a/nativelib/src/main/resources/scala-native/gc/commix/Constants.h	2010-01-01 00:00:00
++++ b/nativelib/src/main/resources/scala-native/gc/commix/Constants.h	2026-09-28 00:00:00
+@@ -7,6 +7,9 @@
+ #define DEFAULT_MARK_TIME_RATIO 0.05
+ #define DEFAULT_FREE_RATIO 0.5
+ #define MAX_UNAVAILABLE_RATIO 0.25
++// Guards MAX_UNAVAILABLE_RATIO from forcing growth while free blocks are
++// still abundant (see Heap_shouldGrow).
++#define MIN_FREE_RATIO_TO_DEFER_UNAVAILABLE_GROWTH 0.65
+ #define METADATA_PER_BLOCK                                                     \
+     (sizeof(BlockMeta) + LINE_COUNT * LINE_METADATA_SIZE +                     \
+      WORDS_IN_BLOCK / ALLOCATION_ALIGNMENT_WORDS)
+--- a/nativelib/src/main/resources/scala-native/gc/commix/Heap.c	2010-01-01 00:00:00
++++ b/nativelib/src/main/resources/scala-native/gc/commix/Heap.c	2026-09-28 00:00:00
+@@ -292,9 +292,17 @@
+     uint64_t timeInMark = heap->mark.currentEnd_ns - heap->mark.currentStart_ns;
+     uint64_t timeTotal = heap->mark.currentEnd_ns - heap->mark.lastEnd_ns;
+
++    // commix already expresses these thresholds as ratios (minFreeRatio,
++    // MAX_UNAVAILABLE_RATIO), so match that style here instead of immix's
++    // integer cross-multiply: unavailable ratio alone must not force growth
++    // while free blocks are still abundant, else a steadily growing live set
++    // re-triggers growth even though most of the heap is free
++    // (scala-native/scala-native#2436).
+     return timeInMark >= heap->maxMarkTimeRatio * timeTotal ||
+            freeBlockCount < heap->minFreeRatio * blockCount ||
+-           unavailableBlockCount > blockCount * MAX_UNAVAILABLE_RATIO;
++           (unavailableBlockCount > blockCount * MAX_UNAVAILABLE_RATIO &&
++            freeBlockCount <
++                blockCount * MIN_FREE_RATIO_TO_DEFER_UNAVAILABLE_GROWTH);
+ }
+
+ void Heap_GrowIfNeeded(Heap *heap) {
