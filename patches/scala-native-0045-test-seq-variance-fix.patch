@@ -1,0 +1,244 @@
+diff --git a/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala b/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
+index ecd24ca..ffffe1c 100644
+--- a/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
++++ b/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
+@@ -92,7 +92,7 @@ class MinimalRequiredSymbolsTest extends LinkerSpec {
+ 
+     val mode =
+       s"{debugMetadata=$withDebugMetadata, multithreading=$withMultithreading, targetTriple=$withTargetTriple}"
+-    val found = SymbolsCount(result.defns)
++    val found = SymbolsCount(result.defns.toSeq)
+     if (found.total > expected.total) {
+       fail(
+         s"""|
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
+index 9c9d378..95ccc22 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
+@@ -40,7 +40,7 @@ class InliningTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           assertEquals(nir.Attr.DidOpt, defn.attrs.opt)
+           // Do nothing, it did not lead to StackOverflowError
+         }
+@@ -69,7 +69,7 @@ class InliningTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val jlInteger = nir.Type.Ref(nir.Global.Top("java.lang.Integer"))
+           assertContainsAll(
+             "Not all expression were inlined and constant folded",
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
+index 620fce8..a55f8b0 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
+@@ -112,7 +112,7 @@ class LexicalScopesTest extends OptimizerSpec {
+           assertEquals("innerResult-parent", result.id, innerResult.parent)
+           assertEquals("deep-parent", innerResult.id, deep.parent)
+       }
+-      test(result.defns)
++      test(result.defns.toSeq)
+       afterLowering(config, result)(test)
+   }
+ 
+@@ -179,7 +179,7 @@ class LexicalScopesTest extends OptimizerSpec {
+             )
+           }
+       }
+-      test(result.defns)
++      test(result.defns.toSeq)
+       afterLowering(config, result)(test)
+   }
+ 
+@@ -207,7 +207,7 @@ class LexicalScopesTest extends OptimizerSpec {
+     setupConfig = _.withMode(build.Mode.releaseFast)
+   ) {
+     case (config, result) =>
+-      findEntry(result.defns).foreach { implicit defn =>
++      findEntry(result.defns.toSeq).foreach { implicit defn =>
+         assertContainsAll(
+           "named vals",
+           Seq("a", "myTmp"),
+@@ -254,7 +254,7 @@ class LexicalScopesTest extends OptimizerSpec {
+     setupConfig = _.withMode(build.Mode.releaseFast)
+   ) {
+     case (config, result) =>
+-      findEntry(result.defns).foreach { implicit defn =>
++      findEntry(result.defns.toSeq).foreach { implicit defn =>
+         assertContainsAll(
+           "named vals",
+           Seq("a", "b", "myTmp"),
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
+index 0d3fcc4..ad4f3ea 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
+@@ -79,7 +79,7 @@ class LocalNamesTest extends OptimizerSpec {
+           )
+           assertDistinct(lets)
+         }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+       afterLowering(config, result)(checkLocalNames)
+   }
+ 
+@@ -242,7 +242,7 @@ class LocalNamesTest extends OptimizerSpec {
+               Seq("buffer", "addr", "rawptr", "toPtr", "fromPtr", "size")
+             assertDistinct(lets.values.toSeq.filterNot(filteredOut.contains))
+           }
+-      checkLocalNames(result.defns, beforeLowering = true)
++      checkLocalNames(result.defns.toSeq, beforeLowering = true)
+       afterLowering(config, result) {
+         checkLocalNames(_, beforeLowering = false)
+       }
+@@ -306,7 +306,7 @@ class LocalNamesTest extends OptimizerSpec {
+               }
+               .getOrElse(fail("not found label with expected params"))
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+   @Test def inlinedNames(): Unit = optimize(
+@@ -356,7 +356,7 @@ class LocalNamesTest extends OptimizerSpec {
+               defn.debugInfo.localNames.values
+             )
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+   @Test def inlinedNames2(): Unit = optimize(
+@@ -406,7 +406,7 @@ class LocalNamesTest extends OptimizerSpec {
+               defn.debugInfo.localNames.values
+             )
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+   @Test def polyInlinedNames(): Unit = optimize(
+@@ -453,7 +453,7 @@ class LocalNamesTest extends OptimizerSpec {
+               defn.debugInfo.localNames.values
+             )
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+ }
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
+index ab18447..3c04091 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
+@@ -50,7 +50,7 @@ class PolyInlineGetClassTest extends OptimizerSpec {
+       setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val getClassByReceiver = defn.insts
+             .collect {
+               case nir.Inst.Let(_, nir.Op.Method(obj, sig), _)
+@@ -119,7 +119,7 @@ class PolyInlineGetClassTest extends OptimizerSpec {
+       setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val receivers = defn.insts.collect {
+             case nir.Inst.Let(_, nir.Op.Method(obj, sig), _)
+                 if sig == nir.Rt.GetClassSig =>
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
+index d3d4939..4f599d2 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
+@@ -47,7 +47,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -101,7 +101,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -152,7 +152,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -205,7 +205,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -260,7 +260,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -320,7 +320,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+ 
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+@@ -378,7 +378,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -442,7 +442,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/package.scala b/tools/src/test/scala/scala/scalanative/optimizer/package.scala
+index 5cc891f..fc011b8 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/package.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/package.scala
+@@ -90,7 +90,7 @@ package object optimizer {
+     implicit val platform: PlatformInfo = PlatformInfo(config)
+     implicit val meta: Metadata =
+       new Metadata(optimized, config, Nil)
+-    val lowered = llvm.CodeGen.lower(defns)
++    val lowered = llvm.CodeGen.lower(defns.toSeq)
+     Await.result(lowered.map(fn), duration.Duration.Inf)
+   }
+ 
