@@ -52,7 +52,7 @@ new file mode 100644
 index 0000000..a39a800
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
-@@ -0,0 +1,1210 @@
+@@ -0,0 +1,1248 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -90,7 +90,7 @@ index 0000000..a39a800
 +import scala.scalanative.unsigned._
 +
 +import LLVMCApi._
-+import LLVMCApi.{Core => C, Analysis => A, Target => T, TargetMachine => TM, DebugInfo => DI}
++import LLVMCApi.{Core => C, Analysis => A, Target => T, TargetMachine => TM, DebugInfo => DI, Passes => P}
 +
 +private[codegen] object DirectCodeGen {
 +
@@ -1208,6 +1208,21 @@ index 0000000..a39a800
 +
 +  // ---- object file emission --------------------------------------------
 +
++  // New-PM pipeline string per build.Mode, mirroring the `-O<n>` flag
++  // LLVM.scala's textual-IR-then-clang path passes for the same mode (see
++  // LLVM.scala's Mode -> "-O.." mapping) -- this is the actual middle-end
++  // optimization pipeline (mem2reg, SROA, GVN/redundant-load-elimination,
++  // inlining, ...), distinct from the `LLVMCodeGenLevel*` passed to
++  // `LLVMCreateTargetMachine` below (that one only tunes the codegen
++  // backend's instruction selection/scheduling, and runs no IR-level
++  // passes on its own -- see LLVMCApi.Passes's doc comment).
++  private def passPipelineFor(mode: build.Mode): String = mode match {
++    case build.Mode.Debug       => "default<O0>"
++    case build.Mode.ReleaseFast => "default<O2>"
++    case build.Mode.ReleaseSize => "default<Oz>"
++    case build.Mode.ReleaseFull => "default<O3>"
++  }
++
 +  private def emitObjectFile(objPath: Path): Unit = {
 +    T.LLVMInitializeX86TargetInfo()
 +    T.LLVMInitializeX86Target()
@@ -1252,6 +1267,29 @@ index 0000000..a39a800
 +        val dataLayoutStr = TM.LLVMCopyStringRepOfTargetData(dataLayout)
 +        C.LLVMSetDataLayout(module, dataLayoutStr)
 +        C.LLVMDisposeMessage(dataLayoutStr)
++
++        // Run the actual middle-end optimization pipeline (mem2reg, SROA,
++        // GVN/redundant-load-elimination, inlining, ...) before codegen --
++        // `LLVMTargetMachineEmitToFile` below never does this on its own,
++        // it only runs the codegen backend's own instruction
++        // selection/scheduling. Without this call, direct-codegen emitted
++        // straight-off-the-NIR-translation IR essentially unoptimized,
++        // which is why e.g. a hot method re-reading the same
++        // already-loaded object field 2-3 times over compiled to exactly
++        // that many redundant loads instead of being collapsed to one.
++        val passOptions = P.LLVMCreatePassBuilderOptions()
++        try {
++          val err = P.LLVMRunPasses(module, toCString(passPipelineFor(config.mode)), tm, passOptions)
++          if (err != null) {
++            // LLVMGetErrorMessage consumes `err` -- call it exactly once,
++            // reuse the one returned CString for both the message and the
++            // matching LLVMDisposeErrorMessage.
++            val errMsgC = P.LLVMGetErrorMessage(err)
++            val msg = fromCString(errMsgC)
++            P.LLVMDisposeErrorMessage(errMsgC)
++            unsupported(s"LLVMRunPasses failed: $msg")
++          }
++        } finally P.LLVMDisposePassBuilderOptions(passOptions)
 +
 +        val emitErrMsg = alloc[CString](1)
 +        val filename = toCString(objPath.toAbsolutePath.toString)
@@ -1323,7 +1361,7 @@ new file mode 100644
 index 0000000..01b480a
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,550 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -1355,6 +1393,12 @@ index 0000000..01b480a
 +  type LLVMTargetRef = Ptr[Byte]
 +  type LLVMTargetMachineRef = Ptr[Byte]
 +  type LLVMTargetDataRef = Ptr[Byte]
++  // llvm-c/Transforms/PassBuilder.h + llvm-c/Error.h: the new-pass-manager
++  // entry point used to actually run the middle-end optimization pipeline
++  // (mem2reg/SROA/GVN/redundant-load-elimination/...) on a module before
++  // codegen -- see emitObjectFile's doc comment for why this is required.
++  type LLVMPassBuilderOptionsRef = Ptr[Byte]
++  type LLVMErrorRef = Ptr[Byte]
 +  // llvm-c/DebugInfo.h: opaque debug-info metadata handle and DIBuilder.
 +  type LLVMMetadataRef = Ptr[Byte]
 +  type LLVMDIBuilderRef = Ptr[Byte]
@@ -1843,6 +1887,29 @@ index 0000000..01b480a
 +        codegen: CInt,
 +        errorMessage: Ptr[CString]
 +    ): LLVMBool = extern
++  }
++
++  // llvm-c/Transforms/PassBuilder.h + llvm-c/Error.h. `LLVMRunPasses` is the
++  // new-PM equivalent of what `clang -O2` does to a module before handing it
++  // to the codegen backend -- mem2reg, SROA, GVN (incl. redundant
++  // load/store elimination), inlining, etc. `LLVMTargetMachineEmitToFile`
++  // alone only runs the *codegen*-level pipeline (instruction selection /
++  // scheduling), never these IR-level passes, so skipping this call is why
++  // direct-codegen previously emitted unoptimized-looking IR (redundant
++  // reloads of already-live values, etc.) that vanilla's textual-`.ll` +
++  // external `clang -O2` path did not.
++  @extern
++  private[direct] object Passes {
++    def LLVMCreatePassBuilderOptions(): LLVMPassBuilderOptionsRef = extern
++    def LLVMDisposePassBuilderOptions(options: LLVMPassBuilderOptionsRef): Unit = extern
++    def LLVMRunPasses(
++        m: LLVMModuleRef,
++        passes: CString,
++        tm: LLVMTargetMachineRef,
++        options: LLVMPassBuilderOptionsRef
++    ): LLVMErrorRef = extern
++    def LLVMGetErrorMessage(err: LLVMErrorRef): CString = extern
++    def LLVMDisposeErrorMessage(errMsg: CString): Unit = extern
 +  }
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/build/Discover.scala b/tools/src/main/scala/scala/scalanative/build/Discover.scala
