@@ -1,0 +1,81 @@
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+index 0000000..0000000 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -709,14 +709,38 @@
+       import buf._
+       if (platform.is32Bit) let(nir.Op.Load(nir.Type.Ptr, obj), unwind)
+       else {
+-        // 3-way branch: Smi (bit 63 set) / PtrTag-tagged pointer (bit 63
+-        // clear, low 3 bits non-zero) / real object (bit 63 clear, low 3
+-        // bits zero) - see nir.Type.Smi/PtrTag's doc comments for why these
+-        // never collide.
+-        val smiL, notSmiL, mergeL = fresh()
++        // This is the single hottest path in the whole runtime (every
++        // virtual/interface dispatch and Function0/1/2.apply on a value
++        // whose static type doesn't rule out a tagged immediate goes
++        // through here), so the untagged/real-object case - overwhelmingly
++        // the common one, tagged receivers are the rare exception - gets a
++        // SINGLE combined bit-test against both tag schemes at once (bit 63
++        // for Smi, low 3 bits for PtrTag - see nir.Type.Smi/PtrTag's doc
++        // comments for why a blind combined test can't false-positive) and
++        // one branch, matching the un-patched real-object-only shape
++        // instruction-for-instruction on that path. Distinguishing *which*
++        // tag scheme applied only happens behind that branch, in the cold
++        // tagged case - profiled: this collapses the untagged path from two
++        // branches (bit-63 test, then a second low-3-bits test on the
++        // not-Smi side) down to one, at zero extra cost to the tagged path
++        // (still exactly two tests total, just reordered).
++        val realL, taggedL, mergeL = fresh()
+         val result = fresh()
+ 
+         val asLong = conv(nir.Conv.Ptrtoint, nir.Type.Long, obj, unwind)
++        val combinedTagMask = nir.Type.Smi.TagMask | nir.Type.PtrTag.Mask
++        val combinedTagBits =
++          bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(combinedTagMask), unwind)
++        val isAnyTagged =
++          comp(nir.Comp.Ine, nir.Type.Long, combinedTagBits, nir.Val.Long(0L), unwind)
++        branch(isAnyTagged, nir.Next(taggedL), nir.Next(realL))
++
++        label(realL)
++        val realTypeptr = let(nir.Op.Load(nir.Type.Ptr, obj), unwind)
++        jump(mergeL, Seq(realTypeptr))
++
++        label(taggedL)
++        val smiL, notSmiL = fresh()
+         val tagBit =
+           bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(nir.Type.Smi.TagMask), unwind)
+         val isSmiTagged =
+@@ -769,25 +793,17 @@
+         unreachable(nir.Next.None)
+ 
+         label(notSmiL)
+-        val low3 =
+-          bin(nir.Bin.And, nir.Type.Long, asLong, nir.Val.Long(nir.Type.PtrTag.Mask), unwind)
+-        val isPtrTagged =
+-          comp(nir.Comp.Ine, nir.Type.Long, low3, nir.Val.Long(0L), unwind)
+-        val ptrTaggedL, realL = fresh()
+-        branch(isPtrTagged, nir.Next(ptrTaggedL), nir.Next(realL))
+-
+-        label(ptrTaggedL)
++        // `combinedTagBits != 0` (we're only here because `isAnyTagged` was
++        // true) and `isSmiTagged` was false, so this is necessarily the
++        // PtrTag case - no need to re-test the low 3 bits, `taggedL`'s
++        // combined test already proved one of the two schemes matched.
+         // Only one PtrTag kind is wired up today (Ptr[T], discriminant 1) -
+-        // every non-zero low3 pattern the compiler currently emits is that
+-        // one, so no switch needed yet (add one here alongside `genBoxOp`
+-        // when a second kind lands).
++        // every such pointer the compiler currently emits is that one, so
++        // no switch needed yet (add one here alongside `genBoxOp` when a
++        // second kind lands).
+         val ptrBoxRtti = ptrTagBoxRttiConst.getOrElse(util.unreachable)
+         jump(mergeL, Seq(ptrBoxRtti))
+ 
+-        label(realL)
+-        val realTypeptr = let(nir.Op.Load(nir.Type.Ptr, obj), unwind)
+-        jump(mergeL, Seq(realTypeptr))
+-
+         label(mergeL, Seq(nir.Val.Local(result, nir.Type.Ptr)))
+         nir.Val.Local(result, nir.Type.Ptr)
+       }
