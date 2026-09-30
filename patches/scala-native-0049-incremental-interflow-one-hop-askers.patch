@@ -1,0 +1,312 @@
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+index ac03ebb..0302303 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+@@ -14,7 +14,7 @@ import scala.scalanative.nir.Defn.Define.DebugInfo
+ import scala.scalanative.util.ScopedVar
+ 
+ private[scalanative] class Interflow(val config: build.Config)(implicit
+-    val analysis: ReachabilityAnalysis.Result
++    var analysis: ReachabilityAnalysis.Result
+ ) extends Visit
+     with Opt
+     with NoOpt
+@@ -32,6 +32,171 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+     out
+   }
+ 
++  // ---------------------------------------------------------------------
++  // Incremental reprocessing (patches/scala-native-0049): who asked for
++  // whose original body, so a relink can tell exactly which already-`done`
++  // optimized methods are still valid to reuse untouched. Mirrors
++  // Scala.js's own incremental optimizer (`IncOptimizer.scala`'s
++  // `Processable.askBody`/`bodyAskers`/`registeredTo`) -- confirmed by
++  // reading its source: an asker's inlining/propagation decision about a
++  // callee is only ever a function of the callee's *original* (pre-
++  // optimization) body, via `getOriginal`/`maybeOriginal`/`hasOriginal`
++  // below, never of the callee's own optimized `done` entry (`done`/
++  // `isDone` elsewhere in this file are a worklist dedup guard only, same
++  // role `Reach`'s own `done` map already plays -- not a cross-method data
++  // channel). So an unchanged original body means every asker's existing
++  // decision about it remains valid regardless of what that callee itself
++  // re-optimizes to -- invalidation only ever needs to walk one edge per
++  // genuinely-changed original, never a compounding chain.
++  private val askers =
++    new ConcurrentHashMap[nir.Global.Member, java.util.Set[nir.Global.Member]]()
++  private val askedBy =
++    new ConcurrentHashMap[nir.Global.Member, java.util.Set[nir.Global.Member]]()
++  private val currentAskerTl: ThreadLocal[nir.Global.Member] =
++    ThreadLocal.withInitial(() => null: nir.Global.Member)
++
++  private[interflow] def currentAsker: nir.Global.Member = currentAskerTl.get()
++  private[interflow] def withAsker[T](asker: nir.Global.Member)(block: => T): T = {
++    val prev = currentAskerTl.get()
++    currentAskerTl.set(asker)
++    try block
++    finally currentAskerTl.set(prev)
++  }
++
++  private def recordAsk(callee: nir.Global.Member): Unit = {
++    val asker = currentAskerTl.get()
++    if (asker != null && asker != callee) {
++      askers
++        .computeIfAbsent(callee, _ => ConcurrentHashMap.newKeySet[nir.Global.Member]())
++        .add(asker)
++      askedBy
++        .computeIfAbsent(asker, _ => ConcurrentHashMap.newKeySet[nir.Global.Member]())
++        .add(callee)
++    }
++  }
++
++  /** Drops `m`'s own `done`/worklist status and every asker edge it's
++   *  party to (as either side), so it re-enters the worklist fresh and
++   *  rebuilds correct edges as it's reprocessed. Does NOT touch `m`'s
++   *  entries in `askers` as a *key* removed via `askedBy` cleanup below --
++   *  `askers.remove(m)` here drops the (now-stale) record of who *m itself*
++   *  asked about when `m` was a callee's origin lookup subject, which is
++   *  irrelevant once `m` is being reprocessed as an asker again itself.
++   */
++  private def resetForReprocessing(m: nir.Global.Member): Unit = {
++    done.remove(m)
++    started.remove(m)
++    denylist.remove(m)
++    reached.remove(m)
++    Option(askedBy.remove(m)).foreach { calleesAsked =>
++      calleesAsked.forEach { callee =>
++        Option(askers.get(callee)).foreach(_.remove(m))
++      }
++    }
++    askers.remove(m)
++  }
++
++  /** Attempts to reuse THIS already-optimized `Interflow` instance for a
++   *  relink instead of building a fresh one from scratch -- only ever has
++   *  a real chance to succeed inside scalino's `--long-running`
++   *  LinkDriver, the one caller that keeps an `Interflow` (via
++   *  `ScalaNative.previousInterflow`) alive across builds at all.
++   *
++   *  Gated to non-`ReleaseFull` modes only: `ReleaseFull`'s call-site
++   *  specialization (`shallDuplicate`/`duplicateName`/`visitDuplicate`)
++   *  synthesizes extra `Global.Member`s (`Sig.Duplicate`) that don't appear
++   *  in `originals` at all and are created on demand by whichever caller
++   *  needed a specialized copy -- reasoning through how those interact
++   *  with the asker graph is a real additional piece of design this patch
++   *  doesn't attempt; every other mode never creates one
++   *  (`shallDuplicate` unconditionally returns `false` there), so the
++   *  asker/`done` graph only ever contains plain members and the
++   *  argument above applies cleanly.
++   *
++   *  Per-member reuse eligibility is proven two ways at once, both cheap
++   *  and self-contained (no coordination with `Reach` needed): the raw
++   *  original `Defn` must be unchanged (`eq`, falling back to structural
++   *  `==` since a fresh-but-content-identical `Reach` fallback still
++   *  produces new object instances), AND `analysis.infos` for that member
++   *  must be the exact same object as last time -- which can only be true
++   *  if the `Reach` step that produced this `analysis` reused it
++   *  untouched (patch 0048's own `incrementalReprocess`, an all-or-
++   *  nothing-safe pass, never replaces one member's `Info` without also
++   *  meaning every surrounding class/trait shape stayed exactly as it
++   *  was). If either check fails for ANY member, or a non-`Defn.Define`
++   *  top-level changed (should be unreachable given the `infos`-eq
++   *  argument above, checked anyway as defense in depth), this returns
++   *  `None` and the caller builds a completely fresh `Interflow`.
++   */
++  def incrementalReprocess(
++      newConfig: build.Config,
++      newAnalysis: ReachabilityAnalysis.Result
++  )(implicit ec: ExecutionContext): Option[Future[Seq[nir.Defn]]] = {
++    if (mode == build.Mode.ReleaseFull) None
++    else if (newConfig != config) None
++    else {
++      val oldInfos = analysis.infos
++      val newInfos = newAnalysis.infos
++
++      val newOriginals = mutable.Map.empty[nir.Global, nir.Defn]
++      newAnalysis.defns.foreach { defn => newOriginals(defn.name) = defn }
++
++      var safe = true
++      val changed = mutable.Set.empty[nir.Global.Member]
++
++      val it = newOriginals.iterator
++      while (safe && it.hasNext) {
++        val (name, newDefn) = it.next()
++        originals.get(name) match {
++          case None => () // brand new symbol -- picked up fresh via the normal todo/reached path below
++          case Some(oldDefn) =>
++            val sameInfo = (oldInfos.get(name), newInfos.get(name)) match {
++              case (Some(oi), Some(ni)) => oi eq ni
++              case (None, None) => true
++              case _ => false
++            }
++            if (!sameInfo) {
++              safe = false
++            } else if ((oldDefn ne newDefn) && oldDefn != newDefn) {
++              newDefn match {
++                case _: nir.Defn.Define =>
++                  changed += name.asInstanceOf[nir.Global.Member]
++                case _ =>
++                  // A changed Class/Trait/Module/Var/Const/Declare: the
++                  // `sameInfo` check above should already have caught any
++                  // hierarchy/shape change and set `safe = false`, since
++                  // Reach's own incremental pass never lets one of those
++                  // differ while still reusing `infos` -- this branch is
++                  // defense in depth, not an expected path.
++                  safe = false
++              }
++            }
++        }
++      }
++
++      if (!safe) None
++      else {
++        val dirty = mutable.Set.empty[nir.Global.Member]
++        dirty ++= changed
++        changed.foreach { c =>
++          Option(askers.get(c)).foreach { askerSet =>
++            askerSet.forEach(a => dirty += a)
++          }
++        }
++
++        analysis = newAnalysis
++        originals.clear()
++        originals ++= newOriginals
++
++        dirty.foreach(resetForReprocessing)
++        dirty.foreach(pushTodo)
++        visitEntries()
++
++        Some(visitLoop().map(_ => result()))
++      }
++    }
++  }
++
+   // Lock-free: visitLoop() (Debug mode) fans these out across one Future per
+   // pending definition, so every reference inside a visited method's body
+   // used to take one of a handful of shared monitors -- under scala-native's
+@@ -89,12 +254,18 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+   private val blockFreshTl =
+     ThreadLocal.withInitial(() => List.empty[nir.Fresh])
+ 
+-  def hasOriginal(name: nir.Global.Member): Boolean =
++  def hasOriginal(name: nir.Global.Member): Boolean = {
++    recordAsk(name)
+     originals.contains(name) && originals(name).isInstanceOf[nir.Defn.Define]
+-  def getOriginal(name: nir.Global.Member): nir.Defn.Define =
++  }
++  def getOriginal(name: nir.Global.Member): nir.Defn.Define = {
++    recordAsk(name)
+     originals(name).asInstanceOf[nir.Defn.Define]
+-  def maybeOriginal(name: nir.Global.Member): Option[nir.Defn.Define] =
++  }
++  def maybeOriginal(name: nir.Global.Member): Option[nir.Defn.Define] = {
++    recordAsk(name)
+     originals.get(name).collect { case defn: nir.Defn.Define => defn }
++  }
+ 
+   def popTodo(): nir.Global = {
+     val polled = todo.poll()
+@@ -185,14 +356,28 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+ 
+ object Interflow {
+ 
++  /** Persisted across calls so scalino's `--long-running` LinkDriver
++   *  (patches/scala-native-0047/0048/0049) can hand an optimize pass the
++   *  SAME `Interflow` instance it built last time instead of a fresh one --
++   *  see `Interflow.incrementalReprocess`. Process-global for the same
++   *  reason `Link.previousReach` is: one scalino-linkdriver process links
++   *  exactly one `mainClass`/config.
++   */
++  private var previousInterflow: Option[Interflow] = None
++
+   def optimize(config: build.Config, analysis: ReachabilityAnalysis.Result)(
+       implicit ec: ExecutionContext
+   ): Future[Seq[nir.Defn]] = {
+-    val interflow = new Interflow(config)(analysis)
+-    interflow.visitEntries()
+-    interflow
+-      .visitLoop()
+-      .map(_ => interflow.result())
++    previousInterflow
++      .flatMap(_.incrementalReprocess(config, analysis))
++      .getOrElse {
++        val interflow = new Interflow(config)(analysis)
++        interflow.visitEntries()
++        previousInterflow = Some(interflow)
++        interflow
++          .visitLoop()
++          .map(_ => interflow.result())
++      }
+   }
+ 
+   private[scalanative] object LLVMIntrinsics {
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Visit.scala b/tools/src/main/scala/scala/scalanative/interflow/Visit.scala
+index 752659f..69dc5e7 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Visit.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Visit.scala
+@@ -127,30 +127,43 @@ private[interflow] trait Visit { self: Interflow =>
+   def visitMethod(name: nir.Global.Member): Unit =
+     if (!hasStarted(name)) {
+       markStarted(name)
+-      val origname = originalName(name)
+-      val origdefn = getOriginal(origname)
+-      try {
+-        if (shallOpt(name)) {
+-          setDone(name, opt(name))
+-        } else {
+-          noOpt(origdefn)
+-          setDone(name, origdefn)
+-          setDone(origname, origdefn)
++      // Establishes `name` as the "asker" for patches/scala-native-0049's
++      // incremental reprocessing: every `getOriginal`/`maybeOriginal`/
++      // `hasOriginal` call made while optimizing `name` (including the
++      // self-fetch of its own original just below, a harmless no-op self-
++      // edge) gets attributed to `name`, so a later relink knows exactly
++      // who to re-visit if one of those originals changes. `withAsker`
++      // saves/restores the previous thread-local asker, so nested
++      // `visitMethod` calls (specialization's `visitDuplicate`, ReleaseFull
++      // only) still attribute correctly -- though incremental reprocessing
++      // itself is gated off entirely in that mode, this stays correct
++      // (just unused) rather than assuming non-reentrancy.
++      withAsker(name) {
++        val origname = originalName(name)
++        val origdefn = getOriginal(origname)
++        try {
++          if (shallOpt(name)) {
++            setDone(name, opt(name))
++          } else {
++            noOpt(origdefn)
++            setDone(name, origdefn)
++            setDone(origname, origdefn)
++          }
++        } catch {
++          case BailOut(msg) =>
++            log(s"failed to expand ${name.show}: $msg")
++            val baildefn =
++              origdefn.copy(attrs =
++                origdefn.attrs.withOpt(nir.Attr.BailOpt(msg))
++              )(
++                origdefn.pos
++              )
++            noOpt(origdefn)
++            setDone(name, baildefn)
++            setDone(origname, baildefn)
++            markDenylisted(name)
++            markDenylisted(origname)
+         }
+-      } catch {
+-        case BailOut(msg) =>
+-          log(s"failed to expand ${name.show}: $msg")
+-          val baildefn =
+-            origdefn.copy(attrs =
+-              origdefn.attrs.withOpt(nir.Attr.BailOpt(msg))
+-            )(
+-              origdefn.pos
+-            )
+-          noOpt(origdefn)
+-          setDone(name, baildefn)
+-          setDone(origname, baildefn)
+-          markDenylisted(name)
+-          markDenylisted(origname)
+       }
+     }
+ 

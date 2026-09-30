@@ -1,0 +1,231 @@
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+index 3918145..a95be9c 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+@@ -28,40 +28,104 @@ sealed trait ClassPath {
+ 
+ object ClassPath {
+ 
++  /** Persistent, process-wide registry of already-built `Impl`s, keyed by the
++   *  underlying directory/jar's own classpath entry `Path`. Only scalino's
++   *  `--longRunning` LinkDriver loop lives long enough for this to matter:
++   *  within that one process, `ClassLoader.fromDisk(config)` is called again
++   *  on every incremental relink, and without this registry each call would
++   *  rebuild a brand-new `Impl` (and reparse every reachable `.nir` file on
++   *  the classpath from scratch, dependencies included) even though only the
++   *  user's own recompiled classes actually changed. A one-shot build still
++   *  populates this once and simply exits, so it pays only a `ConcurrentHashMap`
++   *  lookup, not a behavior change.
++   */
++  private val registry =
++    new java.util.concurrent.ConcurrentHashMap[Path, Impl]()
++
+   /** Create classpath based on the virtual directory. */
+   private[scalanative] def apply(directory: VirtualDirectory): ClassPath =
+-    new Impl(directory, Logger.nullLogger)
++    apply(directory, Logger.nullLogger)
+ 
+   /** Create classpath based on the virtual directory. */
+   private[scalanative] def apply(
+       directory: VirtualDirectory,
+       log: Logger
+-  ): ClassPath =
+-    new Impl(directory, log)
++  ): ClassPath = {
++    val impl = registry.computeIfAbsent(directory.path, _ => new Impl(directory, log))
++    impl.refresh()
++    impl
++  }
++
++  /** Same as `apply`, but never evaluates `mkDirectory` on a cache hit --
++   *  constructing a real `VirtualDirectory` for a jar opens its zip
++   *  `FileSystem`, and `apply` above still had to construct one for EVERY
++   *  call regardless of the registry (Scala evaluates the argument before
++   *  `apply` ever gets to check its own cache). On a `--longRunning` relink
++   *  that reopens every jar's `FileSystem` on every single build, discarding
++   *  the redundant one each time -- wasteful, and observed to occasionally
++   *  throw outright (a real project's build failed with a bare jar filename
++   *  as the error, consistent with a `FileSystemAlreadyExistsException`-style
++   *  race between the leaked, discarded reopen and the cached `Impl` still
++   *  using the original). `ClassLoader.fromDisk` uses this one, not `apply`.
++   */
++  private[scalanative] def forPath(path: Path, log: Logger)(
++      mkDirectory: => VirtualDirectory
++  ): ClassPath = {
++    registry.get(path) match {
++      case null =>
++        val impl = new Impl(mkDirectory, log)
++        val result = Option(registry.putIfAbsent(path, impl)).getOrElse(impl)
++        result.refresh()
++        result
++      case impl =>
++        impl.refresh()
++        impl
++    }
++  }
+ 
+   private final class Impl(directory: VirtualDirectory, log: Logger)
+       extends ClassPath {
+     val nirFiles = mutable.Map.empty[nir.Global.Top, Path]
+     val serviceProviders = mutable.Map.empty[nir.Global.Top, Path]
+ 
+-    directory.files
+-      .foreach {
+-        case path if path.toString.endsWith(".nir") =>
+-          val name = nir.Global.Top(io.packageNameFromPath(path))
+-          nirFiles.update(name, path)
+-
+-        // First variant for jars, seconds for local directories
+-        case path
+-            if (path.startsWith("/META-INF/services/") ||
+-              path.startsWith("META-INF/services/")) =>
+-          val serviceName = nir.Global.Top(path.getFileName().toString())
+-          serviceProviders.update(serviceName, path)
+-
+-        case _ => ()
+-      }
+-
++    // (mtime as of last successful parse, parsed result) -- reused across
++    // `refresh()` calls as long as the backing file's mtime hasn't moved, so
++    // a recompiled subset of the classpath only reparses that subset.
+     private val cache =
+-      mutable.Map.empty[nir.Global.Top, Option[Seq[nir.Defn]]]
++      mutable.Map.empty[nir.Global.Top, (java.nio.file.attribute.FileTime, Option[Seq[nir.Defn]])]
++
++    /** Re-scans `directory.files` and drops any cached entry whose backing
++     *  file is gone (deleted/renamed since the last scan) so a stale parsed
++     *  `Defn` can never linger and be linked in by mistake. Idempotent and
++     *  cheap to call on every `ClassPath.apply` -- the directory walk itself
++     *  is unavoidable already (scala-native re-walks the classpath for its
++     *  own `Build.checkSum` on every build regardless), only the per-file
++     *  *parse* is what this cache is actually saving.
++     */
++    def refresh(): Unit = {
++      nirFiles.clear()
++      serviceProviders.clear()
++      directory.files
++        .foreach {
++          case path if path.toString.endsWith(".nir") =>
++            val name = nir.Global.Top(io.packageNameFromPath(path))
++            nirFiles.update(name, path)
++
++          // First variant for jars, seconds for local directories
++          case path
++              if (path.startsWith("/META-INF/services/") ||
++                path.startsWith("META-INF/services/")) =>
++            val serviceName = nir.Global.Top(path.getFileName().toString())
++            serviceProviders.update(serviceName, path)
++
++          case _ => ()
++        }
++      // Not `cache.filterInPlace` (mutable.Map, added in 2.13's collections
++      // rework): this file also cross-builds under Scala 2.12 for
++      // scala-native's own sbt meta-build project, where `mutable.Map` has
++      // no such method.
++      cache.keysIterator.filterNot(nirFiles.contains).toList.foreach(cache.remove)
++    }
+ 
+     def contains(name: nir.Global) =
+       nirFiles.contains(name.top)
+@@ -72,15 +136,26 @@ object ClassPath {
+         .toString
+ 
+     def load(name: nir.Global.Top): Option[Seq[nir.Defn]] =
+-      cache.getOrElseUpdate(
+-        name, {
+-          nirFiles.get(name.top).map { file =>
+-            deserializeBinary(directory, file)
++      nirFiles.get(name.top) match {
++        case None => None
++        case Some(file) =>
++          val mtime = directory.lastModified(file)
++          cache.get(name) match {
++            case Some((cachedMtime, cachedResult)) if cachedMtime == mtime =>
++              cachedResult
++            case _ =>
++              val result = Some(deserializeBinary(directory, file))
++              cache.update(name, (mtime, result))
++              result
+           }
+-        }
+-      )
++      }
+ 
+-    lazy val classesWithEntryPoints: Iterable[nir.Global.Top] = {
++    // Not `lazy val`: `Impl` now outlives a single build (see `registry`
++    // above), and `refresh()` mutates `nirFiles`/`serviceProviders` in place
++    // on every incremental relink, so a value memoized from the first build
++    // would silently go stale (e.g. a newly-added entry point or service
++    // provider file would never be picked up in a later build).
++    def classesWithEntryPoints: Iterable[nir.Global.Top] = {
+       nirFiles.filter {
+         case (_, file) =>
+           def logUnreadableFile(err: NirDeserializationException): Unit =
+@@ -96,7 +171,7 @@ object ClassPath {
+       }.keySet
+     }
+ 
+-    lazy val definedServicesProviders
++    def definedServicesProviders
+         : Map[nir.Global.Top, Seq[nir.Global.Top]] = {
+       serviceProviders.map {
+         case (name, path) =>
+diff --git a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
+index 53de092..c6e82cf 100644
+--- a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
++++ b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
+@@ -37,6 +37,14 @@ sealed trait VirtualDirectory {
+   /** List all files in this directory. */
+   def files: Seq[Path]
+ 
++  /** Last-modified time of the file at `path`, used by scalino's persistent
++   *  in-process NIR parse cache (ClassPath.Impl) to invalidate a single
++   *  cached Defn without a full directory rescan/reparse. For a jar entry
++   *  this is the zip entry's own stored mtime, not the jar file's -- distinct
++   *  entries in an unchanged jar never spuriously invalidate each other.
++   */
++  def lastModified(path: Path): java.nio.file.attribute.FileTime
++
+   /** Merges content of source paths into single file in target */
+   def merge(sources: Seq[Path], target: Path): Path
+ 
+@@ -98,6 +106,9 @@ object VirtualDirectory {
+       buffer
+     }
+ 
++    override def lastModified(path: Path): java.nio.file.attribute.FileTime =
++      Files.getLastModifiedTime(resolve(path))
++
+     override def read(path: Path, len: Int): ByteBuffer = {
+       val stream = Files.newInputStream(resolve(path))
+       try {
+@@ -215,6 +226,11 @@ object VirtualDirectory {
+ 
+     override def read(path: Path, len: Int): ByteBuffer = read(path)
+ 
++    override def lastModified(path: Path): java.nio.file.attribute.FileTime =
++      throw new UnsupportedOperationException(
++        "Can't read mtime from empty directory."
++      )
++
+     override def write(path: Path)(fn: Writer => Unit): Path =
+       throw new UnsupportedOperationException("Can't write to empty directory.")
+ 
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
+index da9a3fb..d0d9b7e 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
+@@ -21,7 +21,12 @@ object ClassLoader {
+ 
+   def fromDisk(config: build.Config)(implicit in: Scope): ClassLoader = {
+     val classpath = config.classPath.map { path =>
+-      ClassPath(VirtualDirectory.real(path), config.logger)
++      // ClassPath.forPath, not ClassPath(VirtualDirectory.real(path), ...):
++      // the latter would construct (and, for a jar, reopen the zip
++      // FileSystem of) a `VirtualDirectory` on every single call regardless
++      // of whether ClassPath's own persistent-cache registry already has
++      // this entry -- see ClassPath.forPath's own doc comment.
++      ClassPath.forPath(path, config.logger)(VirtualDirectory.real(path))
+     }
+     new FromDisk(classpath)
+   }

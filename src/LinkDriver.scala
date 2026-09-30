@@ -38,7 +38,8 @@ object LinkDriver:
     linking: List[String] = Nil,
     compile: List[String] = Nil,
     cCompile: List[String] = Nil,
-    cppCompile: List[String] = Nil
+    cppCompile: List[String] = Nil,
+    longRunning: Boolean = false
   )
 
   def parseOpts(rest: Array[String]): Opts =
@@ -61,6 +62,7 @@ object LinkDriver:
         case "--compile" => o = o.copy(compile = o.compile :+ rest(i + 1)); i += 1
         case "--c-compile" => o = o.copy(cCompile = o.cCompile :+ rest(i + 1)); i += 1
         case "--cpp-compile" => o = o.copy(cppCompile = o.cppCompile :+ rest(i + 1)); i += 1
+        case "--long-running" => o = o.copy(longRunning = true)
         case other => System.err.println(s"scalino-linkdriver: ignoring unknown flag '$other'")
       i += 1
     o
@@ -140,8 +142,48 @@ object LinkDriver:
           .withOptimize(opts.optimize)
       )
 
-    val outPath = Scope.apply[java.nio.file.Path] { (s: Scope) =>
-      given Scope = s
-      Build.buildCachedAwait(config)
-    }
-    logger.debug(s"LINKED: $outPath")
+    if opts.longRunning then
+      // Same protocol as scala-js-cli's `--longRunning` (scala-js-cli#64):
+      // one Scope, one process, kept alive across every relink so the
+      // patched scala.scalanative.linker.ClassPath's persistent NIR parse
+      // cache (patches/scala-native-0047) actually survives between builds
+      // -- a fresh Scope per build would tear down and reopen every jar's
+      // NIO FileSystem, and a fresh ClassLoader.fromDisk call still hits the
+      // same cached ClassPath.Impl either way (it's keyed process-globally,
+      // not by Scope), but reusing one Scope avoids paying jar-FileSystem
+      // open/close on every iteration for no reason.
+      val stdin = new java.io.BufferedReader(new java.io.InputStreamReader(System.in))
+      Scope.apply[Unit] { (s: Scope) =>
+        given Scope = s
+        var continue = true
+        while continue do
+          // A build failure (bad source, missing symbol, C compile error...)
+          // must not kill this process -- ScalinoCli's watch mode expects it
+          // to keep running (and keep its warm NIR parse cache) across a
+          // save that temporarily broke the build, same as a one-shot
+          // scalino-linkdriver invocation would just exit nonzero and let
+          // the *caller* keep running. So catch here, report, and loop back
+          // to waiting on stdin instead of propagating.
+          try
+            val outPath = Build.buildCachedAwait(config)
+            logger.debug(s"LINKED: $outPath")
+            // Sentinel printed only after a successful link, mirroring
+            // scala-js-cli's SCALA_JS_LINKING_DONE -- the caller (ScalinoCli,
+            // in watch mode) blocks reading stdout for this exact line
+            // before treating the rebuild as finished.
+            println("SCALINO_LINKING_DONE")
+          catch
+            case e: Exception =>
+              System.err.println(s"scalino-linkdriver: ${e.getMessage}")
+              println("SCALINO_LINKING_FAILED")
+          System.out.flush()
+          // Blocks here until the caller writes a line to trigger the next
+          // relink, or closes stdin to end the process gracefully.
+          continue = stdin.readLine() != null
+      }
+    else
+      val outPath = Scope.apply[java.nio.file.Path] { (s: Scope) =>
+        given Scope = s
+        Build.buildCachedAwait(config)
+      }
+      logger.debug(s"LINKED: $outPath")

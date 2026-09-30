@@ -48,6 +48,7 @@ SHARED_SOURCES=(
   "$VENDOR/tools/src/main/scala/scala/scalanative/linker/Reach.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/linker/Link.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala"
+  "$VENDOR/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/linker/Sub.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/linker/Extractors.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/checker/Check.scala"
@@ -74,6 +75,60 @@ SHARED_SOURCES=(
 )
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 
+# ---- util-targeted patch (util_native0.5_3 + util_3): adds
+# VirtualDirectory.lastModified, which ClassPath.scala (patched below, via
+# SHARED_SOURCES) needs to invalidate its persistent in-memory NIR parse
+# cache per-file instead of per-whole-build -- see patches/scala-native-0047.
+# Single shared source file (pure java.nio, no jvm/native split in
+# util/src/main), so one source list patches both jars. Must run before the
+# nir/tools patches below so their compiles (which need ClassPath.scala to
+# resolve the new method) see the patched util jar, not the stock one. ----
+UTIL_SOURCES=(
+  "$VENDOR/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala"
+)
+
+ORIG_UTIL_JAR="$(tr "$CP_SEP" '\n' < "$WORK/tools-native.cp" | grep "util_native0.5_3-$SCALA_NATIVE_VERSION.jar$")"
+[[ -n "$ORIG_UTIL_JAR" ]] || { echo "could not find util_native0.5_3-$SCALA_NATIVE_VERSION.jar on tools-native.cp" >&2; exit 1; }
+
+PATCHED_UTIL_DIR="$WORK/patched-util-native-classes"
+PATCHED_UTIL_JAR="$DIST/util-native-patched.jar"
+
+rm -rf "$PATCHED_UTIL_DIR"
+mkdir -p "$PATCHED_UTIL_DIR"
+"$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+  -Xplugin:"$NSCPLUGIN_JAR" \
+  -Xplugin-require:scalanative \
+  -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-native.cp")" \
+  -d "$PATCHED_UTIL_DIR" \
+  "${UTIL_SOURCES[@]}"
+
+cp "$ORIG_UTIL_JAR" "$PATCHED_UTIL_JAR"
+(cd "$PATCHED_UTIL_DIR" && "$JAR" uf "$PATCHED_UTIL_JAR" $(find scala -type f))
+
+sed "s#$ORIG_UTIL_JAR#$PATCHED_UTIL_JAR#" "$WORK/tools-native.cp" > "$WORK/util-native-patched.cp"
+
+echo "OK: $PATCHED_UTIL_JAR"
+
+ORIG_UTIL_JAR_JVM="$(tr "$CP_SEP" '\n' < "$WORK/tools.cp" | grep "util_3-$SCALA_NATIVE_VERSION.jar$")"
+[[ -n "$ORIG_UTIL_JAR_JVM" ]] || { echo "could not find util_3-$SCALA_NATIVE_VERSION.jar on tools.cp" >&2; exit 1; }
+
+PATCHED_UTIL_DIR_JVM="$WORK/patched-util-jvm-classes"
+PATCHED_UTIL_JAR_JVM="$DIST/util-jvm-patched.jar"
+
+rm -rf "$PATCHED_UTIL_DIR_JVM"
+mkdir -p "$PATCHED_UTIL_DIR_JVM"
+"$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+  -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")" \
+  -d "$PATCHED_UTIL_DIR_JVM" \
+  "${UTIL_SOURCES[@]}"
+
+cp "$ORIG_UTIL_JAR_JVM" "$PATCHED_UTIL_JAR_JVM"
+(cd "$PATCHED_UTIL_DIR_JVM" && "$JAR" uf "$PATCHED_UTIL_JAR_JVM" $(find scala -type f))
+
+sed "s#$ORIG_UTIL_JAR_JVM#$PATCHED_UTIL_JAR_JVM#" "$WORK/tools.cp" > "$WORK/util-jvm-patched.cp"
+
+echo "OK: $PATCHED_UTIL_JAR_JVM"
+
 # ---- nir-targeted patch (nir_native0.5_3 only -- NOT nir_3/the JVM jar: the
 # JVM bootstrap path's own perf isn't a target, only the final compiled
 # scalino-linkdriver binary's is, and that binary's nir.Val/Type behavior
@@ -95,8 +150,8 @@ NIR_SOURCES=(
   "$VENDOR/nir/src/main/scala/scala/scalanative/nir/SourcePosition.scala"
   "$VENDOR/nir/src/main/scala/scala/scalanative/nir/Show.scala"
 )
-ORIG_NIR_JAR="$(tr "$CP_SEP" '\n' < "$WORK/tools-native.cp" | grep "nir_native0.5_3-$SCALA_NATIVE_VERSION.jar$")"
-[[ -n "$ORIG_NIR_JAR" ]] || { echo "could not find nir_native0.5_3-$SCALA_NATIVE_VERSION.jar on tools-native.cp" >&2; exit 1; }
+ORIG_NIR_JAR="$(tr "$CP_SEP" '\n' < "$WORK/util-native-patched.cp" | grep "nir_native0.5_3-$SCALA_NATIVE_VERSION.jar$")"
+[[ -n "$ORIG_NIR_JAR" ]] || { echo "could not find nir_native0.5_3-$SCALA_NATIVE_VERSION.jar on util-native-patched.cp" >&2; exit 1; }
 
 PATCHED_NIR_DIR="$WORK/patched-nir-native-classes"
 PATCHED_NIR_JAR="$DIST/nir-native-patched.jar"
@@ -106,14 +161,14 @@ mkdir -p "$PATCHED_NIR_DIR"
 "$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
-  -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-native.cp")" \
+  -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/util-native-patched.cp")" \
   -d "$PATCHED_NIR_DIR" \
   "${NIR_SOURCES[@]}"
 
 cp "$ORIG_NIR_JAR" "$PATCHED_NIR_JAR"
 (cd "$PATCHED_NIR_DIR" && "$JAR" uf "$PATCHED_NIR_JAR" $(find scala -type f))
 
-sed "s#$ORIG_NIR_JAR#$PATCHED_NIR_JAR#" "$WORK/tools-native.cp" > "$WORK/nir-native-patched.cp"
+sed "s#$ORIG_NIR_JAR#$PATCHED_NIR_JAR#" "$WORK/util-native-patched.cp" > "$WORK/nir-native-patched.cp"
 
 echo "OK: $PATCHED_NIR_JAR"
 
@@ -168,8 +223,8 @@ echo "OK: $PATCHED_JAR"
 # of object scala.scalanative.nir.Type" even though the native-targeted
 # compile above (which already substitutes nir-native-patched.cp) works
 # fine. Mirrors the native-targeted nir patch immediately above it. ----
-ORIG_NIR_JAR_JVM="$(tr "$CP_SEP" '\n' < "$WORK/tools.cp" | grep "nir_3-$SCALA_NATIVE_VERSION.jar$")"
-[[ -n "$ORIG_NIR_JAR_JVM" ]] || { echo "could not find nir_3-$SCALA_NATIVE_VERSION.jar on tools.cp" >&2; exit 1; }
+ORIG_NIR_JAR_JVM="$(tr "$CP_SEP" '\n' < "$WORK/util-jvm-patched.cp" | grep "nir_3-$SCALA_NATIVE_VERSION.jar$")"
+[[ -n "$ORIG_NIR_JAR_JVM" ]] || { echo "could not find nir_3-$SCALA_NATIVE_VERSION.jar on util-jvm-patched.cp" >&2; exit 1; }
 
 PATCHED_NIR_DIR_JVM="$WORK/patched-nir-jvm-classes"
 PATCHED_NIR_JAR_JVM="$DIST/nir-jvm-patched.jar"
@@ -177,14 +232,14 @@ PATCHED_NIR_JAR_JVM="$DIST/nir-jvm-patched.jar"
 rm -rf "$PATCHED_NIR_DIR_JVM"
 mkdir -p "$PATCHED_NIR_DIR_JVM"
 "$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
-  -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")" \
+  -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/util-jvm-patched.cp")" \
   -d "$PATCHED_NIR_DIR_JVM" \
   "${NIR_SOURCES[@]}"
 
 cp "$ORIG_NIR_JAR_JVM" "$PATCHED_NIR_JAR_JVM"
 (cd "$PATCHED_NIR_DIR_JVM" && "$JAR" uf "$PATCHED_NIR_JAR_JVM" $(find scala -type f))
 
-sed "s#$ORIG_NIR_JAR_JVM#$PATCHED_NIR_JAR_JVM#" "$WORK/tools.cp" > "$WORK/nir-jvm-patched.cp"
+sed "s#$ORIG_NIR_JAR_JVM#$PATCHED_NIR_JAR_JVM#" "$WORK/util-jvm-patched.cp" > "$WORK/nir-jvm-patched.cp"
 
 echo "OK: $PATCHED_NIR_JAR_JVM"
 

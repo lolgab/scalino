@@ -1,0 +1,253 @@
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Link.scala b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+index 5413fe2..162566e 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Link.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+@@ -5,11 +5,32 @@ import scalanative.util.Scope
+ 
+ object Link {
+ 
++  /** Persisted across calls so scalino's `--long-running` LinkDriver
++   *  (patches/scala-native-0047/0048) can hand a relink the SAME `Reach`
++   *  instance it built last time instead of a fresh one -- see
++   *  `Reach.incrementalReprocess`, which is the only thing that actually
++   *  reads this. A one-shot (non-long-running) process only ever calls
++   *  `apply` once, so this is dead weight for it, not a behavior change.
++   *  Process-global like `ClassPath`'s own registry, for the same reason:
++   *  one scalino-linkdriver process links exactly one `mainClass`/config.
++   */
++  private var previousReach: Option[Reach] = None
++
+   /** Load all clases and methods reachable from the entry points. */
+   def apply(config: build.Config, entries: collection.Seq[nir.Global])(implicit
+       scope: Scope
+-  ): ReachabilityAnalysis =
+-    Reach(config, entries, ClassLoader.fromDisk(config))
++  ): ReachabilityAnalysis = {
++    val loader = ClassLoader.fromDisk(config)
++    previousReach
++      .flatMap(_.incrementalReprocess(config, entries, loader))
++      .getOrElse {
++        val reach = new Reach(config, entries, loader)
++        reach.process()
++        reach.processDelayed()
++        previousReach = Some(reach)
++        reach.result()
++      }
++  }
+ 
+   /** Run reachability analysis on already loaded methods. */
+   def apply(
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Reach.scala b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+index a66742d..376727c 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Reach.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+@@ -8,14 +8,23 @@ import scala.collection.mutable
+ 
+ private[linker] class Reach(
+     protected val config: build.Config,
+-    entries: collection.Seq[nir.Global],
+-    protected val loader: ClassLoader
++    protected val entries: collection.Seq[nir.Global],
++    protected var loader: ClassLoader
+ ) extends LinktimeValueResolver
+     with LinktimeIntrinsicCallsResolver {
+   import Reach._
+ 
+   val loaded =
+     mutable.Map.empty[nir.Global.Top, mutable.Map[nir.Global, nir.Defn]]
++  // The exact `Seq[nir.Defn]` `loader.load(top)` returned for each Top
++  // that's ever been demanded, kept purely so `incrementalReprocess` (below)
++  // can tell "definitely unchanged" apart from "might have changed" with a
++  // cheap `eq` check instead of a deep structural diff of every Top on every
++  // relink -- ClassPath's own persistent parse cache (patches/scala-native-
++  // 0047) returns the SAME `Seq` object when a file's mtime hasn't moved, so
++  // `eq` here is exactly as precise as re-reading the mtime would be, without
++  // Reach needing to know anything about mtimes itself.
++  val rawLoaded = mutable.Map.empty[nir.Global.Top, Seq[nir.Defn]]
+   val unreachable = mutable.Map.empty[nir.Global, UnreachableSymbol]
+   val unsupported = mutable.Map.empty[nir.Global, UnsupportedFeature]
+   val enqueued = mutable.Set.empty[nir.Global]
+@@ -152,6 +161,7 @@ private[linker] class Reach(
+           val scope = mutable.Map.empty[nir.Global, nir.Defn]
+           defns.foreach { defn => scope(defn.name) = defn }
+           loaded(owner) = scope
++          rawLoaded(owner) = defns.toSeq
+         }
+     }
+ 
+@@ -428,7 +438,17 @@ private[linker] class Reach(
+       case info: MemberInfo =>
+         info.owner match {
+           case owner: ScopeInfo =>
+-            owner.members += info
++            // `incrementalReprocess` (below) can call `reachDefine`/`newInfo`
++            // a second time for the same member's Global.Name, on a relink
++            // where only that member's body changed -- replace the stale
++            // entry in place instead of appending a duplicate. A normal
++            // (non-incremental) build never has an existing entry here
++            // (each member is visited exactly once), so `indexWhere` always
++            // misses and this is exactly the old `owner.members += info`.
++            owner.members.indexWhere(_.name == info.name) match {
++              case -1  => owner.members += info
++              case idx => owner.members(idx) = info
++            }
+           case _ =>
+             ()
+         }
+@@ -1257,6 +1277,156 @@ private[linker] class Reach(
+     )
+ 
+   lazy val injects: Seq[nir.Defn] = UnsupportedFeatureExtractor.injects
++
++  // ---------------------------------------------------------------------
++  // Incremental reprocessing (patches/scala-native-0048): reusing THIS Reach
++  // instance for a relink instead of building a fresh one from scratch --
++  // only ever attempted by scalino's `--long-running` LinkDriver, the one
++  // caller (Link.scala's `previousReach`) that keeps a Reach instance alive
++  // across builds at all.
++  //
++  // Deliberately narrow: the ONLY thing `incrementalReprocess` ever patches
++  // in place is a `Defn.Define`'s instructions (a method BODY edit) where
++  // that method's owning Top's class hierarchy, attrs, and full member-
++  // signature set are byte-identical to what this instance was already
++  // built from. Anything else it can't prove safe -- a changed Var/Const/
++  // Declare, an added/removed/re-signatured member, a changed parent/
++  // traits/attrs, a Top that disappeared, changed entry points/service
++  // providers, changed `config`/`entries`, or a lingering unreachable/
++  // unsupported failure from the last build -- makes it return `None`, and
++  // the caller falls back to a completely fresh `Reach` (today's behavior,
++  // unconditionally correct).
++  //
++  // Why this narrower slice is safe where the abandoned per-method fact
++  // cache (patches/scala-native-0043, `incremental-reach` branch) wasn't:
++  // that attempt tried to *replay* memoized edges/call-targets/allocation
++  // facts without re-running the worklist at all, which silently dropped
++  // targets whenever the cache missed a fact kind (the documented
++  // Function1.apply miscompile). This instead *re-runs* the real worklist
++  // (`process()`/`processDelayed()`) over the changed bodies, so every
++  // ordinary reach rule (reachOp/reachMethodTargets/reachAllocation/dynamic
++  // dispatch registration/...) still executes exactly as it does for a
++  // fresh build -- nothing is memoized or replayed, only *skipped* for
++  // Tops that provably can't have produced new reachability facts. And
++  // because every one of those rules only ever ADDS to `done`/`infos`/
++  // `dyncandidates`/`dynimpls`/responds maps (never removes), a stale fact
++  // left over from a method body that changed to no longer need something
++  // is merely dead code kept reachable -- a bigger binary, never a wrong
++  // one. `cleanup()` (called from `result()`, unchanged) still prunes
++  // `responds`/`defaultResponds` down to whatever's actually in `done`.
++  def incrementalReprocess(
++      newConfig: build.Config,
++      newEntries: collection.Seq[nir.Global],
++      newLoader: ClassLoader
++  ): Option[ReachabilityAnalysis] = {
++    if (unreachable.nonEmpty || unsupported.nonEmpty) None
++    else if (newConfig != config) None
++    else if (newEntries != entries) None
++    else {
++      val newEntryPointClasses = newLoader.classesWithEntryPoints.toSet
++      val newServiceProviders = newLoader.definedServicesProviders
++      if (newEntryPointClasses != lastEntryPointClasses) None
++      else if (newServiceProviders != lastServiceProviders) None
++      else {
++        // First pass: only decide whether reuse is safe at all. Nothing is
++        // mutated here -- a single disqualifying Top must be able to bail
++        // out to a fresh Reach with this instance's state untouched, since
++        // the caller's fallback path (`new Reach(...)`) doesn't know or
++        // care whether we got partway through mutating the old one.
++        case class TopPatch(freshDefns: Seq[nir.Defn], changed: Seq[nir.Defn.Define])
++        val bodyPatches = mutable.Map.empty[nir.Global.Top, TopPatch]
++        var safe = true
++        val tops = rawLoaded.keysIterator
++        while (safe && tops.hasNext) {
++          val top = tops.next()
++          val oldDefns = rawLoaded(top)
++          newLoader.load(top) match {
++            case None =>
++              safe = false // the file backing this Top disappeared
++            case Some(freshDefns) if freshDefns eq oldDefns =>
++              () // definitely unchanged (ClassPath's own mtime cache hit)
++            case Some(freshDefns) =>
++              val oldByName = loaded(top)
++              if (freshDefns.size != oldByName.size) safe = false
++              else {
++                val freshByName = freshDefns.iterator.map(d => d.name -> d).toMap
++                if (freshByName.keySet != oldByName.keySet) safe = false
++                else {
++                  val changed = List.newBuilder[nir.Defn.Define]
++                  val it = freshByName.iterator
++                  while (safe && it.hasNext) {
++                    val (name, freshDefn) = it.next()
++                    val oldDefn = oldByName(name)
++                    if (freshDefn != oldDefn) {
++                      (freshDefn, oldDefn) match {
++                        case (fd: nir.Defn.Define, od: nir.Defn.Define)
++                            if structuralKey(fd) == structuralKey(od) =>
++                          changed += fd
++                        case _ =>
++                          // A changed Var/Const/Declare, or a Define/Class/
++                          // Trait/Module whose own shape (not just its
++                          // body) differs -- can't prove local reuse safe.
++                          safe = false
++                      }
++                    }
++                  }
++                  val cd = changed.result()
++                  if (safe && cd.nonEmpty) bodyPatches(top) = TopPatch(freshDefns, cd)
++                }
++              }
++          }
++        }
++
++        if (!safe) None
++        else if (bodyPatches.isEmpty) {
++          // Nothing changed at all (every Top hit the `eq` fast path) --
++          // still a legitimate relink (e.g. only C sources changed), just
++          // with literally nothing new for Reach to do.
++          loader = newLoader
++          lastEntryPointClasses = newEntryPointClasses
++          lastServiceProviders = newServiceProviders
++          Some(result())
++        } else {
++          // Second pass: only now, having proven every changed Top safe,
++          // actually mutate this instance.
++          loader = newLoader
++          bodyPatches.foreach {
++            case (top, TopPatch(freshDefns, defines)) =>
++              val scope = loaded(top)
++              defines.foreach { fresh =>
++                scope(fresh.name) = fresh
++                done -= fresh.name
++              }
++              rawLoaded(top) = freshDefns
++          }
++          // Force reprocessing regardless of `enqueued` -- these names were
++          // very likely already enqueued (and `done`) from the LAST build,
++          // and `reachGlobal`'s own `enqueued` dedup would otherwise skip
++          // pushing them onto `todo` a second time.
++          bodyPatches.valuesIterator.foreach {
++            case TopPatch(_, defines) =>
++              defines.foreach(fresh => todo ::= fresh.name)
++          }
++          process()
++          processDelayed()
++          lastEntryPointClasses = newEntryPointClasses
++          lastServiceProviders = newServiceProviders
++          Some(result())
++        }
++      }
++    }
++  }
++
++  private def structuralKey(defn: nir.Defn): Any = defn match {
++    case d: nir.Defn.Define => (d.attrs, d.name, d.ty)
++    case other              => other
++  }
++
++  private var lastEntryPointClasses: Set[nir.Global.Top] =
++    loader.classesWithEntryPoints.toSet
++  private var lastServiceProviders
++      : Map[nir.Global.Top, Iterable[nir.Global.Top]] =
++    loader.definedServicesProviders
+ }
+ 
+ private[scalanative] object Reach {

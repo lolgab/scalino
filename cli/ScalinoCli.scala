@@ -186,6 +186,75 @@ object ScalinoCli:
     val out = readAll(proc.getInputStream)
     (proc.waitFor(), out.trim)
 
+  /** One already-running `dist/scalino-linkdriver --long-running` process,
+   *  reused across `-w`/`--watch` rebuilds (LinkDriver.scala's stdin/stdout
+   *  protocol, mirroring scala-js-cli#64's `--longRunning`). Kept alive so
+   *  its patched scala.scalanative.linker.ClassPath in-memory NIR parse
+   *  cache (patches/scala-native-0049) actually survives between rebuilds --
+   *  a one-shot (non-watch) build never touches this, and still goes
+   *  through `runInherited` below, spawning and exiting once as before. */
+  private case class LongRunningLinker(
+    argv: List[String],
+    proc: Process,
+    out: java.io.BufferedReader,
+    in: java.io.OutputStream
+  )
+  private var longRunningLinker: Option[LongRunningLinker] = None
+
+  /** Drives `argv` (the same argv `runInherited` would have used, minus the
+   *  trailing `--long-running` this adds itself) through the persistent
+   *  linkdriver process, respawning it if this is the first call, the
+   *  previous process died, or `argv` changed (different classpath, main
+   *  class, or any native flag -- e.g. switching which file is being run
+   *  under `-w`). Streams the driver's stdout straight to our own stdout
+   *  (matching `runInherited`'s inherited-IO look) until the sentinel line
+   *  LinkDriver.scala prints at the end of each relink, and returns 0/1 the
+   *  same way `runInherited`'s exit code would.
+   */
+  def linkIncremental(argv: List[String]): Int =
+    val (driver, alreadyBuilding) = longRunningLinker match
+      case Some(d) if d.argv == argv && d.proc.isAlive => (d, false)
+      case existing =>
+        existing.foreach { d =>
+          scala.util.Try(d.in.close())
+          if !d.proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) then d.proc.destroyForcibly()
+        }
+        val pb = new JProcessBuilder((argv :+ "--long-running").asJava)
+        pb.redirectError(JProcessBuilder.Redirect.INHERIT)
+        val proc = pb.start()
+        val d = LongRunningLinker(
+          argv,
+          proc,
+          new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream)),
+          proc.getOutputStream
+        )
+        longRunningLinker = Some(d)
+        (d, true)
+
+    // A freshly-spawned process is already linking on its own; an existing
+    // one is blocked waiting on stdin (LinkDriver.scala's `readLine()`) for
+    // exactly this trigger.
+    if !alreadyBuilding then
+      driver.in.write('\n'.toInt)
+      driver.in.flush()
+
+    var line = driver.out.readLine()
+    while line != null && line != "SCALINO_LINKING_DONE" && line != "SCALINO_LINKING_FAILED" do
+      println(line)
+      line = driver.out.readLine()
+
+    if line == "SCALINO_LINKING_DONE" then 0
+    else if line == "SCALINO_LINKING_FAILED" then
+      // LinkDriver.scala caught the build error itself and looped back to
+      // waiting on stdin -- the process (and its warm NIR parse cache) is
+      // still alive and still good to reuse on the next rebuild, which is
+      // the common case in watch mode (a save with a typo, fixed shortly
+      // after). Only a dead process (below) forces a respawn.
+      1
+    else
+      longRunningLinker = None
+      1
+
   def deleteRecursively(p: Path): Unit =
     if Files.exists(p) then
       if Files.isDirectory(p) then
@@ -1676,7 +1745,8 @@ object ScalinoCli:
     extraCompileOnlyClasspath: String = "",
     logLevel: String = "info",
     incremental: Boolean = true,
-    nativeOpts: NativeOpts = NativeOpts()
+    nativeOpts: NativeOpts = NativeOpts(),
+    longRunning: Boolean = false
   ): String =
     val classesDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental)
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
@@ -1707,9 +1777,8 @@ object ScalinoCli:
       nativeOpts.cCompile.flatMap(v => List("--c-compile", v)) ++
       nativeOpts.cppCompile.flatMap(v => List("--cpp-compile", v))
 
-    val linkExit = runInherited(
-      List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel) ++ nativeFlags
-    )
+    val linkCmd = List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel) ++ nativeFlags
+    val linkExit = if longRunning then linkIncremental(linkCmd) else runInherited(linkCmd)
     if linkExit != 0 then fail("linking failed")
 
     val produced = linkDir.resolve(mainClass)
@@ -2011,11 +2080,11 @@ object ScalinoCli:
     mode match
       case "run" =>
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
         runInherited(binPathFor(mainClass).toString :: o.progArgs)
       case "package" =>
         def outPathFor(mc: String): Path = Paths.get(o.out.getOrElse(mc.substring(mc.lastIndexOf('.') + 1)))
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
         val outPath = outPathFor(mainClass)
         if !o.quiet then println(Color.action(s"scalino: wrote $outPath (main class: $mainClass)", System.out))
         0
@@ -2129,7 +2198,7 @@ object ScalinoCli:
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
-        buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, resolveNativeOpts(directives, o))
+        buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, resolveNativeOpts(directives, o), o.watch)
         runInherited(binPath.toString :: o.progArgs)
 
     if o.watch then
