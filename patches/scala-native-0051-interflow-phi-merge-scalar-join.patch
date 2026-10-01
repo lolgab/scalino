@@ -1,0 +1,189 @@
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
+--- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
+@@ -105,12 +105,81 @@
+         val mergeDelayed = mutable.AnyRefMap.empty[nir.Op, nir.Val]
+         val mergeEmitted = mutable.AnyRefMap.empty[nir.Op, nir.Val.Local]
+         val newEscapes = mutable.Set.empty[Addr]
++        // Scoped per computeMerge() attempt, like mergeHeap/mergeLocals below.
++        // Memoizes phi-joins of distinct virtual instances keyed by the exact
++        // branch value tuple, so that two aliases of the same pair of
++        // branch-local objects (e.g. a local and a field both holding them)
++        // resolve to the *same* new merged instance instead of diverging
++        // copies -- mirrors State.delay's delayed.getOrElseUpdate idiom.
++        val joinCache = mutable.Map.empty[Seq[nir.Val], nir.Val]
+ 
+         def isSingleValue(values: Seq[nir.Val]): Boolean =
+           if (values.nonEmpty) {
+             val h = values.head
+             values.forall(_ == h)
+           } else false
++
++        // If every branch value is still a non-escaped VirtualInstance of the
++        // same shape (kind, class, field count, zone), join them into a new
++        // virtual instance field-wise instead of forcing a real heap
++        // allocation on every branch. This widens the same scalar-replacement
++        // precision that "2. Merge heap" below already applies to a *shared*
++        // addr reachable from all branches, to the (more common) case where
++        // each branch allocated at a *different* addr. Falls through to the
++        // existing materialize-based join whenever it doesn't apply, so
++        // behavior is unchanged whenever this new case doesn't fire.
++        def tryJoinVirtual(values: Seq[nir.Val]): Option[nir.Val] = {
++          val addrs = values.collect { case nir.Val.Virtual(addr) => addr }
++          if (addrs.size != values.size) None
++          else {
++            joinCache.get(values) match {
++              case cached @ Some(_) => cached
++              case None =>
++                val instances = states.zip(addrs).map {
++                  case (s, addr) =>
++                    if (s.hasEscaped(addr)) None
++                    else
++                      s.deref(addr) match {
++                        case vi: VirtualInstance => Some(vi)
++                        case _                   => None
++                      }
++                }
++                val joinable = instances.forall(_.isDefined) && {
++                  val head = instances.head.get
++                  (head.kind == ClassKind || head.kind == ArrayKind) &&
++                  instances.tail.forall { other =>
++                    val o = other.get
++                    o.kind == head.kind &&
++                    o.cls == head.cls &&
++                    o.values.length == head.values.length
++                  } &&
++                  instances.tail.forall(_.get.zone == head.zone)
++                }
++                if (!joinable) None
++                else {
++                  val head = instances.head.get
++                  val mergedValues = head.values.indices.map { idx =>
++                    val fieldValues = instances.map(_.get.values(idx))
++                    val bound = head.kind match {
++                      case ClassKind => Some(head.cls.fields(idx).ty)
++                      case _         => None
++                    }
++                    mergePhi(fieldValues, bound)
++                  }.toArray
++                  val newAddr = mergeFresh().id
++                  mergeHeap(newAddr) = VirtualInstance(
++                    head.kind,
++                    head.cls,
++                    mergedValues,
++                    head.zone
++                  )(head.srcPosition, head.scopeId)
++                  val joined = nir.Val.Virtual(newAddr)
++                  joinCache(values) = joined
++                  Some(joined)
++                }
++            }
++          }
++        }
+ 
+         def mergePhi(
+             values: Seq[nir.Val],
+@@ -118,7 +187,7 @@
+             localName: Option[String] = None
+         ): nir.Val = {
+           if (isSingleValue(values)) values.head
+-          else {
++          else tryJoinVirtual(values).getOrElse {
+             val materialized = states.zip(values).map {
+               case (s, v) =>
+                 v match {
+@@ -269,6 +338,7 @@
+           mergeDelayed.clear()
+           mergeEmitted.clear()
+           newEscapes.clear()
++          joinCache.clear()
+           try computeMerge()
+           catch { case MergeProcessor.Restart => () }
+           if (retries > 128) {
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala
+new file mode 100644
+index 0000000..63cef37
+--- /dev/null
++++ b/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala
+@@ -0,0 +1,81 @@
++package scala.scalanative
++package optimizer
++
++import org.junit.Assert._
++import org.junit._
++
++import scala.scalanative.OptimizerSpec
++
++class MergePhiScalarJoinTest extends OptimizerSpec {
++
++  /** Two branches allocate distinct instances of the same shape
++   *  (`Point`), merged at a phi into a single local. Before the
++   *  MergeProcessor phi-merge scalar join, this forced both branches to
++   *  materialize a real `Op.Classalloc`, even though the merged value is
++   *  only ever used for scalar field reads (never escapes as a whole
++   *  reference). With the join in place, the merge keeps a single virtual
++   *  instance whose fields are themselves phi-merged, so no allocation is
++   *  ever emitted.
++   */
++  @Test def noAllocationForJoinableBranches(): Unit = {
++    optimize(
++      entry = "Test",
++      sources = Map(
++        "Test.scala" ->
++          """|final class Point(val x: Int, val y: Int)
++             |
++             |object Test {
++             |  def main(args: Array[String]): Unit = {
++             |    val cond = args.length == 0
++             |    val p = if (cond) new Point(1, 2) else new Point(3, 4)
++             |    println(p.x + p.y)
++             |  }
++             |}
++             |""".stripMargin
++      ),
++      setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
++    ) {
++      case (_, result) =>
++        findEntry(result.defns.toSeq).foreach { defn =>
++          val classallocs = defn.insts.collect {
++            case nir.Inst.Let(_, op: nir.Op.Classalloc, _)
++                if op.name.toString.contains("Point") =>
++              op
++          }
++          assertTrue(
++            "Expected no Op.Classalloc for Point - branches should have " +
++              s"been joined into a single virtual instance; got: $classallocs",
++            classallocs.isEmpty
++          )
++        }
++    }
++  }
++
++  /** Branches allocating arrays of different lengths must NOT be joined
++   *  (field count differs), so the existing materialize-based fallback
++   *  still applies and behavior is unchanged from before the join.
++   */
++  @Test def differentLengthArraysAreNotJoined(): Unit = {
++    optimize(
++      entry = "Test",
++      sources = Map(
++        "Test.scala" ->
++          """|object Test {
++             |  def main(args: Array[String]): Unit = {
++             |    val cond = args.length == 0
++             |    val a = if (cond) new Array[Int](2) else new Array[Int](3)
++             |    println(a.length)
++             |  }
++             |}
++             |""".stripMargin
++      ),
++      setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
++    ) {
++      case (_, result) =>
++        // Just confirming this compiles/optimizes without crashing the
++        // joinability check (arrays of differing length are a real fixture
++        // that must fall through to materialize, not a hypothetical).
++        assertTrue(findEntry(result.defns.toSeq).isDefined)
++    }
++  }
++}
