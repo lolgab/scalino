@@ -1807,6 +1807,189 @@ object ScalinoCli:
   def printVersion(): Unit =
     println(s"scalino ${BuildInfo.scalinoVersion} -- Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}")
 
+  private def oMain: String =
+    s"""|  --main-class <name>        explicit entry point (skips auto-detection)
+       |""".stripMargin
+
+  private def oDeps: String =
+    s"""|  --dep <coord>              add a dependency (repeatable; no -d short form -- real
+       |                             scala-cli's -d means --output, not --dependency)
+       |  --compile-dep <coord>      add a compile-time-only dependency (repeatable)
+       |""".stripMargin
+
+  private def oRepo: String =
+    s"""|  -r, --repository <repo>   extra Maven repository for dependency resolution (repeatable;
+       |                             passed straight through to `cs fetch -r`, e.g. a URL or
+       |                             `sonatype:snapshots`)
+       |""".stripMargin
+
+  private def oScala: String =
+    s"""|  -S, --scala <version>      declare a Scala version (must match ${BuildInfo.scalaVersion})
+       |""".stripMargin
+
+  private def oScalac: String =
+    s"""|  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
+       |""".stripMargin
+
+  private def oWatch: String =
+    s"""|  -w, --watch                rebuild (and, for `run`, rerun) on source changes
+       |  --watching, --watching-path <path>   extra path to watch under -w (repeatable;
+       |                             file or directory, watched recursively)
+       |""".stripMargin
+
+  private def oArgsFile: String =
+    s"""|  --args-file <path>         expand to the file's contents as extra scalac options
+       |                             (dotc's own native `@file` response-file expansion --
+       |                             one option per line, `#` starts a line comment)
+       |""".stripMargin
+
+  private def oOut: String =
+    s"""|  -o, --output <path>        output path (package only)
+       |""".stripMargin
+
+  private def oVerbose: String =
+    s"""|  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
+       |""".stripMargin
+
+  private def oQuiet: String =
+    s"""|  -q, --quiet                only show warnings/errors
+       |""".stripMargin
+
+  private def oColor: String =
+    s"""|  --color <always|auto|never>   colorize output (auto by default; also honors
+       |                             NO_COLOR/CLICOLOR_FORCE, cargo/scala-cli-style)
+       |""".stripMargin
+
+  private def oTestFw: String =
+    s"""|  --test-framework <class>   explicit test framework class (skips auto-detection; test only)
+       |""".stripMargin
+
+  private def oNoInc: String =
+    s"""|  --no-incremental           always fully recompile (skip the incremental-compile cache)
+       |""".stripMargin
+
+  private def oProgArgs: String =
+    s"""|  -- <args...>               program args (run) or test-framework filter args (test),
+       |                             e.g. `scalino test . -- "*MySuite*"` (munit/utest-style filter)
+       |""".stripMargin
+
+  private def nativeOpts: String =
+    s"""|  --native-mode <mode>       debug|release-fast|release-size|release-full (debug by default)
+       |  --native-gc <gc>           immix|commix|boehm|none (immix by default)
+       |  --native-lto <lto>         none|thin|full (none by default)
+       |  --native-clang <path>      path to the clang command (autodetected from PATH by default)
+       |  --native-clangpp <path>    path to the clang++ command (autodetected from PATH by default)
+       |  --native-linking <opt>     extra option passed to clang verbatim during linking (repeatable)
+       |  --native-compile <opt>     extra compile option, all sources (repeatable)
+       |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
+       |  --native-cpp-compile <opt> extra compile option, C++ files only (repeatable)
+       |  --native-target <target>  app|static|dynamic (app by default)
+       |  --embed-resources          embed resources into the binary (readable via the Java resources API)
+       |  --native-multithreading[=true|false]  Scala Native multithreading support
+       |                                        (on by default; pass =false to opt out)
+       |  --native-direct-codegen[=true|false]  skip .ll text + per-file clang,
+       |                                        building object files straight from libLLVM's C
+       |                                        API (on by default, except on Windows; needs the
+       |                                        toolchain itself running as compiled Scala Native
+       |                                        code with a discoverable libLLVM, else it's a
+       |                                        silent no-op; pass =false to opt out)
+       |  --native-gc-stw-sweep      commix GC only: keep mutators paused through the
+       |                             parallel sweep too, instead of resuming them once
+       |                             marking finishes (off by default; throughput over
+       |                             concurrency -- trades commix's concurrent/lazy sweep
+       |                             bookkeeping for a longer, fully parallel STW pause)
+       |  --native-optimize[=true|false]  Scala Native's Interflow NIR optimizer pass
+       |                                  (on by default; pass =false to skip it, e.g. for
+       |                                  faster iterative builds or clearer debug binaries)
+       |""".stripMargin
+
+  private def directivesBlock: String =
+    s"""|directives (in source files), one per line -- `dep`/`options`/etc also
+       |accept scala-cli's own longer spellings (`dependency`/`scalacOption`/...):
+       |  //> using dep "org::name:version"
+       |  //> using compileOnly.dep "org::name:version"
+       |  //> using test.dep "org::name:version"    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
+       |  //> using testFramework "fully.qualified.Framework"   (explicit override)
+       |  //> using scala "3.x"
+       |  //> using mainClass "Foo"
+       |  //> using options "-flag1", "-flag2"
+       |  //> using test.scalacOption "-flag"        (test scope only, in addition to `options` above)
+       |  //> using jar "./lib/local.jar"            (add a local jar straight to the classpath)
+       |  //> using resourceDir "./resources"        (dir on the classpath; combine with
+       |                                             --embed-resources/nativeEmbedResources
+       |                                             to actually bake its files into the binary)
+       |  //> using repository "https://my.org/maven"   (extra Maven repo, repeatable)
+       |  //> using file "./Other.scala"             (extra source, relative to this file's dir)
+       |  //> using exclude "generated/**"            (glob; drop matching sources, cwd-relative)
+       |  //> using nativeMode "release-fast"
+       |  //> using nativeGc "immix"
+       |  //> using nativeLto "thin"
+       |  //> using nativeClang "/path/to/clang"
+       |  //> using nativeClangPP "/path/to/clang++"
+       |  //> using nativeLinking "-L/opt/homebrew/lib"
+       |  //> using nativeCompile "-flag"
+       |  //> using nativeCCompile "-flag"
+       |  //> using nativeCppCompile "-flag"
+       |  //> using nativeTarget "application"   (application|library-dynamic|library-static)
+       |  //> using nativeEmbedResources true
+       |  //> using nativeMultithreading false   (on by default)
+       |  //> using nativeDirectCodegen false   (on by default except on Windows)
+       |  //> using nativeGcStwSweep true   (commix GC only; off by default)
+       |  //> using nativeHeapHistogram true   (live-heap histogram GC debug dump; off by default, adds ~7.5MB to binary)
+       |  //> using nativeOptimize false   (Interflow NIR optimizer; on by default)
+       |""".stripMargin
+
+  private def testNote: String =
+    s"""|`test` auto-detects the test framework structurally (scans the resolved
+       |test classpath for a class implementing sbt.testing.Framework -- no
+       |hardcoded list, so any framework with a scala-native port works, not
+       |just the ones this was verified against). Only SubclassFingerprint-based
+       |frameworks are supported (covers munit/utest/scalatest/zio-test-sbt);
+       |JUnit4-style @Test-annotated discovery is not. Whole test classes are
+       |selected (no per-test-method filtering) -- use `-- <pattern>` to filter,
+       |forwarded to the framework's own runner untouched.
+       |""".stripMargin
+
+  private def setupIdeNote: String =
+    s"""|`setup-ide` writes `.scalino-build/scalino-lsp.json` -- dotty's own
+       |pre-Metals IDE config format (compilerArguments/sourceDirectories/
+       |dependencyClasspath/classDirectory), read by dist/scalino-lsp on
+       |startup. Same command name as scala-cli's `setup-ide`, but a
+       |different output file: this toolchain's LSP speaks that format
+       |directly, no BSP layer needed.
+       |""".stripMargin
+
+  private def completionsNote: String =
+    s"""|`completions` prints a shell completion script to stdout, cargo/
+       |scala-cli-style. A brew/apt/dnf/arch/nix install already places
+       |these for you (pre-generated at build time -- see
+       |build/07-build-scalino.sh); this is mainly for install.sh/manual
+       |installs, e.g.:
+       |  bash:  scalino completions bash > /etc/bash_completion.d/scalino
+       |  zsh:   scalino completions zsh > "$${fpath[1]}/_scalino"
+       |  fish:  scalino completions fish > ~/.config/fish/completions/scalino.fish
+       |""".stripMargin
+
+  private def sourcesNote: String =
+    s"""|a source argument may be a directory: every .scala file under it is
+       |included (skipping hidden and build-output directories). files under
+       |a `test/` directory (or sbt-style `src/test/scala/`) are test scope
+       |and excluded from `run`/`compile` -- scala-cli's convention. `test`
+       |compiles both scopes together (test sources depend on main scope).
+       |""".stripMargin
+
+  private def incrementalNote: String =
+    s"""|compilation is incremental by default: unchanged sources (and
+       |anything that doesn't textually mention a changed name) are reused
+       |from the last build instead of being recompiled -- pass
+       |--no-incremental to always fully recompile.
+       |""".stripMargin
+
+  private def nativeHeader: String =
+    """|Scala Native options (no --native-version -- this toolchain only ever
+       |targets the one pinned scala-native version it was built for):
+       |""".stripMargin
+
   def printUsage(out: java.io.PrintStream): Unit =
     out.print(
       s"""scalino: a mini scala-cli, self-hosted on scalino (no JVM anywhere)
@@ -1822,134 +2005,61 @@ object ScalinoCli:
          |  scalino clean                          delete the .scalino-build directory
          |  scalino version                        print version info
          |  scalino --help                         this message
+         |  scalino <command> --help               help for one command
          |
-         |a source argument may be a directory: every .scala file under it is
-         |included (skipping hidden and build-output directories). files under
-         |a `test/` directory (or sbt-style `src/test/scala/`) are test scope
-         |and excluded from `run`/`compile` -- scala-cli's convention. `test`
-         |compiles both scopes together (test sources depend on main scope).
-         |
-         |compilation is incremental by default: unchanged sources (and
-         |anything that doesn't textually mention a changed name) are reused
-         |from the last build instead of being recompiled -- pass
-         |--no-incremental to always fully recompile.
-         |
+         |$sourcesNote
+         |$incrementalNote
          |${Color.bold("options:", out)}
-         |  --main-class <name>        explicit entry point (skips auto-detection)
-         |  --dep <coord>              add a dependency (repeatable; no -d short form -- real
-         |                             scala-cli's -d means --output, not --dependency)
-         |  --compile-dep <coord>      add a compile-time-only dependency (repeatable)
-         |  -r, --repository <repo>   extra Maven repository for dependency resolution (repeatable;
-         |                             passed straight through to `cs fetch -r`, e.g. a URL or
-         |                             `sonatype:snapshots`)
-         |  -S, --scala <version>      declare a Scala version (must match ${BuildInfo.scalaVersion})
-         |  -O, --scalac-option <opt>  pass an extra compiler flag (repeatable)
-         |  -w, --watch                rebuild (and, for `run`, rerun) on source changes
-         |  --watching, --watching-path <path>   extra path to watch under -w (repeatable;
-         |                             file or directory, watched recursively)
-         |  --args-file <path>         expand to the file's contents as extra scalac options
-         |                             (dotc's own native `@file` response-file expansion --
-         |                             one option per line, `#` starts a line comment)
-         |  -o, --output <path>        output path (package only)
-         |  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
-         |  -q, --quiet                only show warnings/errors
-         |  --color <always|auto|never>   colorize output (auto by default; also honors
-         |                             NO_COLOR/CLICOLOR_FORCE, cargo/scala-cli-style)
-         |  --test-framework <class>   explicit test framework class (skips auto-detection; test only)
-         |  --no-incremental           always fully recompile (skip the incremental-compile cache)
-         |  -- <args...>               program args (run) or test-framework filter args (test),
-         |                             e.g. `scalino test . -- "*MySuite*"` (munit/utest-style filter)
-         |
-         |Scala Native options (no --native-version -- this toolchain only ever
-         |targets the one pinned scala-native version it was built for):
-         |  --native-mode <mode>       debug|release-fast|release-size|release-full (debug by default)
-         |  --native-gc <gc>           immix|commix|boehm|none (immix by default)
-         |  --native-lto <lto>         none|thin|full (none by default)
-         |  --native-clang <path>      path to the clang command (autodetected from PATH by default)
-         |  --native-clangpp <path>    path to the clang++ command (autodetected from PATH by default)
-         |  --native-linking <opt>     extra option passed to clang verbatim during linking (repeatable)
-         |  --native-compile <opt>     extra compile option, all sources (repeatable)
-         |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
-         |  --native-cpp-compile <opt> extra compile option, C++ files only (repeatable)
-         |  --native-target <target>  app|static|dynamic (app by default)
-         |  --embed-resources          embed resources into the binary (readable via the Java resources API)
-         |  --native-multithreading[=true|false]  Scala Native multithreading support
-         |                                        (on by default; pass =false to opt out)
-         |  --native-direct-codegen[=true|false]  skip .ll text + per-file clang,
-         |                                        building object files straight from libLLVM's C
-         |                                        API (on by default, except on Windows; needs the
-         |                                        toolchain itself running as compiled Scala Native
-         |                                        code with a discoverable libLLVM, else it's a
-         |                                        silent no-op; pass =false to opt out)
-         |  --native-gc-stw-sweep      commix GC only: keep mutators paused through the
-         |                             parallel sweep too, instead of resuming them once
-         |                             marking finishes (off by default; throughput over
-         |                             concurrency -- trades commix's concurrent/lazy sweep
-         |                             bookkeeping for a longer, fully parallel STW pause)
-         |  --native-optimize[=true|false]  Scala Native's Interflow NIR optimizer pass
-         |                                  (on by default; pass =false to skip it, e.g. for
-         |                                  faster iterative builds or clearer debug binaries)
-         |
-         |directives (in source files), one per line -- `dep`/`options`/etc also
-         |accept scala-cli's own longer spellings (`dependency`/`scalacOption`/...):
-         |  //> using dep "org::name:version"
-         |  //> using compileOnly.dep "org::name:version"
-         |  //> using test.dep "org::name:version"    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
-         |  //> using testFramework "fully.qualified.Framework"   (explicit override)
-         |  //> using scala "3.x"
-         |  //> using mainClass "Foo"
-         |  //> using options "-flag1", "-flag2"
-         |  //> using test.scalacOption "-flag"        (test scope only, in addition to `options` above)
-         |  //> using jar "./lib/local.jar"            (add a local jar straight to the classpath)
-         |  //> using resourceDir "./resources"        (dir on the classpath; combine with
-         |                                             --embed-resources/nativeEmbedResources
-         |                                             to actually bake its files into the binary)
-         |  //> using repository "https://my.org/maven"   (extra Maven repo, repeatable)
-         |  //> using file "./Other.scala"             (extra source, relative to this file's dir)
-         |  //> using exclude "generated/**"            (glob; drop matching sources, cwd-relative)
-         |  //> using nativeMode "release-fast"
-         |  //> using nativeGc "immix"
-         |  //> using nativeLto "thin"
-         |  //> using nativeClang "/path/to/clang"
-         |  //> using nativeClangPP "/path/to/clang++"
-         |  //> using nativeLinking "-L/opt/homebrew/lib"
-         |  //> using nativeCompile "-flag"
-         |  //> using nativeCCompile "-flag"
-         |  //> using nativeCppCompile "-flag"
-         |  //> using nativeTarget "application"   (application|library-dynamic|library-static)
-         |  //> using nativeEmbedResources true
-         |  //> using nativeMultithreading false   (on by default)
-         |  //> using nativeDirectCodegen false   (on by default except on Windows)
-         |  //> using nativeGcStwSweep true   (commix GC only; off by default)
-         |  //> using nativeHeapHistogram true   (live-heap histogram GC debug dump; off by default, adds ~7.5MB to binary)
-         |  //> using nativeOptimize false   (Interflow NIR optimizer; on by default)
-         |
-         |`test` auto-detects the test framework structurally (scans the resolved
-         |test classpath for a class implementing sbt.testing.Framework -- no
-         |hardcoded list, so any framework with a scala-native port works, not
-         |just the ones this was verified against). Only SubclassFingerprint-based
-         |frameworks are supported (covers munit/utest/scalatest/zio-test-sbt);
-         |JUnit4-style @Test-annotated discovery is not. Whole test classes are
-         |selected (no per-test-method filtering) -- use `-- <pattern>` to filter,
-         |forwarded to the framework's own runner untouched.
-         |
-         |`setup-ide` writes `.scalino-build/scalino-lsp.json` -- dotty's own
-         |pre-Metals IDE config format (compilerArguments/sourceDirectories/
-         |dependencyClasspath/classDirectory), read by dist/scalino-lsp on
-         |startup. Same command name as scala-cli's `setup-ide`, but a
-         |different output file: this toolchain's LSP speaks that format
-         |directly, no BSP layer needed.
-         |
-         |`completions` prints a shell completion script to stdout, cargo/
-         |scala-cli-style. A brew/apt/dnf/arch/nix install already places
-         |these for you (pre-generated at build time -- see
-         |build/07-build-scalino.sh); this is mainly for install.sh/manual
-         |installs, e.g.:
-         |  bash:  scalino completions bash > /etc/bash_completion.d/scalino
-         |  zsh:   scalino completions zsh > "$${fpath[1]}/_scalino"
-         |  fish:  scalino completions fish > ~/.config/fish/completions/scalino.fish
-         |""".stripMargin
+         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oNoInc$oProgArgs
+         |$nativeHeader$nativeOpts
+         |$directivesBlock
+         |$testNote
+         |$setupIdeNote
+         |$completionsNote""".stripMargin
     )
+
+  val HelpCommands: Set[String] =
+    Set("run", "compile", "package", "test", "setup-ide", "completions", "clean", "version")
+
+  /** `scalino <command> --help`: usage plus only the options/notes that apply to
+   *  that command. */
+  def printCommandHelp(cmd: String, out: java.io.PrintStream): Unit =
+    def head(usage: String, desc: String): String =
+      s"$desc\n\n${Color.bold("usage:", out)}\n  $usage\n\n"
+    def opts(parts: String*): String =
+      s"${Color.bold("options:", out)}\n${parts.mkString}\n"
+    val common = oDeps + oRepo + oScala + oScalac + oArgsFile + oVerbose + oQuiet + oColor + oNoInc
+    val text = cmd match
+      case "run" =>
+        head("scalino run <sources...> [options] [-- <program args>]", "Compile and run.") +
+          sourcesNote + "\n" + incrementalNote + "\n" +
+          opts(oMain + common + oWatch + oProgArgs) +
+          nativeHeader + nativeOpts + "\n" + directivesBlock
+      case "compile" =>
+        head("scalino compile <sources...> [options]", "Compile only, no link (see build output).") +
+          sourcesNote + "\n" + incrementalNote + "\n" +
+          opts(common + oWatch) + directivesBlock
+      case "package" =>
+        head("scalino package <sources...> -o <out> [options]", "Compile and link a native binary.") +
+          sourcesNote + "\n" + incrementalNote + "\n" +
+          opts(oMain + common + oOut + oWatch) +
+          nativeHeader + nativeOpts + "\n" + directivesBlock
+      case "test" =>
+        head("scalino test <sources...> [options] [-- <framework args>]", "Compile and run tests.") +
+          sourcesNote + "\n" + incrementalNote + "\n" +
+          opts(common + oWatch + oTestFw + oProgArgs) +
+          nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + testNote
+      case "setup-ide" =>
+        head("scalino setup-ide <sources...> [options]", "Write .scalino-build/scalino-lsp.json for editor LSP support.") +
+          sourcesNote + "\n" + opts(common) + directivesBlock + "\n" + setupIdeNote
+      case "completions" =>
+        head("scalino completions <bash|zsh|fish>", "Print a shell completion script to stdout.") + completionsNote
+      case "clean" =>
+        head("scalino clean", "Delete the .scalino-build directory.")
+      case "version" =>
+        head("scalino version", "Print version info.")
+    out.print(text)
+
 
   case class RunOpts(
     sources: List[Path] = Nil,
@@ -2439,6 +2549,11 @@ object ScalinoCli:
   def main(rawArgs: Array[String]): Unit =
     val args = hoistLeadingFlags(extractColorFlag(rawArgs))
     if args.isEmpty then { printUsage(System.err); sys.exit(1) }
+    // `scalino <command> --help`: per-command help. Stops at `--` (program/
+    // framework args) so `scalino run . -- --help` still reaches the program.
+    if HelpCommands.contains(args(0)) && args.drop(1).takeWhile(_ != "--").exists(a => a == "-h" || a == "--help") then
+      printCommandHelp(args(0), System.out)
+      return
     args(0) match
       case "-h" | "--help" => printUsage(System.out)
       case "--version" | "version" => printVersion()
