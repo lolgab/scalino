@@ -1871,6 +1871,36 @@ object ScalinoCli:
     compileToClasses(sources, classesDir, cc, extraOptions, incremental)
     classesDir
 
+  /** Mirrors `src` into `dst` (hard links, copy fallback) minus every class
+   *  file belonging to one of `excluded` (fully-qualified names): `Foo.class`/
+   *  `Foo.nir`/`Foo.tasty` plus anything nested or companion (`Foo$...`).
+   *  Used to link a test binary without the unselected suites -- see
+   *  `testNote` for why leaving them out of the driver isn't enough. */
+  def filteredLinkClasses(src: Path, dst: Path, excluded: Set[String]): Path =
+    deleteRecursively(dst)
+    Files.createDirectories(dst)
+    val excludedPaths = excluded.map(_.replace('.', '/'))
+    def isExcluded(rel: String): Boolean =
+      val base = rel.lastIndexOf('.') match
+        case -1 => rel
+        case i => rel.substring(0, i)
+      excludedPaths.exists(e => base == e || base.startsWith(e + "$"))
+    // Relative paths built by hand (not `Path#relativize`): `File#listFiles`
+    // on this toolchain's javalib can hand back an absolute path for a
+    // relative parent, and relativize then rejects the mixed pair.
+    def walk(rel: String): Unit =
+      for f <- Option(src.resolve(rel).toFile.listFiles()).map(_.toList).getOrElse(Nil) do
+        val childRel = if rel.isEmpty then f.getName else rel + "/" + f.getName
+        if f.isDirectory then
+          Files.createDirectories(dst.resolve(childRel))
+          walk(childRel)
+        else if !isExcluded(childRel) then
+          val target = dst.resolve(childRel)
+          try Files.createLink(target, src.resolve(childRel))
+          catch case _: Exception => Files.copy(src.resolve(childRel), target, java.nio.file.StandardCopyOption.COPY_ATTRIBUTES)
+    walk("")
+    dst
+
   def buildBinary(
     sources: List[Path],
     explicitMainClass: Option[String],
@@ -1881,13 +1911,17 @@ object ScalinoCli:
     logLevel: String = "info",
     incremental: Boolean = true,
     nativeOpts: NativeOpts = NativeOpts(),
-    longRunning: Boolean = false
+    longRunning: Boolean = false,
+    excludeFromLink: Set[String] = Set.empty
   ): String =
-    val classesDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental)
+    val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental)
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
 
-    val mainClass = detectMainClass(classesDir, explicitMainClass)
+    val mainClass = detectMainClass(compiledDir, explicitMainClass)
     val linkDir = Paths.get(".scalino-build").resolve(mainClass).resolve("link")
+    val classesDir =
+      if excludeFromLink.isEmpty then compiledDir
+      else filteredLinkClasses(compiledDir, Paths.get(".scalino-build").resolve(mainClass).resolve("link-classes"), excludeFromLink)
 
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir$CP_SEP${cc.nativelibsCp}"
@@ -1999,6 +2033,11 @@ object ScalinoCli:
     s"""|  --test-framework <class>   explicit test framework class (skips auto-detection; test only)
        |""".stripMargin
 
+  private def oTestOnly: String =
+    s"""|  --test-only <glob>         only run test classes whose fully-qualified name matches the glob
+       |                             (test only); the rest are left out of the linked binary entirely
+       |""".stripMargin
+
   private def oNoInc: String =
     s"""|  --no-incremental           always fully recompile (skip the incremental-compile cache)
        |""".stripMargin
@@ -2083,6 +2122,16 @@ object ScalinoCli:
        |JUnit4-style @Test-annotated discovery is not. Whole test classes are
        |selected (no per-test-method filtering) -- use `-- <pattern>` to filter,
        |forwarded to the framework's own runner untouched.
+       |
+       |`--test-only <glob>` (scala-cli's own flag; `*`/`**` match any characters,
+       |`?` one) keeps only the test classes whose fully-qualified name matches, and
+       |leaves every other discovered test class out of the link. Scala Native roots
+       |each reflectively-instantiable class's static initializer, so merely not
+       |mentioning a suite in the generated driver would not let the optimizer drop
+       |it; excluding its NIR from the link classpath does. The link is therefore
+       |smaller and faster. Ancestors of a selected test stay linked; if a selected
+       |test references another test class some other way and the trimmed link
+       |fails, scalino retries with every test class linked.
        |""".stripMargin
 
   private def setupIdeNote: String =
@@ -2145,7 +2194,7 @@ object ScalinoCli:
          |$sourcesNote
          |$incrementalNote
          |${Color.bold("options:", out)}
-         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oNoInc$oProgArgs
+         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oNoInc$oProgArgs
          |$nativeHeader$nativeOpts
          |$directivesBlock
          |$testNote
@@ -2182,7 +2231,7 @@ object ScalinoCli:
       case "test" =>
         head("scalino test <sources...> [options] [-- <framework args>]", "Compile and run tests.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
-          opts(common + oWatch + oTestFw + oProgArgs) +
+          opts(common + oWatch + oTestFw + oTestOnly + oProgArgs) +
           nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + testNote
       case "setup-ide" =>
         head("scalino setup-ide <sources...> [options]", "Write .scalino-build/scalino-lsp.json for editor LSP support.") +
@@ -2211,6 +2260,7 @@ object ScalinoCli:
     verbose: Boolean = false,
     quiet: Boolean = false,
     testFrameworkOpt: Option[String] = None,
+    testOnly: Option[String] = None,
     noIncremental: Boolean = false,
     cliNativeMode: Option[String] = None,
     cliNativeGc: Option[String] = None,
@@ -2261,6 +2311,7 @@ object ScalinoCli:
         case "-v" | "--verbose" => o = o.copy(verbose = true)
         case "-q" | "--quiet" => o = o.copy(quiet = true)
         case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
+        case "--test-only" => o = o.copy(testOnly = Some(args(i + 1))); i += 1
         case "--no-incremental" => o = o.copy(noIncremental = true)
         case "--native-version" =>
           die("--native-version is not supported -- this toolchain only ever targets the one pinned scala-native version it was built for")
@@ -2446,15 +2497,42 @@ object ScalinoCli:
         fail(s"${frameworkFqcns.mkString(", ")}: no SubclassFingerprint reported -- annotation-based " +
           "(JUnit4-style) test discovery isn't supported")
 
-      val matches = discoverTestClasses(classesDir, specs, testJars)
+      val discovered = discoverTestClasses(classesDir, specs, testJars)
+      val matches = o.testOnly match
+        case Some(glob) =>
+          val re = globToRegex(glob)
+          discovered.filter(m => re.matches(m.className))
+        case None => discovered
+      // A selected test's own ancestors must stay linkable even when they are
+      // themselves discovered test classes (e.g. a concrete base suite): the
+      // linker can only keep what's still on its classpath.
+      val keep = scala.collection.mutable.Set.empty[String]
+      def collectAncestors(name: String): Unit =
+        if keep.add(name) then
+          findClassInfo(name, classesDir, testJars).foreach { info =>
+            info.superClass.foreach(collectAncestors)
+            info.interfaces.foreach(collectAncestors)
+          }
+      matches.foreach(m => collectAncestors(if m.isModule then m.className + "$" else m.className))
+      val excluded = discovered.filterNot(matches.contains).map(_.className).filterNot(keep).toSet
       if matches.isEmpty then
-        if !o.quiet then println(Color.action("scalino: no tests found", System.out))
-        0
+        if !o.quiet then
+          val why = if discovered.isEmpty then "no tests found" else s"no test class matches --test-only ${o.testOnly.get}"
+          println(Color.action(s"scalino: $why", System.out))
+        if discovered.isEmpty || o.testOnly.isEmpty then 0 else 1
       else
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
-        buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, resolveNativeOpts(directives, o), o.watch)
+        def build(exclude: Set[String]) =
+          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, resolveNativeOpts(directives, o), o.watch, exclude)
+        // Besides inheritance (handled above), a selected test could reference
+        // an excluded test class some other way -- if the trimmed link fails,
+        // fall back to the full link rather than failing the run.
+        try build(excluded)
+        catch case BuildFailed(_) if excluded.nonEmpty =>
+          System.err.println("scalino: warning: link with --test-only exclusions failed (a selected test references an excluded test class?) -- retrying with every test class linked")
+          build(Set.empty)
         runInherited(binPath.toString :: o.progArgs)
 
     if o.watch then
@@ -2568,7 +2646,7 @@ object ScalinoCli:
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output -v --verbose -q --quiet " +
-    "--color --test-framework --no-incremental --native-mode --native-gc --native-lto " +
+    "--color --test-framework --test-only --no-incremental --native-mode --native-gc --native-lto " +
     "--native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-gc-stw-sweep --native-optimize -h --help"
@@ -2590,7 +2668,7 @@ object ScalinoCli:
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
-       |    --args-file|-o|--output|--test-framework|--native-clang|--native-clangpp|--native-linking| \\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-clang|--native-clangpp|--native-linking| \\
        |    --native-compile|--native-c-compile|--native-cpp-compile)
        |      COMPREPLY=($$(compgen -f -- "$$cur")); return ;;
        |  esac
@@ -2625,7 +2703,7 @@ object ScalinoCli:
        |    completions) _values 'shell' bash zsh fish; return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
-       |    --args-file|-o|--output|--test-framework|--native-clang|--native-clangpp|--native-linking|\\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-clang|--native-clangpp|--native-linking|\\
        |    --native-compile|--native-c-compile|--native-cpp-compile)
        |      _files; return ;;
        |  esac
