@@ -166,6 +166,11 @@ object ScalinoCli:
     if msg == CompilationFailed then System.err.println(msg)
     else System.err.println(Color.error(s"scalino: $msg"))
 
+  /** scala-cli's own wording and tag (note the double space). */
+  def fileNotFound(p: Path): Nothing =
+    System.err.println(s"[${Color.red("error")}]  File not found: ${p.toAbsolutePath.normalize}")
+    sys.exit(1)
+
   def exitBuildFailure(msg: String): Nothing =
     reportBuildFailure(msg)
     sys.exit(1)
@@ -249,9 +254,14 @@ object ScalinoCli:
     private def isSummary(l: String): Boolean =
       l.nonEmpty && l.head.isDigit && l.endsWith(" found") && (l.contains(" error") || l.contains(" warning"))
 
-    private def displayPath(path: String): String =
+    def emit(isWarning: Boolean, lines: List[String]): Unit =
+      val tag = if isWarning then Color.yellow("warn") else Color.red("error")
+      lines.foreach(l => System.err.println(s"[$tag] $l"))
+
+    def displayPath(path: String): String =
       val cwd = Paths.get("").toAbsolutePath.toString
-      if path.startsWith(cwd + "/") then
+      if !Paths.get(path).isAbsolute then "./" + (if path.startsWith("./") then path.drop(2) else path)
+      else if path.startsWith(cwd + "/") then
         val rest = path.drop(cwd.length + 1)
         "./" + (if rest.startsWith("./") then rest.drop(2) else rest)
       else path
@@ -505,13 +515,21 @@ object ScalinoCli:
     // string literal like `|  //> using dep "..."`, etc.), which isn't a
     // directive at all -- this repo's own cli/ScalinoCli.scala is full of such
     // mentions, and scanning "." pulls that file in as a source.
-    for src <- sources; rawLine <- readFile(src).linesIterator do
+    for src <- sources; (rawLine, lineIdx) <- readFile(src).linesIterator.zipWithIndex do
       val line = rawLine.trim
       if line.startsWith("//>") then
         anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
           val key = m.group(1)
           if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
-            System.err.println(Color.warn(s"scalino: warning: unsupported directive '//> using $key' in $src -- ignoring"))
+            // scala-cli-style diagnostic (it hard-errors on these; we keep going).
+            val keyIdx = rawLine.indexOf(key, rawLine.indexOf("using") + 5)
+            val values = rawLine.substring(keyIdx + key.length).trim
+            Diagnostics.emit(true, List(
+              s"${Diagnostics.displayPath(src.toString)}:${lineIdx + 1}:${keyIdx + 1}",
+              s"Unsupported directive: $key" + (if values.nonEmpty then s" with values: $values" else "") + " -- ignoring",
+              rawLine,
+              " " * keyIdx + "^" * key.length
+            ))
         }
         directiveValues(line, "dep", "deps", "dependency", "dependencies").foreach(vs => deps = deps ++ vs)
         directiveValues(line, "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
@@ -2313,7 +2331,9 @@ object ScalinoCli:
         def outPathFor(mc: String): Path = Paths.get(o.out.getOrElse(mc.substring(mc.lastIndexOf('.') + 1)))
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
         val outPath = outPathFor(mainClass)
-        if !o.quiet then println(Color.action(s"scalino: wrote $outPath (main class: $mainClass)", System.out))
+        if !o.quiet then
+          val shown = if outPath.isAbsolute || outPath.startsWith("..") then outPath.toString else "./" + outPath
+          println(s"Wrote ${outPath.toAbsolutePath.normalize}, run it with\n  $shown")
         0
       case "compile" =>
         compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)
@@ -2352,7 +2372,7 @@ object ScalinoCli:
     val o = defaultToCwd(parseRunOpts(args))
     if mode == "compile" && o.out.isDefined then
       die("compile: -o/--output is not valid here -- use 'scalino package -o' to produce a binary")
-    o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
+    o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
     val allExpanded = expandSources(o.sources)
     if allExpanded.isEmpty then die("no .scala files found")
     val (expanded, testSources) = partitionSources(allExpanded)
@@ -2375,7 +2395,7 @@ object ScalinoCli:
    *  doesn't call `partitionSources` at all. */
   def handleTest(args: Array[String]): Unit =
     val o = defaultToCwd(parseRunOpts(args))
-    o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
+    o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
     val expanded = expandSources(o.sources)
     if expanded.isEmpty then die("no .scala files found")
 
@@ -2431,7 +2451,6 @@ object ScalinoCli:
         if !o.quiet then println(Color.action("scalino: no tests found", System.out))
         0
       else
-        if !o.quiet then println(Color.action(s"scalino: found ${matches.length} test class(es): ${matches.map(_.className).sorted.mkString(", ")}", System.out))
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
@@ -2464,7 +2483,7 @@ object ScalinoCli:
    *  type-checks against the same inputs a real build would use. */
   def handleSetupIde(args: Array[String]): Unit =
     val o = defaultToCwd(parseRunOpts(args))
-    o.sources.find(!Files.exists(_)).foreach(p => die(s"no such file: $p"))
+    o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
     val allExpanded = expandSources(o.sources)
     if allExpanded.isEmpty then die("no .scala files found")
     val (expanded, testSources) = partitionSources(allExpanded)
@@ -2518,7 +2537,7 @@ object ScalinoCli:
     // and classDirectory, not a second one just for this file.
     val configPath = Paths.get(".scalino-build", "scalino-lsp.json")
     Files.write(configPath, json.getBytes("UTF-8"))
-    println(Color.action(s"scalino: wrote ${configPath.toAbsolutePath} -- point dist/scalino-lsp (or an editor's LSP binary override) at this project", System.out))
+    println(s"Wrote configuration file for ide in: ${configPath.toAbsolutePath}")
 
     // No editor-specific settings.json is written here anymore: install.sh
     // symlinks scalino-lsp onto PATH alongside scalino, and both editor
@@ -2659,7 +2678,6 @@ object ScalinoCli:
     val buildDir = Paths.get(".scalino-build")
     if Files.exists(buildDir) then
       deleteRecursively(buildDir)
-      System.err.println(Color.action(s"removed $buildDir", System.err))
 
   // Boolean flags accepted before the sub-command too (`scalino -w compile`),
   // mill/bun-style: they're hoisted to just after it. Flags that take a value
