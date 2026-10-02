@@ -5,7 +5,7 @@
 # fields in the third-party packaging metadata that can't fetch them at
 # eval/build time on its own:
 #   packaging/arch/PKGBUILD        (pkgver, sha256sums_x86_64/_aarch64)
-#   packaging/nix/sources.json     (version, linux-x86_64/linux-arm64 sha256)
+#   packaging/nix/sources.json     (version, all 4 platform sha256, stdlib sources jars)
 #   packaging/homebrew/scalino.rb  (version, all 4 platform sha256)
 #
 # Usage: build/10-update-package-metadata.sh vX.Y.Z
@@ -42,11 +42,30 @@ sed -i.bak \
 rm -f packaging/arch/PKGBUILD.bak
 
 # --- packaging/nix/sources.json ---
+# Also pins the stdlib -sources.jar files (scalino-lsp's go-to-definition into
+# scala-library/scala3-library): the Nix package installs them next to the
+# stdlib jars, since a store path can't be filled in by the CLI at run time.
+# SCALA_VERSION is the one this release was built with (the release may be
+# older than the checkout, so prefer the tag's own versions.env).
+scala_version="$(curl -fsSL "https://raw.githubusercontent.com/$repo/$tag/versions.env" | sed -n 's/^SCALA_VERSION=//p')"
+sha_src() {
+  curl -fsSL "https://repo1.maven.org/maven2/org/scala-lang/$1/$scala_version/$1-$scala_version-sources.jar" -o "$work/$1-src.jar" >&2
+  (sha256sum "$work/$1-src.jar" 2>/dev/null || shasum -a 256 "$work/$1-src.jar") | cut -d' ' -f1
+}
+sha_src_scala_library="$(sha_src scala-library)"
+sha_src_scala3_library="$(sha_src scala3-library_3)"
 cat > packaging/nix/sources.json <<EOF
 {
   "version": "$version",
   "linux-x86_64": { "sha256": "$sha_linux_x86_64" },
-  "linux-arm64":  { "sha256": "$sha_linux_arm64" }
+  "linux-arm64":  { "sha256": "$sha_linux_arm64" },
+  "macos-x86_64": { "sha256": "$sha_macos_x86_64" },
+  "macos-arm64":  { "sha256": "$sha_macos_arm64" },
+  "scalaVersion": "$scala_version",
+  "stdlibSources": {
+    "scala-library":     { "sha256": "$sha_src_scala_library" },
+    "scala3-library_3":  { "sha256": "$sha_src_scala3_library" }
+  }
 }
 EOF
 

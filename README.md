@@ -108,6 +108,50 @@ was bootstrapped from:
 ./hello
 ```
 
+## Hermetic / Nix builds
+
+Nix builds run without network access, except fixed-output derivations whose
+hash is declared up front. So dependencies need a lockfile that something
+else can fetch beforehand:
+
+```
+scalino lock .          # writes scalino.lock.json: per jar, path + URL + sha256
+scalino run . --offline # builds from the lock + local cache only, never the network
+```
+
+While `scalino.lock.json` exists, builds take their classpath from it
+instead of resolving through coursier. `SCALINO_CACHE=<dir>` (else
+`COURSIER_CACHE`) sets where the jars live, laid out as
+`<dir>/https/<host>/...`; `--offline` / `SCALINO_OFFLINE=1` forbids any
+network use. With the flake in `packaging/nix`:
+
+```nix
+scalino.lib.${system}.mkScalinoApp {
+  pname = "myapp";
+  src = ./.;                       # contains scalino.lock.json
+  # extraArgs = [ "--native-mode" "release-fast" ];
+}
+```
+
+This fetches every locked jar with `pkgs.fetchurl` and builds offline. Re-run
+`scalino lock` whenever dependencies change. The flake supports
+x86_64/aarch64 Linux and macOS.
+
+For editing, `mkScalinoDevShell` gives a `nix develop` shell with the same
+offline cache plus the locked `-sources.jar`s (and the pinned stdlib sources
+shipped in the package), so `scalino setup-ide .` and `scalino-lsp` work,
+including go-to-definition into libraries, without network:
+
+```nix
+devShells.${system}.default = scalino.lib.${system}.mkScalinoDevShell {
+  lockFile = ./scalino.lock.json;
+};
+```
+
+The shell's cache is a read-only store path and offline is on. To change
+dependencies, re-lock with a writable cache, then re-enter the shell:
+`SCALINO_OFFLINE=0 SCALINO_CACHE= scalino lock .`
+
 ## Editor support
 
 `dist/scalino-lsp` gives editors like Zed, VS Code, and Neovim Scala
