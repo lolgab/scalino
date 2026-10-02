@@ -177,7 +177,67 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     Range(Position(r.getStart().getLine(), r.getStart().getCharacter()), Position(r.getEnd().getLine(), r.getEnd().getCharacter()))
 
   private def toLocation(l0: l.Location): Location =
-    Location(l0.getUri(), toRange(l0.getRange()))
+    Location(clientUri(l0.getUri()), toRange(l0.getRange()))
+
+  /** The compiler reports dependency sources as
+   *  `jar:file:///x-sources.jar!/pkg/X.scala` (read in memory, see
+   *  patches/scala3-0014). Clients that can open such URIs (VS Code/Neovim
+   *  extensions in this repo set `SCALINO_LSP_JAR_URIS=1`) get them as-is;
+   *  for any other client extract the entry to a cache file lazily, only
+   *  when a definition result actually points at it. */
+  private val jarUris: Boolean = sys.env.get("SCALINO_LSP_JAR_URIS").exists(v => v == "1" || v == "true")
+  private val depsSrcRoot: Path =
+    Paths.get(System.getProperty("user.home"), ".cache", "scalino", "lsp-deps-src")
+
+  /** Documents the client opened by `jar:` URI (VS Code/Neovim go-to-def
+   *  into a dependency, then hover/go-to-def from there). The PC resolves
+   *  document URIs through `Paths.get(uri)` in many places, which can't take
+   *  `jar:`, so it sees a synthetic never-written `file:` URI instead
+   *  (the text always comes from the client's buffer); this maps it back. */
+  private val jarDocs = new java.util.concurrent.ConcurrentHashMap[String, String]()
+
+  private def pcUri(raw: String): URI =
+    if (!raw.startsWith("jar:")) new URI(raw)
+    else {
+      // VS Code percent-encodes the opaque part ("jar:file%3A///x.jar%21/..."):
+      // normalize to the plain "jar:file:///x.jar!/..." form we hand out.
+      val uri = "jar:" + new URI(raw).getSchemeSpecificPart
+      val sep = uri.indexOf("!/")
+      val entry = if (sep < 0) "Unknown.scala" else new URI("file:///" + uri.substring(sep + 2)).getPath.stripPrefix("/")
+      val virtual = depsSrcRoot.resolve("jar-open").resolve(Integer.toHexString(uri.hashCode)).resolve(entry).toUri
+      jarDocs.put(virtual.toString, uri)
+      virtual
+    }
+
+  private def clientUri(uri: String): String =
+    if (jarDocs.containsKey(uri)) jarDocs.get(uri)
+    else if (jarUris || !uri.startsWith("jar:file:")) uri
+    else
+      try {
+        val sep = uri.indexOf("!/")
+        val jar = Paths.get(new URI(uri.substring(4, sep)))
+        val entry = new URI("file:///" + uri.substring(sep + 2)).getPath.stripPrefix("/")
+        val cached = depsSrcRoot
+          .resolve(Integer.toHexString(jar.toString.hashCode))
+          .resolve(entry)
+        if (!Files.exists(cached)) {
+          val zf = new java.util.zip.ZipFile(jar.toFile)
+          try {
+            val ze = zf.getEntry(entry)
+            if (ze == null) return uri
+            Files.createDirectories(cached.getParent)
+            val tmp = Files.createTempFile(cached.getParent, cached.getFileName.toString, ".tmp")
+            try {
+              val in = zf.getInputStream(ze)
+              try Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+              finally in.close()
+              Files.move(tmp, cached, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+            } finally Files.deleteIfExists(tmp)
+          } finally zf.close()
+        }
+        cached.toUri.toString
+      } catch { case NonFatal(_) => uri }
 
   private def toTextEdit(e: l.TextEdit): TextEdit =
     TextEdit(toRange(e.getRange()), e.getNewText())
@@ -195,14 +255,14 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
   def didOpen(params: DidOpenTextDocumentParams): Unit = thisServer.synchronized {
     val document = params.textDocument
-    val uri = new URI(document.uri)
+    val uri = pcUri(document.uri)
     buffers(uri) = document.text
-    publishDiagnosticsFor(uri, document.uri)
+    if (!document.uri.startsWith("jar:")) publishDiagnosticsFor(uri, document.uri)
   }
 
   def didChange(params: DidChangeTextDocumentParams): Unit = thisServer.synchronized {
     val document = params.textDocument
-    val uri = new URI(document.uri)
+    val uri = pcUri(document.uri)
     val change = params.contentChanges.head
     assert(change.range.isEmpty, "TextDocumentSyncKind.Incremental support is not implemented")
     buffers(uri) = change.text
@@ -250,7 +310,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def didClose(params: DidCloseTextDocumentParams): Unit = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     buffers.remove(uri)
     bufferVersions.remove(uri)
     pendingDiagnostics.remove(uri).foreach(_.cancel(false))
@@ -258,7 +318,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def completion(params: TextDocumentPositionParams): CompletionList = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val result = requirePc().complete(offsetParams(uri, params.position), l.CompletionTriggerKind.Invoked)
     CompletionList(
       isIncomplete = result.isIncomplete(),
@@ -287,13 +347,13 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def definition(params: TextDocumentPositionParams): List[Location] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val result = requirePc().definition(offsetParams(uri, params.position))
     result.locations().asScala.map(toLocation).toList
   }
 
   def references(params: ReferenceParams): List[Location] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val offset = positionToOffset(text, params.position)
     val request = PcReferencesRequest(
@@ -306,19 +366,19 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def rename(params: RenameParams): WorkspaceEdit = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val edits = requirePc().rename(offsetParams(uri, params.position), params.newName)
     WorkspaceEdit(Map(params.textDocument.uri -> edits.asScala.map(toTextEdit).toList))
   }
 
   def documentHighlight(params: TextDocumentPositionParams): List[DocumentHighlight] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val result = requirePc().documentHighlight(offsetParams(uri, params.position))
     result.asScala.map(h => DocumentHighlight(toRange(h.getRange()), Option(h.getKind()).map(_.getValue()).getOrElse(1))).toList
   }
 
   def hover(params: TextDocumentPositionParams): Option[Hover] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val result = requirePc().hover(offsetParams(uri, params.position))
     result.toScala.map { sig =>
       val h = sig.toLsp()
@@ -332,7 +392,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def signatureHelp(params: TextDocumentPositionParams): SignatureHelp = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val result = requirePc().signatureHelp(offsetParams(uri, params.position))
     SignatureHelp(
       signatures = result.getSignatures().asScala.map { sig =>
@@ -358,18 +418,18 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   def implementation(params: TextDocumentPositionParams): List[Location] = Nil
 
   def typeDefinition(params: TextDocumentPositionParams): List[Location] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val result = requirePc().typeDefinition(offsetParams(uri, params.position))
     result.locations().asScala.map(toLocation).toList
   }
 
   def prepareRename(params: TextDocumentPositionParams): Option[Range] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     requirePc().prepareRename(offsetParams(uri, params.position)).toScala.map(toRange)
   }
 
   def selectionRange(params: SelectionRangeParams): List[Lsp.SelectionRange] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val offsets: List[OffsetParams] = params.positions.map(pos => offsetParams(uri, pos))
     def convert(sr: l.SelectionRange): Lsp.SelectionRange =
       Lsp.SelectionRange(toRange(sr.getRange()), Option(sr.getParent()).map(convert))
@@ -377,7 +437,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def inlayHint(params: InlayHintParams): List[Lsp.InlayHint] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val rangeParams = CompilerRangeParams(uri, text, positionToOffset(text, params.range.start), positionToOffset(text, params.range.end))
     // Enable every hint kind PC supports -- there's no separate LSP-level
@@ -433,7 +493,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
    *  line/character (nodes are sorted by position first since the encoding
    *  requires monotonically increasing positions). */
   def semanticTokens(params: DocumentSymbolParams): Lsp.SemanticTokens = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val nodes = requirePc().semanticTokens(CompilerVirtualFileParams(uri, text)).asScala.toList.sortBy(n => (n.start(), n.end()))
     val data = List.newBuilder[Int]
@@ -473,7 +533,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
    *  any) come back", so a thrown exception is treated the same as an empty
    *  result. */
   def codeAction(params: CodeActionParams): List[Lsp.CodeAction] = thisServer.synchronized {
-    val uri = new URI(params.textDocument.uri)
+    val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val startOffset = positionToOffset(text, params.range.start)
     val endOffset = positionToOffset(text, params.range.end)

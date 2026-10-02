@@ -1,0 +1,120 @@
+diff --git a/compiler/src/dotty/tools/dotc/core/Symbols.scala b/compiler/src/dotty/tools/dotc/core/Symbols.scala
+index 9982b82..fa11055 100644
+--- a/compiler/src/dotty/tools/dotc/core/Symbols.scala
++++ b/compiler/src/dotty/tools/dotc/core/Symbols.scala
+@@ -63,6 +63,11 @@ object Symbols extends SymUtils {
+   @sharable private val sourcesJarExistsCache: java.util.concurrent.ConcurrentHashMap[java.nio.file.Path, Boolean] =
+     new java.util.concurrent.ConcurrentHashMap()
+ 
++  /** `jar:` URI -> source read from a sibling `-sources.jar`, see
++   *  `ClassSymbol#sourceFromSourcesJar`. */
++  @sharable private val virtualSourceCache: java.util.concurrent.ConcurrentHashMap[String, SourceFile] =
++    new java.util.concurrent.ConcurrentHashMap()
++
+   /** A Symbol represents a Scala definition/declaration or a package.
+    *  @param myCoord The coordinates of the symbol (a position or an index)
+    *  @param id     A unique identifier of the symbol (unique per ContextBase)
+@@ -575,7 +580,7 @@ object Symbols extends SymUtils {
+      *  this machine, but real enough to pass `Symbol.source`'s `valid()`
+      *  check since `SourceFile#exists` doesn't look at the filesystem).
+      *  Derive the sibling `-sources.jar` of the binary jar backing this
+-     *  class and lazily extract the matching entry to a disk cache,
++     *  class and read the matching entry into an in-memory virtual file,
+      *  upgrading to that real file so go-to-definition/hover can resolve
+      *  into library sources instead of the bogus path silently dropping out
+      *  at `toUriOption` (`AbstractFile#exists` is a real filesystem check).
+@@ -621,25 +626,24 @@ object Symbols extends SymUtils {
+               // that's actually in the jar.
+               val segments = relPath.stripPrefix("./").replace('\\', '/').split("/").toList
+               val candidates = segments.tails.filter(_.sizeIs >= 2).map(_.mkString("/")).toList
+-              val cacheRoot = java.nio.file.Paths.get(System.getProperty("user.home"), ".cache", "scalino", "lsp-deps-src")
+-              val jarHash = java.lang.Integer.toHexString(sourcesJarPath.toString.hashCode)
+               val zf = new java.util.zip.ZipFile(sourcesJarPath.toFile)
+               try
+                 val found = candidates.iterator.map(c => (c, zf.getEntry(c))).find(_._2 != null)
+                 found match
+                   case None => NoSource
+                   case Some((entryName, entry)) =>
+-                    val cachedFile = cacheRoot.resolve(jarHash).resolve(entryName)
+-                    if !java.nio.file.Files.exists(cachedFile) then
+-                      java.nio.file.Files.createDirectories(cachedFile.getParent)
+-                      val tmp = java.nio.file.Files.createTempFile(cachedFile.getParent, cachedFile.getFileName.toString, ".tmp")
+-                      try
+-                        val in = zf.getInputStream(entry)
+-                        try java.nio.file.Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+-                        finally in.close()
+-                        java.nio.file.Files.move(tmp, cachedFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+-                      finally java.nio.file.Files.deleteIfExists(tmp)
+-                    if java.nio.file.Files.exists(cachedFile) then ctx.getSource(cachedFile.toString) else NoSource
++                    // Read the entry straight from the jar into an in-memory
++                    // `VirtualFile` whose path is the entry's `jar:` URI --
++                    // nothing is extracted to disk, and the editor is handed
++                    // that same URI (see PcDefinitionProvider). Memoized per
++                    // URI: `VirtualFile` has identity equality, so
++                    // `ctx.getSource` alone would re-read the entry for every
++                    // top-level class defined in the same file.
++                    val jarUri = "jar:" + sourcesJarPath.toUri.toString + "!/" + entryName
++                    virtualSourceCache.computeIfAbsent(jarUri, uri =>
++                      val in = zf.getInputStream(entry)
++                      val bytes = try in.readAllBytes() finally in.close()
++                      ctx.getSource(new io.VirtualFile(uri, bytes)))
+               finally zf.close()
+       catch case scala.util.control.NonFatal(_) => NoSource
+ 
+diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+index c910245..9fde7e8 100644
+--- a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
++++ b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+@@ -159,11 +159,13 @@ class PcDefinitionProvider(
+       // drop every classpath symbol).
+       val upgraded = symbol.source
+       val fromJarSources =
+-        if upgraded.exists && upgraded.file.exists && upgraded != pos.source then
++        if upgraded.exists && upgraded != pos.source then
+           val symPos = symbol.sourcePos
+-          Option(upgraded.file.jpath) match
+-            case Some(p) if symPos.exists => List(new Location(p.toUri.toString, symPos.toLsp))
+-            case _ => Nil
++          // In-memory `jar:file:///x-sources.jar!/pkg/X.scala` virtual file
++          // (patches/scala3-0014): its path IS the URI to report.
++          val uriStr = upgraded.file.path
++          if uriStr.startsWith("jar:") && symPos.exists then List(new Location(uriStr, symPos.toLsp))
++          else Nil
+         else Nil
+       if fromJarSources.nonEmpty then fromJarSources
+       else
+@@ -226,32 +228,12 @@ class PcDefinitionProvider(
+               try
+                 Option(zf.getEntry(entryName)) match
+                   case None => Nil
+-                  case Some(entry) =>
+-                    val cacheRoot = java.nio.file.Paths.get(
+-                      System.getProperty("user.home"), ".cache", "scalino", "lsp-deps-src"
+-                    )
+-                    val jarHash = java.lang.Integer.toHexString(sourcesJarPath.toString.hashCode)
+-                    val cachedFile = cacheRoot.resolve(jarHash).resolve(entryName)
+-                    if !java.nio.file.Files.exists(cachedFile) then
+-                      java.nio.file.Files.createDirectories(cachedFile.getParent)
+-                      val tmp = java.nio.file.Files.createTempFile(
+-                        cachedFile.getParent, cachedFile.getFileName.toString, ".tmp"
+-                      )
+-                      try
+-                        val in = zf.getInputStream(entry)
+-                        try java.nio.file.Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+-                        finally in.close()
+-                        java.nio.file.Files.move(
+-                          tmp, cachedFile,
+-                          java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+-                          java.nio.file.StandardCopyOption.ATOMIC_MOVE
+-                        )
+-                      finally java.nio.file.Files.deleteIfExists(tmp)
++                  case Some(_) =>
+                     // No pickled/classfile position to point at (see the
+                     // doc comment above) -- opening the right file at its
+                     // top beats not opening anything.
+                     List(new Location(
+-                      cachedFile.toUri.toString,
++                      "jar:" + sourcesJarPath.toUri.toString + "!/" + entryName,
+                       new Range(new Position(0, 0), new Position(0, 0))
+                     ))
+               finally zf.close()

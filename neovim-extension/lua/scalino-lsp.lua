@@ -61,6 +61,46 @@ local function reattach_open_buffers(cfg)
   end)
 end
 
+-- scalino-lsp reports dependency sources as
+-- `jar:file:///abs/x-sources.jar!/pkg/X.scala` (see SCALINO_LSP_JAR_URIS
+-- below) so they're read straight from the jar instead of an extracted copy.
+-- Neovim has no handler for that scheme: read the entry with `unzip -p`
+-- into a read-only scratch buffer.
+local function setup_jar_reader()
+  local group = vim.api.nvim_create_augroup("scalino_lsp_jar", { clear = true })
+  vim.api.nvim_create_autocmd("BufReadCmd", {
+    group = group,
+    pattern = "jar:*",
+    callback = function(args)
+      local name = args.match
+      local sep = name:find("!/", 1, true)
+      if not sep then
+        return
+      end
+      local jar = vim.uri_to_fname(name:sub(5, sep - 1))
+      local entry = vim.uri_decode(name:sub(sep + 2))
+      if vim.fn.executable("unzip") ~= 1 then
+        vim.notify("scalino-lsp: `unzip` not found on PATH, cannot open " .. name, vim.log.levels.ERROR)
+        return
+      end
+      local res = vim.system({ "unzip", "-p", jar, entry }, { text = true }):wait()
+      if res.code ~= 0 then
+        vim.notify(
+          "scalino-lsp: cannot read " .. entry .. " from " .. jar .. ": " .. (res.stderr or ""),
+          vim.log.levels.ERROR
+        )
+        return
+      end
+      local buf = args.buf
+      vim.bo[buf].buftype = "nofile"
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(res.stdout or "", "\n", { plain = true }))
+      vim.bo[buf].modifiable = false
+      vim.bo[buf].modified = false
+      vim.bo[buf].filetype = "scala"
+    end,
+  })
+end
+
 --- @param opts table|nil { path?: string, args?: string[], env?: table }
 function M.setup(opts)
   opts = opts or {}
@@ -69,9 +109,25 @@ function M.setup(opts)
   local cfg = {
     cmd = cmd,
     filetypes = { "scala" },
-    root_markers = { ".scalino-build", "build.sbt", ".git" },
-    cmd_env = opts.env,
+    root_dir = function(bufnr, on_dir)
+      if vim.api.nvim_buf_get_name(bufnr):find("^jar:") then
+        -- Read-only dependency source (above): reuse the running client's
+        -- root so hover/go-to-definition work from inside it. No client
+        -- yet => no project to attach to.
+        local c = vim.lsp.get_clients({ name = "scalino_lsp" })[1]
+        if c and c.root_dir then
+          on_dir(c.root_dir)
+        end
+        return
+      end
+      local root = vim.fs.root(bufnr, { ".scalino-build", "build.sbt", ".git" })
+      if root then
+        on_dir(root)
+      end
+    end,
+    cmd_env = vim.tbl_extend("force", { SCALINO_LSP_JAR_URIS = "1" }, opts.env or {}),
   }
+  setup_jar_reader()
   cfg.on_exit = function(_, _, _)
     reattach_open_buffers(cfg)
   end
