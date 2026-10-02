@@ -31,6 +31,7 @@ object LinkDriver:
     embedResources: Boolean = false,
     multithreading: Boolean = false,
     directCodegen: Boolean = false,
+    compactHeaders: Boolean = true,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
     incrementalCompilation: Boolean = false,
@@ -54,6 +55,8 @@ object LinkDriver:
         case "--embed-resources" => o = o.copy(embedResources = true)
         case "--multithreading" => o = o.copy(multithreading = true)
         case "--direct-codegen" => o = o.copy(directCodegen = true)
+        case "--compact-headers" => o = o.copy(compactHeaders = true)
+        case "--no-compact-headers" => o = o.copy(compactHeaders = false)
         case "--gc-stw-sweep" => o = o.copy(gcStwSweep = true)
         case "--heap-histogram" => o = o.copy(heapHistogram = true)
         case "--incremental-compilation" => o = o.copy(incrementalCompilation = true)
@@ -132,6 +135,7 @@ object LinkDriver:
           .withEmbedResources(opts.embedResources)
           .withMultithreading(if opts.multithreading then Some(true) else None)
           .withLLVMDirectCodeGen(opts.directCodegen)
+          .withCompactHeaders(opts.compactHeaders)
           .withGCStwSweep(opts.gcStwSweep)
           // DirectCodeGen now has its own (scoped) DIBuilder-based debug-info
           // support (Phase 3), so debug info no longer needs forcing off for

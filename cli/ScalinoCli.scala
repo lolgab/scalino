@@ -421,6 +421,7 @@ object ScalinoCli:
     nativeEmbedResources: Option[Boolean],
     nativeMultithreading: Option[Boolean],
     nativeDirectCodegen: Option[Boolean],
+    nativeCompactHeaders: Option[Boolean],
     nativeGcStwSweep: Option[Boolean],
     nativeHeapHistogram: Option[Boolean],
     nativeOptimize: Option[Boolean],
@@ -447,7 +448,7 @@ object ScalinoCli:
     "repository", "repositories", "file", "files", "exclude",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativeTarget",
-    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize"
+    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize"
     // deliberately NOT "nativeVersion": this toolchain only ever targets the
     // one pinned scala-native version it was built for (see the "scala"
     // directive's own version-mismatch warning below for the same reason) --
@@ -503,6 +504,7 @@ object ScalinoCli:
     var nativeEmbedResources = Option.empty[Boolean]
     var nativeMultithreading = Option.empty[Boolean]
     var nativeDirectCodegen = Option.empty[Boolean]
+    var nativeCompactHeaders = Option.empty[Boolean]
     var nativeGcStwSweep = Option.empty[Boolean]
     var nativeHeapHistogram = Option.empty[Boolean]
     var nativeOptimize = Option.empty[Boolean]
@@ -558,6 +560,7 @@ object ScalinoCli:
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
+        directiveBool(line, "nativeCompactHeaders").foreach(v => nativeCompactHeaders = Some(v))
         directiveBool(line, "nativeGcStwSweep").foreach(v => nativeGcStwSweep = Some(v))
         directiveBool(line, "nativeHeapHistogram").foreach(v => nativeHeapHistogram = Some(v))
         directiveBool(line, "nativeOptimize").foreach(v => nativeOptimize = Some(v))
@@ -565,7 +568,7 @@ object ScalinoCli:
       deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile,
-      nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
+      nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct
     )
 
@@ -2131,6 +2134,7 @@ object ScalinoCli:
     embedResources: Boolean = false,
     multithreading: Boolean = true,
     directCodegen: Boolean = true,
+    compactHeaders: Boolean = true,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
     optimize: Boolean = true,
@@ -2166,6 +2170,14 @@ object ScalinoCli:
       // OS-sniffing already makes.
       directCodegen = directives.nativeDirectCodegen
         .orElse(o.cliNativeDirectCodegen)
+        .getOrElse(!sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")),
+      // Default-on everywhere except Windows (untested there), with an explicit
+      // opt-out via the directive or `--native-compact-headers=false`. Only
+      // takes effect for 64-bit targets linked with the immix GC (see
+      // NativeConfig.compactHeadersEnabled), anything else silently falls back
+      // to regular object headers.
+      compactHeaders = directives.nativeCompactHeaders
+        .orElse(o.cliNativeCompactHeaders)
         .getOrElse(!sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")),
       // Opt-in, commix GC only: see NativeConfig.gcStwSweep.
       gcStwSweep = directives.nativeGcStwSweep.getOrElse(false) || o.cliNativeGcStwSweep,
@@ -2266,6 +2278,7 @@ object ScalinoCli:
       (if nativeOpts.multithreading then List("--multithreading") else Nil) ++
       (if incremental then List("--incremental-compilation") else Nil) ++
       (if nativeOpts.directCodegen then List("--direct-codegen") else Nil) ++
+      (if nativeOpts.compactHeaders then List("--compact-headers") else List("--no-compact-headers")) ++
       (if nativeOpts.gcStwSweep then List("--gc-stw-sweep") else Nil) ++
       (if nativeOpts.heapHistogram then List("--heap-histogram") else Nil) ++
       (if !nativeOpts.optimize then List("--no-opt") else Nil) ++
@@ -2408,6 +2421,11 @@ object ScalinoCli:
        |                                        toolchain itself running as compiled Scala Native
        |                                        code with a discoverable libLLVM, else it's a
        |                                        silent no-op; pass =false to opt out)
+       |  --native-compact-headers[=true|false]  4 byte object headers (class id and lock
+       |                                        bits) instead of 8-16 bytes: less memory for
+       |                                        every object and array (on by default, except
+       |                                        on Windows; only for 64-bit targets with the
+       |                                        immix GC; pass =false to opt out)
        |  --native-gc-stw-sweep      commix GC only: keep mutators paused through the
        |                             parallel sweep too, instead of resuming them once
        |                             marking finishes (off by default; throughput over
@@ -2449,6 +2467,7 @@ object ScalinoCli:
        |  //> using nativeEmbedResources true
        |  //> using nativeMultithreading false   (on by default)
        |  //> using nativeDirectCodegen false   (on by default except on Windows)
+       |  //> using nativeCompactHeaders false   (on by default except on Windows)
        |  //> using nativeGcStwSweep true   (commix GC only; off by default)
        |  //> using nativeHeapHistogram true   (live-heap histogram GC debug dump; off by default, adds ~7.5MB to binary)
        |  //> using nativeOptimize false   (Interflow NIR optimizer; on by default)
@@ -2622,6 +2641,7 @@ object ScalinoCli:
     cliEmbedResources: Boolean = false,
     cliNativeMultithreading: Option[Boolean] = None,
     cliNativeDirectCodegen: Option[Boolean] = None,
+    cliNativeCompactHeaders: Option[Boolean] = None,
     cliNativeGcStwSweep: Boolean = false,
     cliNativeHeapHistogram: Boolean = false,
     cliNativeOptimize: Option[Boolean] = None
@@ -2686,6 +2706,12 @@ object ScalinoCli:
           if (v != "true" && v != "false")
             die(s"--native-direct-codegen=$v: expected true or false")
           o = o.copy(cliNativeDirectCodegen = Some(v == "true"))
+        case "--native-compact-headers" => o = o.copy(cliNativeCompactHeaders = Some(true))
+        case f if f.startsWith("--native-compact-headers=") =>
+          val v = f.drop("--native-compact-headers=".length)
+          if (v != "true" && v != "false")
+            die(s"--native-compact-headers=$v: expected true or false")
+          o = o.copy(cliNativeCompactHeaders = Some(v == "true"))
         case "--native-gc-stw-sweep" => o = o.copy(cliNativeGcStwSweep = true)
         case "--native-heap-histogram" => o = o.copy(cliNativeHeapHistogram = true)
         case "--native-optimize" => o = o.copy(cliNativeOptimize = Some(true))
@@ -2997,7 +3023,7 @@ object ScalinoCli:
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-target --embed-resources --native-multithreading " +
-    "--native-direct-codegen --native-gc-stw-sweep --native-optimize -h --help"
+    "--native-direct-codegen --native-compact-headers --native-gc-stw-sweep --native-optimize -h --help"
 
   private def bashCompletion: String =
     s"""_scalino() {
