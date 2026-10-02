@@ -305,6 +305,9 @@ object ScalinoCli:
   def runCaptureStdout(cmd: List[String]): (Int, String) =
     val pb = new JProcessBuilder(cmd.asJava)
     pb.redirectError(JProcessBuilder.Redirect.INHERIT)
+    // Only `cs` reads these; harmless for any other command routed through here.
+    envOpt("SCALINO_CACHE").foreach(c => pb.environment().put("COURSIER_CACHE", c))
+    if offlineMode then pb.environment().put("COURSIER_MODE", "offline")
     val proc = pb.start()
     val out = readAll(proc.getInputStream)
     (proc.waitFor(), out.trim)
@@ -673,22 +676,347 @@ object ScalinoCli:
   def resolveDeps(deps: List[String], cacheDir: Path, repositories: List[String] = Nil): String =
     if deps.isEmpty then ""
     else
-      Files.createDirectories(cacheDir)
-      val key = sanitizeKey((deps.sorted ::: repositories.sorted).mkString(","))
-      val cacheFile = cacheDir.resolve(s"deps-$key.cp")
-      val cached = Option.when(Files.exists(cacheFile))(readFile(cacheFile)).filter(cachedClasspathStillValid)
-      cached match
-        case Some(cp) => cp
-        case None =>
-          val cs = s"$dist/scalino-cs"
-          val coords = deps.map(toCoursierCoord) ::: alwaysIncludedArtifacts
-          val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
-          val repoFlags = repositories.flatMap(r => List("-r", r))
+      // scalino.lock.json (see `scalino lock`) wins over everything: when it
+      // covers this dependency set and its artifacts are on disk, no `cs`
+      // process (and no network) is involved at all.
+      lockedClasspath(lockKeyFor(deps, repositories)).getOrElse {
+        if !offlineMode && loadLock().nonEmpty then
+          System.err.println(Color.warn(
+            s"scalino: warning: ${deps.mkString(", ")} not covered by $LockFileName -- run `scalino lock` to update it"))
+        Files.createDirectories(cacheDir)
+        val key = sanitizeKey((deps.sorted ::: repositories.sorted).mkString(","))
+        val cacheFile = cacheDir.resolve(s"deps-$key.cp")
+        val cached = Option.when(Files.exists(cacheFile))(readFile(cacheFile)).filter(cachedClasspathStillValid)
+        cached.getOrElse {
           System.err.println(Color.action(s"scalino: resolving ${deps.mkString(", ")}"))
-          val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: repoFlags ::: List("--classpath"))
-          if code != 0 then fail(s"dependency resolution failed for: ${deps.mkString(", ")}")
+          val cp = csFetchClasspath(deps, repositories)
           Files.write(cacheFile, cp.getBytes("UTF-8"))
           cp
+        }
+      }
+
+  /** The raw `cs fetch --classpath` call behind `resolveDeps` (no caching, no
+   *  lockfile) -- also what `scalino lock` runs to (re)generate the lock. */
+  private def csFetchClasspath(deps: List[String], repositories: List[String]): String =
+    val cs = s"$dist/scalino-cs"
+    val coords = deps.map(toCoursierCoord) ::: alwaysIncludedArtifacts
+    val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
+    val repoFlags = repositories.flatMap(r => List("-r", r))
+    val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: repoFlags ::: List("--classpath"))
+    if code != 0 then
+      val hint = if offlineMode then " (offline mode: every artifact must already be in the cache -- see `scalino lock`)" else ""
+      fail(s"dependency resolution failed for: ${deps.mkString(", ")}$hint")
+    cp
+
+  // ---------------------------------------------------------------------
+  // Offline mode + lockfile, for hermetic builds (Nix, Bazel, air-gapped CI).
+  //
+  // `scalino lock` records, per dependency set, the exact jars `cs fetch`
+  // resolved: cache-relative path, source URL and sha256. With a lockfile
+  // present `resolveDeps` builds the classpath straight from it (no coursier
+  // resolution => no POMs needed, transitive versions pinned), and an
+  // external tool can fetch every `{url, sha256}` up front (Nix:
+  // `pkgs.fetchurl` per artifact) and lay the files out at `path` under
+  // $SCALINO_CACHE. `--offline`/SCALINO_OFFLINE=1 additionally forbids any
+  // network use (cs runs with COURSIER_MODE=offline).
+  // ---------------------------------------------------------------------
+
+  val LockFileName = "scalino.lock.json"
+
+  private def envOpt(name: String): Option[String] =
+    Option(System.getenv(name)).filter(_.nonEmpty)
+
+  /** Set by `--offline` (parseRunOpts) or SCALINO_OFFLINE=1. */
+  private var offlineMode: Boolean = envOpt("SCALINO_OFFLINE").exists(_ != "0")
+
+  /** Where coursier keeps downloaded artifacts: SCALINO_CACHE, else
+   *  COURSIER_CACHE (used as-is, laid out as `<root>/https/<host>/...`),
+   *  else coursier's platform default. */
+  def coursierCacheRoot: Path =
+    envOpt("SCALINO_CACHE").orElse(envOpt("COURSIER_CACHE")).map(Paths.get(_)).getOrElse {
+      val home = System.getProperty("user.home")
+      if System.getProperty("os.name", "").contains("Mac") then Paths.get(home, "Library", "Caches", "Coursier", "v1")
+      else Paths.get(envOpt("XDG_CACHE_HOME").getOrElse(s"$home/.cache"), "coursier", "v1")
+    }
+
+  /** One locked jar. `path` is relative to the cache root (`https/<host>/...`)
+   *  unless `local`, in which case it is an absolute path to an artifact that
+   *  came from a `file:` repository (not reproducible; kept so the lock still
+   *  yields a complete classpath on the machine that made it). */
+  case class LockArtifact(path: String, url: Option[String], sha256: Option[String], local: Boolean)
+
+  def lockKeyFor(deps: List[String], repositories: List[String]): String =
+    (deps.sorted ::: repositories.sorted).mkString(",")
+
+  private val Sha256K: Array[Int] = Array(
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  )
+
+  /** Hand-rolled SHA-256 (FIPS 180-4): this toolchain's javalib has no
+   *  java.security.MessageDigest, and the digest must match what Nix's
+   *  fetchurl computes over the same bytes. */
+  def sha256Hex(data: Array[Byte]): String =
+    val h = Array(0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19)
+    // message || 0x80 || zero pad || 64-bit big-endian bit length, to a multiple of 64 bytes
+    val padded = new Array[Byte]((data.length + 9 + 63) / 64 * 64)
+    System.arraycopy(data, 0, padded, 0, data.length)
+    padded(data.length) = 0x80.toByte
+    val bitLen = data.length.toLong * 8
+    for k <- 0 until 8 do padded(padded.length - 1 - k) = ((bitLen >>> (8 * k)) & 0xff).toByte
+    val w = new Array[Int](64)
+    for block <- 0 until padded.length / 64 do
+      for t <- 0 until 16 do
+        val o = block * 64 + t * 4
+        w(t) = ((padded(o) & 0xff) << 24) | ((padded(o + 1) & 0xff) << 16) | ((padded(o + 2) & 0xff) << 8) | (padded(o + 3) & 0xff)
+      for t <- 16 until 64 do
+        val s0 = Integer.rotateRight(w(t - 15), 7) ^ Integer.rotateRight(w(t - 15), 18) ^ (w(t - 15) >>> 3)
+        val s1 = Integer.rotateRight(w(t - 2), 17) ^ Integer.rotateRight(w(t - 2), 19) ^ (w(t - 2) >>> 10)
+        w(t) = w(t - 16) + s0 + w(t - 7) + s1
+      var a = h(0); var b = h(1); var c = h(2); var d = h(3)
+      var e = h(4); var f = h(5); var g = h(6); var hh = h(7)
+      for t <- 0 until 64 do
+        val bigS1 = Integer.rotateRight(e, 6) ^ Integer.rotateRight(e, 11) ^ Integer.rotateRight(e, 25)
+        val ch = (e & f) ^ (~e & g)
+        val t1 = hh + bigS1 + ch + Sha256K(t) + w(t)
+        val bigS0 = Integer.rotateRight(a, 2) ^ Integer.rotateRight(a, 13) ^ Integer.rotateRight(a, 22)
+        val maj = (a & b) ^ (a & c) ^ (b & c)
+        val t2 = bigS0 + maj
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2
+      h(0) += a; h(1) += b; h(2) += c; h(3) += d; h(4) += e; h(5) += f; h(6) += g; h(7) += hh
+    h.map(x => (0 until 8).map(k => Integer.toHexString((x >>> (28 - 4 * k)) & 0xf)).mkString).mkString
+
+  private def sha256Hex(p: Path): String = sha256Hex(Files.readAllBytes(p))
+
+  private def lockArtifactFor(classpathEntry: String): LockArtifact =
+    val abs = Paths.get(classpathEntry).toAbsolutePath.normalize
+    val root = coursierCacheRoot.toAbsolutePath.normalize
+    val rel: Option[String] =
+      if abs.startsWith(root) then Some(root.relativize(abs).toString)
+      else
+        val s = abs.toString
+        List("/https/", "/http/").map(s.indexOf(_)).filter(_ >= 0).minOption.map(i => s.substring(i + 1))
+    rel.filter(r => r.startsWith("https/") || r.startsWith("http/")) match
+      case Some(r) =>
+        val slash = r.indexOf('/')
+        LockArtifact(r, Some(r.substring(0, slash) + "://" + r.substring(slash + 1)), Some(sha256Hex(abs)), false)
+      case None =>
+        System.err.println(Color.warn(s"scalino: warning: $abs is not from a remote repository -- lock entry is machine-local"))
+        LockArtifact(abs.toString, None, None, true)
+
+  private var lockCache: Option[Map[String, List[LockArtifact]]] = None
+
+  /** Parsed `scalino.lock.json` (dependency-set key -> artifacts in classpath
+   *  order); empty if the file doesn't exist. */
+  private def loadLock(): Map[String, List[LockArtifact]] =
+    lockCache.getOrElse {
+      val p = Paths.get(LockFileName)
+      val parsed =
+        if !Files.exists(p) then Map.empty[String, List[LockArtifact]]
+        else
+          try
+            def obj(a: Any): Map[String, Any] = a.asInstanceOf[Map[String, Any]]
+            def arr(a: Any): List[Any] = a.asInstanceOf[List[Any]]
+            val sets = obj(obj(new MiniJsonParser(readFile(p)).parseDocument())("sets"))
+            sets.map { case (key, set) =>
+              key -> arr(obj(set)("artifacts")).map { a =>
+                val m = obj(a)
+                LockArtifact(
+                  m("path").asInstanceOf[String],
+                  m.get("url").map(_.asInstanceOf[String]),
+                  m.get("sha256").map(_.asInstanceOf[String]),
+                  m.get("local").contains(true)
+                )
+              }
+            }
+          catch case scala.util.control.NonFatal(e) => fail(s"$LockFileName: malformed (${e.getMessage}) -- regenerate with `scalino lock`")
+      lockCache = Some(parsed)
+      parsed
+    }
+
+  private def lockedClasspath(key: String): Option[String] =
+    loadLock().get(key).flatMap { arts =>
+      val root = coursierCacheRoot
+      val paths = arts.map(a => if a.local then Paths.get(a.path) else root.resolve(a.path))
+      val missing = paths.filterNot(Files.exists(_))
+      if missing.isEmpty then Some(paths.map(_.toString).mkString(CP_SEP))
+      else if offlineMode then
+        fail(s"offline: ${missing.size} artifact(s) from $LockFileName missing under $root, e.g. ${missing.head} " +
+          "-- pre-populate the cache (SCALINO_CACHE) from the lockfile")
+      else None // not downloaded yet: fall back to a normal `cs fetch`
+    }
+
+  /** The `-sources.jar`s `setup-ide` wants (see `fetchSourcesBestEffort`),
+   *  recorded in the lock so an external fetcher can place them next to the
+   *  classes jars -- that sibling layout is how scalino-lsp finds them.
+   *  Best-effort like its sibling: a dependency tree where `cs` can't find
+   *  every sources jar just yields none for that set. */
+  private def csFetchSourceJars(deps: List[String], repositories: List[String]): List[String] =
+    val repoFlags = repositories.flatMap(r => List("-r", r))
+    val (code, out) = runCaptureStdout(
+      s"$dist/scalino-cs" :: "fetch" :: deps.map(toCoursierCoord) ::: repoFlags ::: List("--classifier", "sources"))
+    if code != 0 then
+      System.err.println(Color.warn(s"scalino: warning: no sources jars recorded for ${deps.mkString(", ")} (not all are published)"))
+      Nil
+    else out.linesIterator.map(_.trim).filter(_.nonEmpty).toList
+
+  /** `scalino lock [sources...]`: resolves every dependency set the other
+   *  commands would resolve (main, test.dep, compile-only; with and without
+   *  test/ sources' directives) and writes `scalino.lock.json`. */
+  def handleLock(args: Array[String]): Unit =
+    val o = defaultToCwd(parseRunOpts(args))
+    o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
+    val allExpanded = expandSources(o.sources)
+    if allExpanded.isEmpty then die("no .scala files found")
+    val (mainSources, _) = partitionSources(allExpanded)
+
+    val groups = scala.collection.mutable.LinkedHashMap.empty[String, (List[String], List[String])]
+    for srcs <- List(mainSources, allExpanded).filter(_.nonEmpty) do
+      val d = parseDirectives(srcs)
+      val repos = (d.repositories ++ o.cliRepositories).distinct
+      val sets = List(
+        (d.deps ++ o.cliDeps).distinct,
+        d.testDeps,
+        (d.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
+      )
+      for ds <- sets if ds.nonEmpty do groups.getOrElseUpdate(lockKeyFor(ds, repos), (ds, repos))
+
+    try
+      val resolved = groups.toList.sortBy(_._1).map { case (key, (ds, repos)) =>
+        System.err.println(Color.action(s"scalino: locking ${ds.mkString(", ")}"))
+        val cp = csFetchClasspath(ds, repos)
+        (key, ds, repos, cp.split(CP_SEP).filter(_.nonEmpty).toList.map(lockArtifactFor), csFetchSourceJars(ds, repos).map(lockArtifactFor).filter(!_.local))
+      }
+      def artifactJson(a: LockArtifact): String =
+        val fields =
+          List(Some("path" -> jsonStr(a.path)), a.url.map(u => "url" -> jsonStr(u)),
+            a.sha256.map(h => "sha256" -> jsonStr(h)), Option.when(a.local)("local" -> "true")).flatten
+        fields.map((k, v) => s"${jsonStr(k)}: $v").mkString("{", ", ", "}")
+      def artifactsJson(arts: List[LockArtifact]): String =
+        if arts.isEmpty then "[]"
+        else arts.map(a => "        " + artifactJson(a)).mkString("[\n", ",\n", "\n      ]")
+      val setsJson = resolved.map { case (key, ds, repos, arts, srcs) =>
+        s"""    ${jsonStr(key)}: {
+           |      "deps": ${jsonArr(ds)},
+           |      "repositories": ${jsonArr(repos)},
+           |      "artifacts": ${artifactsJson(arts)},
+           |      "sources": ${artifactsJson(srcs)}
+           |    }""".stripMargin
+      }
+      val json =
+        s"""{
+           |  "version": 1,
+           |  "scalino": ${jsonStr(BuildInfo.scalinoVersion)},
+           |  "sets": {
+           |${setsJson.mkString(",\n")}
+           |  }
+           |}
+           |""".stripMargin
+      Files.write(Paths.get(LockFileName), json.getBytes("UTF-8"))
+      println(s"Wrote $LockFileName (${resolved.map(_._4.size).sum} artifacts in ${resolved.size} dependency set(s))")
+    catch case BuildFailed(msg) => exitBuildFailure(msg)
+
+  /** Just enough JSON to read back `scalino.lock.json`: objects -> Map,
+   *  arrays -> List, strings, numbers (Double), booleans, null. */
+  private final class MiniJsonParser(s: String):
+    private var i = 0
+
+    private def err(msg: String): Nothing = throw new IllegalArgumentException(s"$msg at offset $i")
+    private def ws(): Unit = while i < s.length && s(i).isWhitespace do i += 1
+    private def peek: Char = if i < s.length then s(i) else err("unexpected end of input")
+
+    def parseDocument(): Any =
+      val v = value()
+      ws()
+      if i != s.length then err("trailing data")
+      v
+
+    private def value(): Any =
+      ws()
+      peek match
+        case '{' => obj()
+        case '[' => arr()
+        case '"' => str()
+        case 't' => lit("true", true)
+        case 'f' => lit("false", false)
+        case 'n' => lit("null", null)
+        case _ => num()
+
+    private def lit(word: String, v: Any): Any =
+      if !s.startsWith(word, i) then err(s"expected $word")
+      i += word.length
+      v
+
+    private def num(): Double =
+      val start = i
+      while i < s.length && "+-0123456789.eE".indexOf(s(i)) >= 0 do i += 1
+      if start == i then err("unexpected character")
+      s.substring(start, i).toDouble
+
+    private def str(): String =
+      i += 1
+      val sb = new StringBuilder
+      while peek != '"' do
+        if s(i) == '\\' then
+          i += 1
+          peek match
+            case 'n' => sb.append('\n')
+            case 't' => sb.append('\t')
+            case 'r' => sb.append('\r')
+            case 'b' => sb.append('\b')
+            case 'f' => sb.append('\f')
+            case 'u' =>
+              sb.append(Integer.parseInt(s.substring(i + 1, i + 5), 16).toChar)
+              i += 4
+            case c => sb.append(c)
+        else sb.append(s(i))
+        i += 1
+      i += 1
+      sb.toString
+
+    private def arr(): List[Any] =
+      i += 1
+      ws()
+      if peek == ']' then { i += 1; Nil }
+      else
+        val b = List.newBuilder[Any]
+        var more = true
+        while more do
+          b += value()
+          ws()
+          peek match
+            case ',' => i += 1
+            case ']' => i += 1; more = false
+            case _ => err("expected ',' or ']'")
+        b.result()
+
+    private def obj(): Map[String, Any] =
+      i += 1
+      ws()
+      if peek == '}' then { i += 1; Map.empty }
+      else
+        val b = Map.newBuilder[String, Any]
+        var more = true
+        while more do
+          ws()
+          if peek != '"' then err("expected string key")
+          val k = str()
+          ws()
+          if peek != ':' then err("expected ':'")
+          i += 1
+          b += k -> value()
+          ws()
+          peek match
+            case ',' => i += 1
+            case '}' => i += 1; more = false
+            case _ => err("expected ',' or '}'")
+        b.result()
 
   /** Best-effort: also fetches `-sources.jar` classifiers for `deps`
    *  (transitively, so a click into a transitive dependency's symbols works
@@ -709,7 +1037,7 @@ object ScalinoCli:
         Files.createDirectories(cacheDir)
         val key = sanitizeKey((deps.sorted ::: repositories.sorted).mkString(","))
         val marker = cacheDir.resolve(s"deps-$key.sources-fetched")
-        if !Files.exists(marker) then
+        if !offlineMode && !Files.exists(marker) then
           val cs = s"$dist/scalino-cs"
           val coords = deps.map(toCoursierCoord)
           val repoFlags = repositories.flatMap(r => List("-r", r))
@@ -739,7 +1067,7 @@ object ScalinoCli:
       val libDir = Paths.get(dist, "lib")
       Files.createDirectories(libDir)
       val marker = libDir.resolve(s".stdlib-sources-fetched-${BuildInfo.scalaVersion}")
-      if !Files.exists(marker) then
+      if !offlineMode && !Files.exists(marker) then
         val cs = s"$dist/scalino-cs"
         val artifacts = List(
           ("org.scala-lang", "scala-library"),
@@ -2042,6 +2370,19 @@ object ScalinoCli:
     s"""|  --no-incremental           always fully recompile (skip the incremental-compile cache)
        |""".stripMargin
 
+  private def oOffline: String =
+    s"""|  --offline                  never touch the network: resolve from $LockFileName and the
+       |                             local artifact cache only (also SCALINO_OFFLINE=1). Cache dir:
+       |                             $$SCALINO_CACHE (-> COURSIER_CACHE), else coursier's default
+       |""".stripMargin
+
+  private def lockNote: String =
+    s"""|lockfile:
+       |  `scalino lock <sources...>` resolves all dependencies and writes $LockFileName
+       |  (per artifact: cache-relative path, URL, sha256). While it exists, builds use it
+       |  instead of resolving -- reproducible, and fetchable up front by Nix and friends.
+       |""".stripMargin
+
   private def oProgArgs: String =
     s"""|  -- <args...>               program args (run) or test-framework filter args (test),
        |                             e.g. `scalino test . -- "*MySuite*"` (munit/utest-style filter)
@@ -2185,8 +2526,9 @@ object ScalinoCli:
          |  scalino package <sources...> [options] -o <out>   compile and link a native binary
          |  scalino test <sources...> [options] [-- <framework args>]   compile and run tests
          |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
+         |  scalino lock <sources...> [options]    resolve dependencies and write scalino.lock.json
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
-         |  scalino clean                          delete the .scalino-build directory
+         |  scalino clean                         delete the .scalino-build directory
          |  scalino version                        print version info
          |  scalino --help                         this message
          |  scalino <command> --help               help for one command
@@ -2194,16 +2536,17 @@ object ScalinoCli:
          |$sourcesNote
          |$incrementalNote
          |${Color.bold("options:", out)}
-         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oNoInc$oProgArgs
+         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oNoInc$oOffline$oProgArgs
          |$nativeHeader$nativeOpts
          |$directivesBlock
+         |$lockNote
          |$testNote
          |$setupIdeNote
          |$completionsNote""".stripMargin
     )
 
   val HelpCommands: Set[String] =
-    Set("run", "compile", "package", "test", "setup-ide", "completions", "clean", "version")
+    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "version")
 
   /** `scalino <command> --help`: usage plus only the options/notes that apply to
    *  that command. */
@@ -2212,7 +2555,7 @@ object ScalinoCli:
       s"$desc\n\n${Color.bold("usage:", out)}\n  $usage\n\n"
     def opts(parts: String*): String =
       s"${Color.bold("options:", out)}\n${parts.mkString}\n"
-    val common = oDeps + oRepo + oScala + oScalac + oArgsFile + oVerbose + oQuiet + oColor + oNoInc
+    val common = oDeps + oRepo + oScala + oScalac + oArgsFile + oVerbose + oQuiet + oColor + oNoInc + oOffline
     val text = cmd match
       case "run" =>
         head("scalino run <sources...> [options] [-- <program args>]", "Compile and run.") +
@@ -2236,6 +2579,10 @@ object ScalinoCli:
       case "setup-ide" =>
         head("scalino setup-ide <sources...> [options]", "Write .scalino-build/scalino-lsp.json for editor LSP support.") +
           sourcesNote + "\n" + opts(common) + directivesBlock + "\n" + setupIdeNote
+      case "lock" =>
+        head("scalino lock <sources...> [options]", s"Resolve all dependencies and write $LockFileName.") +
+          sourcesNote + "\n" + opts(oDeps + oRepo + oScala + oScalac + oArgsFile + oVerbose + oQuiet + oColor + oOffline) +
+          directivesBlock + "\n" + lockNote
       case "completions" =>
         head("scalino completions <bash|zsh|fish>", "Print a shell completion script to stdout.") + completionsNote
       case "clean" =>
@@ -2313,6 +2660,7 @@ object ScalinoCli:
         case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
         case "--test-only" => o = o.copy(testOnly = Some(args(i + 1))); i += 1
         case "--no-incremental" => o = o.copy(noIncremental = true)
+        case "--offline" => offlineMode = true
         case "--native-version" =>
           die("--native-version is not supported -- this toolchain only ever targets the one pinned scala-native version it was built for")
         case "--native-mode" => o = o.copy(cliNativeMode = Some(args(i + 1))); i += 1
@@ -2641,12 +2989,12 @@ object ScalinoCli:
   // themselves (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
   // ---------------------------------------------------------------------
 
-  private val completionSubcommands = "run compile package test setup-ide clean version completions"
+  private val completionSubcommands = "run compile package test setup-ide lock clean version completions"
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output -v --verbose -q --quiet " +
-    "--color --test-framework --test-only --no-incremental --native-mode --native-gc --native-lto " +
+    "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-gc-stw-sweep --native-optimize -h --help"
@@ -2760,8 +3108,8 @@ object ScalinoCli:
   // Boolean flags accepted before the sub-command too (`scalino -w compile`),
   // mill/bun-style: they're hoisted to just after it. Flags that take a value
   // aren't hoisted -- can't tell their value from the sub-command position.
-  private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental")
-  private val HoistTargets = Set("run", "compile", "package", "test")
+  private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental", "--offline")
+  private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock")
 
   def hoistLeadingFlags(args: Array[String]): Array[String] =
     val lead = args.takeWhile(HoistableFlags.contains)
@@ -2790,6 +3138,7 @@ object ScalinoCli:
       case "setup-ide" => handleSetupIde(args.drop(1))
       case "completions" => handleCompletions(args.drop(1))
       case "clean" => handleClean(args.drop(1))
+      case "lock" => handleLock(args.drop(1))
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
         handleRunOrCompile("run", args) // implicit `run`, e.g. `scalino Foo.scala`
       case other =>
