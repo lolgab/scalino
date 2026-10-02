@@ -136,6 +136,11 @@ object ScalinoCli:
      *  <path>", ...) -- cargo's own bold green for every such verb, success
      *  included, not just a distinct "done" color. */
     def action(s: String, stream: java.io.PrintStream = System.err): String = paint(BOLD_GREEN, s, stream)
+    /** scala-cli's dim gray for its own "Compiling project (...)" progress lines. */
+    def gray(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[90m", s, stream)
+    /** scala-cli's plain (non-bold) red/yellow for its `[error]`/`[warn]` tags. */
+    def red(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[31m", s, stream)
+    def yellow(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[33m", s, stream)
     /** Plain emphasis, no color -- section headers in `--help` output. */
     def bold(s: String, stream: java.io.PrintStream = System.out): String = paint(BOLD, s, stream)
 
@@ -151,6 +156,19 @@ object ScalinoCli:
    *  it's caught once at the top and turned into the same `die` exit. */
   case class BuildFailed(msg: String) extends RuntimeException(msg)
   def fail(msg: String): Nothing = throw BuildFailed(msg)
+
+  /** scala-cli prints a bare "Compilation failed" after a failed compile (the
+   *  diagnostics and the "Error compiling project" line already came before
+   *  it) -- not a `scalino:`-prefixed red fatal like every other failure. */
+  val CompilationFailed = "Compilation failed"
+
+  def reportBuildFailure(msg: String): Unit =
+    if msg == CompilationFailed then System.err.println(msg)
+    else System.err.println(Color.error(s"scalino: $msg"))
+
+  def exitBuildFailure(msg: String): Nothing =
+    reportBuildFailure(msg)
+    sys.exit(1)
 
   def readFile(p: Path): String =
     new String(Files.readAllBytes(p), "UTF-8")
@@ -175,6 +193,101 @@ object ScalinoCli:
     cwd.foreach(p => pb.directory(p.toFile))
     extraEnv.foreach { case (k, v) => pb.environment().put(k, v) }
     pb.start().waitFor()
+
+  /** Runs scalino-dotc with stdout+stderr merged and captured (stdin still
+   *  inherited), so its plain-text diagnostics can be re-rendered
+   *  scala-cli-style by `Diagnostics`. */
+  def runCaptureAll(cmd: List[String]): (Int, String) =
+    val pb = new JProcessBuilder(cmd.asJava)
+    pb.redirectErrorStream(true)
+    pb.redirectInput(JProcessBuilder.Redirect.INHERIT)
+    val proc = pb.start()
+    val out = readAll(proc.getInputStream)
+    (proc.waitFor(), out)
+
+  /** Re-renders dotc's `-color:never` diagnostics the way scala-cli prints
+   *  them: every line behind a colored `[warn]`/`[error]` tag, the location
+   *  as `./path:line:col` (1-based column), then the message, then the source
+   *  line with its caret -- no `-- [E006] Not Found Error ---` rule, no
+   *  line-number gutter, no "longer explanation" footer, no "N errors found"
+   *  summary. Anything that doesn't look like a diagnostic passes through. */
+  object Diagnostics:
+    private final case class Header(isWarning: Boolean, path: String, line: Int, col: Int)
+
+    private def parseHeader(l: String): Option[Header] =
+      if !l.startsWith("-- ") then None
+      else
+        val body = l.drop(3).reverse.dropWhile(_ == '-').reverse.trim
+        val sep = body.indexOf(": ")
+        if sep < 0 then None
+        else
+          val title = body.substring(0, sep)
+          val loc = body.substring(sep + 2)
+          val c2 = loc.lastIndexOf(':')
+          val c1 = if c2 > 0 then loc.lastIndexOf(':', c2 - 1) else -1
+          if c1 < 0 then None
+          else
+            (loc.substring(c1 + 1, c2).toIntOption, loc.substring(c2 + 1).toIntOption) match
+              case (Some(line), Some(col)) => Some(Header(title.contains("Warning"), loc.substring(0, c1), line, col))
+              case _ => None
+
+    /** Index of the gutter bar if `l` is a diagnostic body line (`  |...` or `12 |...`). */
+    private def gutter(l: String): Int =
+      val bar = l.indexOf('|')
+      if bar < 1 then -1
+      else if l.substring(0, bar).forall(c => c == ' ' || c.isDigit) then bar
+      else -1
+
+    private def isSourceLine(l: String): Boolean =
+      val bar = gutter(l)
+      bar > 0 && l.substring(0, bar).exists(_.isDigit)
+
+    private def isCaretLine(l: String): Boolean =
+      val bar = gutter(l)
+      bar > 0 && !isSourceLine(l) && l.substring(bar + 1).trim.nonEmpty && l.substring(bar + 1).forall(c => c == ' ' || c == '^')
+
+    private def isSummary(l: String): Boolean =
+      l.nonEmpty && l.head.isDigit && l.endsWith(" found") && (l.contains(" error") || l.contains(" warning"))
+
+    private def displayPath(path: String): String =
+      val cwd = Paths.get("").toAbsolutePath.toString
+      if path.startsWith(cwd + "/") then
+        val rest = path.drop(cwd.length + 1)
+        "./" + (if rest.startsWith("./") then rest.drop(2) else rest)
+      else path
+
+    private def render(h: Header, body: List[String]): List[String] =
+      val tag = if h.isWarning then Color.yellow("warn") else Color.red("error")
+      val prefix = s"[$tag] "
+      val (snippet, msg0) =
+        val (a, b) = body.span(l => isSourceLine(l) || isCaretLine(l))
+        (a.map(l => l.substring(gutter(l) + 1)), b.map(l => l.substring(gutter(l) + 1)))
+      val firstIndent = msg0.find(_.trim.nonEmpty).map(_.takeWhile(_ == ' ').length).getOrElse(0)
+      val msg = msg0
+        .map(l => l.drop(math.min(firstIndent, l.takeWhile(_ == ' ').length)))
+        .filterNot(_.trim.startsWith("longer explanation available when compiling with"))
+        .reverse.dropWhile(_.trim.isEmpty).reverse
+      (s"${displayPath(h.path)}:${h.line}:${h.col + 1}" :: msg ::: snippet).map(prefix + _)
+
+    def render(raw: String): List[String] =
+      val lines = raw.split("\n", -1).toList.map(_.stripSuffix("\r"))
+      val out = scala.collection.mutable.ListBuffer.empty[String]
+      var rest = lines
+      while rest.nonEmpty do
+        val l = rest.head
+        parseHeader(l) match
+          case Some(h) =>
+            val (body, tail) = rest.tail.span(b => gutter(b) >= 0)
+            out ++= render(h, body)
+            rest = tail
+          case None =>
+            if l.trim.nonEmpty && !isSummary(l) then out += l
+            rest = rest.tail
+      out.toList
+
+  /** scala-cli's progress-line label: `Scala 3.9.0, JVM (27)` there, the
+   *  platform this toolchain actually targets here. */
+  def buildLabel: String = s"Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}"
 
   /** Runs a command capturing stdout, with stderr passed straight through
    *  (matches `cs fetch --classpath`: download progress on stderr, the
@@ -1615,7 +1728,7 @@ object ScalinoCli:
       // scala-cli/sbt both print a line before a real compile -- scalino-dotc
       // itself stays silent on success (no "compiling..." banner of its own),
       // so without this a multi-second compile looks like scalino hung.
-      System.err.println(Color.action(s"scalino: compiling ${toCompile.size} source(s) to $classesDir"))
+      System.err.println(Color.gray(s"Compiling project ($buildLabel)"))
       // classesDir on the compile classpath (harmless on a full rebuild --
       // it's freshly emptied above) is what lets scalino-dotc resolve
       // symbols from files it isn't recompiling this round out of their
@@ -1628,11 +1741,15 @@ object ScalinoCli:
         "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
         "-Yretain-trees"
       ) ++ extraOptions ++ List(
-        "-d", classesDir.toString
+        "-color:never", "-d", classesDir.toString
       ) ++ toCompile.map(_.toString)
 
-      val compileExit = runInherited(compileCmd)
-      if compileExit != 0 then fail("compilation failed")
+      val (compileExit, compileOut) = runCaptureAll(compileCmd)
+      Diagnostics.render(compileOut).foreach(System.err.println)
+      if compileExit != 0 then
+        System.err.println(Color.gray(s"Error compiling project ($buildLabel)"))
+        fail(CompilationFailed)
+      System.err.println(Color.gray(s"Compiled project ($buildLabel)"))
       // On failure, the manifest is deliberately left untouched: it still
       // describes the last known-good state, so the next attempt treats
       // every file in this failed batch as still-changed and retries it
@@ -2200,7 +2317,6 @@ object ScalinoCli:
         0
       case "compile" =>
         compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)
-        if !o.quiet then println(Color.action(s"scalino: compiled ${expanded.size} source(s)", System.out))
         0
 
   /** Polls source mtimes every 500ms and reruns `attempt` on change --
@@ -2234,11 +2350,11 @@ object ScalinoCli:
       val watchPaths = expanded ++ expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)))
       watchLoop(watchPaths) { () =>
         try buildAndMaybeRun(mode, expanded, o)
-        catch case BuildFailed(msg) => System.err.println(Color.error(s"scalino: $msg"))
+        catch case BuildFailed(msg) => reportBuildFailure(msg)
       }
     else
       try sys.exit(buildAndMaybeRun(mode, expanded, o))
-      catch case BuildFailed(msg) => die(msg)
+      catch case BuildFailed(msg) => exitBuildFailure(msg)
 
   /** `scalino test` -- see the design note above `readAllBytes`/`ClassInfo` for
    *  the overall approach (structural framework discovery, a probe binary
@@ -2314,11 +2430,11 @@ object ScalinoCli:
     if o.watch then
       watchLoop(expanded) { () =>
         try attempt()
-        catch case BuildFailed(msg) => System.err.println(Color.error(s"scalino: $msg"))
+        catch case BuildFailed(msg) => reportBuildFailure(msg)
       }
     else
       try sys.exit(attempt())
-      catch case BuildFailed(msg) => die(msg)
+      catch case BuildFailed(msg) => exitBuildFailure(msg)
 
   /** JSON string/array literals for `.scalino-build/scalino-lsp.json` -- hand-rolled rather
    *  than pulling in a JSON library: the shape is fixed (see ProjectConfig
