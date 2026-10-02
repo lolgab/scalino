@@ -630,10 +630,10 @@ index 31fa0cf..d5fbf4a 100644
          zone->page = page;
      } else {
 diff --git a/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala b/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
-index 868d4fa..8a7e46c 100644
+index 868d4fa..a59187b 100644
 --- a/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
-@@ -61,6 +61,11 @@ object LinktimeInfo {
+@@ -61,6 +61,16 @@ object LinktimeInfo {
    )
    def isMultithreadingEnabled: Boolean = resolved
  
@@ -642,11 +642,16 @@ index 868d4fa..8a7e46c 100644
 +  )
 +  def isCompactHeaders: Boolean = resolved
 +
++  @resolvedAtLinktime(
++    "scala.scalanative.meta.linktimeinfo.isCompactByteArrays"
++  )
++  def isCompactByteArrays: Boolean = resolved
++
    // Referenced in nscplugin and codegen
    @resolvedAtLinktime(
      "scala.scalanative.meta.linktimeinfo.contendedPaddingWidth"
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
-index 2b5550d..93490a6 100644
+index 2b5550d..23be290 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
 @@ -32,7 +32,7 @@ import scalanative.unsigned._
@@ -678,7 +683,32 @@ index 2b5550d..93490a6 100644
      array
    }
  
-@@ -366,7 +368,8 @@ object ByteArray {
+@@ -324,7 +326,7 @@ final class ByteArray private () extends Array[Byte] {
+ 
+   @inline def atRawUnsafe(i: Int): RawPtr = {
+     val rawptr = castObjectToRawPtr(this)
+-    elemRawPtr(rawptr, MemoryLayout.Array.ValuesOffset + 1 * i)
++    elemRawPtr(rawptr, MemoryLayout.Array.ByteValuesOffset + 1 * i)
+   }
+ 
+   @inline def apply(i: Int): Byte = loadByte(atRaw(i))
+@@ -336,8 +338,8 @@ final class ByteArray private () extends Array[Byte] {
+     val arr     = GC.alloc_array(arrcls, length, 1)
+     val src     = castObjectToRawPtr(this)
+     ffi.memcpy(
+-      elemRawPtr(arr, MemoryLayout.Array.ValuesOffset),
+-      elemRawPtr(src, MemoryLayout.Array.ValuesOffset),
++      elemRawPtr(arr, MemoryLayout.Array.ByteValuesOffset),
++      elemRawPtr(src, MemoryLayout.Array.ByteValuesOffset),
+       castIntToRawSizeUnsigned(1 * length)
+     )
+     val array = castRawPtrToObject(arr).asInstanceOf[ByteArray]
+@@ -362,11 +364,12 @@ object ByteArray {
+       throw new NegativeArraySizeException
+     }
+     val arrcls  = classOf[ByteArray]
+-    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.ValuesOffset + 1 * length)
++    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.ByteValuesOffset + 1 * length)
      val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
      val array = castRawPtrToObject(arr).asInstanceOf[ByteArray]
      storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
@@ -787,7 +817,7 @@ index 2b5550d..93490a6 100644
      val array = castRawPtrToObject(arr).asInstanceOf[BlobArray]
      storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
-index 0784b08..e9d9dec 100644
+index 0784b08..35ac549 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
 @@ -32,7 +32,7 @@ import scalanative.unsigned._
@@ -803,7 +833,7 @@ index 0784b08..e9d9dec 100644
  % for T, sizeT in types.items():
  %{
     Repr = 'Byte' if T == 'Blob' else T
-+   ValuesOff = 'BlobValuesOffset' if T == 'Blob' else 'ValuesOffset'
++   ValuesOff = 'BlobValuesOffset' if T == 'Blob' else ('ByteValuesOffset' if T == 'Byte' else 'ValuesOffset')
  }%
  
  % if T == 'Blob':
@@ -855,22 +885,23 @@ index 0784b08..e9d9dec 100644
      array
    }
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
-index 681d869..15d2d49 100644
+index 681d869..e88967f 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
-@@ -1,7 +1,10 @@
+@@ -1,7 +1,11 @@
  package scala.scalanative.runtime
  
  import scala.scalanative.annotation.alwaysinline
 -import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
 +import scala.scalanative.meta.LinktimeInfo.{
++  isCompactByteArrays,
 +  isCompactHeaders,
 +  isMultithreadingEnabled
 +}
  import scala.scalanative.runtime.Intrinsics.{castRawSizeToInt, sizeOf}
  
  private[runtime] object MemoryLayout {
-@@ -14,6 +17,22 @@ private[runtime] object MemoryLayout {
+@@ -14,6 +18,22 @@ private[runtime] object MemoryLayout {
     */
    @alwaysinline private def PtrSize = castRawSizeToInt(sizeOf[RawPtr])
    @alwaysinline private def IntSize = 4
@@ -893,7 +924,7 @@ index 681d869..15d2d49 100644
  
    private def requiresEnabledMulithreading = throw new IllegalStateException(
      "Field available only in multithreading mode"
-@@ -22,16 +41,19 @@ private[runtime] object MemoryLayout {
+@@ -22,16 +42,19 @@ private[runtime] object MemoryLayout {
    object Rtti {
      @alwaysinline def ClassOffset = 0
      @alwaysinline def LockWordOffset =
@@ -917,7 +948,7 @@ index 681d869..15d2d49 100644
      @alwaysinline def NameOffset = InterfacesOffset + PtrSize
  
      @deprecated("Not a part of Rtti layout", since = "0.5.6") @alwaysinline
-@@ -54,23 +76,40 @@ private[runtime] object MemoryLayout {
+@@ -54,23 +77,46 @@ private[runtime] object MemoryLayout {
    object Object {
      @alwaysinline def RttiOffset = 0
      @alwaysinline def LockWordOffset =
@@ -960,6 +991,12 @@ index 681d869..15d2d49 100644
 +    @alwaysinline def BlobLimitOffset =
 +      if (isCompactHeaders) LengthOffset + IntSize
 +      else StrideOffset
++    // ByteArray elements stay at the regular offset unless compact byte arrays
++    // are enabled, third party code (jsoniter-scala) depends on it.
++    @alwaysinline def ByteValuesOffset =
++      if (isCompactHeaders && !isCompactByteArrays)
++        (if (isMultithreadingEnabled) 3 else 2) * PtrSize
++      else ValuesOffset
 +    @alwaysinline def BlobValuesOffset =
 +      if (isCompactHeaders) 2 * PtrSize
 +      else ValuesOffset
@@ -1511,10 +1548,10 @@ index 0c9440d..722f111 100644
      // Always generate debug metadata on Windows, it's required for stack traces to work
      val debugFlags =
 diff --git a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
-index 89972ad..40fc0d8 100644
+index 89972ad..27f8f48 100644
 --- a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
-@@ -127,6 +127,25 @@ sealed trait NativeConfig {
+@@ -127,6 +127,42 @@ sealed trait NativeConfig {
    private[scalanative] def multithreadingSupport: Boolean =
      multithreading.getOrElse(true)
  
@@ -1526,11 +1563,28 @@ index 89972ad..40fc0d8 100644
 +   */
 +  def compactHeaders: Boolean
 +
++  /** Also use the compact header for `Array[Byte]`. When disabled, byte arrays
++   *  keep the elements at the same offset as without compact headers (16 bytes
++   *  from the start, 24 with multithreading), because libraries such as
++   *  jsoniter-scala-core read and write them through raw pointers with a copy
++   *  of the runtime array layout. On by default, disable it if a dependency does
++   *  that. Has no effect without [[compactHeaders]].
++   */
++  def compactByteArrays: Boolean
++
++  /** EXPERIMENTAL. Create a new config with given compactByteArrays value. See
++   *  [[compactByteArrays]].
++   */
++  def withCompactByteArrays(value: Boolean): NativeConfig
++
 +  /** Whether compact object headers are actually used for this configuration.
 +   *  Not supported (yet) on 32-bit platforms, nor with GCs other than Immix.
 +   */
 +  private[scalanative] def compactHeadersEnabled: Boolean =
 +    compactHeaders && !is32BitPlatform && gc == GC.Immix
++
++  private[scalanative] def compactByteArraysEnabled: Boolean =
++    compactHeadersEnabled && compactByteArrays
 +
 +  /** EXPERIMENTAL. Create a new config with given compactHeaders value. See
 +   *  [[compactHeaders]].
@@ -1540,42 +1594,48 @@ index 89972ad..40fc0d8 100644
    /** EXPERIMENTAL, commix GC only. Keep mutator threads fully paused through
     *  the parallel sweep phase instead of resuming them as soon as marking
     *  finishes (commix's normal behavior). Commix's marking phase is already
-@@ -388,6 +407,7 @@ object NativeConfig {
+@@ -388,6 +424,8 @@ object NativeConfig {
        optimize = true,
        useIncrementalCompilation = true,
        useLLVMDirectCodeGen = false,
 +      compactHeaders = true,
++      compactByteArrays = true,
        multithreading = None, // detect
        gcStwSweep = false,
        linktimeProperties = Map.empty,
-@@ -422,6 +442,7 @@ object NativeConfig {
+@@ -422,6 +460,8 @@ object NativeConfig {
        optimize: Boolean,
        useIncrementalCompilation: Boolean,
        useLLVMDirectCodeGen: Boolean,
 +      compactHeaders: Boolean,
++      compactByteArrays: Boolean,
        multithreading: Option[Boolean],
        gcStwSweep: Boolean,
        linktimeProperties: LinktimeProperites,
-@@ -505,6 +526,9 @@ object NativeConfig {
+@@ -505,6 +545,12 @@ object NativeConfig {
      override def withLLVMDirectCodeGen(value: Boolean): NativeConfig =
        copy(useLLVMDirectCodeGen = value)
  
 +    override def withCompactHeaders(value: Boolean): NativeConfig =
 +      copy(compactHeaders = value)
 +
++    override def withCompactByteArrays(value: Boolean): NativeConfig =
++      copy(compactByteArrays = value)
++
      def withMultithreading(enabled: Boolean): NativeConfig =
        copy(multithreading = Some(enabled))
  
-@@ -602,6 +626,7 @@ object NativeConfig {
+@@ -602,6 +648,8 @@ object NativeConfig {
            | - optimize                 $optimize
            | - incrementalCompilation:  $useIncrementalCompilation
            | - useLLVMDirectCodeGen:    $useLLVMDirectCodeGen
 +          | - compactHeaders:          $compactHeaders
++          | - compactByteArrays:       $compactByteArrays
            | - multithreading           ${multithreading.getOrElse("detect")}
            | - gcStwSweep:              $gcStwSweep
            | - linktimeProperties:      ${showMap(linktimeProperties)}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala b/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
-index 97c8574..a787286 100644
+index 97c8574..5b674d3 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
 @@ -19,7 +19,7 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
@@ -1627,7 +1687,7 @@ index 97c8574..a787286 100644
            meta.lockWordType.toList // optional, multithreading only
        ) {
      final val RttiIdx = Common.RttiIdx
-@@ -102,18 +108,29 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
+@@ -102,18 +108,40 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
  
    object ArrayHeader
        extends Layout(
@@ -1648,6 +1708,17 @@ index 97c8574..a787286 100644
 -    final val StrideIdx = LengthIdx + 1
 +    final val StrideIdx = if (meta.useCompactHeaders) -1 else LengthIdx + 1
 +
++    /** Header of ByteArray when it keeps the elements where they were without
++     *  compact headers (see NativeConfig.compactByteArrays): 16 bytes from the
++     *  object start, 24 with multithreading.
++     */
++    val byteLayout: nir.Type.StructValue =
++      if (!meta.useCompactHeaders || meta.useCompactByteArrays) layout
++      else {
++        val ints = (if (meta.platform.isMultithreadingEnabled) 6 else 4)
++        nir.Type.StructValue(List.fill(ints)(nir.Type.Int))
++      }
++
 +    /** Header of BlobArray, which keeps its scannable limit in the header.
 +     *  With compact headers it is padded to keep the elements 16 bytes from
 +     *  the object start.
@@ -1662,7 +1733,7 @@ index 97c8574..a787286 100644
  
    object Array
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
-index c0affca..e6f6df7 100644
+index c0affca..e90ec1c 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
 @@ -18,7 +18,7 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
@@ -1674,7 +1745,7 @@ index c0affca..e6f6df7 100644
      }
      val usesCustomAlignment = entries.exists(_.attrs.align.isDefined)
      val isArray = nir.Type.isArray(cls.name)
-@@ -28,12 +28,33 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
+@@ -28,12 +28,35 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
        val layout = MemoryLayout.ofAlignedFields(fields)
        (fields, layout)
      } else {
@@ -1682,6 +1753,8 @@ index c0affca..e6f6df7 100644
 -      val layout = MemoryLayout(rttiHeader.layout +: entries.map(_.ty))
 +      val header =
 +        if (cls.name == nir.Rt.BlobArray.name) ArrayHeader.blobLayout
++        else if (cls.name == nir.Type.typeToArray(nir.Type.Byte))
++          ArrayHeader.byteLayout
 +        else if (isArray) ArrayHeader.layout
 +        else ObjectHeader.layout
 +      val layout = MemoryLayout(header +: entries.map(_.ty))
@@ -1710,7 +1783,7 @@ index c0affca..e6f6df7 100644
    val struct = nir.Type.StructValue(layout.tys.map(_.ty))
    val size = layout.size
    val referenceOffsetsValue = nir.Val.Const(
-@@ -41,3 +62,10 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
+@@ -41,3 +64,10 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
    )
  
  }
@@ -1762,7 +1835,7 @@ index 28be44a..2e42b19 100644
        buf +=
          nir.Defn.Const(
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
-index 5348033..5f7f99a 100644
+index 5348033..ebc99a5 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 @@ -426,7 +426,7 @@ private[scalanative] object Lower {
@@ -1816,7 +1889,7 @@ index 5348033..5f7f99a 100644
          jump(mergeL, Seq(realTypeptr))
  
          label(taggedL)
-@@ -2364,10 +2390,15 @@ private[scalanative] object Lower {
+@@ -2364,10 +2390,16 @@ private[scalanative] object Lower {
      }
  
      private def arrayMemoryLayout(
@@ -1827,13 +1900,14 @@ index 5348033..5f7f99a 100644
 -      Seq(ArrayHeader.layout, nir.Type.ArrayValue(ty, length))
 +      Seq(
 +        if (arrTy == nir.Rt.BlobArray) ArrayHeader.blobLayout
++        else if (ty == nir.Type.Byte) ArrayHeader.byteLayout
 +        else ArrayHeader.layout,
 +        nir.Type.ArrayValue(ty, length)
 +      )
      )
      private def arrayValuePath(idx: nir.Val) = Seq(zero, one, idx)
  
-@@ -2384,7 +2415,7 @@ private[scalanative] object Lower {
+@@ -2384,7 +2416,7 @@ private[scalanative] object Lower {
        genArraylengthOp(buf, len, nir.Op.Arraylength(arr))
        genGuardInBounds(buf, idx, nir.Val.Local(len, nir.Type.Int))
  
@@ -1842,7 +1916,7 @@ index 5348033..5f7f99a 100644
        val elemPtr = buf.elem(arrTy, arr, arrayValuePath(idx), unwind)
        genLoadOp(buf, n, nir.Op.Load(ty, elemPtr, Some(nir.MemoryOrder.Unordered)))
      }
-@@ -2401,7 +2432,7 @@ private[scalanative] object Lower {
+@@ -2401,7 +2433,7 @@ private[scalanative] object Lower {
        genArraylengthOp(buf, len, nir.Op.Arraylength(arr))
        genGuardInBounds(buf, idx, nir.Val.Local(len, nir.Type.Int))
  
@@ -1851,7 +1925,7 @@ index 5348033..5f7f99a 100644
        val elemPtr = buf.elem(arrTy, arr, arrayValuePath(idx), unwind)
        genStoreOp(buf, n, nir.Op.Store(ty, elemPtr, value, Some(nir.MemoryOrder.Unordered)))
      }
-@@ -2481,10 +2512,11 @@ private[scalanative] object Lower {
+@@ -2481,10 +2513,11 @@ private[scalanative] object Lower {
        val charsLength = nir.Val.Int(chars.length)
        val charsConst = nir.Val.Const(
          nir.Val.StructValue(
@@ -1865,7 +1939,7 @@ index 5348033..5f7f99a 100644
              nir.Val.ArrayValue(
                nir.Type.Char,
                chars.toSeq.map(nir.Val.Char(_))
-@@ -2507,7 +2539,7 @@ private[scalanative] object Lower {
+@@ -2507,7 +2540,7 @@ private[scalanative] object Lower {
  
        nir.Val.Const(
          nir.Val.StructValue(
@@ -1875,10 +1949,10 @@ index 5348033..5f7f99a 100644
              fieldValues
          )
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala b/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
-index d8310af..345ee90 100644
+index d8310af..b1f0ccf 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
-@@ -13,10 +13,33 @@ private[scalanative] class Metadata(
+@@ -13,10 +13,34 @@ private[scalanative] class Metadata(
    def config: build.NativeConfig = buildConfig.compilerConfig
    private implicit def self: Metadata = this
  
@@ -1893,6 +1967,7 @@ index d8310af..345ee90 100644
 +   *  rtti pointer. The rtti is recovered through `__rtti_table[id]`.
 +   */
 +  final val useCompactHeaders = platform.useCompactHeaders
++  final val useCompactByteArrays = platform.useCompactByteArrays
 +  require(
 +    !useCompactHeaders || !platform.is32Bit,
 +    "Compact object headers are supported only on 64-bit platforms"
@@ -1913,7 +1988,7 @@ index d8310af..345ee90 100644
    val layouts = new CommonMemoryLayouts()
    val rtti = mutable.Map.empty[linker.Info, RuntimeTypeInformation]
    val vtable = mutable.Map.empty[linker.Class, VirtualTable]
-@@ -27,6 +50,11 @@ private[scalanative] class Metadata(
+@@ -27,6 +51,11 @@ private[scalanative] class Metadata(
    val ranges = mutable.Map.empty[linker.Class, Range]
  
    val classes = initClassIdsAndRanges()
@@ -1925,7 +2000,7 @@ index d8310af..345ee90 100644
    val (traits, traitIdsContext) = initTraitIds()
    val moduleArray = new ModuleArray(this)
  
-@@ -111,3 +139,12 @@ private[scalanative] class Metadata(
+@@ -111,3 +140,12 @@ private[scalanative] class Metadata(
      }
    }
  }
@@ -1939,22 +2014,24 @@ index d8310af..345ee90 100644
 +  final val MaxCompactHeaderClasses = (1 << 16) - 1
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala b/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
-index 684b058..3a444ad 100644
+index 684b058..cc0764c 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
-@@ -7,6 +7,7 @@ private[scalanative] case class PlatformInfo(
+@@ -7,6 +7,8 @@ private[scalanative] case class PlatformInfo(
      targetsWindows: Boolean,
      is32Bit: Boolean,
      isMultithreadingEnabled: Boolean,
 +    useCompactHeaders: Boolean,
++    useCompactByteArrays: Boolean,
      useOpaquePointers: Boolean,
      useGCYieldPointTraps: Boolean,
      useCxxExceptions: Boolean
-@@ -20,6 +21,7 @@ private[scalanative] object PlatformInfo {
+@@ -20,6 +22,8 @@ private[scalanative] object PlatformInfo {
      targetsWindows = config.targetsWindows,
      is32Bit = config.compilerConfig.is32BitPlatform,
      isMultithreadingEnabled = config.compilerConfig.multithreadingSupport,
 +    useCompactHeaders = config.compilerConfig.compactHeadersEnabled,
++    useCompactByteArrays = config.compilerConfig.compactByteArraysEnabled,
      useOpaquePointers =
        Discover.features.opaquePointers(config.compilerConfig).isAvailable,
      useGCYieldPointTraps = config.useTrapBasedGCYieldPoints,
@@ -2038,14 +2115,15 @@ index 7e03a94..f2497d5 100644
        defn: nir.Defn,
        insts: Seq[nir.Inst],
 diff --git a/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala b/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
-index 8bfe217..6201d1f 100644
+index 8bfe217..0bbb4bc 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
-@@ -24,6 +24,7 @@ private[linker] trait LinktimeValueResolver { self: Reach =>
+@@ -24,6 +24,8 @@ private[linker] trait LinktimeValueResolver { self: Reach =>
        s"$linktimeInfo.debugMode" -> (conf.mode == Mode.debug),
        s"$linktimeInfo.releaseMode" -> (conf.mode == Mode.releaseFast || conf.mode == Mode.releaseFull || conf.mode == Mode.releaseSize),
        s"$linktimeInfo.isMultithreadingEnabled" -> conf.multithreadingSupport,
 +      s"$linktimeInfo.isCompactHeaders" -> conf.compactHeadersEnabled,
++      s"$linktimeInfo.isCompactByteArrays" -> conf.compactByteArraysEnabled,
        s"$linktimeInfo.isWeakReferenceSupported" -> {
          conf.gc == GC.Immix ||
          conf.gc == GC.Commix ||

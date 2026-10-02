@@ -32,6 +32,9 @@ object LinkDriver:
     multithreading: Boolean = false,
     directCodegen: Boolean = false,
     compactHeaders: Boolean = true,
+    // None: on, unless a library depending on the regular array layout is on
+    // the classpath, see `LayoutDependentLibraries`
+    compactByteArrays: Option[Boolean] = None,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
     incrementalCompilation: Boolean = false,
@@ -42,6 +45,8 @@ object LinkDriver:
     cppCompile: List[String] = Nil,
     longRunning: Boolean = false
   )
+
+  val LayoutDependentLibraries = List("jsoniter-scala-core_native")
 
   def parseOpts(rest: Array[String]): Opts =
     var o = Opts()
@@ -57,6 +62,8 @@ object LinkDriver:
         case "--direct-codegen" => o = o.copy(directCodegen = true)
         case "--compact-headers" => o = o.copy(compactHeaders = true)
         case "--no-compact-headers" => o = o.copy(compactHeaders = false)
+        case "--compact-byte-arrays" => o = o.copy(compactByteArrays = Some(true))
+        case "--no-compact-byte-arrays" => o = o.copy(compactByteArrays = Some(false))
         case "--gc-stw-sweep" => o = o.copy(gcStwSweep = true)
         case "--heap-histogram" => o = o.copy(heapHistogram = true)
         case "--incremental-compilation" => o = o.copy(incrementalCompilation = true)
@@ -97,6 +104,19 @@ object LinkDriver:
     val lto = try opts.lto.map(LTO.apply).getOrElse(LTO.default) catch case e: IllegalArgumentException => die(e.getMessage)
     val target = try opts.target.map(parseBuildTarget).getOrElse(BuildTarget.default) catch case e: IllegalArgumentException => die(e.getMessage)
 
+    // Libraries reading and writing the elements of Array[Byte] through raw
+    // pointers, with a copy of the regular Scala Native array layout (for
+    // instance jsoniter-scala-core's ByteArrayAccess). Compact byte arrays
+    // would make them access the wrong bytes, even past the end of the array.
+    val compactByteArrays = opts.compactByteArrays.getOrElse {
+      LayoutDependentLibraries.find(lib => cp.exists(_.toString.contains(lib))) match
+        case Some(lib) =>
+          if logLevel != "quiet" then
+            System.err.println(s"scalino-linkdriver: not using compact byte arrays, $lib reads them through raw pointers")
+          false
+        case None => true
+    }
+
     val config = Config.empty
       .withBaseDir(workDir)
       .withModuleName(mainClass)
@@ -136,6 +156,7 @@ object LinkDriver:
           .withMultithreading(if opts.multithreading then Some(true) else None)
           .withLLVMDirectCodeGen(opts.directCodegen)
           .withCompactHeaders(opts.compactHeaders)
+          .withCompactByteArrays(compactByteArrays)
           .withGCStwSweep(opts.gcStwSweep)
           // DirectCodeGen now has its own (scoped) DIBuilder-based debug-info
           // support (Phase 3), so debug info no longer needs forcing off for
