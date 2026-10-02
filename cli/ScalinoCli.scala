@@ -2326,16 +2326,27 @@ object ScalinoCli:
   def watchLoop(sources: List[Path])(attempt: () => Unit): Unit =
     def mtimes(): Map[Path, Long] =
       sources.filter(Files.exists(_)).map(p => p -> Files.getLastModifiedTime(p).toMillis).toMap
+    // Same wording scala-cli prints after every iteration, success or failure.
+    def watching(): Unit =
+      System.err.println(Color.gray("Watching sources, press Ctrl+C to exit, or press Enter to re-run."))
+    // Enter on stdin forces a rebuild (scala-cli's behavior); swallow whatever
+    // was typed. A closed/non-interactive stdin just never reports bytes.
+    def enterPressed(): Boolean =
+      try
+        val n = System.in.available()
+        if n > 0 then { System.in.read(new Array[Byte](n)); true } else false
+      catch case _: java.io.IOException => false
     attempt()
-    System.err.println(Color.action("scalino: watching for changes (Ctrl+C to stop)..."))
+    watching()
     var last = mtimes()
     while true do
       Thread.sleep(500)
       val cur = mtimes()
-      if cur != last then
+      val enter = enterPressed()
+      if cur != last || enter then
         last = cur
-        System.err.println(Color.action("scalino: change detected, rebuilding..."))
         attempt()
+        watching()
 
   def handleRunOrCompile(mode: String, args: Array[String]): Unit =
     val o = defaultToCwd(parseRunOpts(args))
