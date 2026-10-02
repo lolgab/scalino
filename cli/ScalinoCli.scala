@@ -14,7 +14,7 @@
 // bytecode scalino-dotc emits for a real `public static void main(String[])`,
 // not a source-text heuristic), and a persistent on-disk cache for both
 // dependency resolution and compile/link output.
-// No watch mode, no multi-Scala-version support (this binary only ever
+// No multi-Scala-version support (this binary only ever
 // targets the one Scala/scala-native version it was built for -- a
 // `//> using scala` directive that disagrees just gets a warning).
 
@@ -2424,8 +2424,20 @@ object ScalinoCli:
       deleteRecursively(buildDir)
       System.err.println(Color.action(s"removed $buildDir", System.err))
 
+  // Boolean flags accepted before the sub-command too (`scalino -w compile`),
+  // mill/bun-style: they're hoisted to just after it. Flags that take a value
+  // aren't hoisted -- can't tell their value from the sub-command position.
+  private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental")
+  private val HoistTargets = Set("run", "compile", "package", "test")
+
+  def hoistLeadingFlags(args: Array[String]): Array[String] =
+    val lead = args.takeWhile(HoistableFlags.contains)
+    val rest = args.drop(lead.length)
+    if lead.nonEmpty && rest.nonEmpty && HoistTargets.contains(rest(0)) then rest(0) +: (lead ++ rest.drop(1))
+    else args
+
   def main(rawArgs: Array[String]): Unit =
-    val args = extractColorFlag(rawArgs)
+    val args = hoistLeadingFlags(extractColorFlag(rawArgs))
     if args.isEmpty then { printUsage(System.err); sys.exit(1) }
     args(0) match
       case "-h" | "--help" => printUsage(System.out)
