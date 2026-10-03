@@ -1,0 +1,369 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/commix/MutatorThread.c b/nativelib/src/main/resources/scala-native/gc/commix/MutatorThread.c
+--- a/nativelib/src/main/resources/scala-native/gc/commix/MutatorThread.c
++++ b/nativelib/src/main/resources/scala-native/gc/commix/MutatorThread.c
+@@ -56,9 +56,8 @@
+ #endif
+ 
+ #ifdef SCALANATIVE_GC_USE_YIELDPOINT_TRAPS
++    // All mutators share one trap page, which only the GC arms
+     self->yieldpointTrap = YieldPointTrap_init();
+-    YieldPointTrap_disarm(self->yieldpointTrap);
+-    scalanative_GC_yieldpoint_trap = self->yieldpointTrap;
+ #endif
+ 
+     MutatorThread_switchState(self, GC_MutatorThreadState_Managed);
+diff --git a/nativelib/src/main/resources/scala-native/gc/commix/Synchronizer.c b/nativelib/src/main/resources/scala-native/gc/commix/Synchronizer.c
+--- a/nativelib/src/main/resources/scala-native/gc/commix/Synchronizer.c
++++ b/nativelib/src/main/resources/scala-native/gc/commix/Synchronizer.c
+@@ -96,8 +96,6 @@
+ #include <sys/time.h>
+ #include <unistd.h>
+ #endif
+-
+-SN_ThreadLocal void **scalanative_GC_yieldpoint_trap;
+ 
+ static void YieldPointTrap_armAllMutators(void) {
+     MutatorThreads_foreach(mutatorThreads, node) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h
+--- a/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h
+@@ -7,7 +7,7 @@
+ extern atomic_bool Synchronizer_stopThreads;
+ #ifdef SCALANATIVE_GC_USE_YIELDPOINT_TRAPS
+ #include "shared/ThreadUtil.h"
+-extern SN_ThreadLocal void **scalanative_GC_yieldpoint_trap;
++extern void **scalanative_GC_yieldpoint_trap;
+ #endif
+ 
+ void Synchronizer_init();
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/MutatorThread.c b/nativelib/src/main/resources/scala-native/gc/immix/MutatorThread.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/MutatorThread.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/MutatorThread.c
+@@ -55,9 +55,8 @@
+ #endif
+ 
+ #ifdef SCALANATIVE_GC_USE_YIELDPOINT_TRAPS
++    // All mutators share one trap page, which only the GC arms
+     self->yieldpointTrap = YieldPointTrap_init();
+-    YieldPointTrap_disarm(self->yieldpointTrap);
+-    scalanative_GC_yieldpoint_trap = self->yieldpointTrap;
+ #endif
+ 
+     MutatorThread_switchState(self, GC_MutatorThreadState_Managed);
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Synchronizer.c b/nativelib/src/main/resources/scala-native/gc/immix/Synchronizer.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Synchronizer.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Synchronizer.c
+@@ -94,8 +94,6 @@
+ #include <sys/time.h>
+ #include <unistd.h>
+ #endif
+-
+-SN_ThreadLocal void **scalanative_GC_yieldpoint_trap;
+ 
+ static void YieldPointTrap_armAllMutators(void) {
+     MutatorThreads_foreach(mutatorThreads, node) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h b/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
+--- a/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
++++ b/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
+@@ -91,10 +91,10 @@
+ void scalanative_GC_yield();
+ #ifdef SCALANATIVE_GC_USE_YIELDPOINT_TRAPS
+ #include "shared/ThreadUtil.h"
+-// Thread-local pointer to this mutator's own trap page (see MutatorThread).
+-// Each pthread mmap/VirtualAlloc's a private page; the GC arms every mutator's
+-// page during STW so faulting loads do not share one TLB/mprotect target.
+-extern SN_ThreadLocal void **scalanative_GC_yieldpoint_trap;
++// Pointer to the trap page polled by every mutator (see YieldPointTrap.c). The
++// GC arms it during STW. It is a plain global: a thread-local read is much
++// more expensive on some targets (macOS).
++extern void **scalanative_GC_yieldpoint_trap;
+ #endif
+ 
+ void scalanative_GC_add_roots(void *addr_low, void *addr_high);
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c b/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c
+--- a/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c
++++ b/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c
+@@ -28,73 +28,38 @@
+ #endif
+ 
+ /*
+- * Recycled trap-page freelist.
++ * Shared trap page.
+  *
+- * Every mutator thread owns a trap cell (a single page protected with
+- * mprotect(PROT_NONE) when GC arms safepoints). The pointer to that cell is
+- * cached in the thread-local @scalanative_GC_yieldpoint_trap slot.
++ * All mutator threads poll the same trap page, whose address is stored in the
++ * plain (not thread-local) global @scalanative_GC_yieldpoint_trap. The GC
++ * always arms and disarms the traps of every mutator together during a
++ * stop-the-world pause, so one page protected with mprotect(PROT_NONE) is
++ * equivalent to one page per thread. A single global read keeps the poll
++ * cheap on every target: a thread-local read costs a call into the dynamic
++ * loader on macOS (_tlv_get_addr), and an extra address computation elsewhere.
+  *
+- * Continuation suspend/resume can move execution to a different OS thread
+- * mid-function. LLVM is allowed to CSE/hoist the TLS-slot read (and the
+- * underlying `mrs tpidr_el0` on AArch64) to a single read at function entry
+- * and spill the resulting trap-cell pointer to the stack. After resumption on
+- * another carrier the spilled pointer still references the *original*
+- * carrier's trap cell. If that carrier has terminated and we munmap'd the
+- * page, the next safepoint poll would dereference unmapped memory and
+- * SIGSEGV with si_code=SEGV_MAPERR. The signal handler cannot recover because
+- * there is no GC in progress (so isContinuationStaleTrapFault returns false).
+- *
+- * To keep stale TLS-cached pointers safe to dereference we never unmap a trap
+- * page. Pages from terminated mutators are disarmed and pushed onto a global
+- * freelist, then handed out to subsequent threads. The freelist link is stored
+- * inside the page itself (the pointer slot is unused while disarmed).
+- *
+- * Worst-case scenarios after recycling:
+- *   - Stale pointer reads a disarmed page: load returns whatever bits live in
+- *     the page (the safepoint poll discards the loaded value via ldr xzr).
+- *   - Stale pointer reads a page whose new owner has been re-armed during
+- *     STW: SEGV_ACCERR (BUS_ADRERR on macOS) with Synchronizer_stopThreads
+- *     set; SafepointTrapHandler treats it as a stale-carrier trap and yields
+- *     on the current mutator.
++ * The page is created once and never unmapped, so a poll that is delayed or
++ * resumed on another OS thread (continuations) always dereferences a mapped
++ * page.
+  */
+-static safepoint_t YieldPointTrap_freeList = NULL;
+-static mutex_t YieldPointTrap_freeListLock;
+-static atomic_bool YieldPointTrap_freeListReady = false;
++void **scalanative_GC_yieldpoint_trap = NULL;
++static atomic_bool YieldPointTrap_armed = false;
++static mutex_t YieldPointTrap_lock;
++static atomic_bool YieldPointTrap_lockReady = false;
+ 
+-static void YieldPointTrap_initFreeList(void) {
++static void YieldPointTrap_initLock(void) {
+     bool expected = false;
+-    if (atomic_compare_exchange_strong(&YieldPointTrap_freeListReady, &expected,
++    if (atomic_compare_exchange_strong(&YieldPointTrap_lockReady, &expected,
+                                        true)) {
+-        mutex_init(&YieldPointTrap_freeListLock);
++        mutex_init(&YieldPointTrap_lock);
+     } else {
+         /* Wait for the initializer to publish the mutex. */
+-        while (!atomic_load(&YieldPointTrap_freeListReady)) {
++        while (!atomic_load(&YieldPointTrap_lockReady)) {
+             thread_yield();
+         }
+     }
+ }
+ 
+-static safepoint_t YieldPointTrap_popFreeList(void) {
+-    if (!atomic_load(&YieldPointTrap_freeListReady))
+-        return NULL;
+-    mutex_lock(&YieldPointTrap_freeListLock);
+-    safepoint_t reused = YieldPointTrap_freeList;
+-    if (reused != NULL) {
+-        YieldPointTrap_freeList = (safepoint_t) * (void **)reused;
+-        *(void **)reused = NULL;
+-    }
+-    mutex_unlock(&YieldPointTrap_freeListLock);
+-    return reused;
+-}
+-
+-static void YieldPointTrap_pushFreeList(safepoint_t ref) {
+-    YieldPointTrap_initFreeList();
+-    mutex_lock(&YieldPointTrap_freeListLock);
+-    *(void **)ref = (void *)YieldPointTrap_freeList;
+-    YieldPointTrap_freeList = ref;
+-    mutex_unlock(&YieldPointTrap_freeListLock);
+-}
+-
+ /*
+  * Registry of every trap page ever allocated by this process, for
+  * SafepointTrapHandler to answer "is this fault address one of OUR OWN
+@@ -137,7 +102,7 @@
+ static void *YieldPointTrap_registry[YIELD_POINT_TRAP_REGISTRY_CAPACITY];
+ static atomic_size_t YieldPointTrap_registryCount = 0;
+ 
+-static void YieldPointTrap_register(void *addr) {
++static void YieldPointTrap_registerLocked(void *addr) {
+     // Writers (this function) are NOT signal-handler code -- they run from
+     // ordinary thread context whenever a new mutator thread needs a fresh
+     // trap page -- so, unlike the read side below, they're free to take a
+@@ -155,8 +120,6 @@
+     // release ordering, a reader on a weakly-ordered architecture (ARM64)
+     // could observe the bumped count before the pointer write itself is
+     // visible -- reading a stale/zero slot, defeating the whole registry.
+-    YieldPointTrap_initFreeList();
+-    mutex_lock(&YieldPointTrap_freeListLock);
+     size_t idx = atomic_load_explicit(&YieldPointTrap_registryCount,
+                                       memory_order_relaxed);
+     if (idx < YIELD_POINT_TRAP_REGISTRY_CAPACITY) {
+@@ -164,7 +127,6 @@
+     }
+     atomic_store_explicit(&YieldPointTrap_registryCount, idx + 1,
+                           memory_order_release);
+-    mutex_unlock(&YieldPointTrap_freeListLock);
+     // idx >= capacity is silently dropped: see the capacity comment above
+     // for why that's not expected in practice. A dropped registration only
+     // means one more mutator's stale traps fall back to being treated as
+@@ -201,44 +163,42 @@
+ #endif
+ 
+ safepoint_t YieldPointTrap_init() {
+-    YieldPointTrap_initFreeList();
+-    safepoint_t reused = YieldPointTrap_popFreeList();
+-    if (reused != NULL) {
+-#if defined(__APPLE__)
+-        YieldPointTrap_resetTaskMachBadAccessPorts();
+-#endif
+-        return reused;
+-    }
+-
+-    bool allocated;
+-    void *addr =
++    YieldPointTrap_initLock();
++    mutex_lock(&YieldPointTrap_lock);
++    if (scalanative_GC_yieldpoint_trap == NULL) {
++        bool allocated;
++        void *addr =
+ #ifdef _WIN32
+-        VirtualAlloc(NULL, sizeof(safepoint_t), MEM_RESERVE | MEM_COMMIT,
+-                     PAGE_READWRITE);
+-    allocated = addr != NULL;
++            VirtualAlloc(NULL, sizeof(safepoint_t), MEM_RESERVE | MEM_COMMIT,
++                         PAGE_READWRITE);
++        allocated = addr != NULL;
+ #else
+-        mmap(NULL, sizeof(safepoint_t), PROT_WRITE | PROT_READ,
+-             MAP_NORESERVE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+-    allocated = addr != MAP_FAILED;
++            mmap(NULL, sizeof(safepoint_t), PROT_WRITE | PROT_READ,
++                 MAP_NORESERVE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        allocated = addr != MAP_FAILED;
+ #endif
+-    if (!allocated) {
+-        GC_LOG_ERROR("Failed to create GC safepoint trap: %s", strerror(errno));
+-        exit(errno);
++        if (!allocated) {
++            GC_LOG_ERROR("Failed to create GC safepoint trap: %s",
++                         strerror(errno));
++            exit(errno);
++        }
++        YieldPointTrap_registerLocked(addr);
++        scalanative_GC_yieldpoint_trap = (safepoint_t)addr;
+     }
+-    // Only reached for a genuinely NEW page (the freelist-reuse path above
+-    // already returned) -- a page recycled from the freelist was already
+-    // registered the first time it was created, and the registry is a
+-    // permanent, append-only record of every distinct page address, not a
+-    // reference count.
+-    YieldPointTrap_register(addr);
++    safepoint_t trap = scalanative_GC_yieldpoint_trap;
++    mutex_unlock(&YieldPointTrap_lock);
+ 
+ #if defined(__APPLE__)
+     YieldPointTrap_resetTaskMachBadAccessPorts();
+ #endif
+-    return addr;
++    return trap;
+ }
+ 
++/* The trap page is shared, so the GC arming every mutator's trap protects the
++ * page once; repeated calls are no-ops. */
+ void YieldPointTrap_arm(safepoint_t ref) {
++    if (atomic_exchange(&YieldPointTrap_armed, true))
++        return;
+     bool success;
+ #ifdef _WIN32
+     DWORD oldAccess;
+@@ -254,6 +214,8 @@
+ }
+ 
+ void YieldPointTrap_disarm(safepoint_t ref) {
++    if (!atomic_exchange(&YieldPointTrap_armed, false))
++        return;
+     bool success;
+ #ifdef _WIN32
+     DWORD oldAccess;
+@@ -270,17 +232,8 @@
+ }
+ 
+ void YieldPointTrap_free(safepoint_t ref) {
+-    if (ref == NULL) {
+-        return;
+-    }
+-    /* Disarm before recycling so that any stale TLS-cached pointer can read
+-     * the page without faulting. The page is then handed back to the global
+-     * freelist; we deliberately never munmap/VirtualFree it. See the file
+-     * header for the full rationale (continuation migration + LLVM CSE of
+-     * the TLS trap-cell pointer). */
+-    YieldPointTrap_disarm(ref);
+-    *(void **)ref = NULL;
+-    YieldPointTrap_pushFreeList(ref);
++    // The trap page is shared by all mutators and lives for the whole process.
++    (void)ref;
+ }
+ 
+ #endif
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+@@ -661,12 +661,6 @@
+             // top-level defs -- only names meant to cross a linkage-unit
+             // boundary (isExtern) keep default visibility.
+             C.LLVMSetVisibility(v, if (isExtern) LLVMDefaultVisibility else LLVMHiddenVisibility)
+-            // Matches AbstractCodeGen's `isThreadLocal` -- a single hardcoded
+-            // name check, not a general NIR attribute (see its comment:
+-            // "Currently we have a single usage for interaction with GC").
+-            if (isExtern && name == Lower.GCYieldPointTrapName &&
+-                platform.isMultithreadingEnabled && platform.useGCYieldPointTraps)
+-              C.LLVMSetThreadLocal(v, 1)
+             globals(name) = v
+             globalsByName(mangled) = v
+             v
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
+--- a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
+@@ -222,12 +222,6 @@
+       unsupported(defn)
+   }
+ 
+-  // Currently we have a single usage for interaction with GC
+-  private def isThreadLocal(name: nir.Global): Boolean =
+-    (name == Lower.GCYieldPointTrapName) &&
+-      platform.isMultithreadingEnabled &&
+-      platform.useGCYieldPointTraps
+-
+   private[codegen] def genGlobalDefn(
+       attrs: nir.Attrs,
+       name: nir.Global,
+@@ -240,9 +234,6 @@
+     genGlobal(name)
+     str(" = ")
+     str(if (attrs.isExtern) "external " else "hidden ")
+-    if (attrs.isExtern && isThreadLocal(name)) {
+-      str("thread_local ")
+-    }
+     str(if (isConst) "constant" else "global")
+     str(" ")
+     if (attrs.isExtern) {
+@@ -1049,19 +1040,10 @@
+       case Lower.GCYield if useGCYieldPointTraps =>
+         // We can't express volatile load in NIR, inline only expected usage.
+         //
+-        // Both loads must be volatile. The first reads the per-thread trap
+-        // cell pointer from the thread-local @scalanative_GC_yieldpoint_trap
+-        // slot; without volatile, LLVM is free to CSE/hoist this load (and
+-        // the underlying `mrs tpidr_el0` address calculation on AArch64) to
+-        // a single read at function entry, spilling the result to the stack.
+-        // Continuation suspend/resume can then move execution to a different
+-        // OS thread mid-function; subsequent safepoint polls would reuse the
+-        // spilled (stale) trap-cell pointer of the original carrier. When
+-        // GC arms safepoints all carriers' trap pages get mprotected, so the
+-        // stale dereference faults on a foreign mutator's page and the
+-        // SafepointTrapHandler cannot match it against the current carrier.
+-        // Marking the load volatile forbids LLVM from removing/merging it
+-        // and forces a fresh TLS-slot read at every yield point.
++        // Poll the shared trap page: load its address from the plain global
++        // @scalanative_GC_yieldpoint_trap, then load from the page. The GC
++        // protects the page to stop the world. Both loads are volatile so
++        // LLVM keeps a real load at every yield point.
+         val trap = fresh()
+         val nir.Sig.Extern(safepointTrapField) =
+           Lower.GCYieldPointTrapName.sig.unmangled: @unchecked
