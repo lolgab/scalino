@@ -57,6 +57,7 @@ mkdir -p "$work/classes"
   -classpath "$compile_cp" \
   -Xplugin:"$plugin_jar" -Xplugin-require:scalanative \
   -Yretain-trees \
+  -Xearly-tasty-output "$work/classes" \
   -d "$work/classes" \
   "${sources[@]}"
 

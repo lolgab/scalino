@@ -2091,7 +2091,10 @@ object ScalinoCli:
         "-javabootclasspath", cc.javaBase,
         "-classpath", compileCp,
         "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
-        "-Yretain-trees"
+        "-Yretain-trees",
+        // The reduced dotc has no JVM backend, so this early (pipelined)
+        // output is the only way a .tasty gets written next to the .nir.
+        "-Xearly-tasty-output", classesDir.toString
       ) ++ extraOptions ++ List(
         "-color:never", "-d", classesDir.toString
       ) ++ toCompile.map(_.toString)
