@@ -1,12 +1,17 @@
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/CommonConstants.h	2010-01-01 00:00:00
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/CommonConstants.h	2026-09-22 12:52:00
-@@ -34,7 +34,30 @@
+@@ -33,8 +33,44 @@
+ 
  #define LARGE_BLOCK_MASK (~((1 << LARGE_OBJECT_MIN_SIZE_BITS) - 1))
  
- #define EARLY_GROWTH_THRESHOLD (128 * 1024 * 1024UL)
--#define EARLY_GROWTH_RATE 2.0
--#define GROWTH_RATE 1.414213562
-+// Lowered from the upstream 2.0/sqrt(2) pair. Measured on this project's own
+-#define EARLY_GROWTH_THRESHOLD (128 * 1024 * 1024UL)
++// Below this size the heap is cheap to grow aggressively. It starts tiny
++// (DEFAULT_MIN_HEAP_SIZE), so at 1.2x it took ~20 collections just to reach
++// 128MB and ~50 to reach 2GB. Doubling up to 1GB needs ~8 and cut the warm
++// link of a mid-size project by ~25% for ~10% more RSS. Above it the slow rate
++// below applies, which is what the multi-GB self-hosting measurement is about.
++#define EARLY_GROWTH_THRESHOLD (1024 * 1024 * 1024UL)
++// GROWTH_RATE: lowered from the upstream sqrt(2). Measured on this project's own
 +// workload (self-hosted scalino-linkdriver linking dotc's own NIR, via
 +// SCALANATIVE_HEAP_HISTOGRAM_FILE): committed heap peaked at 9-13GB against
 +// only ~387MB-850MB of real live-object bytes at the same points -- Immix
@@ -29,7 +34,16 @@
 +// int8_t once LINE_COUNT exceeds 128, crashing scalino-linkdriver's own GC
 +// (SIGSEGV in Allocator_allocSlow, reproduced) in release builds where the
 +// guarding assert is stripped.
-+#define EARLY_GROWTH_RATE 1.2
++//
++// Re-checked later (the 1.2/1.1 numbers above no longer reproduce): that
++// self-link now runs out of heap under every rate tried (1.2/1.1, 2.0/1.1 and
++// the upstream pair), at the maximum heap with only ~23% of lines live. The
++// heap is mostly partially used blocks, so a large array finds no run of
++// contiguous free blocks. Growth rates cannot fix that; it needs compaction or
++// evacuation of sparse blocks. The EARLY_* pair above is what still matters:
++// reaching 1GB by doubling instead of 1.2x saves ~40 collections.
+ #define EARLY_GROWTH_RATE 2.0
+-#define GROWTH_RATE 1.414213562
 +#define GROWTH_RATE 1.1
  
  #endif // IMMIX_COMMON_CONSTANTS_H
