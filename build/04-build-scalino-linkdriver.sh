@@ -221,6 +221,9 @@ fi
 BUILT="$LINK_WORK/LinkDriver"
 [[ -f "$BUILT" ]] || BUILT="$LINK_WORK/LinkDriver.exe"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
+# rm first: overwriting a running/mapped signed binary in place leaves a stale code-signature
+# cache on macOS and the new file is killed at launch (CODE SIGNING: rejecting invalid page)
+rm -f "$DIST/scalino-linkdriver"
 cp "$BUILT" "$DIST/scalino-linkdriver"
 chmod +x "$DIST/scalino-linkdriver"
 

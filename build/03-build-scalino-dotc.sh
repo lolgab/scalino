@@ -137,6 +137,7 @@ DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$
 
 BUILT="$LINK_WORK/dotty.tools.dotc.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
+rm -f "$DIST/scalino-dotc" # new inode, see 04-build-scalino-linkdriver.sh
 cp "$BUILT" "$DIST/scalino-dotc"
 echo "OK: $DIST/scalino-dotc"
 

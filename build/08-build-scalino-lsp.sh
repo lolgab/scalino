@@ -179,6 +179,7 @@ DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$
 
 BUILT="$LINK_WORK/dotty.tools.languageserver.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
+rm -f "$DIST/scalino-lsp" # new inode, see 04-build-scalino-linkdriver.sh
 cp "$BUILT" "$DIST/scalino-lsp"
 # On macOS/arm64, the linker's own ad-hoc signature on this particular
 # binary is sometimes rejected by the kernel at exec time (observed: exec
