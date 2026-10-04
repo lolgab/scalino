@@ -1,0 +1,129 @@
+--- a/tools/src/main/scala/scala/scalanative/linker/Reach.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+@@ -79,6 +79,7 @@ private[linker] class Reach(
+ 
+   def result(): ReachabilityAnalysis = {
+     cleanup()
++    reportPruned()
+ 
+     val defns = mutable.UnrolledBuffer.empty[nir.Defn]
+     defns.sizeHint(done.size)
+@@ -254,13 +255,103 @@ private[linker] class Reach(
+     done(defn.name) = defn
+   }
+ 
++  /** `//> using nativePrune <pattern>` (scalino): link-time pruning. Every
++   *  method whose owner class matches one of the patterns gets its body
++   *  replaced by a throw of `UnsupportedOperationException`, so whatever was reachable only
++   *  through those bodies is never loaded, optimized or code-generated.
++   *  Patterns arrive `;`-joined in the `scalino.prune` link-time property
++   *  (a String, so it is part of the config hash and a changed list forces
++   *  a full relink). A pattern is `pkg.Class` (also matches `pkg.Class$`,
++   *  `pkg.Class$Inner`, ...), a package `pkg.sub` (everything below it), or
++   *  `pkg.Class#method` to prune a single method name.
++   */
++  private lazy val prunePatterns: Seq[(String, Option[String])] =
++    config.compilerConfig.linktimeProperties
++      .get(PruneProperty)
++      .collect { case s: String => s }
++      .map(_.split(';').iterator.map(_.trim).filter(_.nonEmpty).map { p =>
++        p.indexOf('#') match {
++          case -1 => (p, None)
++          case i  => (p.substring(0, i), Some(p.substring(i + 1)))
++        }
++      }.toVector)
++      .getOrElse(Vector.empty)
++  private lazy val pruneHits = new Array[Int](prunePatterns.length)
++
++  private def matchesPrunedOwner(owner: String, pattern: String): Boolean =
++    owner.startsWith(pattern) && (
++      owner.length == pattern.length || {
++        val c = owner.charAt(pattern.length)
++        c == '$' || c == '.'
++      }
++    )
++
++  private def pruneBody(defn: nir.Defn.Define): Option[nir.Defn.Define] =
++    if (prunePatterns.isEmpty || defn.insts.isEmpty) None
++    else
++      defn.name match {
++        case nir.Global.Member(owner, sig) =>
++          val method = sig.unmangled match {
++            case nir.Sig.Method(id, _, _) => id
++            case nir.Sig.Ctor(_)          => "<init>"
++            case _                        => ""
++          }
++          val idx = prunePatterns.indexWhere { case (cls, onlyMethod) =>
++            matchesPrunedOwner(owner.id, cls) && onlyMethod.forall(_ == method)
++          }
++          if (idx < 0) None
++          else {
++            pruneHits(idx) += 1
++            config.logger.debug(s"nativePrune: ${owner.id}.$method")
++            implicit val pos: nir.SourcePosition = defn.pos
++            implicit val scopeId: nir.ScopeId = nir.ScopeId.TopLevel
++            implicit val fresh: nir.Fresh = nir.Fresh(defn.insts)
++            val buf = new nir.InstructionBuilder()
++            buf += defn.insts.head // keeps the original entry label + params
++            val exc = nir.Global.Top("java.lang.UnsupportedOperationException")
++            val excTy = nir.Type.Ref(exc)
++            val obj = buf.classalloc(exc, nir.Next.None)
++            buf.call(
++              nir.Type.Function(Seq(excTy, nir.Rt.String), nir.Type.Unit),
++              nir.Val.Global(
++                exc.member(nir.Sig.Ctor(Seq(nir.Rt.String))),
++                nir.Type.Ptr
++              ),
++              Seq(
++                obj,
++                nir.Val.String(
++                  s"${owner.id}.$method was pruned at link time (nativePrune)"
++                )
++              ),
++              nir.Next.None
++            )
++            buf.raise(obj, nir.Next.None)
++            Some(defn.copy(insts = buf.toSeq)(defn.pos))
++          }
++        case _ => None
++      }
++
++  private def reportPruned(): Unit =
++    if (prunePatterns.nonEmpty) {
++      val total = pruneHits.sum
++      config.logger.info(s"nativePrune: replaced $total method bodies with a throw")
++      prunePatterns.zip(pruneHits).foreach { case ((cls, m), hits) =>
++        if (hits == 0)
++          config.logger.info(
++            s"nativePrune: '${cls}${m.fold("")("#" + _)}' matched no reachable method"
++          )
++      }
++    }
++
+   private def preprocessDefn(defn: nir.Defn): nir.Defn = {
+     defn match {
+       case defn: nir.Defn.Define =>
+-        (resolveLinktimeDefine(_))
+-          .andThen(resolveDefineIntrinsics)
+-          .andThen(rewriteSmiAllocs)
+-          .apply(defn)
++        pruneBody(defn).getOrElse {
++          (resolveLinktimeDefine(_))
++            .andThen(resolveDefineIntrinsics)
++            .andThen(rewriteSmiAllocs)
++            .apply(defn)
++        }
+ 
+       case _ => defn
+     }
+@@ -1430,6 +1521,10 @@ private[linker] class Reach(
+ }
+ 
+ private[scalanative] object Reach {
++  /** Link-time property carrying scalino's `nativePrune` patterns, see
++   *  `Reach.prunePatterns`. */
++  final val PruneProperty = "scalino.prune"
++
+   private final val ExternForwarderSig =
+     nir.Sig.Generated("$extern$forwarder").mangled
+ 

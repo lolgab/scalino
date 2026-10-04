@@ -43,6 +43,7 @@ object LinkDriver:
     compile: List[String] = Nil,
     cCompile: List[String] = Nil,
     cppCompile: List[String] = Nil,
+    prune: List[String] = Nil,
     longRunning: Boolean = false
   )
 
@@ -72,6 +73,7 @@ object LinkDriver:
         case "--compile" => o = o.copy(compile = o.compile :+ rest(i + 1)); i += 1
         case "--c-compile" => o = o.copy(cCompile = o.cCompile :+ rest(i + 1)); i += 1
         case "--cpp-compile" => o = o.copy(cppCompile = o.cppCompile :+ rest(i + 1)); i += 1
+        case "--prune" => o = o.copy(prune = o.prune :+ rest(i + 1)); i += 1
         case "--long-running" => o = o.copy(longRunning = true)
         case other => System.err.println(s"scalino-linkdriver: ignoring unknown flag '$other'")
       i += 1
@@ -165,6 +167,14 @@ object LinkDriver:
           .withSourceLevelDebuggingConfig(SourceLevelDebuggingConfig.enabled)
           .withIncrementalCompilation(opts.incrementalCompilation)
           .withOptimize(opts.optimize)
+          // `//> using nativePrune`: patterns travel to the linker's Reach
+          // (patches/scala-native-0062) as a String link-time property, so
+          // they are also part of the config hash and a changed list can
+          // never reuse an up-to-date build or an incremental reach.
+          .withLinktimeProperties(
+            if opts.prune.isEmpty then Map.empty[String, Any]
+            else Map[String, Any]("scalino.prune" -> opts.prune.mkString(";"))
+          )
       )
 
     if opts.longRunning then

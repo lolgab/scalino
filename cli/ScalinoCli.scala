@@ -419,6 +419,7 @@ object ScalinoCli:
     nativeCompile: List[String],
     nativeCCompile: List[String],
     nativeCppCompile: List[String],
+    nativePrune: List[String],
     nativeTarget: Option[String],
     nativeEmbedResources: Option[Boolean],
     nativeMultithreading: Option[Boolean],
@@ -451,7 +452,7 @@ object ScalinoCli:
     "testFramework", "test.framework", "jar", "jars", "resourceDir", "resourceDirs",
     "repository", "repositories", "file", "files", "exclude",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
-    "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativeTarget",
+    "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativePrune", "nativeTarget",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -508,6 +509,7 @@ object ScalinoCli:
     var nativeCompile = List.empty[String]
     var nativeCCompile = List.empty[String]
     var nativeCppCompile = List.empty[String]
+    var nativePrune = List.empty[String]
     var nativeTarget = Option.empty[String]
     var nativeEmbedResources = Option.empty[Boolean]
     var nativeMultithreading = Option.empty[Boolean]
@@ -566,6 +568,7 @@ object ScalinoCli:
         directiveValues(line, "nativeCompile").foreach(vs => nativeCompile = nativeCompile ++ vs)
         directiveValues(line, "nativeCCompile").foreach(vs => nativeCCompile = nativeCCompile ++ vs)
         directiveValues(line, "nativeCppCompile").foreach(vs => nativeCppCompile = nativeCppCompile ++ vs)
+        directiveValues(line, "nativePrune").foreach(vs => nativePrune = nativePrune ++ vs)
         directiveValues(line, "nativeTarget").foreach(_.headOption.foreach(v => nativeTarget = Some(v)))
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
@@ -580,7 +583,7 @@ object ScalinoCli:
     Directives(
       deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
-      nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile,
+      nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile, nativePrune,
       nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg
     )
@@ -2160,7 +2163,8 @@ object ScalinoCli:
     linking: List[String] = Nil,
     compile: List[String] = Nil,
     cCompile: List[String] = Nil,
-    cppCompile: List[String] = Nil
+    cppCompile: List[String] = Nil,
+    prune: List[String] = Nil
   )
 
   /** Directives win over the equivalent `--native-*` CLI flag for
@@ -2214,7 +2218,8 @@ object ScalinoCli:
       linking = directives.nativeLinking ++ o.cliNativeLinking,
       compile = directives.nativeCompile ++ o.cliNativeCompile,
       cCompile = directives.nativeCCompile ++ o.cliNativeCCompile,
-      cppCompile = directives.nativeCppCompile ++ o.cliNativeCppCompile
+      cppCompile = directives.nativeCppCompile ++ o.cliNativeCppCompile,
+      prune = directives.nativePrune ++ o.cliNativePrune
     )
 
   /** The compile-only half of a build: parses/resolves nothing itself (that's
@@ -2309,7 +2314,8 @@ object ScalinoCli:
       nativeOpts.linking.flatMap(v => List("--linking", v)) ++
       nativeOpts.compile.flatMap(v => List("--compile", v)) ++
       nativeOpts.cCompile.flatMap(v => List("--c-compile", v)) ++
-      nativeOpts.cppCompile.flatMap(v => List("--cpp-compile", v))
+      nativeOpts.cppCompile.flatMap(v => List("--cpp-compile", v)) ++
+      nativeOpts.prune.flatMap(v => List("--prune", v))
 
     val linkCmd = List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel) ++ nativeFlags
     val linkExit = if longRunning then linkIncremental(linkCmd) else runInherited(linkCmd)
@@ -2467,6 +2473,9 @@ object ScalinoCli:
        |  --native-compile <opt>     extra compile option, all sources (repeatable)
        |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
        |  --native-cpp-compile <opt> extra compile option, C++ files only (repeatable)
+       |  --native-prune <pattern>   link-time prune: replace the bodies of every method of a class
+       |                             (`pkg.Class`), package (`pkg.sub`) or method (`pkg.Class#name`) with a
+       |                             throw, dropping whatever was reachable only through them (repeatable)
        |  --native-target <target>  app|static|dynamic (app by default)
        |  --embed-resources          embed resources into the binary (readable via the Java resources API)
        |  --native-multithreading[=true|false]  Scala Native multithreading support
@@ -2524,6 +2533,7 @@ object ScalinoCli:
        |  //> using nativeCompile "-flag"
        |  //> using nativeCCompile "-flag"
        |  //> using nativeCppCompile "-flag"
+       |  //> using nativePrune "org.http4s.ember.core.h2"   (class, package or Class#method; bodies become a throw)
        |  //> using nativeTarget "application"   (application|library-dynamic|library-static)
        |  //> using nativeEmbedResources true
        |  //> using nativeMultithreading false   (on by default)
@@ -2700,6 +2710,7 @@ object ScalinoCli:
     cliNativeCompile: List[String] = Nil,
     cliNativeCCompile: List[String] = Nil,
     cliNativeCppCompile: List[String] = Nil,
+    cliNativePrune: List[String] = Nil,
     cliEmbedResources: Boolean = false,
     cliNativeMultithreading: Option[Boolean] = None,
     cliNativeDirectCodegen: Option[Boolean] = None,
@@ -2760,6 +2771,7 @@ object ScalinoCli:
         case "--native-compile" => o = o.copy(cliNativeCompile = o.cliNativeCompile :+ args(i + 1)); i += 1
         case "--native-c-compile" => o = o.copy(cliNativeCCompile = o.cliNativeCCompile :+ args(i + 1)); i += 1
         case "--native-cpp-compile" => o = o.copy(cliNativeCppCompile = o.cliNativeCppCompile :+ args(i + 1)); i += 1
+        case "--native-prune" => o = o.copy(cliNativePrune = o.cliNativePrune :+ args(i + 1)); i += 1
         case "--format" | "--formats" =>
           Packaging.parseFormats(List(args(i + 1))) match
             case Left(err) => die(err)
@@ -3110,7 +3122,7 @@ object ScalinoCli:
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
-    "--native-cpp-compile --native-target --embed-resources --native-multithreading " +
+    "--native-cpp-compile --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-optimize -h --help"
 
   private def bashCompletion: String =
@@ -3133,7 +3145,7 @@ object ScalinoCli:
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
        |    --args-file|-o|--output|--test-framework|--test-only|--native-clang|--native-clangpp|--native-linking| \\
-       |    --native-compile|--native-c-compile|--native-cpp-compile)
+       |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      COMPREPLY=($$(compgen -f -- "$$cur")); return ;;
        |  esac
        |
@@ -3170,7 +3182,7 @@ object ScalinoCli:
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
        |    --args-file|-o|--output|--test-framework|--test-only|--native-clang|--native-clangpp|--native-linking|\\
-       |    --native-compile|--native-c-compile|--native-cpp-compile)
+       |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      _files; return ;;
        |  esac
        |
