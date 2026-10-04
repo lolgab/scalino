@@ -431,7 +431,8 @@ object ScalinoCli:
     jars: List[String],
     testOptions: List[String],
     resourceDirs: List[String],
-    repositories: List[String]
+    repositories: List[String],
+    pkg: Map[String, List[String]] = Map.empty
   )
 
   private val quotedRe = """"([^"]*)"""".r
@@ -451,7 +452,11 @@ object ScalinoCli:
     "repository", "repositories", "file", "files", "exclude",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativeTarget",
-    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize"
+    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize",
+    // `scalino package --format ...` metadata -- see cli/Packaging.scala
+    "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
+    "packageHomepage", "packageDep", "packageDeps", "packageFile", "packageFiles",
+    "packageDockerBase", "packageDockerImage", "packageReleaseUrl"
     // deliberately NOT "nativeVersion": this toolchain only ever targets the
     // one pinned scala-native version it was built for (see the "scala"
     // directive's own version-mismatch warning below for the same reason) --
@@ -516,6 +521,7 @@ object ScalinoCli:
     var testOptions = List.empty[String]
     var resourceDirs = List.empty[String]
     var repositories = List.empty[String]
+    var pkg = Map.empty[String, List[String]]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must be a comment-only line, `//>` as its first
     // non-blank characters -- NOT just "contains `//>` anywhere". An
@@ -569,12 +575,14 @@ object ScalinoCli:
         directiveBool(line, "nativeGcStwSweep").foreach(v => nativeGcStwSweep = Some(v))
         directiveBool(line, "nativeHeapHistogram").foreach(v => nativeHeapHistogram = Some(v))
         directiveBool(line, "nativeOptimize").foreach(v => nativeOptimize = Some(v))
+        for (spelling, canonical) <- Packaging.DirectiveAliases do
+          directiveValues(line, spelling).foreach(vs => pkg = pkg.updated(canonical, pkg.getOrElse(canonical, Nil) ++ vs))
     Directives(
       deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile,
       nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
-      jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct
+      jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg
     )
 
   /** scala-cli's three dependency formats:
@@ -2373,6 +2381,38 @@ object ScalinoCli:
     s"""|  -o, --output <path>        output path (package only)
        |""".stripMargin
 
+  private def oPackage: String =
+    s"""|  --format <list>            distribution format(s), comma-separated or repeated:
+       |                               binary  bare native executable (default; uses -o <file>)
+       |                               tar     <name>-<ver>-<triple>.tar.gz + .sha256 (Linux, macOS)
+       |                               deb     Debian/Ubuntu package (Linux/glibc)
+       |                               rpm     RHEL/Fedora/SUSE package (Linux/glibc; needs rpmbuild)
+       |                               docker  Dockerfile + image (builds with docker/podman if present)
+       |                               brew    Homebrew formula over every tarball in the output dir
+       |                             with any non-binary format, -o is an output *directory* (default: packages)
+       |  --pkg-name <name>         package name (default: the main class, lowercased)
+       |  --pkg-version <version>   package version
+       |  --release-url <url>       where the tarballs will be published (brew)
+       |""".stripMargin
+
+  private def packageDirectivesBlock: String =
+    s"""|packaging directives (for `--format`):
+       |  //> using packageName "my-app"
+       |  //> using packageVersion "1.2.3"
+       |  //> using packageDescription "One-line summary"
+       |  //> using packageMaintainer "Jane Doe <jane@example.com>"
+       |  //> using packageLicense "MIT"
+       |  //> using packageHomepage "https://example.com"
+       |  //> using packageDep "libssl3"             (extra runtime dependency, repeatable; deb/rpm)
+       |  //> using packageFile "./my-app.service:/lib/systemd/system/my-app.service"   (extra installed file)
+       |  //> using packageDockerBase "gcr.io/distroless/cc-debian13"   (default debian:stable-slim, alpine on musl)
+       |  //> using packageDockerImage "ghcr.io/me/my-app"
+       |  //> using packageReleaseUrl "https://github.com/me/my-app/releases/download/v1.2.3"
+       |
+       |There is no cross-compilation: every package holds the binary built on this host. Build
+       |each OS/arch on its own CI runner into the same output dir, then run `--format brew` last.
+       |""".stripMargin
+
   private def oVerbose: String =
     s"""|  -v, --verbose              show full build-tool debug output (raw clang/linker invocations)
        |""".stripMargin
@@ -2608,10 +2648,10 @@ object ScalinoCli:
           sourcesNote + "\n" + incrementalNote + "\n" +
           opts(common + oWatch) + directivesBlock
       case "package" =>
-        head("scalino package <sources...> -o <out> [options]", "Compile and link a native binary.") +
+        head("scalino package <sources...> -o <out> [--format <formats>] [options]", "Compile and link a native binary, or package it (deb, rpm, docker, tar, brew).") +
           sourcesNote + "\n" + incrementalNote + "\n" +
-          opts(oMain + common + oOut + oWatch) +
-          nativeHeader + nativeOpts + "\n" + directivesBlock
+          opts(oMain + common + oOut + oPackage + oWatch) +
+          nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + packageDirectivesBlock
       case "test" =>
         head("scalino test <sources...> [options] [-- <framework args>]", "Compile and run tests.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
@@ -2667,7 +2707,11 @@ object ScalinoCli:
     cliNativeCompactByteArrays: Option[Boolean] = None,
     cliNativeGcStwSweep: Boolean = false,
     cliNativeHeapHistogram: Boolean = false,
-    cliNativeOptimize: Option[Boolean] = None
+    cliNativeOptimize: Option[Boolean] = None,
+    formats: List[String] = Nil,
+    pkgName: Option[String] = None,
+    pkgVersion: Option[String] = None,
+    releaseUrl: Option[String] = None
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (raw
     // clang/linker invocations, NativeConfig dumps), the default ("info")
@@ -2716,6 +2760,14 @@ object ScalinoCli:
         case "--native-compile" => o = o.copy(cliNativeCompile = o.cliNativeCompile :+ args(i + 1)); i += 1
         case "--native-c-compile" => o = o.copy(cliNativeCCompile = o.cliNativeCCompile :+ args(i + 1)); i += 1
         case "--native-cpp-compile" => o = o.copy(cliNativeCppCompile = o.cliNativeCppCompile :+ args(i + 1)); i += 1
+        case "--format" | "--formats" =>
+          Packaging.parseFormats(List(args(i + 1))) match
+            case Left(err) => die(err)
+            case Right(fs) => o = o.copy(formats = (o.formats ++ fs).distinct)
+          i += 1
+        case "--pkg-name" | "--package-name" => o = o.copy(pkgName = Some(args(i + 1))); i += 1
+        case "--pkg-version" | "--package-version" => o = o.copy(pkgVersion = Some(args(i + 1))); i += 1
+        case "--release-url" => o = o.copy(releaseUrl = Some(args(i + 1))); i += 1
         case "--embed-resources" => o = o.copy(cliEmbedResources = true)
         case "--native-multithreading" => o = o.copy(cliNativeMultithreading = Some(true))
         case f if f.startsWith("--native-multithreading=") =>
@@ -2781,6 +2833,13 @@ object ScalinoCli:
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
         runInherited(binPathFor(mainClass).toString :: o.progArgs)
+      case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
+        def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
+        val meta = Packaging.resolveMeta(directives.pkg, mainClass, o.pkgName, o.pkgVersion, o.releaseUrl)
+        try Packaging.packageAll(o.formats, binPathFor(mainClass), meta, Paths.get(o.out.getOrElse("packages")), o.quiet)
+        catch case e: java.io.IOException => fail(s"packaging failed: ${e.getMessage}")
+        0
       case "package" =>
         def outPathFor(mc: String): Path = Paths.get(o.out.getOrElse(mc.substring(mc.lastIndexOf('.') + 1)))
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
@@ -3048,7 +3107,7 @@ object ScalinoCli:
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
-    "-w --watch --watching --watching-path --args-file -o --output -v --verbose -q --quiet " +
+    "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-target --embed-resources --native-multithreading " +
@@ -3068,6 +3127,8 @@ object ScalinoCli:
        |    --native-gc) COMPREPLY=($$(compgen -W "immix commix boehm none" -- "$$cur")); return ;;
        |    --native-lto) COMPREPLY=($$(compgen -W "none thin full" -- "$$cur")); return ;;
        |    --native-target) COMPREPLY=($$(compgen -W "app static dynamic" -- "$$cur")); return ;;
+       |    --format) COMPREPLY=($$(compgen -W "binary tar deb rpm docker brew" -- "$$cur")); return ;;
+       |    --pkg-name|--pkg-version|--release-url) return ;;
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
@@ -3103,6 +3164,8 @@ object ScalinoCli:
        |    --native-gc) _values 'gc' immix commix boehm none; return ;;
        |    --native-lto) _values 'lto' none thin full; return ;;
        |    --native-target) _values 'target' app static dynamic; return ;;
+       |    --format) _values 'format' binary tar deb rpm docker brew; return ;;
+       |    --pkg-name|--pkg-version|--release-url) return ;;
        |    completions) _values 'shell' bash zsh fish; return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
@@ -3143,6 +3206,10 @@ object ScalinoCli:
        |complete -c scalino -l native-gc -x -a "immix commix boehm none"
        |complete -c scalino -l native-lto -x -a "none thin full"
        |complete -c scalino -l native-target -x -a "app static dynamic"
+       |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
+       |complete -c scalino -l pkg-name -x
+       |complete -c scalino -l pkg-version -x
+       |complete -c scalino -l release-url -x
        |complete -c scalino -n '__fish_seen_subcommand_from completions' -f -a "bash zsh fish"
        |""".stripMargin
 

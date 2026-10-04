@@ -108,6 +108,25 @@ was bootstrapped from:
 ./hello
 ```
 
+## Packaging
+
+`scalino package --format` wraps the native binary for distribution (no fpm/dpkg needed; `.rpm` uses `rpmbuild`, docker uses `docker`/`podman`):
+
+```sh
+scalino package . --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
+scalino package . --format brew --release-url https://github.com/me/app/releases/download/v1.2.3
+```
+
+| format | output | notes |
+|---|---|---|
+| `tar` | `<name>-<ver>-<triple>.tar.gz` + `.sha256` | Linux and macOS |
+| `deb` | `<name>_<ver>_<arch>.deb` | Linux/glibc |
+| `rpm` | `<name>-<ver>-1.<arch>.rpm` | Linux/glibc, needs `rpmbuild` |
+| `docker` | `docker/Dockerfile` + image | `debian:stable-slim` base (`alpine` on musl) |
+| `brew` | `<name>.rb` | covers every tarball found in the output dir |
+
+Metadata comes from `//> using packageName|packageVersion|packageDescription|packageMaintainer|packageLicense|packageHomepage|packageDep|packageFile|packageDockerBase|packageDockerImage|packageReleaseUrl` (see `scalino package --help`). There is no cross-compilation: build each OS/arch on its own CI runner into the same output dir, then run `--format brew` last.
+
 ## Hermetic / Nix builds
 
 Nix builds run without network access, except fixed-output derivations whose
