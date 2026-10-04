@@ -1,0 +1,205 @@
+diff --git a/javalib/src/main/scala/java/lang/System.scala b/javalib/src/main/scala/java/lang/System.scala
+index b267907..7d71b55 100644
+--- a/javalib/src/main/scala/java/lang/System.scala
++++ b/javalib/src/main/scala/java/lang/System.scala
+@@ -39,8 +39,11 @@ object System {
+     Runtime.getRuntime().exit(status)
+ 
+   def identityHashCode(x: Object): scala.Int =
+-    java.lang.Long
+-      .hashCode(Intrinsics.castRawPtrToLong(Intrinsics.castObjectToRawPtr(x)))
++    {
++      val ptr = Intrinsics.castObjectToRawPtr(x)
++      scala.scalanative.runtime.GC.noteIdentityHash(ptr)
++      java.lang.Long.hashCode(Intrinsics.castRawPtrToLong(ptr))
++    }
+ 
+   def lineSeparator(): String = {
+     if (isWindows) "\r\n"
+diff --git a/nativelib/src/main/resources/scala-native/gc/boehm/gc.c b/nativelib/src/main/resources/scala-native/gc/boehm/gc.c
+index b4ce052..74a4eb2 100644
+--- a/nativelib/src/main/resources/scala-native/gc/boehm/gc.c
++++ b/nativelib/src/main/resources/scala-native/gc/boehm/gc.c
+@@ -91,6 +91,7 @@ size_t scalanative_GC_stats_collection_duration_total() {
+ }
+ 
+ void scalanative_GC_collect() { GC_gcollect(); }
++void scalanative_GC_note_identity_hash(void *object) { (void)object; }
+ 
+ void scalanative_GC_set_weak_references_collected_callback(
+     WeakReferencesCollectedCallback callback) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c b/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c
+index 32d6f88..1811447 100644
+--- a/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c
++++ b/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c
+@@ -95,6 +95,7 @@ INLINE void *scalanative_GC_alloc_array(Rtti *info, size_t length,
+ }
+ 
+ INLINE void scalanative_GC_collect() { Heap_Collect(&heap); }
++void scalanative_GC_note_identity_hash(void *object) { (void)object; }
+ 
+ INLINE void scalanative_GC_set_weak_references_collected_callback(
+     WeakReferencesCollectedCallback callback) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Block.c b/nativelib/src/main/resources/scala-native/gc/immix/Block.c
+index 652d52b..f9314ca 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Block.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Block.c
+@@ -3,6 +3,7 @@
+ #include <stdio.h>
+ #include <memory.h>
+ #include "Block.h"
++#include "State.h"
+ #include "metadata/ObjectMeta.h"
+ #include "Allocator.h"
+ 
+@@ -10,6 +11,8 @@ INLINE void Block_recycleUnmarkedBlock(Allocator *allocator,
+                                        BlockMeta *blockMeta,
+                                        word_t *blockStart) {
+     memset(blockMeta, 0, sizeof(BlockMeta));
++    if (heap.hashedBlocks != NULL)
++        heap.hashedBlocks[(size_t)(blockStart - heap.heapStart) / WORDS_IN_BLOCK] = 0;
+     // does not unmark in LineMetas because those are ignored by the allocator
+     BlockAllocator_AddFreeBlocks(allocator->blockAllocator, blockMeta, 1);
+     ObjectMeta_ClearBlockAt(Bytemap_Get(allocator->bytemap, blockStart));
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+index a8cac38..e66b886 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -119,6 +119,9 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
+         (Bytemap *)Heap_mapAndAlign(bytemapSpaceSize, ALLOCATION_ALIGNMENT);
+     heap->bytemap = bytemap;
+ 
++    heap->hashedBlocks =
++        (uint8_t *)Heap_mapAndAlign((size_t)maxNumberOfBlocks, 1);
++
+     // Init heap for small objects
+     word_t *heapStart = Heap_mapAndAlign(maxHeapSize, BLOCK_TOTAL_SIZE);
+     if (!heapStart) {
+@@ -160,6 +163,16 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
+     mutex_init(&heap->lock);
+ }
+ 
++void Heap_NoteIdentityHash(Heap *heap, word_t *object) {
++    if (Heap_IsWordInHeap(heap, object) && heap->hashedBlocks != NULL) {
++        size_t block = ((size_t)((uint8_t *)object - (uint8_t *)heap->heapStart)) /
++                       BLOCK_TOTAL_SIZE;
++        // Plain byte store: only ever 0 -> 1 from mutators, read by the GC
++        // while they are stopped.
++        heap->hashedBlocks[block] = 1;
++    }
++}
++
+ void Heap_Collect(Heap *heap, Stack *stack) {
+     MutatorThread *mutatorThread = currentMutatorThread;
+ #ifdef SCALANATIVE_MULTITHREADING_ENABLED
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.h b/nativelib/src/main/resources/scala-native/gc/immix/Heap.h
+index db8b09a..c88a0c3 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.h
+@@ -20,6 +20,10 @@ typedef struct {
+     uint32_t blockCount;
+     uint32_t maxBlockCount;
+     Bytemap *bytemap;
++    // One byte per block: set once an identity hash code (= address, see
++    // _Object.__hashCode) was taken of an object in it. Such a block is never
++    // evacuated, a moved object would silently change its hash code.
++    uint8_t *hashedBlocks;
+     Stats *stats;
+     mutex_t lock;
+ } Heap;
+@@ -41,6 +45,7 @@ static inline LineMeta *Heap_LineMetaForWord(Heap *heap, word_t *word) {
+ }
+ 
+ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize);
++void Heap_NoteIdentityHash(Heap *heap, word_t *object);
+ 
+ bool Heap_isGrowingPossible(Heap *heap, uint32_t incrementInBlocks);
+ void Heap_Collect(Heap *heap, Stack *stack);
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c b/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c
+index 65cc0f4..732174f 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c
+@@ -84,6 +84,10 @@ INLINE void *scalanative_GC_alloc_array(Rtti *info, size_t length,
+ 
+ INLINE void scalanative_GC_collect() { Heap_Collect(&heap, &stack); }
+ 
++void scalanative_GC_note_identity_hash(void *object) {
++    Heap_NoteIdentityHash(&heap, (word_t *)object);
++}
++
+ INLINE void scalanative_GC_set_weak_references_collected_callback(
+     WeakReferencesCollectedCallback callback) {
+     WeakReferences_SetGCFinishedCallback(callback);
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+index a73e145..1e5f8e5 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -678,7 +678,9 @@ static inline bool Evac_IsCandidateBlock(BlockMeta *meta, uint32_t liveBytes,
+     // populated (or left all-zero, if EvacPin_reset was never called
+     // because tracking was off) before this is ever consulted.
+     return !BlockMeta_IsFree(meta) && !BlockMeta_ContainsLargeObjects(meta) &&
+-           !EvacPin_isBlockPinned(blockIndex) && liveBytes > 0 &&
++           !EvacPin_isBlockPinned(blockIndex) &&
++           !(heap.hashedBlocks != NULL && heap.hashedBlocks[blockIndex]) &&
++           liveBytes > 0 &&
+            liveBytes < (uint32_t)(BLOCK_TOTAL_SIZE * EVAC_OCCUPANCY_THRESHOLD);
+ }
+ 
+diff --git a/nativelib/src/main/resources/scala-native/gc/none/gc.c b/nativelib/src/main/resources/scala-native/gc/none/gc.c
+index 29de509..a05cbea 100644
+--- a/nativelib/src/main/resources/scala-native/gc/none/gc.c
++++ b/nativelib/src/main/resources/scala-native/gc/none/gc.c
+@@ -162,6 +162,7 @@ void *scalanative_GC_alloc_array(Rtti *info, size_t length, size_t stride) {
+ }
+ 
+ void scalanative_GC_collect() {}
++void scalanative_GC_note_identity_hash(void *object) { (void)object; }
+ 
+ void scalanative_GC_set_weak_references_collected_callback(
+     WeakReferencesCollectedCallback callback) {}
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h b/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
+index a64d948..74de451 100644
+--- a/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
++++ b/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
+@@ -32,6 +32,9 @@ void *scalanative_GC_alloc_large(Rtti *info, size_t size);
+  * responsible to assign length and stride to Array header. */
+ void *scalanative_GC_alloc_array(Rtti *info, size_t length, size_t stride);
+ void scalanative_GC_collect();
++/* An identity hash code (the object address) was taken: a moving GC must not
++ * move this object any more. No-op for non-moving GCs. */
++void scalanative_GC_note_identity_hash(void *object);
+ 
+ typedef void (*WeakReferencesCollectedCallback)();
+ void scalanative_GC_set_weak_references_collected_callback(
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
+index 9868a60..9652dc0 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
+@@ -27,6 +27,12 @@ object GC {
+   @name("scalanative_GC_collect")
+   private[runtime] def collect(): Unit = extern
+ 
++  /** An identity hash code (the address) of `obj` is about to be used, a moving
++   *  GC must not move it from now on.
++   */
++  @name("scalanative_GC_note_identity_hash")
++  def noteIdentityHash(obj: RawPtr): Unit = extern
++
+   private[runtime] type WeakReferencesCollectedCallback = CFuncPtr0[Unit]
+   @name("scalanative_GC_set_weak_references_collected_callback")
+   private[runtime] def setWeakReferencesCollectedCallback(
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
+index d67bcdb..6da9b10 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
+@@ -14,7 +14,9 @@ private[runtime] class _Object {
+     this eq that
+ 
+   @inline def __hashCode(): scala.Int = {
+-    val addr = castRawPtrToLong(castObjectToRawPtr(this))
++    val ptr = castObjectToRawPtr(this)
++    GC.noteIdentityHash(ptr)
++    val addr = castRawPtrToLong(ptr)
+     addr.toInt ^ (addr >> 32).toInt
+   }
+ 
