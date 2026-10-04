@@ -1,0 +1,88 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
+index 4fd9683..2401c1e 100644
+--- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
++++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
+@@ -1,15 +1,21 @@
+ /* clang-format off */
+ /*
+  * POSIX aarch64: same role as SafepointPollTrampoline-x86_64.S.
+- * Saves Q0–Q7 and X0–X30, calls run_yield + load_resume_pc, br to resume.
++ * Saves Q0–Q7, X0–X30 and NZCV, calls run_yield + load_resume_pc, br to resume.
++ *
++ * The condition flags MUST be preserved: the poll is a plain load placed
++ * between a compare and the branch that consumes it (`cmp ...; ldr xzr,[x];
++ * b.hi loop`), so the interrupted code expects NZCV to survive the poll.
++ * Without this a thread stopped for a GC took the wrong side of that branch
++ * on resume (a loop ended early, a digit was dropped from Integer.toString).
+  * See docs/contrib/gc-safepoint-trampoline.md.
+  */
+ #if defined(SCALANATIVE_MULTITHREADING_ENABLED) &&                              \
+     defined(SCALANATIVE_GC_USE_YIELDPOINT_TRAPS) && !defined(_WIN32) &&         \
+     defined(__aarch64__) && (defined(__linux__) || defined(__APPLE__))
+ 
+-/* q0–q7 caller-saved (128 B) + x0–x30 + resume + pad */
+-#define SFPT_FRAME 384
++/* q0–q7 caller-saved (128 B) + x0–x30 (248 B) + resume + nzcv, 16 B aligned */
++#define SFPT_FRAME 400
+ 
+ .text
+ .balign 16
+@@ -52,6 +58,10 @@ scalanative_gc_safepoint_poll_trampoline:
+     stp x28, x29, [sp, #352]
+     str x30, [sp, #368]
+ 
++    /* x0 is saved above, free to use as scratch */
++    mrs x0, nzcv
++    str x0, [sp, #384]
++
+     bl RUN_YIELD
+     bl LOAD_RESUME
+     str x0, [sp, #376]
+@@ -78,6 +88,9 @@ scalanative_gc_safepoint_poll_trampoline:
+     ldp q2, q3, [sp, #32]
+     ldp q0, q1, [sp, #0]
+ 
++    ldr x16, [sp, #384]
++    msr nzcv, x16
++
+     ldr x16, [sp, #376]
+     add sp, sp, #SFPT_FRAME
+     br x16
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S
+index 909d011..61e1579 100644
+--- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S
++++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S
+@@ -9,7 +9,10 @@
+     defined(SCALANATIVE_GC_USE_YIELDPOINT_TRAPS) && !defined(_WIN32) &&         \
+     defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
+ 
+-/* Frame: 16 XMM (256 B) + 8 resume + 15 GPR (120 B) + pad = 400 B */
++/* Frame: 16 XMM (256 B) + 8 resume + 15 GPR (120 B) + 8 rflags + pad = 400 B.
++ * The flags must survive the poll (a poll can sit between a cmp and the jcc
++ * that consumes it), so nothing before they are saved / after they are
++ * restored may touch them: no subq/addq on %rsp, leaq instead. */
+ #define SFPT_FRAME 400
+ 
+ .text
+@@ -29,7 +32,9 @@ _scalanative_gc_safepoint_poll_trampoline:
+ .type scalanative_gc_safepoint_poll_trampoline, @function
+ scalanative_gc_safepoint_poll_trampoline:
+ #endif
+-    subq $SFPT_FRAME, %rsp
++    leaq -SFPT_FRAME(%rsp), %rsp
++    pushfq
++    popq 392(%rsp)
+ 
+     /* Safepoints can interrupt code at points where %rsp is not 16-byte aligned. */
+     movdqu %xmm0, 0(%rsp)
+@@ -103,7 +108,9 @@ scalanative_gc_safepoint_poll_trampoline:
+     movdqu 0(%rsp), %xmm0
+ 
+     movq 256(%rsp), %r10
+-    addq $SFPT_FRAME, %rsp
++    pushq 392(%rsp)
++    popfq
++    leaq SFPT_FRAME(%rsp), %rsp
+     jmp *%r10
+ 
+ #else
