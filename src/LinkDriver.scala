@@ -183,12 +183,11 @@ object LinkDriver:
         var continue = true
         while continue do
           // A build failure (bad source, missing symbol, C compile error...)
-          // must not kill this process -- ScalinoCli's watch mode expects it
-          // to keep running (and keep its warm NIR parse cache) across a
-          // save that temporarily broke the build, same as a one-shot
-          // scalino-linkdriver invocation would just exit nonzero and let
-          // the *caller* keep running. So catch here, report, and loop back
-          // to waiting on stdin instead of propagating.
+          // is reported on the protocol (SCALINO_LINKING_FAILED) instead of
+          // propagating. The caller (ScalinoCli.linkIncremental) then closes
+          // our stdin, which ends this loop, and spawns a fresh process on
+          // the next link -- failed builds can leave process-global caches
+          // in a half-updated state, so the process isn't reused.
           try
             val outPath = Build.buildCachedAwait(config)
             logger.debug(s"LINKED: $outPath")

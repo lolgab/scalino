@@ -327,6 +327,11 @@ object ScalinoCli:
   )
   private var longRunningLinker: Option[LongRunningLinker] = None
 
+  /** Closes stdin (graceful exit), then force-kills if it doesn't exit in 2s. */
+  private def terminateLinker(d: LongRunningLinker): Unit =
+    scala.util.Try(d.in.close())
+    if !d.proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) then d.proc.destroyForcibly()
+
   /** Drives `argv` (the same argv `runInherited` would have used, minus the
    *  trailing `--long-running` this adds itself) through the persistent
    *  linkdriver process, respawning it if this is the first call, the
@@ -341,10 +346,7 @@ object ScalinoCli:
     val (driver, alreadyBuilding) = longRunningLinker match
       case Some(d) if d.argv == argv && d.proc.isAlive => (d, false)
       case existing =>
-        existing.foreach { d =>
-          scala.util.Try(d.in.close())
-          if !d.proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) then d.proc.destroyForcibly()
-        }
+        existing.foreach(terminateLinker)
         val pb = new JProcessBuilder((argv :+ "--long-running").asJava)
         pb.redirectError(JProcessBuilder.Redirect.INHERIT)
         val proc = pb.start()
@@ -371,11 +373,11 @@ object ScalinoCli:
 
     if line == "SCALINO_LINKING_DONE" then 0
     else if line == "SCALINO_LINKING_FAILED" then
-      // LinkDriver.scala caught the build error itself and looped back to
-      // waiting on stdin -- the process (and its warm NIR parse cache) is
-      // still alive and still good to reuse on the next rebuild, which is
-      // the common case in watch mode (a save with a typo, fixed shortly
-      // after). Only a dead process (below) forces a respawn.
+      // A failed link may leave the process's process-global caches (NIR
+      // parse cache, previousReach, Interflow state) half-updated, so
+      // don't reuse it: terminate it and let the next link spawn a fresh one.
+      terminateLinker(driver)
+      longRunningLinker = None
       1
     else
       longRunningLinker = None
