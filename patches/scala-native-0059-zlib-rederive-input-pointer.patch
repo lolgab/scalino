@@ -1,0 +1,73 @@
+diff --git a/javalib/src/main/scala/java/util/zip/Deflater.scala b/javalib/src/main/scala/java/util/zip/Deflater.scala
+index 6ec53f9..74d76e4 100644
+--- a/javalib/src/main/scala/java/util/zip/Deflater.scala
++++ b/javalib/src/main/scala/java/util/zip/Deflater.scala
+@@ -62,6 +62,9 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
+     } else {
+       stream.nextOut = buf.at(off)
+     }
++    if (inputBuffer != null && inputBuffer.length > 0)
++      stream.nextIn =
++        inputBuffer.at(inOff + (stream.totalIn.toLong - inTotalAtSet).toInt)
+     val err = zlib.deflate(stream, flushParm)
+ 
+     if (err == zlib.Z_MEM_ERROR) {
+@@ -151,6 +154,12 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
+   def setInput(buf: Array[Byte]): Unit =
+     setInput(buf, 0, buf.length)
+ 
++  // The z_stream lives off-heap, so a moving GC cannot update the raw
++  // `nextIn` pointer into the input array between calls: remember the array
++  // and re-derive the pointer from it before every call into zlib.
++  private var inOff: Int = 0
++  private var inTotalAtSet: Long = 0L
++
+   def setInput(buf: Array[Byte], off: Int, nbytes: Int): Unit =
+     if (stream == null) {
+       throw new IllegalStateException()
+@@ -165,6 +174,8 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
+         }
+       }
+       inputBuffer = buf
++      inOff = off
++      inTotalAtSet = stream.totalIn.toLong
+       if (buf.length == 0) {
+         stream.nextIn = Deflater.empty.at(off)
+       } else {
+diff --git a/javalib/src/main/scala/java/util/zip/Inflater.scala b/javalib/src/main/scala/java/util/zip/Inflater.scala
+index 0d07fe3..2e3c57d 100644
+--- a/javalib/src/main/scala/java/util/zip/Inflater.scala
++++ b/javalib/src/main/scala/java/util/zip/Inflater.scala
+@@ -139,12 +139,22 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
+   def setInput(buf: Array[Byte]): Unit =
+     setInput(buf, 0, buf.length)
+ 
++  // The z_stream lives off-heap, so a moving GC cannot update the raw
++  // `nextIn` pointer into the input array between calls: remember the array
++  // and re-derive the pointer from it before every call into zlib.
++  private var inBuf: Array[Byte] = null
++  private var inOff: Int = 0
++  private var inTotalAtSet: Long = 0L
++
+   def setInput(buf: Array[Byte], off: Int, nbytes: Int): Unit =
+     if (stream == null) {
+       throw new NullPointerException()
+     } else if (off <= buf.length && nbytes >= 0 && off >= 0 && buf.length - off >= nbytes) {
+       inRead = 0
+       inLength = nbytes
++      inBuf = buf
++      inOff = off
++      inTotalAtSet = stream.totalIn.toLong
+       if (buf.length == 0) {
+         stream.nextIn = Inflater.empty.at(off)
+       } else {
+@@ -164,6 +174,9 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
+     } else {
+       stream.nextOut = buf.at(off)
+     }
++    if (inBuf != null && inBuf.length > 0)
++      stream.nextIn =
++        inBuf.at(inOff + (stream.totalIn.toLong - inTotalAtSet).toInt)
+     val err = zlib.inflate(stream, zlib.Z_SYNC_FLUSH)
+ 
+     if (err != zlib.Z_OK) {
