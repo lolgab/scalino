@@ -1,7 +1,7 @@
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
 --- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
 +++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
-@@ -105,12 +105,81 @@
+@@ -105,6 +105,82 @@ private[interflow] final class MergeProcessor(
          val mergeDelayed = mutable.AnyRefMap.empty[nir.Op, nir.Val]
          val mergeEmitted = mutable.AnyRefMap.empty[nir.Op, nir.Val.Local]
          val newEscapes = mutable.Set.empty[Addr]
@@ -12,13 +12,82 @@ diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.sca
 +        // resolve to the *same* new merged instance instead of diverging
 +        // copies -- mirrors State.delay's delayed.getOrElseUpdate idiom.
 +        val joinCache = mutable.Map.empty[Seq[nir.Val], nir.Val]
++
++        // The join below builds a *copy* of the branch objects, so it is only
++        // sound if nothing else can still observe the originals: a mutation
++        // through the joined instance must not need to be visible through
++        // another alias of one of the branch objects (and vice versa). These
++        // per-computeMerge() caches back that check (see `canJoin`).
++        val heapRefsCache = mutable.Map.empty[Int, Set[Addr]]
++        var rootTuplesCache: Seq[Seq[nir.Val]] = null
++
++        final class VirtualCollector extends nir.Transform {
++          val addrs = mutable.Set.empty[Addr]
++          override def onVal(value: nir.Val): nir.Val = {
++            value match {
++              case nir.Val.Virtual(addr) => addrs += addr
++              case _                     => ()
++            }
++            super.onVal(value)
++          }
++          override def onType(ty: nir.Type): nir.Type = ty
++        }
++
++        /** Every virtual addr that some heap instance (field, escaped value,
++         *  delayed op) or pending delayed/emitted op of the `idx`-th incoming
++         *  state refers to. */
++        def heapRefs(idx: Int): Set[Addr] = heapRefsCache.getOrElseUpdate(idx, {
++          val c = new VirtualCollector
++          val s = states(idx)
++          s.heap.values.foreach {
++            case vi: VirtualInstance =>
++              vi.values.foreach(c.onVal(_))
++              vi.zone.foreach(c.onVal(_))
++            case EscapedInstance(v)  => c.onVal(v)
++            case DelayedInstance(op) => c.onOp(op)
++          }
++          s.delayed.foreach { case (op, v) => c.onOp(op); c.onVal(v) }
++          s.emitted.foreach { case (op, v) => c.onOp(op); c.onVal(v) }
++          c.addrs.toSet
++        })
++
++        /** The branch-value tuples of every root that survives the merge and
++         *  can hold a reference: locals defined on every incoming edge, and
++         *  the block params. (Locals defined on only some edges are dead
++         *  after the merge: they don't dominate it.) */
++        def rootTuples: Seq[Seq[nir.Val]] = {
++          if (rootTuplesCache == null) {
++            val b = Seq.newBuilder[Seq[nir.Val]]
++            headState.locals.keysIterator.foreach { id =>
++              val vs = states.flatMap(_.locals.get(id))
++              if (vs.size == states.size) b += vs
++            }
++            params.indices.foreach { idx =>
++              b += incoming.map { case (_, (vs, _)) => vs(idx) }
++            }
++            rootTuplesCache = b.result()
++          }
++          rootTuplesCache
++        }
++
++        /** True iff the only thing that refers to each branch object is this
++         *  very `values` tuple: no heap field/op mentions it and no other
++         *  surviving local or param pairs it with a different tuple. */
++        def canJoin(values: Seq[nir.Val], addrs: Seq[Addr]): Boolean =
++          addrs.zipWithIndex.forall {
++            case (addr, i) =>
++              !heapRefs(i).contains(addr) && {
++                val v = nir.Val.Virtual(addr)
++                rootTuples.forall(t => t(i) != v || t == values)
++              }
++          }
  
          def isSingleValue(values: Seq[nir.Val]): Boolean =
            if (values.nonEmpty) {
-             val h = values.head
+@@ -112,13 +188,81 @@ private[interflow] final class MergeProcessor(
              values.forall(_ == h)
            } else false
-+
+ 
 +        // If every branch value is still a non-escaped VirtualInstance of the
 +        // same shape (kind, class, field count, zone), join them into a new
 +        // virtual instance field-wise instead of forcing a real heap
@@ -54,7 +123,13 @@ diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.sca
 +                    o.values.length == head.values.length
 +                  } &&
 +                  instances.tail.forall(_.get.zone == head.zone)
-+                }
++                } &&
++                  // Nested virtual fields would need the same aliasing
++                  // guarantee transitively; just don't join those.
++                  instances.forall(
++                    _.get.values.forall(!_.isInstanceOf[nir.Val.Virtual])
++                  ) &&
++                  canJoin(values, addrs)
 +                if (!joinable) None
 +                else {
 +                  val head = instances.head.get
@@ -80,10 +155,10 @@ diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.sca
 +            }
 +          }
 +        }
- 
++
          def mergePhi(
              values: Seq[nir.Val],
-@@ -118,7 +187,7 @@
+             bound: Option[nir.Type],
              localName: Option[String] = None
          ): nir.Val = {
            if (isSingleValue(values)) values.head
@@ -92,11 +167,13 @@ diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.sca
              val materialized = states.zip(values).map {
                case (s, v) =>
                  v match {
-@@ -269,6 +338,7 @@
+@@ -269,6 +413,9 @@ private[interflow] final class MergeProcessor(
            mergeDelayed.clear()
            mergeEmitted.clear()
            newEscapes.clear()
 +          joinCache.clear()
++          heapRefsCache.clear()
++          rootTuplesCache = null
            try computeMerge()
            catch { case MergeProcessor.Restart => () }
            if (retries > 128) {
