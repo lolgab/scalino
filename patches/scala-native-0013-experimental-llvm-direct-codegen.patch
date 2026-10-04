@@ -52,7 +52,7 @@ new file mode 100644
 index 0000000..a39a800
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
-@@ -0,0 +1,1274 @@
+@@ -0,0 +1,1291 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -93,6 +93,32 @@ index 0000000..a39a800
 +import LLVMCApi.{Core => C, Analysis => A, Target => T, TargetMachine => TM, DebugInfo => DI, Passes => P}
 +
 +private[codegen] object DirectCodeGen {
++
++  private val targetInitLock = new Object
++  private var targetsInitialized = false
++
++  /** Registers the X86/AArch64 targets exactly once per process. LLVM's
++   *  target registry is a global, unsynchronized linked list: initializing
++   *  from several codegen worker threads at once (as every emitObjectFile
++   *  call used to) can corrupt it, after which `LLVMGetTargetFromTriple`
++   *  spins forever walking a cyclic list.
++   */
++  private[direct] def ensureTargetsInitialized(): Unit =
++    targetInitLock.synchronized {
++      if (!targetsInitialized) {
++        T.LLVMInitializeX86TargetInfo()
++        T.LLVMInitializeX86Target()
++        T.LLVMInitializeX86TargetMC()
++        T.LLVMInitializeX86AsmPrinter()
++        T.LLVMInitializeX86AsmParser()
++        T.LLVMInitializeAArch64TargetInfo()
++        T.LLVMInitializeAArch64Target()
++        T.LLVMInitializeAArch64TargetMC()
++        T.LLVMInitializeAArch64AsmPrinter()
++        T.LLVMInitializeAArch64AsmParser()
++        targetsInitialized = true
++      }
++    }
 +
 +  /** Pure, cheap classification of one partition -- no LLVM API calls, just
 +   *  a walk over already-in-memory NIR. Called synchronously (not inside a
@@ -1249,16 +1275,7 @@ index 0000000..a39a800
 +  }
 +
 +  private def emitObjectFile(objPath: Path): Unit = {
-+    T.LLVMInitializeX86TargetInfo()
-+    T.LLVMInitializeX86Target()
-+    T.LLVMInitializeX86TargetMC()
-+    T.LLVMInitializeX86AsmPrinter()
-+    T.LLVMInitializeX86AsmParser()
-+    T.LLVMInitializeAArch64TargetInfo()
-+    T.LLVMInitializeAArch64Target()
-+    T.LLVMInitializeAArch64TargetMC()
-+    T.LLVMInitializeAArch64AsmPrinter()
-+    T.LLVMInitializeAArch64AsmParser()
++    DirectCodeGen.ensureTargetsInitialized()
 +
 +    val triple = config.compilerConfig.targetTriple
 +      .getOrElse(build.Discover.targetTriple(config.compilerConfig))
