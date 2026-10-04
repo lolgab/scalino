@@ -1,0 +1,851 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+index 2d46318..a73e145 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -682,12 +682,63 @@ static inline bool Evac_IsCandidateBlock(BlockMeta *meta, uint32_t liveBytes,
+            liveBytes < (uint32_t)(BLOCK_TOTAL_SIZE * EVAC_OCCUPANCY_THRESHOLD);
+ }
+ 
++// Debug-only targeted tracing for evacuation fixup, gated by two env vars
++// (zero-cost when unset, checked once, same style as every other debug
++// hook in this file): $SCALANATIVE_EVAC_TRACE_FILE (append-only log path)
++// and $SCALANATIVE_EVAC_TRACE_VALUE (hex address of a SPECIFIC stale
++// pointer VALUE to watch for -- not an object to watch being visited, a
++// VALUE to watch for appearing in any slot anywhere: object fields, array
++// elements, stack/root slots). Logs every slot Evac_FixupSlot inspects
++// whose current value matches, whether or not it turns out to be
++// forwarded -- lets you directly observe whether a specific known-stale
++// pointer's slot is ever inspected at all by any fixup pass, instead of
++// only ever seeing the crash site after the fact.
++static int evacTraceEnabledChecked = 0;
++static const char *evacTraceFilePath = NULL;
++static word_t *evacTraceValue = NULL;
++
++static inline bool EvacTrace_enabled(void) {
++    if (!evacTraceEnabledChecked) {
++        evacTraceFilePath = getenv("SCALANATIVE_EVAC_TRACE_FILE");
++        const char *valueStr = getenv("SCALANATIVE_EVAC_TRACE_VALUE");
++        // $SCALANATIVE_EVAC_TRACE_OFFSET (hex, bytes from the heap start)
++        // instead of an absolute address: the heap base moves between runs
++        // (ASLR), but everything else about a single-threaded repro is
++        // deterministic, so an offset seen in one crash can be traced in the
++        // next run.
++        const char *offsetStr = getenv("SCALANATIVE_EVAC_TRACE_OFFSET");
++        if (evacTraceFilePath != NULL && offsetStr != NULL) {
++            evacTraceValue =
++                (word_t *)((uint8_t *)heap.heapStart +
++                           strtoull(offsetStr, NULL, 16));
++        } else if (evacTraceFilePath != NULL && valueStr != NULL) {
++            evacTraceValue = (word_t *)strtoull(valueStr, NULL, 16);
++        } else {
++            evacTraceFilePath = NULL;
++        }
++        evacTraceEnabledChecked = 1;
++    }
++    return evacTraceFilePath != NULL;
++}
++
++static void EvacTrace_log(const char *tag, word_t **slot, word_t *value) {
++    if (!EvacTrace_enabled() || value != evacTraceValue)
++        return;
++    FILE *f = fopen(evacTraceFilePath, "a");
++    if (f == NULL)
++        return;
++    fprintf(f, "%s slot=%p value=%p\n", tag, (void *)slot, (void *)value);
++    fclose(f);
++}
++
+ // One field slot, wherever it came from (object field, array element, root):
+ // if it currently holds the OLD address of an object we just evacuated,
+ // rewrite it to that object's new address. Leaves every other value (null,
+ // non-heap pointer, pointer to a non-forwarded live object) untouched.
+ static inline void Evac_FixupSlot(Heap *heap, word_t **slot) {
+     word_t *value = *slot;
++    if (EvacTrace_enabled())
++        EvacTrace_log("FixupSlot-seen", slot, value);
+     if (value != NULL && Heap_IsWordInHeap(heap, value) &&
+         Bytemap_isPtrAligned(value)) {
+         ObjectMeta *meta = Bytemap_Get(heap->bytemap, value);
+@@ -697,12 +748,60 @@ static inline void Evac_FixupSlot(Heap *heap, word_t **slot) {
+         if (!ObjectMeta_IsFree(meta) && !ObjectMeta_IsPlaceholder(meta)) {
+             Object *object = (Object *)value;
+             if (Evac_IsForwarded(object)) {
+-                *slot = Evac_ForwardedAddress(object);
++                word_t *newAddr = Evac_ForwardedAddress(object);
++                *slot = newAddr;
++                if (EvacTrace_enabled())
++                    EvacTrace_log("FixupSlot-rewrote", slot, newAddr);
++            }
++        } else if (EvacTrace_enabled() && value == evacTraceValue) {
++            FILE *f = fopen(evacTraceFilePath, "a");
++            if (f != NULL) {
++                fprintf(f,
++                        "FixupSlot-rejected-by-bytemap slot=%p value=%p "
++                        "free=%d placeholder=%d\n",
++                        (void *)slot, (void *)value, ObjectMeta_IsFree(meta),
++                        ObjectMeta_IsPlaceholder(meta));
++                fclose(f);
+             }
+         }
+     }
+ }
+ 
++// An inflated lock word is a tagged pointer (low bit set, see
++// Field_isInflatedLock/Field_allignedLockRef in ObjectHeader.h), not a plain
++// pointer slot -- Evac_FixupSlot can't be reused directly on it. Handled
++// entirely separately from Evac_FixupHeapObjects' refFieldOffsets walk below
++// because it isn't one of an object's typed fields at all: every object
++// (and every Rtti) carries its own lockWord header slot unconditionally
++// under USES_LOCKWORD, invisible to refFieldOffsets, and the real pointer
++// inside it (when inflated) is exactly as real a reference to a live heap
++// object (a Monitor) as any typed field -- just as subject to being moved
++// by evacuation, and just as silently left stale if nothing rewrites it.
++// Missing this was a real, reproduced bug: a contended `synchronized`
++// (e.g. PrintStream.println's monitor, inflated once threads actually
++// contend on it) crashed on the next enterMonitor after the Monitor object
++// it pointed at got evacuated out from under it.
++#ifdef USES_LOCKWORD
++static inline void Evac_FixupLockWord(Heap *heap, word_t **lockWordSlot) {
++    word_t *value = *lockWordSlot;
++    if (!Field_isInflatedLock((Field_t)value))
++        return;
++    word_t *monitor = (word_t *)Field_allignedLockRef((Field_t)value);
++    if (monitor == NULL || !Heap_IsWordInHeap(heap, monitor) ||
++        !Bytemap_isPtrAligned(monitor))
++        return;
++    ObjectMeta *meta = Bytemap_Get(heap->bytemap, monitor);
++    if (ObjectMeta_IsFree(meta) || ObjectMeta_IsPlaceholder(meta))
++        return;
++    Object *object = (Object *)monitor;
++    if (Evac_IsForwarded(object)) {
++        word_t *newMonitor = Evac_ForwardedAddress(object);
++        *lockWordSlot =
++            (word_t *)((word_t)newMonitor | MONITOR_INFLATION_MARK_MASK);
++    }
++}
++#endif
++
+ static void Evac_FixupRange(Heap *heap, word_t **from, word_t **to,
+                             size_t stride) {
+     if (from > to) {
+@@ -725,6 +824,14 @@ static void Evac_FixupProgramStack(MutatorThread *thread, Heap *heap) {
+     do {
+         stackTop = MutatorThread_getStackTop(thread, false);
+     } while (stackTop == NULL);
++    if (EvacTrace_enabled()) {
++        FILE *f = fopen(evacTraceFilePath, "a");
++        if (f != NULL) {
++            fprintf(f, "EVAC-range thread=%p stackTop=%p stackBottom=%p\n",
++                    (void *)thread, (void *)stackTop, (void *)stackBottom);
++            fclose(f);
++        }
++    }
+ #ifdef SCALANATIVE_THREAD_ALT_STACK
+     if (thread->threadInfo != NULL &&
+         !isInRange(stackTop, thread->threadInfo->stackTop,
+@@ -777,51 +884,266 @@ static void Evac_FixupCustomRoots(Heap *heap, GC_Roots *roots) {
+ // simple blocks. Runs AFTER copying, so this naturally covers both (a)
+ // survivors that stayed in place (non-candidate blocks, still marked) and
+ // (b) freshly-copied objects in the destination blocks (marked via
+-// Object_Mark during the copy loop below) -- and naturally skips evacuated
+-// source blocks, since those get BlockMeta_Unmark'd before this runs.
+-static void Evac_FixupHeapObjects(Heap *heap) {
++// Object_Mark during the copy loop below) -- and must explicitly skip
++// evacuated SOURCE blocks via the same Evac_IsCandidateBlock test the copy
++// loop used, NOT BlockMeta_IsMarked alone: unmarking/clearing a source
++// block's metadata is deliberately DEFERRED until after every fixup pass
++// (see Marker_Evacuate's final loop) so THIS function's own Evac_FixupSlot
++// calls -- run via program-stack/module/custom-root fixup too, not just
++// here -- can still recognize a pointer into a source block as "points at a
++// forwarded object" while its bytemap still reads allocated/marked. Source
++// blocks are therefore still block-level marked when this runs; walking
++// their contents here would misinterpret every forwarded (tombstoned)
++// object as a live survivor and read its corrupted rtti, so they must be
++// skipped explicitly instead of relying on the unmark to exclude them.
++static inline void Evac_FixupOneObject(Heap *heap, Object *object) {
++    const int objectId = Object_Rtti(object)->rt.id;
++#ifdef USES_LOCKWORD
++    // Every object (array or not) carries its own lockWord slot
++    // unconditionally -- see the big comment on Evac_FixupLockWord for why
++    // this needs separate handling from the refFieldOffsets walk below.
++    Evac_FixupLockWord(heap, &object->lockWord);
++#endif
++    if (Object_IsArray(object)) {
++        ArrayHeader *arrayHeader = (ArrayHeader *)object;
++        if (objectId == __object_array_id) {
++            const size_t length = arrayHeader->length;
++            word_t **fields = (word_t **)Array_Values(arrayHeader);
++            for (size_t k = 0; k < length; k++) {
++                Evac_FixupSlot(heap, &fields[k]);
++            }
++        }
++        // blob arrays hold no pointers -- nothing to fix up
++    } else {
++        int32_t *refFieldOffsets = Object_Rtti(object)->refFieldOffsets;
++        for (int k = 0; refFieldOffsets[k] != LAST_FIELD_OFFSET; k++) {
++            size_t fieldOffset = (size_t)refFieldOffsets[k];
++            word_t **fieldRef = (word_t **)((int8_t *)object + fieldOffset);
++            // Deliberately NOT skipping the weak-referent field here
++            // (unlike marking) -- see file header comment.
++            Evac_FixupSlot(heap, fieldRef);
++        }
++        if (objectId == __boxed_ptr_id) {
++            // No longer "deliberately not fixed up" (see the old file
++            // header comment on this gap) -- a real, reproduced bug: a
++            // boxed Ptr[T]'s single field is a plain untagged raw address
++            // (unlike an inline PtrTag value or a lockWord, it carries no
++            // tag bits at all), not listed in refFieldOffsets precisely
++            // because it isn't a normal typed reference -- but it is
++            // exactly as real a pointer to a movable heap object as any
++            // typed field when it happens to alias one (e.g. an interior
++            // Ptr into an Array's data, the case Marker_Mark's own
++            // boxed_ptr_id branch conservatively marks+pins via
++            // Marker_markConservative). Pinning protects it from being
++            // evacuated FROM, but a boxed Ptr pointing at some OTHER,
++            // non-pinned object that legitimately got evacuated still
++            // needs this rewrite, same as any other field would.
++            Evac_FixupSlot(heap, &object->fields[0]);
++        }
++    }
++}
++
++// scoredBlockCount is Marker_Evacuate's OWN snapshot of heap->blockCount
++// taken at the start of this cycle, BEFORE any Heap_Grow call it makes
++// (upfront destination-space reservation, or growing on demand mid-copy --
++// see the comment where that happens). blockLiveBytes/blockPinned were
++// sized to that snapshot (EvacLog_ensureCapacity/EvacPin_ensureCapacity,
++// both called once per cycle from Marker_MarkRoots, before this function
++// ever runs). Reading heap->blockCount directly here instead would include
++// blocks added by a mid-cycle Heap_Grow -- genuinely new blocks the
++// scoring pass never saw, so indexing blockLiveBytes[i] for one is a
++// flat-out out-of-bounds read on a malloc'd array. That was a real,
++// reproduced bug: non-deterministic SIGBUS/SIGSEGV at garbage (not
++// null/sentinel) addresses under heavy concurrent allocation + a small
++// heap, where Heap_Grow during evacuation is common. A block index at or
++// past scoredBlockCount can never have been a candidate (it didn't exist
++// when candidacy was scored), so it's never skipped here -- which is
++// exactly right: on-demand-grown blocks are destination blocks for this
++// very cycle's copies, and their freshly-copied, marked contents still
++// need the same field fixups as any other block's.
++static void Evac_FixupHeapObjects(Heap *heap, uint32_t scoredBlockCount) {
+     Bytemap *bytemap = heap->bytemap;
++    // See EvacTrace_enabled's comment -- $SCALANATIVE_EVAC_TRACE_OBJ (hex),
++    // if set alongside $SCALANATIVE_EVAC_TRACE_FILE, additionally logs
++    // whether a SPECIFIC object address is ever visited by this loop (and
++    // which block-skip branch it would have hit, if any), complementing
++    // EvacTrace_log's per-slot VALUE tracing.
++    word_t *traceObj = NULL;
++    if (EvacTrace_enabled()) {
++        const char *traceObjStr = getenv("SCALANATIVE_EVAC_TRACE_OBJ");
++        if (traceObjStr != NULL)
++            traceObj = (word_t *)strtoull(traceObjStr, NULL, 16);
++    }
+     for (uint32_t i = 0; i < heap->blockCount; i++) {
+         BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+-        if (!BlockMeta_IsMarked(meta) || BlockMeta_ContainsLargeObjects(meta))
+-            continue;
+         word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
+         word_t *blockEnd = blockStart + WORDS_IN_BLOCK;
++        bool blockContainsTraceObj =
++            traceObj != NULL && (word_t *)traceObj >= blockStart &&
++            (word_t *)traceObj < blockEnd;
++        // Large objects (superblocks) are handled by the separate loop
++        // below, NOT skipped outright -- see its own comment for why they
++        // can't just be ignored like evacuated source blocks can.
++        if (BlockMeta_ContainsLargeObjects(meta)) {
++            if (blockContainsTraceObj) {
++                FILE *f = fopen(evacTraceFilePath, "a");
++                if (f != NULL) {
++                    fprintf(f, "FixupHeapObjects-skip-large block=%u\n", i);
++                    fclose(f);
++                }
++            }
++            continue;
++        }
++        if (!BlockMeta_IsMarked(meta)) {
++            if (blockContainsTraceObj) {
++                FILE *f = fopen(evacTraceFilePath, "a");
++                if (f != NULL) {
++                    fprintf(f, "FixupHeapObjects-skip-unmarked block=%u\n", i);
++                    fclose(f);
++                }
++            }
++            continue;
++        }
++        if (i < scoredBlockCount &&
++            Evac_IsCandidateBlock(meta, blockLiveBytes[i], i)) {
++            if (blockContainsTraceObj) {
++                FILE *f = fopen(evacTraceFilePath, "a");
++                if (f != NULL) {
++                    fprintf(f, "FixupHeapObjects-skip-candidate block=%u\n",
++                            i);
++                    fclose(f);
++                }
++            }
++            continue; // evacuated source block -- skip, see comment above
++        }
++        if (blockContainsTraceObj) {
++            FILE *f = fopen(evacTraceFilePath, "a");
++            if (f != NULL) {
++                fprintf(f, "FixupHeapObjects-scanning block=%u\n", i);
++                fclose(f);
++            }
++        }
+         for (word_t *addr = blockStart; addr < blockEnd;) {
+             ObjectMeta *objMeta = Bytemap_Get(bytemap, addr);
+             if (ObjectMeta_IsMarked(objMeta)) {
+                 Object *object = (Object *)addr;
+-                const int objectId = Object_Rtti(object)->rt.id;
+-                if (Object_IsArray(object)) {
+-                    ArrayHeader *arrayHeader = (ArrayHeader *)object;
+-                    if (objectId == __object_array_id) {
+-                        const size_t length = arrayHeader->length;
+-                        word_t **fields = (word_t **)Array_Values(arrayHeader);
+-                        for (size_t k = 0; k < length; k++) {
+-                            Evac_FixupSlot(heap, &fields[k]);
+-                        }
++                if (traceObj != NULL && addr == traceObj) {
++                    FILE *f = fopen(evacTraceFilePath, "a");
++                    if (f != NULL) {
++                        fprintf(f, "FixupHeapObjects-visit obj=%p\n",
++                                (void *)addr);
++                        fclose(f);
+                     }
+-                    // blob arrays hold no pointers -- nothing to fix up
+-                } else {
+-                    int32_t *refFieldOffsets = Object_Rtti(object)->refFieldOffsets;
+-                    for (int k = 0; refFieldOffsets[k] != LAST_FIELD_OFFSET;
+-                         k++) {
+-                        size_t fieldOffset = (size_t)refFieldOffsets[k];
+-                        word_t **fieldRef =
+-                            (word_t **)((int8_t *)object + fieldOffset);
+-                        // Deliberately NOT skipping the weak-referent field
+-                        // here (unlike marking) -- see file header comment.
+-                        Evac_FixupSlot(heap, fieldRef);
+-                    }
+-                    // The __boxed_ptr_id conservative-scan case is
+-                    // deliberately not fixed up -- see file header comment.
+                 }
++                Evac_FixupOneObject(heap, object);
+                 addr += Object_Size(object) / sizeof(word_t);
+             } else {
++                if (traceObj != NULL && addr == traceObj) {
++                    FILE *f = fopen(evacTraceFilePath, "a");
++                    if (f != NULL) {
++                        fprintf(f,
++                                "FixupHeapObjects-NOT-marked-at-addr obj=%p\n",
++                                (void *)addr);
++                        fclose(f);
++                    }
++                }
+                 addr += ALLOCATION_ALIGNMENT_WORDS;
+             }
+         }
+     }
++
++    // Large objects (superblocks) are never evacuation candidates
++    // themselves (Evac_IsCandidateBlock already excludes
++    // BlockMeta_ContainsLargeObjects), but a large live ObjectArray's own
++    // ELEMENTS can still reference smaller, normally-evacuated objects --
++    // this was a real, reproduced bug: the loop above's own
++    // BlockMeta_ContainsLargeObjects skip meant a large object's contents
++    // were never visited at all, so references inside e.g. a compiler's
++    // large symbol-table array were silently left stale (surfaced as
++    // ClassCastExceptions reading the wrong object through a corrupted
++    // slot). A superblock's mark state lives on its first object's
++    // ObjectMeta entry (see LargeAllocator_Sweep), not on BlockMeta (whose
++    // own flags field instead encodes superblock-start/middle), so it must
++    // be checked separately from the simple-block loop above.
++    // A superblock holds MORE than just the object at its first block (see the
++    // layout comment in LargeAllocator_Sweep): a large object can start at
++    // the very beginning of the first block, or at any MIN_BLOCK_SIZE step of
++    // the LAST block except its first one (that is the first object's tail).
++    // Missing the latter was a real, reproduced bug: a plain 1024-element
++    // object array (8208 bytes) was allocated mid-superblock, was never
++    // visited here, and kept pointing at objects evacuation had moved.
++    for (uint32_t i = 0; i < heap->blockCount; i++) {
++        BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
++        if (!BlockMeta_IsSuperblockStart(meta))
++            continue;
++        const uint32_t superblockSize = BlockMeta_SuperblockSize(meta);
++        word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
++        word_t *blockEnd = blockStart + WORDS_IN_BLOCK * superblockSize;
++        word_t *lastBlockStart = blockEnd - WORDS_IN_BLOCK;
++        if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, blockStart))) {
++            Evac_FixupOneObject(heap, (Object *)blockStart);
++        }
++        for (word_t *current = lastBlockStart + (MIN_BLOCK_SIZE / WORD_SIZE);
++             current < blockEnd; current += MIN_BLOCK_SIZE / WORD_SIZE) {
++            if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, current))) {
++                Evac_FixupOneObject(heap, (Object *)current);
++            }
++        }
++    }
++}
++
++// Debug-only helper for $SCALANATIVE_EVAC_VALIDATE_FILE: reports every
++// reference field of `object` that still points at a forwarded (evacuated)
++// object after the fixup passes ran.
++static void Evac_ValidateObject(Heap *heap, Object *object,
++                                const char *validateFilePath, uint32_t block) {
++    Bytemap *bytemap = heap->bytemap;
++    if (Object_IsArray(object)) {
++        if (Object_Rtti(object)->rt.id != __object_array_id)
++            return;
++        ArrayHeader *ah = (ArrayHeader *)object;
++        word_t **fields = (word_t **)Array_Values(ah);
++        for (size_t k = 0; k < (size_t)ah->length; k++) {
++            word_t *v = fields[k];
++            if (v != NULL && Heap_IsWordInHeap(heap, v) &&
++                Bytemap_isPtrAligned(v)) {
++                ObjectMeta *vm = Bytemap_Get(bytemap, v);
++                if (!ObjectMeta_IsFree(vm) && !ObjectMeta_IsPlaceholder(vm) &&
++                    Evac_IsForwarded((Object *)v)) {
++                    FILE *f = fopen(validateFilePath, "a");
++                    if (f != NULL) {
++                        fprintf(f,
++                                "STALE array obj=%p rttiId=%d elem=%zu "
++                                "value=%p block=%u\n",
++                                (void *)object, Object_Rtti(object)->rt.id, k,
++                                (void *)v, block);
++                        fclose(f);
++                    }
++                }
++            }
++        }
++        return;
++    }
++    int32_t *offs = Object_Rtti(object)->refFieldOffsets;
++    for (int k = 0; offs[k] != LAST_FIELD_OFFSET; k++) {
++        word_t *v = *(word_t **)((int8_t *)object + offs[k]);
++        if (v != NULL && Heap_IsWordInHeap(heap, v) &&
++            Bytemap_isPtrAligned(v)) {
++            ObjectMeta *vm = Bytemap_Get(bytemap, v);
++            if (!ObjectMeta_IsFree(vm) && !ObjectMeta_IsPlaceholder(vm) &&
++                Evac_IsForwarded((Object *)v)) {
++                FILE *f = fopen(validateFilePath, "a");
++                if (f != NULL) {
++                    fprintf(f,
++                            "STALE field obj=%p rttiId=%d fieldOffset=%d "
++                            "value=%p block=%u\n",
++                            (void *)object, Object_Rtti(object)->rt.id, offs[k],
++                            (void *)v, block);
++                    fclose(f);
++                }
++            }
++        }
++    }
+ }
+ 
+ void Marker_Evacuate(Heap *heap, Stack *stack) {
+@@ -836,10 +1158,26 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+     uint32_t candidateBlockCount = 0;
+     for (uint32_t i = 0; i < blockCount; i++) {
+         BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+-        if (Evac_IsCandidateBlock(meta, blockLiveBytes[i], i)) {
++        bool isCandidate = Evac_IsCandidateBlock(meta, blockLiveBytes[i], i);
++        if (isCandidate) {
+             totalLiveBytes += blockLiveBytes[i];
+             candidateBlockCount++;
+         }
++        if (EvacTrace_enabled() && evacTraceValue != NULL) {
++            word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
++            word_t *blockEnd = blockStart + WORDS_IN_BLOCK;
++            if (evacTraceValue >= blockStart && evacTraceValue < blockEnd) {
++                FILE *f = fopen(evacTraceFilePath, "a");
++                if (f != NULL) {
++                    fprintf(f,
++                            "Scoring: traceValue=%p block=%u candidate=%d "
++                            "liveBytes=%u pinned=%d\n",
++                            (void *)evacTraceValue, i, isCandidate,
++                            blockLiveBytes[i], EvacPin_isBlockPinned(i));
++                    fclose(f);
++                }
++            }
++        }
+     }
+     if (candidateBlockCount == 0)
+         return;
+@@ -920,15 +1258,39 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+                     BlockMeta *destBlockMeta =
+                         BlockAllocator_GetFreeBlock(&blockAllocator);
+                     if (destBlockMeta == NULL) {
+-                        // Should be unreachable given the free-count check
+-                        // above -- if it ever happens, objects already
+-                        // forwarded this call are already committed, so
+-                        // continuing would silently corrupt memory. Fail
+-                        // loudly instead, matching this codebase's own
+-                        // convention for genuinely unrecoverable states.
+-                        Heap_exitWithOutOfMemory(
+-                            "evacuation: destination blocks exhausted "
+-                            "unexpectedly mid-copy");
++                        // neededBlocks above is an upfront ESTIMATE
++                        // (totalLiveBytes/BLOCK_TOTAL_SIZE + a flat
++                        // constant margin), not an exact bound -- real
++                        // per-destination-block padding waste (never
++                        // letting an object straddle two destination
++                        // blocks) scales with how many destination blocks
++                        // actually get used, which scales with how many
++                        // candidate blocks there are. Under heavy
++                        // concurrent allocation (many threads churning the
++                        // heap between cycles) that estimate was observed
++                        // to run short -- a real, reproduced bug (hit via
++                        // a small heap + several contended threads).
++                        // Objects already forwarded this call are already
++                        // committed, so this can't just bail out like the
++                        // upfront check can -- grow by one more block, the
++                        // same way the upfront reservation does, instead
++                        // of treating a merely-approximate estimate being
++                        // short as a fatal condition.
++                        if (!Heap_isGrowingPossible(heap, 1)) {
++                            Heap_exitWithOutOfMemory(
++                                "evacuation: destination blocks exhausted "
++                                "mid-copy and heap cannot grow further");
++                        }
++                        Heap_Grow(heap, 1);
++                        destBlockMeta = BlockAllocator_GetFreeBlock(&blockAllocator);
++                        if (destBlockMeta == NULL) {
++                            // Heap_Grow just added blocks to the free list;
++                            // this would mean growth itself is broken, not
++                            // a sizing shortfall -- genuinely unrecoverable.
++                            Heap_exitWithOutOfMemory(
++                                "evacuation: grew heap but still no free "
++                                "destination block (bug in Heap_Grow)");
++                        }
+                     }
+                     word_t *newBlockStart = BlockMeta_GetBlockStart(
+                         heap->blockMetaStart, heap->heapStart, destBlockMeta);
+@@ -950,24 +1312,105 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+                 addr += ALLOCATION_ALIGNMENT_WORDS;
+             }
+         }
+-
+-        // Fully evacuated: make Block_Recycle (which runs right after this
+-        // whole function returns, via Heap_Recycle) treat it exactly like
+-        // any other fully-dead block -- !BlockMeta_IsMarked triggers
+-        // Block_recycleUnmarkedBlock, adding it straight to the free list.
+-        BlockMeta_Unmark(meta);
+-        ObjectMeta_ClearBlockAt(Bytemap_Get(bytemap, blockStart));
++        // Deliberately NOT unmarking/clearing this block's metadata here --
++        // see the big comment below, right before the loop that does it.
+     }
+ 
+     // Rewrite every pointer that could reference an old, now-forwarded
+     // address: every root, then every field of every still-marked object
+-    // (survivors-in-place and freshly-copied alike).
++    // (survivors-in-place and freshly-copied alike). This MUST run while
++    // every evacuated source block's bytemap still reads allocated/marked
++    // (i.e. before the unmark/clear loop below) -- Evac_FixupSlot decides
++    // whether a slot's value could even possibly be a forwarded object by
++    // checking that address's OWN bytemap entry first (a cheap way to avoid
++    // dereferencing ->rtti on a value that isn't a real object pointer at
++    // all); clearing a source block's bytemap to free BEFORE this runs would
++    // make every reference into it look like "not an object, nothing to
++    // check" and silently skip rewriting it -- exactly the bug this
++    // ordering fixes (real, reproduced: every reference to an evacuated
++    // object was left stale, corrupting whatever read it later, e.g. a
++    // ClassCastException/SIGSEGV in CharsetEncoder.encodeLoopArray on an
++    // evacuated backing array).
+     MutatorThreads_foreach(mutatorThreads, node) {
+         Evac_FixupProgramStack(node->value, heap);
+     }
+     Evac_FixupModules(heap);
+     Evac_FixupCustomRoots(heap, customRoots);
+-    Evac_FixupHeapObjects(heap);
++    Evac_FixupHeapObjects(heap, blockCount);
++
++    // Debug-only: $SCALANATIVE_EVAC_VALIDATE_FILE (zero-cost when unset) --
++    // re-walks every live, non-candidate (survivor) object's fields right
++    // after the real fixup pass above and reports ANY field that still
++    // points at a forwarded (stale) object, by construction something the
++    // fixup pass above should have already corrected. Unlike
++    // EvacTrace_log/SCALANATIVE_EVAC_TRACE_VALUE (which needs a specific
++    // address known in advance, from a previous crash), this finds a
++    // missed fixup dynamically, in any run, without foreknowledge -- real
++    // object addresses vary enough run to run (allocation-order/timing
++    // dependent) that a hardcoded target address from one crash often
++    // doesn't match the next run's addresses at all.
++    if (getenv("SCALANATIVE_EVAC_VALIDATE_FILE") != NULL) {
++        const char *validateFilePath = getenv("SCALANATIVE_EVAC_VALIDATE_FILE");
++        for (uint32_t i = 0; i < heap->blockCount; i++) {
++            BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
++            word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
++            if (BlockMeta_IsSuperblockStart(meta)) {
++                // Same object positions as Evac_FixupHeapObjects' large loop.
++                const uint32_t n = BlockMeta_SuperblockSize(meta);
++                word_t *blockEnd = blockStart + WORDS_IN_BLOCK * n;
++                if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, blockStart)))
++                    Evac_ValidateObject(heap, (Object *)blockStart,
++                                        validateFilePath, i);
++                for (word_t *cur = blockEnd - WORDS_IN_BLOCK +
++                                   (MIN_BLOCK_SIZE / WORD_SIZE);
++                     cur < blockEnd; cur += MIN_BLOCK_SIZE / WORD_SIZE) {
++                    if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, cur)))
++                        Evac_ValidateObject(heap, (Object *)cur,
++                                            validateFilePath, i);
++                }
++                continue;
++            }
++            if (BlockMeta_ContainsLargeObjects(meta) || !BlockMeta_IsMarked(meta))
++                continue;
++            if (i < blockCount && Evac_IsCandidateBlock(meta, blockLiveBytes[i], i))
++                continue; // source block -- its own fields are expected stale
++            word_t *blockEnd = blockStart + WORDS_IN_BLOCK;
++            for (word_t *addr = blockStart; addr < blockEnd;) {
++                ObjectMeta *objMeta = Bytemap_Get(bytemap, addr);
++                if (!ObjectMeta_IsMarked(objMeta)) {
++                    addr += ALLOCATION_ALIGNMENT_WORDS;
++                    continue;
++                }
++                Object *object = (Object *)addr;
++                Evac_ValidateObject(heap, object, validateFilePath, i);
++                addr += Object_Size(object) / sizeof(word_t);
++            }
++        }
++    }
++
++    // NOW it's safe to make every evacuated source block look fully dead:
++    // every pointer that could reference one has already been rewritten
++    // above. Block_Recycle (which runs right after this whole function
++    // returns, via Heap_Recycle) treats !BlockMeta_IsMarked as
++    // Block_recycleUnmarkedBlock, adding it straight to the free list.
++    for (uint32_t i = 0; i < blockCount; i++) {
++        BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
++        if (!Evac_IsCandidateBlock(meta, blockLiveBytes[i], i))
++            continue;
++        word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
++        BlockMeta_Unmark(meta);
++        ObjectMeta_ClearBlockAt(Bytemap_Get(bytemap, blockStart));
++        // Debug-only ($SCALANATIVE_EVAC_POISON, zero-cost when unset): the
++        // allocator zeroes memory when it hands it out, so scribbling over the
++        // evacuated source block here is safe, and turns any later use of a
++        // stale pointer into it (a reference nothing rewrote) into a loud
++        // crash instead of silently reading a tombstone.
++        static int poisonOn = -1;
++        if (poisonOn < 0)
++            poisonOn = getenv("SCALANATIVE_EVAC_POISON") != NULL;
++        if (poisonOn)
++            memset(blockStart, 0xAB, BLOCK_TOTAL_SIZE);
++    }
+ 
+     GC_LOG_INFO("Evacuation done");
+ }
+@@ -1078,33 +1521,83 @@ static inline void Marker_markLockWords(Heap *heap, Stack *stack,
+ #endif
+ }
+ 
++// Pins the block of whatever object `address` points into, if anything.
++// Deliberately NOT gated on Bytemap_isPtrAligned the way marking is: marking
++// can afford to ignore an unaligned word (the object is kept alive by its
++// base pointer somewhere else, or it isn't a pointer at all), but a MOVING
++// collector cannot -- compiled code freely keeps a derived pointer
++// (`array + header + index * elemSize`, e.g. the cursor of a loop filling a
++// Array[Char]) in a register or stack slot, and if only the object's block
++// is moved that pointer silently keeps reading and WRITING the stale copy.
++// Real, reproduced bug: Integer.toString lost its leading digit under
++// evacuation + threads ("k05" instead of "k105"). Object_resolveConservativeAddress
++// already rounds an unaligned address down and walks back to the object start.
++static void Evac_PinConservative(Heap *heap, word_t *address) {
++    // PINNING: this object is (at least) reachable via a conservative
++    // scan (stack, registers, custom roots, or a boxed-ptr scan -- every
++    // caller of Marker_markConservative). Conservative scanning cannot
++    // tell a real reference apart from a non-pointer word that merely
++    // looks like one, so a moving evacuator can NEVER safely rewrite the
++    // slot that led here -- it might not be a pointer at all. Mark the
++    // whole containing block pinned so evacuation skips it entirely this
++    // cycle. This fixes a real, reproduced SIGSEGV/data-corruption bug
++    // from evacuating objects reachable only via a stack local that
++    // happened to alias a moved address.
++    //
++    // Deliberately resolved via Object_GetConservativeObjectForPin, NOT
++    // Object_GetUnmarkedObject below -- an object already marked via a
++    // real/precise reference elsewhere (e.g. a field also holding this
++    // same array, common for reused buffers like an encoder's backing
++    // array) is exactly the case Object_GetUnmarkedObject's "already
++    // marked" bail-out treats as "nothing to do here" (a valid
++    // marking-work dedup). But this conservative root can still be an
++    // unfixable derived/interior pointer into that same object, so the
++    // pin must not be skipped just because marking happened via the
++    // other path -- omitting this was the root cause of a real,
++    // reproduced evacuation memory-corruption bug (ClassCastException /
++    // SIGSEGV in CharsetEncoder.encodeLoopArray on the encoder's
++    // long-lived, repeatedly-marked-elsewhere backing array).
++    if (g_evacTrackingOn) {
++        Object *pinTarget = Object_GetConservativeObjectForPin(heap, address);
++        if (pinTarget != NULL) {
++            EvacPin_record(heap, pinTarget);
++            if (EvacTrace_enabled() && (word_t *)pinTarget == evacTraceValue) {
++                FILE *f = fopen(evacTraceFilePath, "a");
++                if (f != NULL) {
++                    fprintf(f,
++                            "Marker_markConservative-PIN addr=%p "
++                            "pinTarget=%p\n",
++                            (void *)address, (void *)pinTarget);
++                    fclose(f);
++                }
++            }
++        } else if (EvacTrace_enabled() && (word_t *)address == evacTraceValue) {
++            FILE *f = fopen(evacTraceFilePath, "a");
++            if (f != NULL) {
++                fprintf(f,
++                        "Marker_markConservative-NO-PIN-TARGET addr=%p\n",
++                        (void *)address);
++                fclose(f);
++            }
++        }
++    }
++}
++
+ void Marker_markConservative(Heap *heap, Stack *stack, word_t *address) {
+     assert(Heap_IsWordInHeap(heap, address));
++    if (g_evacTrackingOn)
++        Evac_PinConservative(heap, address);
+     if (Bytemap_isPtrAligned(address)) {
+         if (graphDumpFile != NULL) {
+             Object *dumpObj = GraphDump_resolveConservative(heap, address);
+             if (dumpObj != NULL)
+                 GraphDump_recordDiscovery(dumpObj);
+         }
+-        Object *object = Object_GetUnmarkedObject(heap, address);
+         Bytemap *bytemap = heap->bytemap;
++        Object *object = Object_GetUnmarkedObject(heap, address);
+         if (object != NULL) {
+             ObjectMeta *objectMeta = Bytemap_Get(bytemap, (word_t *)object);
+             if (ObjectMeta_IsAllocated(objectMeta)) {
+-                // PINNING: this object is only known live via a conservative
+-                // scan (stack, registers, custom roots, or a boxed-ptr scan
+-                // -- every caller of Marker_markConservative). Conservative
+-                // scanning cannot tell a real reference apart from a
+-                // non-pointer word that merely looks like one, so a moving
+-                // evacuator can NEVER safely rewrite the slot that led here
+-                // -- it might not be a pointer at all. Mark the whole
+-                // containing block pinned so evacuation skips it entirely
+-                // this cycle. This fixes a real, reproduced SIGSEGV/data-
+-                // corruption bug from evacuating objects reachable only via
+-                // a stack local that happened to alias a moved address.
+-                if (g_evacTrackingOn) {
+-                    EvacPin_record(heap, object);
+-                }
+                 Marker_markObject(heap, stack, bytemap, object, objectMeta);
+             }
+         }
+@@ -1210,6 +1703,17 @@ NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
+     for (ubyte_t *current = alignedFrom; current < alignedTo;
+          current += stride) {
+         word_t *addr = *(word_t **)current;
++        if (EvacTrace_enabled() && addr == evacTraceValue) {
++            FILE *f = fopen(evacTraceFilePath, "a");
++            if (f != NULL) {
++                fprintf(f,
++                        "Marker_markRange-seen slot=%p value=%p "
++                        "inHeap=%d\n",
++                        (void *)current, (void *)addr,
++                        Heap_IsWordInHeap(heap, addr));
++                fclose(f);
++            }
++        }
+         if (Heap_IsWordInHeap(heap, addr)) {
+             Marker_markConservative(heap, stack, addr);
+         }
+@@ -1224,6 +1728,14 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+         // Can spuriously fail, very rare, yet deadly
+         stackTop = MutatorThread_getStackTop(thread, false);
+     } while (stackTop == NULL);
++    if (EvacTrace_enabled()) {
++        FILE *f = fopen(evacTraceFilePath, "a");
++        if (f != NULL) {
++            fprintf(f, "MARK-range thread=%p stackTop=%p stackBottom=%p\n",
++                    (void *)thread, (void *)stackTop, (void *)stackBottom);
++            fclose(f);
++        }
++    }
+ #ifdef SCALANATIVE_THREAD_ALT_STACK
+     if (thread->threadInfo != NULL &&
+         !isInRange(stackTop, thread->threadInfo->stackTop,
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Object.c b/nativelib/src/main/resources/scala-native/gc/immix/Object.c
+index 201bcdf..19eb5c3 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Object.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Object.c
+@@ -13,8 +13,12 @@ word_t *Object_LastWord(Object *object) {
+     return last;
+ }
+ 
+-Object *Object_getInnerPointer(Heap *heap, BlockMeta *blockMeta, word_t *word,
+-                               ObjectMeta *wordMeta) {
++// acceptMarked: also resolve an interior pointer into an object that is
++// already marked (its meta reads marked, not allocated), see
++// Object_GetConservativeObjectForPin.
++static Object *Object_getInnerPointer(Heap *heap, BlockMeta *blockMeta,
++                                      word_t *word, ObjectMeta *wordMeta,
++                                      bool acceptMarked) {
+     int stride;
+     word_t *blockStart;
+     if (BlockMeta_ContainsLargeObjects(blockMeta)) {
+@@ -35,7 +39,8 @@ Object *Object_getInnerPointer(Heap *heap, BlockMeta *blockMeta, word_t *word,
+         currentMeta -= stride;
+     }
+     Object *object = (Object *)current;
+-    if (ObjectMeta_IsAllocated(currentMeta) &&
++    if ((ObjectMeta_IsAllocated(currentMeta) ||
++         (acceptMarked && ObjectMeta_IsMarked(currentMeta))) &&
+         (ubyte_t *)word < (ubyte_t *)current + Object_Size(object)) {
+         return object;
+     } else {
+@@ -43,7 +48,8 @@ Object *Object_getInnerPointer(Heap *heap, BlockMeta *blockMeta, word_t *word,
+     }
+ }
+ 
+-Object *Object_GetUnmarkedObject(Heap *heap, word_t *word) {
++static Object *Object_resolveConservativeAddress(Heap *heap, word_t *word,
++                                                 bool acceptMarked) {
+     BlockMeta *blockMeta =
+         Block_GetBlockMeta(heap->blockMetaStart, heap->heapStart, word);
+ 
+@@ -54,15 +60,26 @@ Object *Object_GetUnmarkedObject(Heap *heap, word_t *word) {
+     }
+ 
+     ObjectMeta *wordMeta = Bytemap_Get(heap->bytemap, word);
+-    if (ObjectMeta_IsPlaceholder(wordMeta) || ObjectMeta_IsMarked(wordMeta)) {
++    if (ObjectMeta_IsPlaceholder(wordMeta)) {
+         return NULL;
++    } else if (ObjectMeta_IsMarked(wordMeta)) {
++        return acceptMarked ? (Object *)word : NULL;
+     } else if (ObjectMeta_IsAllocated(wordMeta)) {
+         return (Object *)word;
+     } else {
+-        return Object_getInnerPointer(heap, blockMeta, word, wordMeta);
++        return Object_getInnerPointer(heap, blockMeta, word, wordMeta,
++                                      acceptMarked);
+     }
+ }
+ 
++Object *Object_GetUnmarkedObject(Heap *heap, word_t *word) {
++    return Object_resolveConservativeAddress(heap, word, false);
++}
++
++Object *Object_GetConservativeObjectForPin(Heap *heap, word_t *word) {
++    return Object_resolveConservativeAddress(heap, word, true);
++}
++
+ void Object_Mark(Heap *heap, Object *object, ObjectMeta *objectMeta) {
+     // Mark the object itself
+     ObjectMeta_SetMarked(objectMeta);
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Object.h b/nativelib/src/main/resources/scala-native/gc/immix/Object.h
+index a4688bb..d4ffef8 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Object.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Object.h
+@@ -8,6 +8,14 @@
+ 
+ word_t *Object_LastWord(Object *object);
+ Object *Object_GetUnmarkedObject(Heap *heap, word_t *address);
++// Like Object_GetUnmarkedObject, but also resolves an already-marked object
++// (reached via a precise reference elsewhere) instead of returning NULL --
++// for evacuation pinning, not marking-work dedup. See Marker_markConservative
++// for why: an object can be reachable both precisely (already marked) AND
++// via a conservative/derived pointer that evacuation can never fix up, and
++// the pinning decision must not skip it just because marking already
++// happened through the other path.
++Object *Object_GetConservativeObjectForPin(Heap *heap, word_t *address);
+ void Object_Mark(Heap *heap, Object *object, ObjectMeta *objectMeta);
+ 
+ #endif // IMMIX_OBJECT_H
