@@ -20,8 +20,8 @@ attaches to those files, whether or not metals-zed stays installed.
 
 ## Install
 
-Published to Zed's extension gallery as **Scalino LSP**: `cmd-shift-p` ->
-"zed: extensions" -> search "Scalino LSP" -> install. This only installs the
+Published to Zed's extension gallery as **Scalino**: `cmd-shift-p` ->
+"zed: extensions" -> search "Scalino" -> install. This only installs the
 extension (grammar + language server wiring) -- `scalino-lsp` itself is
 still your own build, not auto-downloaded (see "Scope" below), so steps 1-4
 below are still required either way.

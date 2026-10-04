@@ -48,8 +48,8 @@ auto-downloaded (see "Scope" below) -- steps 1-3 below are still required.
    writes `.scalino-build/scalino-lsp.json` there (`../cli/ScalinoCli.scala`'s
    `setup-ide` command) -- editor config (step 2) is separate and this
    command doesn't touch it.
-4. Open the project in VS Code. Check the "Scalino LSP" output channel
-   (`View` -> `Output`, pick "Scalino LSP" from the dropdown) if
+4. Open the project in VS Code. Check the "Scalino" output channel
+   (`View` -> `Output`, pick "Scalino" from the dropdown) if
    diagnostics/hover don't show up -- set `scalino-lsp.trace.server` to
    `"verbose"` first for a full trace of every request/notification, and
    this extension's own `.scalino-build/scalino-lsp.log` (written to the

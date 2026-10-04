@@ -1,6 +1,6 @@
 {
   "name": "scalino-lsp",
-  "displayName": "Scalino LSP",
+  "displayName": "Scalino",
   "description": "JVM-free Scala language server (scalino-lsp, from scalino) -- diagnostics and hover without Metals' JVM dependency.",
   "version": "0.0.6",
   "publisher": "lolgab",
@@ -25,7 +25,7 @@
     ],
     "configuration": {
       "type": "object",
-      "title": "Scalino LSP",
+      "title": "Scalino",
       "properties": {
         "scalino-lsp.path": {
           "type": "string",

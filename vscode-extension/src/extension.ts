@@ -172,7 +172,7 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   };
 
-  client = new LanguageClient(SERVER_ID, "Scalino LSP", serverOptions, clientOptions);
+  client = new LanguageClient(SERVER_ID, "Scalino", serverOptions, clientOptions);
   client.start();
 }
 

@@ -160,7 +160,7 @@ Metals' JVM dependency. Run `scalino setup-ide <sources...>` to generate its
 project config (`.scalino-build/scalino-lsp.json`).
 
 For Zed, [`zed-extension/`](zed-extension/) wires it up as a real
-extension, published to Zed's gallery as "Scalino LSP". For VS Code,
+extension, published to Zed's gallery as "Scalino". For VS Code,
 [`vscode-extension/`](vscode-extension/) does the same, packaged locally
 for now (not yet on the Marketplace). For Neovim,
 [`neovim-extension/`](neovim-extension/) provides a `vim.lsp` client config
