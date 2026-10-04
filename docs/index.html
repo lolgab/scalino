@@ -161,6 +161,7 @@
       <a href="#install">Install</a>
       <a href="#action">In action</a>
       <a href="#benefits">Benefits</a>
+      <a href="#hermetic">Nix</a>
       <a href="#editors">Editors</a>
       <a href="#status">Status</a>
     </nav>
@@ -197,7 +198,8 @@
   <p class="section-sub">Grabs the latest release for your OS/arch, verifies its checksum, and installs
     <code class="mono">scalino</code> to <code class="mono">~/.local/bin</code>. The only thing it expects
     already on the machine is <code class="mono">clang</code> — every build links through it, even a
-    zero-dependency Hello World.</p>
+    zero-dependency Hello World. Packages (deb, rpm, Arch, Nix, Homebrew) install bash/zsh/fish
+    completions for you.</p>
 
   <div class="tabs" id="install-tabs">
     <button class="tab active" data-panel="i-curl">curl</button>
@@ -216,8 +218,8 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
 <span class="cm"># installs to /usr/lib/scalino/, symlinked into /usr/bin/</span></pre></div>
     <div class="panel" id="i-manual"><pre><span class="cm"># each release ships a self-contained dist/ tarball:</span>
 <span class="cm"># compiler + linker + scalino, for linux/macOS (x86_64+arm64)</span>
-<span class="cm"># and windows (x86_64, experimental)</span>
-./dist/scalino</pre></div>
+./dist/scalino
+<span class="cm"># shell completions: dist/completions/, or `scalino completions &lt;bash|zsh|fish&gt;`</span></pre></div>
   </div>
 </section>
 
@@ -235,6 +237,7 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
     <button class="tab" data-panel="a-macro">Real macros</button>
     <button class="tab" data-panel="a-deps">Dependencies</button>
     <button class="tab" data-panel="a-watch">Watch mode</button>
+    <button class="tab" data-panel="a-test">Tests</button>
     <button class="tab" data-panel="a-compile">Build a binary</button>
     <button class="tab" data-panel="a-ide">Editor setup</button>
   </div>
@@ -264,14 +267,20 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
       <div class="note">Resolution shells out to a bundled, renamed coursier (<code class="mono">scalino-cs</code>) — no separate install, classpaths cached in <code class="mono">.scalino-build/</code>.</div></div>
 
     <div class="panel" id="a-watch"><pre>scalino run -w</pre>
-      <div class="note">Rebuilds and reruns on save. Same flags as scala-cli: <code class="mono">--dep</code>, <code class="mono">-S/--scala</code>, <code class="mono">-O/--scalac-option</code>, <code class="mono">--main-class</code>, <code class="mono">-o/--output</code>.</div></div>
+      <div class="note">Rebuilds and reruns on save, with scala-cli-style output (same wording, colors and diagnostics). Builds are incremental: only changed sources recompile. Same flags as scala-cli: <code class="mono">--dep</code>, <code class="mono">-S/--scala</code>, <code class="mono">-O/--scalac-option</code>, <code class="mono">--main-class</code>, <code class="mono">-o/--output</code>. Boolean flags like <code class="mono">-w</code> work before the sub-command, and every command has <code class="mono">--help</code>.</div></div>
+
+    <div class="panel" id="a-test"><pre><span class="cm">//&gt; using test.dep "org.scalameta::munit::1.0.0"</span>
+
+scalino test .
+scalino test . --test-only <span class="st">"*MySuite*"</span></pre>
+      <div class="note">Finds munit, utest, scalatest and zio-test automatically. <code class="mono">--test-only &lt;glob&gt;</code> links only the selected test classes, so the rest never reach the binary.</div></div>
 
     <div class="panel" id="a-compile"><pre>scalino package -o hello
 ./hello</pre>
-      <div class="note">A real, standalone native executable — no JVM, no bytecode, nothing to install on the machine that runs it.</div></div>
+      <div class="note">A real, standalone native executable — no JVM, no bytecode, nothing to install on the machine that runs it. Tune it with <code class="mono">--native-mode release-fast</code>, <code class="mono">--native-gc</code>, <code class="mono">--native-lto</code>.</div></div>
 
     <div class="panel" id="a-ide"><pre>scalino setup-ide</pre>
-      <div class="note">Generates <code class="mono">.scalino-build/scalino-lsp.json</code>, then <code class="mono">dist/scalino-lsp</code> gives your editor diagnostics, hover, go-to-definition, references, and rename — without Metals' JVM dependency.</div></div>
+      <div class="note">Generates <code class="mono">.scalino-build/scalino-lsp.json</code>, then <code class="mono">dist/scalino-lsp</code> gives your editor diagnostics, completions, hover, go-to-definition, references, and rename — without Metals' JVM dependency.</div></div>
   </div>
 </section>
 
@@ -287,6 +296,15 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
     <div class="benefit"><div class="icon">⚡</div>
       <h3>Fast to install, fast to run</h3>
       <p>One native binary — no JDK to provision, no <code class="mono">setup-java</code> step. Starts instantly, no JIT warmup, which adds up over every CI run.</p></div>
+    <div class="benefit"><div class="icon">⚙</div>
+      <h3>Fast builds</h3>
+      <p>Object files come straight from libLLVM's C API — no <code class="mono">.ll</code> text, no per-file clang. Compilation and linking are both incremental, so a rebuild touches only what changed.</p></div>
+    <div class="benefit"><div class="icon">▫</div>
+      <h3>Lean binaries</h3>
+      <p>4-byte object headers (class id and lock bits in one word) shrink every object and array, on by default. Opt out with <code class="mono">--native-compact-headers=false</code>.</p></div>
+    <div class="benefit"><div class="icon">#</div>
+      <h3>Hermetic builds</h3>
+      <p><code class="mono">scalino lock</code> pins every jar by URL and sha256, and <code class="mono">--offline</code> builds with no network. A Nix flake builds on top of it.</p></div>
     <div class="benefit"><div class="icon">$</div>
       <h3>Familiar by design</h3>
       <p>A mini scala-cli, shaped like the real one on purpose — same directives, same flags, same instinct for finding your entry point.</p></div>
@@ -295,12 +313,37 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
 
 <hr class="divider">
 
+<section id="hermetic" class="wrap">
+  <p class="eyebrow">Hermetic builds</p>
+  <h2>Lock it, then build with no network.</h2>
+  <p class="section-sub">Nix builds can't reach the network, so dependencies need a lockfile that something
+    else fetches first. <code class="mono">scalino lock</code> writes one;
+    <code class="mono">--offline</code> (or <code class="mono">SCALINO_OFFLINE=1</code>) builds from it and the local cache only.</p>
+  <div class="panelwrap">
+    <div class="panel-head"><span>shell / nix</span><span>scalino.lock.json</span></div>
+    <div class="panel active"><pre>scalino lock .          <span class="cm"># per jar: path + URL + sha256</span>
+scalino run . --offline <span class="cm"># lock + local cache only</span>
+
+<span class="cm"># flake.nix</span>
+scalino.lib.${system}.mkScalinoApp {
+  pname = <span class="st">"myapp"</span>;
+  src = ./.;   <span class="cm"># contains scalino.lock.json</span>
+}</pre>
+      <div class="note">Every locked jar is fetched with <code class="mono">pkgs.fetchurl</code>. <code class="mono">mkScalinoDevShell</code> gives an offline <code class="mono">nix develop</code> shell where <code class="mono">scalino-lsp</code> and go-to-definition into libraries work too. Linux and macOS, x86_64 and aarch64.</div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
 <section id="editors" class="wrap">
   <p class="eyebrow">Editor support</p>
   <h2>Metals-inspired tooling, without Metals' JVM.</h2>
-  <p class="section-sub"><code class="mono">scalino-lsp</code> is self-hosted the same way as the compiler —
-    verified against a real native binary on a hand-written project, a real multi-package third-party
-    project, and end-to-end inside actual Zed.</p>
+  <p class="section-sub"><code class="mono">scalino-lsp</code> is built on dotc's presentation compiler and self-hosted
+    the same way as the compiler. It covers diagnostics, completion, hover, go-to-definition (into
+    dependency sources read straight from their jars, and into Scala Native's own sources),
+    type definition, references, rename, selection ranges, inlay hints, semantic tokens and code actions.
+    It shuts down when idle, and Neovim clients reattach on restart.</p>
   <div class="editors">
     <div class="editor"><div class="glyph">Z</div><h4>Zed</h4><p>Published to Zed's extension gallery as "Scalino LSP"</p></div>
     <div class="editor"><div class="glyph">▤</div><h4>VS Code</h4><p>Packaged in <code class="mono">vscode-extension/</code>, not yet on the Marketplace</p></div>
@@ -319,15 +362,18 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
       <ul>
         <li>Scala 3 → NIR → native executable, end to end</li>
         <li>Real inline/quote macros via the custom tree interpreter</li>
-        <li><code class="mono">scalino-lsp</code>: diagnostics, hover, go-to-definition, references, rename</li>
+        <li><code class="mono">scalino-lsp</code>: diagnostics, completion, hover, go-to-definition, type definition, references, rename, inlay hints, semantic tokens, code actions</li>
+        <li>Direct LLVM codegen, incremental compile and link, 4-byte object headers, all on by default</li>
+        <li><code class="mono">run</code>, <code class="mono">test</code>, <code class="mono">package</code>, <code class="mono">lock</code>, <code class="mono">--offline</code>, shell completions</li>
         <li>Self-hosted since 2026-09-07 — zero JVM anywhere in the shipped binaries</li>
       </ul>
     </div>
     <div class="statuscard">
-      <h3><span class="pill next">Next</span> Full editor support</h3>
+      <h3><span class="pill next">Next</span> Gaps still open</h3>
       <ul>
-        <li>General quote-pattern matching (<code class="mono">case '{ ... } =&gt;</code>) — the main known macro gap</li>
+        <li>Structural quote-type patterns beyond a bare type variable (<code class="mono">case '[List[t]] =&gt;</code>) — the main known macro gap</li>
         <li>VS Code Marketplace listing</li>
+        <li>Windows builds (disabled in releases for now)</li>
         <li>Broader third-party library coverage cross-published for scala-native</li>
       </ul>
     </div>
@@ -342,6 +388,7 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
         <a href="https://github.com/lolgab/scalino" target="_blank" rel="noopener">GitHub</a>
         <a href="https://github.com/lolgab/scalino/releases" target="_blank" rel="noopener">Releases</a>
         <a href="https://github.com/lolgab/scalino/blob/main/docs/findings.md" target="_blank" rel="noopener">Self-hosting findings</a>
+        <a href="https://github.com/lolgab/scalino/tree/main/tools/heap-viewer" target="_blank" rel="noopener">GC heap viewer</a>
         <a href="https://github.com/lolgab/scalino/blob/main/LICENSE" target="_blank" rel="noopener">License (Apache 2.0)</a>
       </div>
       <div class="footcol">
