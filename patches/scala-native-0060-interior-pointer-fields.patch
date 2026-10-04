@@ -1,0 +1,196 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+index 1e5f8e5..fefadb9 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -898,6 +898,44 @@ static void Evac_FixupCustomRoots(Heap *heap, GC_Roots *roots) {
+ // their contents here would misinterpret every forwarded (tombstoned)
+ // object as a live survivor and read its corrupted rtti, so they must be
+ // skipped explicitly instead of relying on the unmark to exclude them.
++// Rewrites a raw pointer into the MIDDLE of another heap object (see
++// FieldLayout.isInteriorPointer in the compiler: e.g. java.nio.Buffer's cached
++// address of its backing array's data) after the object it points into was
++// moved. Not a reference, so it is invisible to refFieldOffsets and to
++// marking (the real reference keeping the target alive is another field).
++static inline void Evac_FixupInteriorSlot(Heap *heap, word_t **slot) {
++    word_t *value = *slot;
++    if (value == NULL || !Heap_IsWordInHeap(heap, value))
++        return;
++    BlockMeta *blockMeta =
++        Block_GetBlockMeta(heap->blockMetaStart, heap->heapStart, value);
++    if (BlockMeta_ContainsLargeObjects(blockMeta))
++        return; // large objects never move
++    // Walk back to the start of the object containing `value`. Can't use
++    // Object_getInnerPointer: it asks Object_Size, which a tombstone (forwarded
++    // header, no rtti) can't answer.
++    word_t *blockStart = Block_GetBlockStartForWord(value);
++    word_t *cursor =
++        (word_t *)((word_t)value & ALLOCATION_ALIGNMENT_INVERSE_MASK);
++    ObjectMeta *meta = Bytemap_Get(heap->bytemap, cursor);
++    while (cursor >= blockStart && ObjectMeta_IsFree(meta)) {
++        cursor -= ALLOCATION_ALIGNMENT_WORDS;
++        meta--;
++    }
++    if (cursor < blockStart || !ObjectMeta_IsMarked(meta))
++        return;
++    Object *target = (Object *)cursor;
++    if (!Evac_IsForwarded(target))
++        return;
++    word_t *newBase = Evac_ForwardedAddress(target);
++    size_t offset = (size_t)((uint8_t *)value - (uint8_t *)target);
++    // One-past-the-end of the previous object looks like the start of this
++    // one: only a zero-length view, never dereferenced, leave it alone.
++    if (offset >= Object_Size((Object *)newBase))
++        return;
++    *slot = (word_t *)((uint8_t *)newBase + offset);
++}
++
+ static inline void Evac_FixupOneObject(Heap *heap, Object *object) {
+     const int objectId = Object_Rtti(object)->rt.id;
+ #ifdef USES_LOCKWORD
+@@ -925,6 +963,18 @@ static inline void Evac_FixupOneObject(Heap *heap, Object *object) {
+             // (unlike marking) -- see file header comment.
+             Evac_FixupSlot(heap, fieldRef);
+         }
++        // The compiler appends a second -1 terminated list after the
++        // reference offsets: raw pointers into the middle of heap objects.
++        {
++            int32_t *interiorOffsets = refFieldOffsets;
++            while (*interiorOffsets != LAST_FIELD_OFFSET)
++                interiorOffsets++;
++            for (interiorOffsets++; *interiorOffsets != LAST_FIELD_OFFSET;
++                 interiorOffsets++) {
++                Evac_FixupInteriorSlot(
++                    heap, (word_t **)((int8_t *)object + *interiorOffsets));
++            }
++        }
+         if (objectId == __boxed_ptr_id) {
+             // No longer "deliberately not fixed up" (see the old file
+             // header comment on this gap) -- a real, reproduced bug: a
+@@ -1094,12 +1144,66 @@ static void Evac_FixupHeapObjects(Heap *heap, uint32_t scoredBlockCount) {
+     }
+ }
+ 
++static uint32_t validateScoredBlocks = 0;
++
+ // Debug-only helper for $SCALANATIVE_EVAC_VALIDATE_FILE: reports every
+ // reference field of `object` that still points at a forwarded (evacuated)
+ // object after the fixup passes ran.
+ static void Evac_ValidateObject(Heap *heap, Object *object,
+                                 const char *validateFilePath, uint32_t block) {
+     Bytemap *bytemap = heap->bytemap;
++    // Raw-word scan: no word of a survivor may still point into an evacuated
++    // source block. Expect false positives: two packed Int fields read as one
++    // word can look like a heap address (e.g. BitmapIndexedMapNode's
++    // nodeMap + size, high word 3 = 0x3_xxxxxxxx). A real hit has isRef=0 and
++    // a value that is not block-aligned noise; check the class's field layout. Catches what refFieldOffsets can't describe: raw pointers
++    // (Ptr fields, data pointers into arrays, ...) held inside heap objects.
++    if (!(Object_IsArray(object) &&
++          Object_Rtti(object)->rt.id != __object_array_id)) {
++        size_t words = Object_Size(object) / sizeof(word_t);
++        // Arrays of primitives hold arbitrary data, skip them.
++        for (size_t w = 0; w < words; w++) {
++            word_t *v = ((word_t **)object)[w];
++            if (v == NULL || !Heap_IsWordInHeap(heap, v))
++                continue;
++            uint32_t vb = Block_GetBlockIndexForWord(heap->heapStart, v);
++            if (vb >= validateScoredBlocks || vb == block)
++                continue;
++            BlockMeta *vm = BlockMeta_GetFromIndex(heap->blockMetaStart, vb);
++            if (!Evac_IsCandidateBlock(vm, blockLiveBytes[vb], vb))
++                continue;
++            FILE *f = fopen(validateFilePath, "a");
++            if (f != NULL) {
++                // Is this slot a declared reference field?
++                int isRef = 0;
++                if (!Object_IsArray(object)) {
++                    int32_t *offs = Object_Rtti(object)->refFieldOffsets;
++                    for (int k = 0; offs[k] != LAST_FIELD_OFFSET; k++)
++                        if ((size_t)offs[k] == w * sizeof(word_t))
++                            isRef = 1;
++                }
++                // State of the target's own metadata and block.
++                word_t *aligned = (word_t *)((word_t)v & ALLOCATION_ALIGNMENT_INVERSE_MASK);
++                ObjectMeta *tm = Bytemap_Get(bytemap, aligned);
++                BlockMeta *tb = BlockMeta_GetFromIndex(heap->blockMetaStart, vb);
++                fprintf(f,
++                        "RAW-STALE obj=%p rttiId=%d wordOffset=%zu isRef=%d value=%p "
++                        "aligned=%d tFree=%d tMarked=%d tAlloc=%d tPlaceholder=%d "
++                        "tBlockMarked=%d tLive=%u tPinned=%d tHashed=%d tForwarded=%d",
++                        (void *)object, Object_Rtti(object)->rt.id,
++                        w * sizeof(word_t), isRef, (void *)v,
++                        (int)(((word_t)v & ~ALLOCATION_ALIGNMENT_INVERSE_MASK) == 0),
++                        ObjectMeta_IsFree(tm), ObjectMeta_IsMarked(tm),
++                        ObjectMeta_IsAllocated(tm), ObjectMeta_IsPlaceholder(tm),
++                        BlockMeta_IsMarked(tb), blockLiveBytes[vb],
++                        EvacPin_isBlockPinned(vb),
++                        heap->hashedBlocks != NULL && heap->hashedBlocks[vb],
++                        ObjectMeta_IsMarked(tm) ? (int)Evac_IsForwarded((Object *)aligned) : -1);
++                fprintf(f, "\n");
++                fclose(f);
++            }
++        }
++    }
+     if (Object_IsArray(object)) {
+         if (Object_Rtti(object)->rt.id != __object_array_id)
+             return;
+@@ -1353,6 +1457,7 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+     // doesn't match the next run's addresses at all.
+     if (getenv("SCALANATIVE_EVAC_VALIDATE_FILE") != NULL) {
+         const char *validateFilePath = getenv("SCALANATIVE_EVAC_VALIDATE_FILE");
++        validateScoredBlocks = blockCount;
+         for (uint32_t i = 0; i < heap->blockCount; i++) {
+             BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+             word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
+index e90ec1c..f7fb5f6 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
+@@ -59,8 +59,31 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
+ 
+   val struct = nir.Type.StructValue(layout.tys.map(_.ty))
+   val size = layout.size
++
++  /** Byte offsets of the raw pointer fields that point into the middle of
++   *  another heap object, see FieldLayout.isInteriorPointer.
++   */
++  private lazy val interiorPointerOffsets: Seq[nir.Val.Int] =
++    if (nir.Type.isArray(cls.name) || layout.tys.size != entries.size + 1)
++      Seq.empty
++    else
++      layout.tys.tail
++        .zip(entries)
++        .collect {
++          case (MemoryLayout.PositionedType(_, offset), f)
++              if FieldLayout.isInteriorPointer(f) =>
++            nir.Val.Int(offset.toInt)
++        }
++
++  /** `[reference offsets..., -1, interior pointer offsets..., -1]`. Readers of
++   *  the reference offsets stop at the first -1 and never see the rest, a moving
++   *  GC reads the second list to rewrite the interior pointers.
++   */
+   val referenceOffsetsValue = nir.Val.Const(
+-    nir.Val.ArrayValue(nir.Type.Int, layout.referenceFieldsOffsets)
++    nir.Val.ArrayValue(
++      nir.Type.Int,
++      layout.referenceFieldsOffsets ++ (interiorPointerOffsets :+ nir.Val.Int(-1))
++    )
+   )
+ 
+ }
+@@ -70,4 +93,15 @@ private[codegen] object FieldLayout {
+   /** Classes accessed through hand written layouts, in the runtime or the GC */
+   def keepsDeclarationOrder(name: nir.Global): Boolean =
+     name == nir.Rt.Class.name || name == nir.Rt.StringName
++
++  /** RawPtr fields that hold the address of the middle of a heap object (the
++   *  data of a backing array). They are not references, but a moving GC has to
++   *  rewrite them when the object they point into is moved.
++   */
++  def isInteriorPointer(f: Field): Boolean =
++    f.owner.name == nir.Global.Top("java.nio.Buffer") &&
++      (f.name.sig.unmangled match {
++        case nir.Sig.Field("_rawAddress", _) => true
++        case _                               => false
++      })
+ }
