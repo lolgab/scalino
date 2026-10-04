@@ -52,7 +52,7 @@ new file mode 100644
 index 0000000..a39a800
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
-@@ -0,0 +1,1248 @@
+@@ -0,0 +1,1274 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -1219,8 +1219,33 @@ index 0000000..a39a800
 +  private def passPipelineFor(mode: build.Mode): String = mode match {
 +    case build.Mode.Debug       => "default<O0>"
 +    case build.Mode.ReleaseFast => "default<O2>"
-+    case build.Mode.ReleaseSize => "default<Oz>"
++    // Not `default<Oz>`: LLVM 23 removed that pipeline spelling ("Use O2 in
++    // conjunction with the minsize attribute instead") and rejects it with
++    // report_fatal_error, i.e. exit() from a codegen worker thread. See
++    // markFunctionsForSize.
++    case build.Mode.ReleaseSize => "default<O2>"
 +    case build.Mode.ReleaseFull => "default<O3>"
++  }
++
++  // `clang -Oz` is the `O2` pipeline plus `optsize`+`minsize` on every
++  // function (the size level lives in function attributes, which the inliner,
++  // unroller and vectorizer consult). Spelling it this way works on every
++  // LLVM version, unlike the `default<Oz>` pipeline string (see
++  // passPipelineFor).
++  private def markFunctionsForSize(): Unit = {
++    val ctx = C.LLVMGetModuleContext(module)
++    def enumAttr(name: String): LLVMAttributeRef =
++      Zone.acquire { implicit z =>
++        val kind = C.LLVMGetEnumAttributeKindForName(toCString(name), name.length.toUSize)
++        C.LLVMCreateEnumAttribute(ctx, kind, 0.toULong)
++      }
++    val attrs = List(enumAttr("optsize"), enumAttr("minsize"))
++    var fn = C.LLVMGetFirstFunction(module)
++    while (fn != null) {
++      if (C.LLVMIsDeclaration(fn) == 0)
++        attrs.foreach(a => C.LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, a))
++      fn = C.LLVMGetNextFunction(fn)
++    }
 +  }
 +
 +  private def emitObjectFile(objPath: Path): Unit = {
@@ -1277,6 +1302,7 @@ index 0000000..a39a800
 +        // which is why e.g. a hot method re-reading the same
 +        // already-loaded object field 2-3 times over compiled to exactly
 +        // that many redundant loads instead of being collapsed to one.
++        if (config.mode == build.Mode.ReleaseSize) markFunctionsForSize()
 +        val passOptions = P.LLVMCreatePassBuilderOptions()
 +        try {
 +          val err = P.LLVMRunPasses(module, toCString(passPipelineFor(config.mode)), tm, passOptions)
@@ -1361,7 +1387,7 @@ new file mode 100644
 index 0000000..01b480a
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,569 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -1382,6 +1408,7 @@ index 0000000..01b480a
 +// name depends on the runtime-discovered LLVM version, which isn't a
 +// compile-time literal.
 +import scala.scalanative.unsafe._
++import scala.scalanative.unsigned._
 +
 +private[direct] object LLVMCApi {
 +  type LLVMContextRef = Ptr[Byte]
@@ -1399,6 +1426,9 @@ index 0000000..01b480a
 +  // codegen -- see emitObjectFile's doc comment for why this is required.
 +  type LLVMPassBuilderOptionsRef = Ptr[Byte]
 +  type LLVMErrorRef = Ptr[Byte]
++  // llvm-c/Core.h: function attributes (LLVMAttributeFunctionIndex == ~0U)
++  type LLVMAttributeRef = Ptr[Byte]
++  final val LLVMAttributeFunctionIndex: CUnsignedInt = 0xffffffffL.toUInt
 +  // llvm-c/DebugInfo.h: opaque debug-info metadata handle and DIBuilder.
 +  type LLVMMetadataRef = Ptr[Byte]
 +  type LLVMDIBuilderRef = Ptr[Byte]
@@ -1575,6 +1605,21 @@ index 0000000..01b480a
 +        functionTy: LLVMTypeRef
 +    ): LLVMValueRef = extern
 +    def LLVMGetNamedFunction(m: LLVMModuleRef, name: CString): LLVMValueRef = extern
++    def LLVMGetFirstFunction(m: LLVMModuleRef): LLVMValueRef = extern
++    def LLVMGetNextFunction(fn: LLVMValueRef): LLVMValueRef = extern
++    def LLVMIsDeclaration(global: LLVMValueRef): LLVMBool = extern
++    def LLVMGetModuleContext(m: LLVMModuleRef): LLVMContextRef = extern
++    def LLVMGetEnumAttributeKindForName(name: CString, len: CSize): CUnsignedInt = extern
++    def LLVMCreateEnumAttribute(
++        ctx: LLVMContextRef,
++        kindId: CUnsignedInt,
++        value: CUnsignedLongLong
++    ): LLVMAttributeRef = extern
++    def LLVMAddAttributeAtIndex(
++        fn: LLVMValueRef,
++        idx: CUnsignedInt,
++        attr: LLVMAttributeRef
++    ): Unit = extern
 +    def LLVMGetParam(fn: LLVMValueRef, index: CUnsignedInt): LLVMValueRef = extern
 +    def LLVMSetFunctionCallConv(fn: LLVMValueRef, cc: CUnsignedInt): Unit = extern
 +
