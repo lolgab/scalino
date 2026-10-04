@@ -77,6 +77,7 @@ SHARED_SOURCES=(
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/Visit.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala"
+  "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala"
 )
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 

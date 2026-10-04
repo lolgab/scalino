@@ -1,0 +1,1237 @@
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -204,9 +204,20 @@
+         }
+       )
+ 
++      stackObjectSlots.clear()
+       insts.foreach {
+         case inst @ nir.Inst.Let(n, nir.Op.Var(ty), unwind) =>
+           buf.let(n, nir.Op.Stackalloc(ty, one), unwind)(inst.pos, inst.scopeId)
++        case inst @ nir.Inst.Let(n, nir.Op.Classalloc(ClassRef(cls), Some(nir.Val.Null)), unwind) =>
++          val words = (meta.layout(cls).size + 7) / 8
++          val slot = fresh()
++          buf.let(slot, nir.Op.Stackalloc(nir.Type.Long, nir.Val.Int(words.toInt)), nir.Next.None)(inst.pos, inst.scopeId)
++          stackObjectSlots(n.id) = slot
++        case inst @ nir.Inst.Let(n, op @ nir.Op.Arrayalloc(_, _, Some(nir.Val.Null)), unwind) =>
++          val (_, _, _, total) = stackArrayInfo(op)
++          val slot = fresh()
++          buf.let(slot, nir.Op.Stackalloc(nir.Type.Long, nir.Val.Int(((total + 7) / 8).toInt)), nir.Next.None)(inst.pos, inst.scopeId)
++          stackObjectSlots(n.id) = slot
+         case _ => ()
+       }
+ 
+@@ -1640,6 +1651,74 @@
+         op: nir.Op.Classalloc
+     )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
+       val nir.Op.Classalloc(ClassRef(cls), v) = op: @unchecked
++      if (v.contains(nir.Val.Null)) {
++        // Stack object, proven non-escaping by interflow.EscapeAnalysis
++        val slot = nir.Val.Local(stackObjectSlots(n.id), nir.Type.Ptr)
++        val size = meta.layout(cls).size
++        buf.call(
++          memsetSig,
++          memset,
++          Seq(slot, nir.Val.Int(0), nir.Val.Size(size)),
++          unwind
++        )
++        val header = meta.headerWordVal(cls)
++        buf.store(header.ty, slot, header, unwind)
++        buf.let(n, nir.Op.Conv(nir.Conv.Bitcast, op.resty, slot), unwind)
++      } else genHeapClassallocOp(buf, n, op)
++    }
++
++    private val stackObjectSlots = mutable.LongMap.empty[nir.Local]
++
++    /** (array class, element type, length, total size in bytes) of a stack array */
++    private def stackArrayInfo(op: nir.Op.Arrayalloc): (Class, nir.Type, Int, Long) = {
++      val nir.Op.Arrayalloc(ty, init, _) = op
++      val len = init match {
++        case nir.Val.Int(l)            => l
++        case nir.Val.ArrayValue(_, vs) => vs.length
++        case _                         => util.unreachable
++      }
++      val arrName = nir.Type.typeToArray.getOrElse(ty, nir.Type.typeToArray(nir.Rt.Object))
++      val arrCls = ClassRef.unapply(arrName).get
++      val total = MemoryLayout.sizeOf(arrayMemoryLayout(op.resty, ty, len))
++      (arrCls, ty, len, total)
++    }
++
++    def genStackArrayallocOp(
++        buf: nir.InstructionBuilder,
++        n: nir.Local,
++        op: nir.Op.Arrayalloc
++    )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
++      val (arrCls, ty, len, total) = stackArrayInfo(op)
++      val slot = nir.Val.Local(stackObjectSlots(n.id), nir.Type.Ptr)
++      buf.call(memsetSig, memset, Seq(slot, nir.Val.Int(0), nir.Val.Size(total)), unwind)
++      def hdr(idx: Int, ty: nir.Type, v: nir.Val): Unit = {
++        val p = buf.elem(ArrayHeader.layout, slot, Seq(zero, nir.Val.Int(idx)), unwind)
++        buf.store(ty, p, v, unwind)
++      }
++      val header = meta.headerWordVal(arrCls)
++      hdr(ArrayHeader.RttiIdx, header.ty, header)
++      hdr(ArrayHeader.LengthIdx, nir.Type.Int, nir.Val.Int(len))
++      if (!meta.useCompactHeaders)
++        hdr(ArrayHeader.StrideIdx, nir.Type.Int, nir.Val.Int(MemoryLayout.sizeOf(ty).toInt))
++      op.init match {
++        case nir.Val.ArrayValue(_, values) =>
++          val arrTy = arrayMemoryLayout(op.resty, ty, len)
++          values.zipWithIndex.foreach {
++            case (value, idx) =>
++              val ep = buf.elem(arrTy, slot, arrayValuePath(nir.Val.Int(idx)), unwind)
++              buf.store(ty, ep, genVal(buf, value), unwind)
++          }
++        case _ => ()
++      }
++      buf.let(n, nir.Op.Conv(nir.Conv.Bitcast, op.resty, slot), unwind)
++    }
++
++    def genHeapClassallocOp(
++        buf: nir.InstructionBuilder,
++        n: nir.Local,
++        op: nir.Op.Classalloc
++    )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
++      val nir.Op.Classalloc(ClassRef(cls), v) = op: @unchecked
+       val zone = v.map(genVal(buf, _))
+ 
+       val size = meta.layout(cls).size
+@@ -2330,6 +2409,10 @@
+         op: nir.Op.Arrayalloc
+     )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
+       val nir.Op.Arrayalloc(ty, v1, v2) = op
++      if (v2.contains(nir.Val.Null)) {
++        genStackArrayallocOp(buf, n, op)
++        return
++      }
+       val init = genVal(buf, v1)
+       val zone = v2.map(genVal(buf, _))
+       init match {
+--- a/tools/src/main/scala/scala/scalanative/checker/Check.scala
++++ b/tools/src/main/scala/scala/scalanative/checker/Check.scala
+@@ -376,8 +376,9 @@
+   }
+ 
+   def checkZone(zone: nir.Val): Unit = zone match {
+-    case nir.Val.Null | nir.Val.Unit =>
+-      error(s"zone defined with null or unit")
++    case nir.Val.Null => () // stack-allocation marker, see interflow.EscapeAnalysis
++    case nir.Val.Unit =>
++      error(s"zone defined with unit")
+     case v =>
+       v.ty match {
+         case nir.Type.Ptr | _: nir.Type.RefKind => ()
+--- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
++++ b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+@@ -64,7 +64,19 @@
+         ) {
+           Interflow
+             .optimize(config, analysis)
+-            .map(Link(config, analysis.entries, _))
++            .map { defns =>
++              if (sys.env.contains("SCALANATIVE_ESCAPE_REPORT"))
++                config.logger.time("Escape analysis report") {
++                  interflow.EscapeAnalysis.report(config, analysis, defns)
++                }
++              val finalDefns =
++                if (stackObjectsEnabled(config))
++                  config.logger.time("Analyzing object escapes") {
++                    interflow.EscapeAnalysis.transform(config, analysis, defns)
++                  }
++                else defns
++              Link(config, analysis.entries, finalDefns)
++            }
+         }
+       }
+     else {
+@@ -72,6 +84,17 @@
+       Future.successful(analysis)
+     }
+   }
++
++  /** Stack allocation of non-escaping objects is on by default in release
++   *  modes only. `SCALANATIVE_STACK_OBJECTS` forces it: `0`/`false` disables
++   *  it, any other value enables it.
++   */
++  private def stackObjectsEnabled(config: Config): Boolean =
++    sys.env.get("SCALANATIVE_STACK_OBJECTS") match {
++      case Some("0") | Some("false") => false
++      case Some(_)                   => true
++      case None                      => config.mode != Mode.Debug
++    }
+ 
+   private def withReachabilityPostprocessing(
+       config: Config,
+--- a/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
+@@ -38,16 +38,27 @@
+         def callerTooBig = mergeProcessor.currentSize() > maxCallerSize
+         def inlineDepthLimitExceeded = inliningBacktrace.size > maxInlineDepth
+         def hasUnwind = defn.hasUnwind
++        // Allocation-oriented inlining: callees that take a not yet
++        // materialized (virtual) object, or that return a fresh object, are
++        // worth inlining so allocations can be scalar replaced / stack
++        // allocated in the caller.
++        def allocInline =
++          Inline.allocInlineEnabled(mode) && defn.insts.size <= Inline.MaxAllocInlineSize && (
++            hasVirtualArgs || defn.insts.exists {
++              case nir.Inst.Let(_, _: nir.Op.Classalloc | _: nir.Op.Box | _: nir.Op.Arrayalloc, _) => true
++              case _ => false
++            }
++          )
+ 
+         val shall = mode match {
+           case build.Mode.Debug =>
+-            alwaysInline || isCtor
++            alwaysInline || isCtor || allocInline
+           case build.Mode.ReleaseFast =>
+-            alwaysInline || hintInline || isSmall || isCtor
++            alwaysInline || hintInline || isSmall || isCtor || allocInline
+           case build.Mode.ReleaseSize =>
+-            alwaysInline || isSmall || isCtor
++            alwaysInline || isSmall || isCtor || allocInline
+           case build.Mode.ReleaseFull =>
+-            alwaysInline || hintInline || isSmall || isCtor || hasVirtualArgs
++            alwaysInline || hintInline || isSmall || isCtor || hasVirtualArgs || allocInline
+         }
+         lazy val shallNot = {
+           def hardLimits =
+@@ -245,3 +256,20 @@
+       adapt(res, retty)
+     }
+ }
++
++private[interflow] object Inline {
++
++  /** Allocation oriented inlining is on by default in release modes only.
++   *  `SCALANATIVE_INLINE_ALLOC` forces it: `0`/`false` disables it, any other
++   *  value enables it (a number also sets the maximal callee size).
++   */
++  def allocInlineEnabled(mode: build.Mode): Boolean =
++    sys.env.get("SCALANATIVE_INLINE_ALLOC") match {
++      case Some("0") | Some("false") => false
++      case Some(_)                   => true
++      case None                      => mode != build.Mode.Debug
++    }
++
++  val MaxAllocInlineSize: Int =
++    sys.env.get("SCALANATIVE_INLINE_ALLOC").flatMap(_.toIntOption).filter(_ > 1).getOrElse(64)
++}
+--- /dev/null
++++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
+@@ -0,0 +1,1015 @@
++package scala.scalanative
++package interflow
++
++import scala.collection.mutable
++
++import scala.scalanative.linker._
++
++/** Interprocedural, unification-based (Steensgaard style) escape analysis.
++ *
++ *  Runs on optimized NIR. Per function it builds a points-to graph where every
++ *  SSA value is a node and every node has at most one "content" node (what is
++ *  reachable through its fields). Flow between values unifies their classes.
++ *  Classes carry flags describing how their members may outlive the frame.
++ *  Callee summaries (per parameter: escapes / returned / shares memory with
++ *  other params) let calls to analyzable targets avoid forcing escape.
++ *
++ *  Currently report-only: it finds allocation sites that could live on the
++ *  stack, it does not transform anything.
++ */
++private[scalanative] object EscapeAnalysis {
++
++  // Class flags
++  private final val Global = 1 // members stored into / reachable from globals
++  private final val Returned = 2 // reachable from return value
++  private final val Ext = 4 // members are contents of heap/caller memory
++  private final val ExtRoot = 8 // members are heap/caller objects: contents are Ext
++  private final val NonParam = 16
++  // members are global heap objects (modules, call results, ...): storing
++  // anything into their contents makes it escape
++  private final val HeapRoot = 32
++  // all contents of members are the member itself (coarse, after merging
++  // unrelated memory shapes)
++  private final val Collapsed = 64
++  // some member is a raw pointer view of an object (Ref -> Ptr bitcast)
++  private final val FromRef = 128
++  // ... and a tracked value is loaded/stored through a raw pointer
++  private final val RawAccessed = 256 // members may be something other than a param
++
++  /** Per-parameter facts, joined over all possible targets of a call. */
++  /** libc functions that never retain pointers passed to them. */
++  val NonCapturingExterns: Set[String] = Set(
++    "memcpy", "memmove", "memset", "memcmp", "strlen", "strcmp", "strncmp",
++    "strchr", "strrchr", "strstr", "strcpy", "strncpy", "strcat", "bcmp"
++  )
++
++  final class Summary(
++      val escapes: Array[Boolean],
++      val retSelf: Array[Boolean],
++      val retDeep: Array[Boolean],
++      val retFresh: Boolean,
++      // params with the same group id may share memory
++      val group: Array[Int]
++  )
++
++  final case class Candidate(
++      kind: String,
++      escapes: Boolean,
++      inLoop: Boolean,
++      reason: String,
++      id: Long = -1L,
++      isClass: Boolean = false
++  )
++
++  final class Result(
++      val candidates: Seq[Candidate]
++  )
++
++  private val StackExcludedPrefixes = Seq("java.lang.ref.")
++  private val StackExcludedNames = Set(
++    "java.lang.Thread",
++    "java.lang.String",
++    "java.lang.Class",
++    "java.lang.Throwable"
++  )
++  private val MaxStackFields = 24
++  private[interflow] val MaxTargets = 48
++  private val MaxStackArrayLength = 64
++  private val MaxStackBytesPerFunction = 1024
++
++  /** Rewrites non-escaping, non-loop `Classalloc`s to the stack-allocation
++   *  form understood by `Lower`: `Classalloc(cls, Some(Val.Null))`.
++   */
++  def transform(
++      config: build.Config,
++      analysis: ReachabilityAnalysis.Result,
++      defns: Seq[nir.Defn]
++  ): Seq[nir.Defn] = {
++    implicit val a: ReachabilityAnalysis.Result = analysis
++    val ea = new EscapeAnalysis(analysis, defns)
++    ea.runAll()
++    var converted = 0
++    // debugging aids: restrict which classes get stack allocated
++    val include = sys.env.get("SCALANATIVE_STACK_INCLUDE").map(_.r)
++    val exclude = sys.env.get("SCALANATIVE_STACK_EXCLUDE").map(_.r)
++    def allowed(kind: String): Boolean =
++      include.forall(_.findFirstIn(kind).isDefined) &&
++        exclude.forall(_.findFirstIn(kind).isEmpty)
++    val out = defns.map {
++      case d: nir.Defn.Define =>
++        val sites = mutable.LongMap.empty[Boolean]
++        val arraySites = mutable.LongMap.empty[Boolean]
++        var budget = MaxStackBytesPerFunction
++        ea.resultOf(d.name).candidates.foreach { c =>
++          if (c.isClass && !c.escapes && !c.inLoop && allowed(c.kind) &&
++              !StackExcludedNames.contains(c.kind) &&
++              !StackExcludedPrefixes.exists(c.kind.startsWith)) {
++            val name = nir.Global.Top(c.kind)
++            name match {
++              case ClassRef(cls)
++                  if cls.fields.size <= MaxStackFields &&
++                    !cls.attrs.isAbstract && !cls.isModule =>
++                val bytes = 16 + 8 * cls.fields.size
++                if (budget >= bytes) {
++                  budget -= bytes
++                  sites(c.id) = true
++                  if (sys.env.contains("SCALANATIVE_STACK_VERBOSE"))
++                    config.logger.info(s"[escape-site] ${c.kind} in ${d.name.show}")
++                }
++              case _ => ()
++            }
++          }
++        }
++        // constant-length arrays
++        d.insts.foreach {
++          case nir.Inst.Let(n, nir.Op.Arrayalloc(ty, init, None), _)
++              if ea.resultOf(d.name).candidates.exists(c => c.id == n.id && !c.escapes && !c.inLoop) &&
++                allowed("array:" + ty.show) && ty != nir.Type.Byte =>
++            val len = init match {
++              case nir.Val.Int(l)            => l
++              case nir.Val.ArrayValue(_, vs) => vs.length
++              case _                         => -1
++            }
++            val bytes = 24 + len * (if (ty.isInstanceOf[nir.Type.RefKind] || ty == nir.Type.Long || ty == nir.Type.Double) 8 else 4)
++            if (len >= 0 && len <= MaxStackArrayLength && budget >= bytes) {
++              budget -= bytes
++              arraySites(n.id) = true
++              if (sys.env.contains("SCALANATIVE_STACK_VERBOSE"))
++                config.logger.info(s"[escape-site] array:${ty.show} len=$len in ${d.name.show}")
++            }
++          case _ => ()
++        }
++        if (sites.isEmpty && arraySites.isEmpty) d
++        else {
++          converted += sites.size + arraySites.size
++          val insts = d.insts.map {
++            case nir.Inst.Let(n, nir.Op.Arrayalloc(ty, init, None), unwind)
++                if arraySites.contains(n.id) =>
++              nir.Inst.Let(n, nir.Op.Arrayalloc(ty, init, Some(nir.Val.Null)), unwind)(d.pos, nir.ScopeId.TopLevel)
++            case nir.Inst.Let(n, nir.Op.Classalloc(name, None), unwind)
++                if sites.contains(n.id) =>
++              nir.Inst.Let(
++                n,
++                nir.Op.Classalloc(name, Some(nir.Val.Null)),
++                unwind
++              )(d.pos, nir.ScopeId.TopLevel)
++            case inst => inst
++          }
++          d.copy(insts = insts)(d.pos)
++        }
++      case d => d
++    }
++    config.logger.info(s"Allocated $converted objects on the stack")
++    out
++  }
++
++  def report(
++      config: build.Config,
++      analysis: ReachabilityAnalysis.Result,
++      defns: Seq[nir.Defn]
++  ): Unit = {
++    val ea = new EscapeAnalysis(analysis, defns, recordReasons = true)
++    sys.env.get("SCALANATIVE_ESCAPE_DUMP").foreach { pats =>
++      val ps = pats.split(",").filter(_.nonEmpty)
++      ea.defines.valuesIterator
++        .filter(d => ps.exists(p => d.name.show.contains(p)))
++        .foreach { d => System.err.println("[escape-dump] " + d.show) }
++    }
++    val all = mutable.ArrayBuffer.empty[Candidate]
++    ea.runAll()
++    ea.defines.keysIterator.foreach { n => all ++= ea.resultOf(n).candidates }
++    val total = all.size
++    val noEsc = all.filter(!_.escapes)
++    val noEscNoLoop = noEsc.filter(!_.inLoop)
++    val log = config.logger
++    log.info(
++      s"[escape] alloc sites=$total non-escaping=${noEsc.size} " +
++        s"non-escaping-outside-loops=${noEscNoLoop.size}"
++    )
++    def top(title: String, cs: Seq[Candidate]): Unit = {
++      val byKind = cs.groupBy(_.kind).toSeq.map { case (k, v) => (k, v.size) }
++      byKind.sortBy(-_._2).take(40).foreach {
++        case (k, n) => log.info(s"[escape]   $title $n $k")
++      }
++    }
++    all.filter(_.escapes).groupBy(_.reason).toSeq.map { case (k, v) => (k, v.size) }
++      .sortBy(-_._2).take(60).foreach {
++        case (k, n) => log.info(s"[escape]   reason $n $k")
++      }
++    sys.env.get("SCALANATIVE_ESCAPE_KIND_REASONS").foreach { kinds =>
++      kinds.split(";").filter(_.nonEmpty).foreach { k =>
++        val cs = all.filter(c => c.kind == k)
++        log.info(s"[escape-kind] $k sites=${cs.size} eligible=${cs.count(!_.escapes)}")
++        cs.filter(_.escapes).groupBy(_.reason).toSeq.map { case (r, v) => (r, v.size) }
++          .sortBy(-_._2).take(8).foreach {
++            case (r, n) => log.info(s"[escape-kind]    $n ${r.take(200)}")
++          }
++      }
++    }
++    top("stack-eligible", noEscNoLoop.toSeq)
++    top("escaping", all.filter(_.escapes).toSeq)
++  }
++}
++
++private[scalanative] class EscapeAnalysis(
++    analysisResult: ReachabilityAnalysis.Result,
++    defns: Seq[nir.Defn],
++    recordReasons: Boolean = false
++) {
++  import EscapeAnalysis._
++  private implicit val analysis: ReachabilityAnalysis.Result = analysisResult
++
++  val defines: mutable.LinkedHashMap[nir.Global.Member, nir.Defn.Define] = {
++    val m = mutable.LinkedHashMap.empty[nir.Global.Member, nir.Defn.Define]
++    defns.foreach {
++      case d: nir.Defn.Define => m(d.name) = d
++      case _                  => ()
++    }
++    m
++  }
++
++  def resultOf(n: nir.Global.Member): Result = results(n)
++
++  private val results = mutable.HashMap.empty[nir.Global.Member, Result]
++  private val summaries = mutable.HashMap.empty[nir.Global.Member, Summary]
++  private val inProgress = mutable.HashSet.empty[nir.Global.Member]
++
++  private def unknownSummary(n: Int): Summary =
++    new Summary(
++      Array.fill(n)(true),
++      Array.fill(n)(false),
++      Array.fill(n)(false),
++      retFresh = true,
++      Array.tabulate(n)(identity)
++    )
++
++  private def bottomSummary(n: Int): Summary =
++    new Summary(
++      Array.fill(n)(false),
++      Array.fill(n)(false),
++      Array.fill(n)(false),
++      retFresh = false,
++      Array.tabulate(n)(identity)
++    )
++
++  private def sameSummary(a: Summary, b: Summary): Boolean =
++    java.util.Arrays.equals(a.escapes, b.escapes) &&
++      java.util.Arrays.equals(a.retSelf, b.retSelf) &&
++      java.util.Arrays.equals(a.retDeep, b.retDeep) &&
++      a.retFresh == b.retFresh &&
++      java.util.Arrays.equals(a.group, b.group)
++
++  private val fieldKeys = mutable.HashMap.empty[nir.Global, Int]
++  private def fieldKey(n: nir.Global): Int =
++    fieldKeys.getOrElseUpdate(n, fieldKeys.size + 1)
++
++  private val callersOf =
++    mutable.HashMap.empty[nir.Global.Member, mutable.Set[nir.Global.Member]]
++  private val queue = mutable.Queue.empty[nir.Global.Member]
++  private val queued = mutable.HashSet.empty[nir.Global.Member]
++  private var currentCaller: nir.Global.Member = null
++
++  /** Current summary of callee; analyzes it on demand. Callees in progress
++   *  (recursion) are optimistic (bottom) until the fixpoint pass fixes them.
++   */
++  def summaryOf(name: nir.Global.Member): Option[Summary] =
++    defines.get(name).map { d =>
++      if (currentCaller != null)
++        callersOf.getOrElseUpdate(name, mutable.Set.empty) += currentCaller
++      if (!results.contains(name) && !inProgress.contains(name)) analyze(d)
++      summaries.getOrElse(name, bottomSummary(d.ty.args.size))
++    }
++
++  private var analyses = 0
++  private val changeCount = mutable.HashMap.empty[nir.Global.Member, Int]
++  def analyze(defn: nir.Defn.Define): Result = {
++    analyses += 1
++    val saved = currentCaller
++    currentCaller = defn.name
++    inProgress += defn.name
++    val r =
++      try new FunctionAnalysis(defn).run()
++      finally {
++        inProgress -= defn.name
++        currentCaller = saved
++      }
++    results(defn.name) = r
++    r
++  }
++
++  /** Least upper bound of two summaries (summaries only ever grow, which
++   *  makes the interprocedural fixpoint converge).
++   */
++  private def joinSummary(a: Summary, b: Summary): Summary = {
++    val n = a.escapes.length
++    val dsu = Array.tabulate(n)(identity)
++    def find(x: Int): Int = { var r = x; while (dsu(r) != r) r = dsu(r); r }
++    def link(x: Int, y: Int): Unit = { val rx = find(x); val ry = find(y); if (rx < ry) dsu(ry) = rx else if (ry < rx) dsu(rx) = ry }
++    var i = 0
++    while (i < n) {
++      link(i, a.group(i)); link(i, b.group(i)); i += 1
++    }
++    new Summary(
++      Array.tabulate(n)(i => a.escapes(i) || b.escapes(i)),
++      Array.tabulate(n)(i => a.retSelf(i) || b.retSelf(i)),
++      Array.tabulate(n)(i => a.retDeep(i) || b.retDeep(i)),
++      a.retFresh || b.retFresh,
++      Array.tabulate(n)(find)
++    )
++  }
++
++  /** Representative of every group = smallest member index. */
++  private def canonical(group: Array[Int]): Array[Int] = {
++    val rep = mutable.HashMap.empty[Int, Int]
++    group.indices.foreach(i => rep.getOrElseUpdate(group(i), i))
++    Array.tabulate(group.length)(i => rep(group(i)))
++  }
++
++  private def publish(name: nir.Global.Member, s0: Summary, n: Int): Unit = {
++    val old = summaries.getOrElse(name, bottomSummary(n))
++    val s = joinSummary(old, s0)
++    summaries(name) = s
++    if (!sameSummary(old, s) && sys.env.contains("SCALANATIVE_ESCAPE_OSC")) {
++      val c = changeCount.getOrElse(name, 0) + 1
++      changeCount(name) = c
++      if (c > 40 && c < 46)
++        System.err.println(
++          s"[escape-osc] ${name.show.take(100)} change#$c\n  old esc=${old.escapes.toSeq} self=${old.retSelf.toSeq} deep=${old.retDeep.toSeq} fresh=${old.retFresh} grp=${old.group.toSeq}\n  new esc=${s.escapes.toSeq} self=${s.retSelf.toSeq} deep=${s.retDeep.toSeq} fresh=${s.retFresh} grp=${s.group.toSeq}"
++        )
++    }
++    if (!sameSummary(old, s))
++      callersOf.getOrElse(name, Nil).foreach { c =>
++        if (queued.add(c)) queue.enqueue(c)
++      }
++  }
++
++  /** Analyze everything, then iterate until summaries stop changing. */
++  def runAll(): Unit = {
++    val t0 = System.nanoTime()
++    defines.valuesIterator.foreach { d =>
++      if (!results.contains(d.name)) analyze(d)
++    }
++    val t1 = System.nanoTime()
++    val firstPass = analyses
++    var rounds = 0
++    while (queue.nonEmpty && rounds < 3000000) {
++      val n = queue.dequeue()
++      queued -= n
++      analyze(defines(n))
++      rounds += 1
++    }
++    if (sys.env.contains("SCALANATIVE_ESCAPE_STATS"))
++      System.err.println(
++        s"[escape-stats] defines=${defines.size} firstPass=${firstPass} analyses " +
++          s"in ${(t1 - t0) / 1000000}ms, reanalyses=$rounds in ${(System.nanoTime() - t1) / 1000000}ms"
++      )
++  }
++
++  private def isPrimitive(ty: nir.Type): Boolean = ty match {
++    case nir.Type.Float | nir.Type.Double | nir.Type.Bool | nir.Type.Unit |
++        nir.Type.Nothing | nir.Type.Null =>
++      true
++    case _: nir.Type.FixedSizeI => ty != nir.Type.Long // keep 64bit: may carry pointers
++    case _                      => false
++  }
++
++  private def targetsOf(
++      objTy: nir.Type,
++      sig: nir.Sig
++  ): Option[Seq[nir.Global.Member]] = {
++    val r = objTy match {
++      case ExactClassRef(cls, _)                       => cls.resolve(sig).map(Seq(_))
++      case nir.Type.Ref(ClassRef(cls), _, _) if !sig.isVirtual =>
++        cls.resolve(sig).map(Seq(_))
++      case nir.Type.Ref(ScopeRef(scope), _, _) =>
++        Some(scope.targets(sig).toSeq)
++      case _ => None
++    }
++    r.filter(_.nonEmpty)
++  }
++
++  private val tracePat = sys.env.get("SCALANATIVE_ESCAPE_TRACE")
++  private def tracing(d: nir.Defn.Define): Boolean =
++    tracePat.exists(p => d.name.show.contains(p))
++
++  private class FunctionAnalysis(defn: nir.Defn.Define) {
++    private val trace = tracing(defn)
++    private def tr(msg: => String): Unit =
++      if (trace) System.err.println("[escape-trace] " + defn.name.show.take(60) + ": " + msg)
++    // ---- union find ----
++    private var parent = new Array[Int](256)
++    private var flags = new Array[Int](256)
++    private var fmap = new Array[mutable.LongMap[Int]](256)
++    private var size = 0
++    private val localNode = mutable.LongMap.empty[Int]
++
++    private def fresh(f: Int = 0): Int = {
++      if (size == parent.length) {
++        val n = size * 2
++        parent = java.util.Arrays.copyOf(parent, n)
++        flags = java.util.Arrays.copyOf(flags, n)
++        fmap = java.util.Arrays.copyOf(fmap, n)
++      }
++      val id = size
++      parent(id) = id
++      flags(id) = f
++      fmap(id) = null
++      size += 1
++      id
++    }
++
++    private def find(x: Int): Int = {
++      var r = x
++      while (parent(r) != r) r = parent(r)
++      var c = x
++      while (parent(c) != r) {
++        val next = parent(c)
++        parent(c) = r
++        c = next
++      }
++      r
++    }
++
++    private def union(a: Int, b: Int): Unit = {
++      val stack = mutable.Stack[(Int, Int)]((a, b))
++      while (stack.nonEmpty) {
++        val (x, y) = stack.pop()
++        val rx = find(x)
++        val ry = find(y)
++        if (rx != ry) {
++          val mx = fmap(rx)
++          val my = fmap(ry)
++          parent(ry) = rx
++          flags(rx) |= flags(ry)
++          if (my != null) {
++            if (mx == null) fmap(rx) = my
++            else
++              my.foreach {
++                case (k, c2) =>
++                  mx.get(k) match {
++                    case Some(c1) => stack.push((c1, c2))
++                    case None     => mx(k) = c2
++                  }
++              }
++          }
++          fmap(ry) = null
++          if ((flags(rx) & Collapsed) != 0) {
++            val m = fmap(rx)
++            if (m != null) m.foreach { case (_, c) => stack.push((rx, c)) }
++          }
++        }
++      }
++    }
++
++    /** Make every content of `x` be `x` itself. */
++    private def collapse(x: Int): Unit = {
++      val r = find(x)
++      if ((flags(r) & Collapsed) == 0) {
++        flags(r) |= Collapsed
++        val m = fmap(r)
++        if (m != null) m.values.toList.foreach(c => union(r, c))
++      }
++    }
++
++    /** Content node of `x` under field key `k` (0 = array element / raw). */
++    private def contentOf(x: Int, k: Int = 0): Int = {
++      val r = find(x)
++      if ((flags(r) & Collapsed) != 0) r
++      else {
++        var m = fmap(r)
++        if (m == null) { m = mutable.LongMap.empty[Int]; fmap(r) = m }
++        m.get(k) match {
++          case Some(c) => c
++          case None =>
++            val c = fresh()
++            m(k) = c
++            c
++        }
++      }
++    }
++
++    private def flag(x: Int, f: Int): Unit = flags(find(x)) |= f
++    private val events = mutable.ArrayBuffer.empty[(Int, () => String)]
++    private def flagG(x: Int, reason: => String): Unit = {
++      flag(x, Global)
++      if (recordReasons) events += ((x, () => reason))
++    }
++
++    // ---- value -> node ----
++    private def isTrackedTy(ty: nir.Type): Boolean = !isPrimitive(ty)
++
++    /** Node of a value, or -1 if the value is an untracked constant. */
++    private def nd(v: nir.Val): Int = v match {
++      case nir.Val.Local(id, ty) =>
++        if (!isTrackedTy(ty)) -1
++        else localNode.getOrElseUpdate(id.id, fresh())
++      case nir.Val.StructValue(vs) =>
++        val n = fresh()
++        vs.foreach { e => val m = nd(e); if (m >= 0) union(n, m) }
++        n
++      case nir.Val.ArrayValue(_, vs) =>
++        val n = fresh()
++        vs.foreach { e => val m = nd(e); if (m >= 0) union(n, m) }
++        n
++      case nir.Val.Const(inner) => nd(inner)
++      case _                    => -1
++    }
++
++    private def resultNode(id: nir.Local, ty: nir.Type): Int =
++      if (isTrackedTy(ty)) localNode.getOrElseUpdate(id.id, fresh()) else -1
++
++    private def globalize(v: nir.Val, reason: => String): Unit = {
++      val n = nd(v)
++      if (n >= 0) flagG(n, reason)
++    }
++
++    private def unifyVals(a: Int, b: Int): Unit =
++      if (a >= 0 && b >= 0) union(a, b)
++
++    /** value `v` is stored into memory pointed to by `p` */
++    private def store(p: nir.Val, v: nir.Val, k: Int = 0): Unit = {
++      val vn = nd(v)
++      if (vn >= 0) {
++        val pn = nd(p)
++        if (pn < 0) flagG(vn, "store-to-untracked")
++        else {
++          if (k == 0) flag(pn, RawAccessed)
++          union(contentOf(pn, k), vn)
++        }
++      }
++    }
++
++    /** result `r` is loaded from memory pointed to by `p` */
++    private def load(r: Int, p: nir.Val, k: Int = 0): Unit =
++      if (r >= 0) {
++        val pn = nd(p)
++        if (pn < 0) flag(r, HeapRoot | NonParam)
++        else {
++          if (k == 0) flag(pn, RawAccessed)
++          union(r, contentOf(pn, k))
++        }
++      }
++
++    // ---- control flow ----
++    private val labelParams = mutable.LongMap.empty[Seq[nir.Val.Local]]
++    private val blockOf = mutable.LongMap.empty[Int] // let id -> block idx
++    private val labelIdx = mutable.LongMap.empty[Int]
++    private val succs = mutable.ArrayBuffer.empty[mutable.ArrayBuffer[Int]]
++    private val retNode = fresh()
++    private val methodOf = mutable.LongMap.empty[(nir.Val, nir.Sig)]
++    private case class Cand(
++        id: Long,
++        kind: String,
++        node: Int,
++        block: Int,
++        isClass: Boolean
++    )
++    private val cands = mutable.ArrayBuffer.empty[Cand]
++
++    private def nextEdges(next: nir.Next, from: Int): Unit = next match {
++      case nir.Next.None => ()
++      case nir.Next.Unwind(exc, n) =>
++        val e = nd(exc)
++        if (e >= 0) { flag(e, HeapRoot | NonParam); flagG(e, "unwind-exc") }
++        nextEdges(n, from)
++      case nir.Next.Case(_, n) => nextEdges(n, from)
++      case nir.Next.Label(id, args) =>
++        labelParams.get(id.id).foreach { ps =>
++          ps.zip(args).foreach {
++            case (p, a) => unifyVals(nd(p), nd(a))
++          }
++        }
++        labelIdx.get(id.id).foreach { to => succs(from) += to }
++    }
++
++    def run(): Result = {
++      val insts = defn.insts
++      var blocks = 0
++      insts.foreach {
++        case nir.Inst.Label(id, ps) =>
++          labelParams(id.id) = ps
++          labelIdx(id.id) = blocks
++          succs += mutable.ArrayBuffer.empty[Int]
++          blocks += 1
++        case _ => ()
++      }
++      val params = insts.head match {
++        case nir.Inst.Label(_, ps) => ps
++        case _                     => Nil
++      }
++      params.foreach { p =>
++        val n = nd(p)
++        if (n >= 0) flag(n, ExtRoot)
++      }
++
++      var cur = -1
++      insts.foreach {
++        case nir.Inst.Label(_, _) =>
++          cur += 1
++        case nir.Inst.Let(id, op, unwind) =>
++          blockOf(id.id) = cur
++          nextEdges(unwind, cur)
++          letOp(id, op, cur)
++        case nir.Inst.Ret(v) =>
++          val n = nd(v)
++          if (n >= 0) union(retNode, n)
++        case nir.Inst.Jump(n) => nextEdges(n, cur)
++        case nir.Inst.If(_, a, b) =>
++          nextEdges(a, cur); nextEdges(b, cur)
++        case nir.Inst.Switch(_, d, cs) =>
++          nextEdges(d, cur); cs.foreach(nextEdges(_, cur))
++        case nir.Inst.Throw(v, u) =>
++          globalize(v, "throw"); nextEdges(u, cur)
++        case nir.Inst.Unreachable(u) => nextEdges(u, cur)
++        case nir.Inst.LinktimeIf(_, a, b) =>
++          nextEdges(a, cur); nextEdges(b, cur)
++      }
++
++      smashRawViews()
++      finalizeFlags()
++      val loopBlocks = blocksInCycles(blocks)
++      cands.foreach { c =>
++        tr(s"cand ${c.kind} id=${c.id} flags=${flags(find(c.node))} root=${find(c.node)}")
++      }
++      val byRoot = events.groupBy { case (n, _) => find(n) }
++      val candidates = cands.map { c =>
++        val r = find(c.node)
++        val f = flags(r)
++        val esc = (f & (Global | Returned | Ext)) != 0
++        val reason =
++          if (!esc) ""
++          else if ((f & Global) != 0)
++            byRoot.get(r).map(_.head._2()).getOrElse("global-propagated")
++          else if ((f & Returned) != 0) "returned"
++          else "ext(stored into heap/param/call-result)"
++        Candidate(c.kind, esc, loopBlocks(c.block max 0), reason, c.id, c.isClass)
++      }
++      summarize(params)
++      new Result(candidates.toSeq)
++    }
++
++    private def addCand(
++        id: nir.Local,
++        kind: String,
++        block: Int,
++        isClass: Boolean = false
++    ): Unit = {
++      val n = localNode.getOrElseUpdate(id.id, fresh())
++      flag(n, NonParam)
++      cands += Cand(id.id, kind, n, block, isClass)
++    }
++
++    private def letOp(id: nir.Local, op: nir.Op, block: Int): Unit = {
++      def res(ty: nir.Type) = resultNode(id, ty)
++      op match {
++        case nir.Op.Call(ty, ptr, args) =>
++          call(id, ty, ptr, args)
++        case nir.Op.Load(ty, ptr, _) =>
++          load(res(ty), ptr)
++        case nir.Op.Store(ty, ptr, v, _) =>
++          if (isTrackedTy(v.ty)) store(ptr, v)
++        case nir.Op.Elem(_, ptr, idxs) =>
++          unifyVals(res(nir.Type.Ptr), nd(ptr))
++        case nir.Op.Extract(aggr, _) =>
++          unifyVals(res(op.resty), nd(aggr))
++        case nir.Op.Insert(aggr, v, _) =>
++          val r = res(op.resty)
++          unifyVals(r, nd(aggr)); unifyVals(r, nd(v))
++        case nir.Op.Stackalloc(_, n) =>
++          res(nir.Type.Ptr)
++        case nir.Op.Bin(_, ty, l, r) =>
++          // pointers can hide in 64-bit ints
++          val rn = res(ty)
++          unifyVals(rn, nd(l)); unifyVals(rn, nd(r))
++        case _: nir.Op.Comp | _: nir.Op.Fence | _: nir.Op.SizeOf |
++            _: nir.Op.AlignmentOf | _: nir.Op.Is | _: nir.Op.Arraylength =>
++          ()
++        case nir.Op.Conv(conv, ty, v) =>
++          val r = res(ty)
++          unifyVals(r, nd(v))
++          if (r >= 0 && ty == nir.Type.Ptr && v.ty.isInstanceOf[nir.Type.RefKind])
++            flag(r, FromRef)
++        case nir.Op.Classalloc(ClassRef(cls), None) =>
++          addCand(id, cls.name.id, block, isClass = true)
++        case nir.Op.Classalloc(_, Some(_)) =>
++          val n = res(op.resty)
++          flag(n, HeapRoot | NonParam)
++        case nir.Op.Classalloc(_, _) =>
++          flag(res(op.resty), HeapRoot | NonParam)
++        case nir.Op.Fieldload(ty, obj, fname) =>
++          if (isTrackedTy(ty)) load(res(ty), obj, fieldKey(fname))
++        case nir.Op.Fieldstore(ty, obj, fname, v) =>
++          if (isTrackedTy(ty)) store(obj, v, fieldKey(fname))
++        case nir.Op.Field(obj, fname) =>
++          // pointer to a single field: its raw content is that field's content
++          val r = res(nir.Type.Ptr)
++          val on = nd(obj)
++          if (on >= 0) union(contentOf(r, 0), contentOf(on, fieldKey(fname)))
++          else flag(r, HeapRoot | NonParam)
++        case nir.Op.Method(obj, sig) =>
++          methodOf(id.id) = ((obj, sig))
++        case nir.Op.Dynmethod(obj, _) =>
++          globalize(obj, "dynmethod")
++        case nir.Op.Module(_) =>
++          flag(res(op.resty), HeapRoot | NonParam)
++        case nir.Op.As(ty, obj) =>
++          unifyVals(res(ty), nd(obj))
++        case nir.Op.Copy(v) =>
++          unifyVals(res(v.ty), nd(v))
++        case nir.Op.Box(ty, obj) =>
++          val kind = ty match {
++            case r: nir.Type.RefKind => "box:" + r.className.id
++            case _                   => "box"
++          }
++          addCand(id, kind, block)
++          if (isTrackedTy(obj.ty)) store(nir.Val.Local(id, op.resty), obj)
++        case nir.Op.Unbox(ty, obj) =>
++          val r = res(op.resty)
++          if (isTrackedTy(op.resty)) load(r, obj)
++        case nir.Op.Var(_) =>
++          res(nir.Type.Ptr)
++        case nir.Op.Varload(slot) =>
++          val r = res(op.resty)
++          load(r, slot)
++        case nir.Op.Varstore(slot, v) =>
++          if (isTrackedTy(v.ty)) store(slot, v)
++        case nir.Op.Arrayalloc(ty, init, None) =>
++          val constLen = init match {
++            case nir.Val.Int(_) | nir.Val.ArrayValue(_, _) => true
++            case _                                         => false
++          }
++          val r = res(op.resty)
++          if (constLen) {
++            addCand(id, "array:" + ty.show, block)
++            init match {
++              case nir.Val.ArrayValue(_, vs) =>
++                vs.foreach { e => if (isTrackedTy(e.ty)) store(nir.Val.Local(id, op.resty), e) }
++              case _ => ()
++            }
++          } else flag(r, HeapRoot | NonParam)
++        case nir.Op.Arrayalloc(_, init, Some(_)) =>
++          flag(res(op.resty), HeapRoot | NonParam)
++          globalize(init, "zone-array-init")
++        case nir.Op.Arrayload(ty, arr, _) =>
++          if (isTrackedTy(ty)) load(res(ty), arr)
++        case nir.Op.Arraystore(ty, arr, _, v) =>
++          if (isTrackedTy(ty)) store(arr, v)
++      }
++    }
++
++    private def call(
++        id: nir.Local,
++        ty: nir.Type.Function,
++        ptr: nir.Val,
++        args: Seq[nir.Val]
++    ): Unit = {
++      val resNode = resultNode(id, ty.ret)
++      val externId: Option[String] = ptr match {
++        case nir.Val.Global(m: nir.Global.Member, _) if m.sig.isExtern =>
++          m.sig.unmangled match {
++            case nir.Sig.Extern(eid) => Some(eid)
++            case _                   => None
++          }
++        case _ => None
++      }
++      if (externId.exists(NonCapturingExterns.contains)) {
++        if (resNode >= 0) {
++          if (args.nonEmpty && nd(args.head) >= 0) union(resNode, nd(args.head))
++          else flag(resNode, HeapRoot | NonParam)
++        }
++      } else callResolved(id, ty, ptr, args, resNode)
++    }
++
++    private def callResolved(
++        id: nir.Local,
++        ty: nir.Type.Function,
++        ptr: nir.Val,
++        args: Seq[nir.Val],
++        resNode: Int
++    ): Unit = {
++      val targets: Option[Seq[nir.Global.Member]] = ptr match {
++        case nir.Val.Global(m: nir.Global.Member, _) => Some(Seq(m))
++        case nir.Val.Local(l, _) =>
++          methodOf.get(l.id).flatMap {
++            case (obj, sig) =>
++              val realTy = nir.Type.Ref(
++                obj.ty match {
++                  case r: nir.Type.RefKind => r.className
++                  case _                   => nir.Rt.Object.name
++                },
++                exact = obj.ty match {
++                  case r: nir.Type.RefKind => r.isExact
++                  case _                   => false
++                },
++                nullable = true
++              )
++              if (obj.ty.isInstanceOf[nir.Type.RefKind]) targetsOf(realTy, sig)
++              else None
++          }
++        case _ => None
++      }
++      val sums: Option[Seq[Summary]] = targets.filter(_.size <= MaxTargets).flatMap { ts =>
++        val ss = ts.map { t =>
++          defines.get(t) match {
++            case Some(d) if d.ty.args.size == args.size && !d.attrs.isExtern =>
++              summaryOf(t)
++            case _ => None
++          }
++        }
++        if (ss.forall(_.isDefined)) Some(ss.map(_.get)) else None
++      }
++      tr(
++        s"call ${ptr.show.take(120)} args=${args.map(_.show.take(30))} targets=${targets
++          .map(_.map(_.show.take(80)))} sums=${sums.map(_.map(x => (x.escapes.toSeq, x.retSelf.toSeq, x.retDeep.toSeq, x.retFresh, x.group.toSeq)))}"
++      )
++      sums match {
++        case None =>
++          def why = "unknown-call:" + (ptr match {
++            case nir.Val.Global(m, _) => m.show
++            case nir.Val.Local(l, _) =>
++              methodOf.get(l.id) match {
++                case Some((o, sig)) => "virtual:" + o.ty.show + "::" + sig.show
++                case None           => "indirect"
++              }
++            case _ => "other"
++          })
++          args.foreach(globalize(_, why))
++          if (resNode >= 0) flag(resNode, HeapRoot | NonParam)
++        case Some(ss) =>
++          var fresh = resNode >= 0
++          val n = args.size
++          val argNodes = args.map(nd)
++          var i = 0
++          while (i < n) {
++            val an = argNodes(i)
++            if (an >= 0) {
++              ss.foreach { s =>
++                if (s.escapes(i)) flagG(an, "callee-escapes:" + targets.map(_.headOption.map(_.show).getOrElse("?")).getOrElse("?") + "#" + i)
++                if (s.retSelf(i) && resNode >= 0) union(resNode, an)
++                if (s.retDeep(i) && resNode >= 0) {
++                  union(resNode, an)
++                  collapse(resNode)
++                }
++                var j = 0
++                while (j < n) {
++                  if (j != i && s.group(j) == s.group(i)) {
++                    val bn = argNodes(j)
++                    if (bn >= 0) {
++                      union(an, bn)
++                      collapse(an)
++                    }
++                  }
++                  j += 1
++                }
++              }
++            }
++            i += 1
++          }
++          if (resNode >= 0) {
++            val freshRes = ss.exists(_.retFresh)
++            if (freshRes) flag(resNode, HeapRoot | NonParam)
++          }
++      }
++    }
++
++    // ---- flag propagation ----
++    /** Objects accessed through raw pointer views may have any field
++     *  read/written: merge all of their field contents.
++     */
++    private def smashRawViews(): Unit = {
++      var changed = true
++      var rounds = 0
++      while (changed && rounds < 8) {
++        changed = false
++        rounds += 1
++        var i = 0
++        while (i < size) {
++          if (parent(i) == i && fmap(i) != null &&
++              (flags(i) & (FromRef | RawAccessed)) == (FromRef | RawAccessed) &&
++              fmap(i).size > 1) {
++            val cs = fmap(i).values.toList
++            val first = find(cs.head)
++            if (cs.exists(c => find(c) != first)) {
++              cs.tail.foreach(c => union(cs.head, c))
++              changed = true
++            }
++          }
++          i += 1
++        }
++      }
++    }
++
++    private def finalizeFlags(): Unit = {
++      flag(retNode, Returned)
++      var changed = true
++      while (changed) {
++        changed = false
++        var i = 0
++        while (i < size) {
++          if (parent(i) == i && fmap(i) != null) {
++            val f = flags(i)
++            var add = f & (Global | Returned | Ext)
++            if ((f & (ExtRoot | Ext)) != 0) add |= Ext
++            if ((f & ExtRoot) != 0) add |= ExtRoot
++            if ((f & HeapRoot) != 0) add |= Global | HeapRoot
++            fmap(i).values.toList.foreach { c =>
++              val rc = find(c)
++              if ((flags(rc) | add) != flags(rc)) {
++                flags(rc) |= add
++                changed = true
++              }
++            }
++          }
++          i += 1
++        }
++      }
++    }
++
++    private def blocksInCycles(n: Int): Array[Boolean] = {
++      // Tarjan SCC
++      val index = Array.fill(n)(-1)
++      val low = new Array[Int](n)
++      val onStack = new Array[Boolean](n)
++      val inCycle = new Array[Boolean](n)
++      val st = mutable.Stack[Int]()
++      var counter = 0
++      def strong(v: Int): Unit = {
++        index(v) = counter; low(v) = counter; counter += 1
++        st.push(v); onStack(v) = true
++        succs(v).foreach { w =>
++          if (index(w) == -1) { strong(w); low(v) = low(v) min low(w) }
++          else if (onStack(w)) low(v) = low(v) min index(w)
++        }
++        if (low(v) == index(v)) {
++          val comp = mutable.ArrayBuffer.empty[Int]
++          var w = st.pop()
++          onStack(w) = false
++          comp += w
++          while (w != v) {
++            w = st.pop(); onStack(w) = false; comp += w
++          }
++          if (comp.size > 1 || succs(v).contains(v)) comp.foreach(inCycle(_) = true)
++        }
++      }
++      var v = 0
++      while (v < n) { if (index(v) == -1) strong(v); v += 1 }
++      inCycle
++    }
++
++    // ---- summary ----
++    private def closure(root: Int): Set[Int] = {
++      val seen = mutable.HashSet.empty[Int]
++      val todo = mutable.Stack[Int](find(root))
++      seen += find(root)
++      while (todo.nonEmpty) {
++        val cur = todo.pop()
++        val m = fmap(cur)
++        if (m != null)
++          m.values.foreach { c =>
++            val rc = find(c)
++            if (seen.add(rc)) todo.push(rc)
++          }
++      }
++      seen.toSet
++    }
++
++    private def summarize(params: Seq[nir.Val.Local]): Unit = {
++      val n = params.size
++      val pn = params.map(nd)
++      val clos = pn.map(p => if (p >= 0) closure(p) else Set.empty[Int])
++      val retClos = closure(retNode)
++      val retRoot = find(retNode)
++      val escapes = new Array[Boolean](n)
++      val retSelf = new Array[Boolean](n)
++      val retDeep = new Array[Boolean](n)
++      val group = Array.tabulate(n)(identity)
++      var i = 0
++      while (i < n) {
++        if (pn(i) >= 0) {
++          val c = clos(i)
++          if (c.exists(r => (flags(r) & Global) != 0)) escapes(i) = true
++          val root = find(pn(i))
++          if (root == retRoot) retSelf(i) = true
++          else if (c.exists(retClos.contains)) retDeep(i) = true
++          var j = 0
++          while (j < i) {
++            if (pn(j) >= 0 && clos(j).exists(c.contains)) {
++              val gj = group(j)
++              // merge groups
++              var k = 0
++              while (k < n) { if (group(k) == group(i)) group(k) = gj; k += 1 }
++            }
++            j += 1
++          }
++        }
++        i += 1
++      }
++      val retFresh = (flags(retRoot) & NonParam) != 0
++      publish(
++        defn.name,
++        new Summary(escapes, retSelf, retDeep, retFresh, canonical(group)),
++        n
++      )
++    }
++  }
++}
