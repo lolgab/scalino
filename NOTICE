@@ -4,13 +4,96 @@ Copyright 2026 Lorenzo Gabriele
 Licensed under the Apache License, Version 2.0 (see /LICENSE at this repo's
 root for the full text).
 
-scalino's distributed binaries (scalino, scalino-dotc, scalino-linkdriver,
+scalino's own binaries (scalino, scalino-dotc, scalino-linkdriver,
 scalino-lsp and the jars under lib/) are built from patched checkouts of the
 Scala 3 compiler/library and the Scala Native runtime/toolchain (see
 patches/ for scalino's own changes to both), plus scalino's own code. Both
 upstream projects are Apache License 2.0. Per that license's redistribution
 terms (Section 4(d)), their NOTICE/attribution content is reproduced below
 in full, unmodified from their own repositories.
+
+Besides those, a release also contains the following components, each under its
+own licence (not scalino's):
+
+================================================================================
+OpenJDK java.base -- dist/java.base.jar
+================================================================================
+
+java.base.jar is the class files of the java.base module of the OpenJDK build
+(Eclipse Temurin) that built scalino, extracted unmodified so that the compiler
+can read the signatures of java.lang/java.util. OpenJDK is licensed under the
+GNU General Public License, version 2, with the Classpath Exception; the
+licence texts, and the notices for the third-party code inside java.base, are
+in legal/java.base/ (LICENSE, ASSEMBLY_EXCEPTION, ADDITIONAL_LICENSE_INFO, ...)
+next to the jar. Source code: https://openjdk.org/ and
+https://github.com/adoptium (Temurin). The jar is only read as data by the
+compiler; nothing of scalino links against it.
+
+================================================================================
+Coursier -- scalino-cs
+================================================================================
+
+scalino-cs is the unmodified `cs` launcher of Coursier
+(https://github.com/coursier/coursier), licensed under the Apache License,
+Version 2.0 (full text in /LICENSE); it is a GraalVM native image, so it also contains the
+Substrate VM runtime and the parts of the JDK class library it needs, under the
+GPLv2 with the Classpath Exception (see "OpenJDK" above and
+https://github.com/oracle/graal), and the libraries Coursier depends on, all of
+them under permissive licences listed in Coursier's own distribution.
+
+================================================================================
+LLVM and zstd -- statically linked into scalino-linkdriver
+================================================================================
+
+The linker driver links the LLVM libraries (used by Scala Native's direct code
+generator) statically. LLVM (https://llvm.org) is licensed under the Apache
+License v2.0 with LLVM Exceptions (https://llvm.org/LICENSE.txt); as that
+licence's exception allows, no further conditions apply to the object form.
+LLVM in turn links zstd, reproduced here as its licence asks:
+
+  BSD License
+
+  For Zstandard software
+
+  Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without modification,
+  are permitted provided that the following conditions are met:
+
+   * Redistributions of source code must retain the above copyright notice, this
+     list of conditions and the following disclaimer.
+
+   * Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+   * Neither the name Facebook, nor Meta, nor the names of its contributors may
+     be used to endorse or promote products derived from this software without
+     specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+  ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+  ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+Cross-compilation sysroots -- scalino-sysroot-<triple>.tar.gz (separate downloads)
+================================================================================
+
+`scalino sysroot fetch` downloads sysroots that are separate release assets,
+not part of scalino's own code or its Apache-2.0 licence. They hold third-party
+software (musl, glibc and the Linux kernel headers from Debian, Apple's open
+source Darwin headers via the Zig project, mingw-w64, LLVM's compiler-rt, libc++
+and libunwind), each under its own licence. Every tarball contains these licence
+texts in LICENSES/, a README naming each component and where its source is
+(for glibc, the written offer the LGPL asks for). build/12-build-sysroot.sh
+builds them from checksum-pinned upstream sources.
 
 ================================================================================
 Scala 3 (dotty) -- vendor/scala3/NOTICE.md

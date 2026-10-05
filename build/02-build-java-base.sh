@@ -10,6 +10,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
 
 OUT="$DIST/java.base.jar"
+
+# java.base.jar is OpenJDK code (GPLv2 with the Classpath Exception): ship the
+# licence texts the JDK itself provides for that module, including the notices
+# for the third-party code inside it (ICU, zlib, ...). See NOTICE.
+if [[ -d "$JAVA_HOME/legal/java.base" ]]; then
+  rm -rf "$DIST/legal/java.base"
+  mkdir -p "$DIST/legal"
+  cp -R "$JAVA_HOME/legal/java.base" "$DIST/legal/java.base"
+fi
+
 if [[ -f "$OUT" ]]; then
   echo "OK: $OUT already built"
   exit 0
