@@ -1,0 +1,11 @@
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -143,6 +143,8 @@
+         memoryCommit(blockMetaStart, blockMetaSpaceSize) &&
+         memoryCommit(lineMetaStart, lineMetaSpaceSize) &&
+         memoryCommit(bytemap, bytemapSpaceSize) &&
++        // heap->hashedBlocks is written without any prior growth step
++        memoryCommit(heap->hashedBlocks, (size_t)maxNumberOfBlocks) &&
+         // Due to lack of over-committing on Windows on Heap init reserve memory
+         // chunk equal to maximal size of heap, but commit only minimal needed
+         // chunk of memory. Additional chunks of heap should be committed on
