@@ -56,8 +56,9 @@ jobs:
         shell: bash
         env:
           # JVM heap for the link steps; the rest of RAM is needed by clang/LLVM
-          # and the runner agent (80% on 16 GB runners got the runner killed).
-          SCALINO_LINK_RAM_PERCENT: '55'
+          # and the runner agent (80% on the 16 GB Linux runners got the runner
+          # killed). macOS runners have less RAM and need the full 80%.
+          SCALINO_LINK_RAM_PERCENT: ${{ runner.os == 'Linux' && '55' || '80' }}
         run: ./build/all.sh
 
       - name: Memory log
