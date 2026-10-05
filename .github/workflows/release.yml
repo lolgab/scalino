@@ -112,6 +112,33 @@ jobs:
             assets/*.rpm.sha256
           if-no-files-found: error
 
+  # Cross-compilation sysroots (`scalino sysroot fetch <triple>`): musl +
+  # compiler-rt per Linux target, cross-built with clang so one runner makes
+  # every arch. Independent of the toolchain build above.
+  sysroots:
+    name: sysroot (${{ matrix.triple }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update -y && sudo apt-get install -y clang lld llvm cmake ninja-build make curl
+
+      - name: Build sysroot
+        run: ./build/12-build-sysroot.sh ${{ matrix.triple }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sysroot-${{ matrix.triple }}
+          path: |
+            dist/sysroot-packages/*.tar.gz
+            dist/sysroot-packages/*.tar.gz.sha256
+          if-no-files-found: error
+
   # Windows x86_64 release build disabled -- see docs/findings.md.
   # build-windows:
   #   name: build (windows-x86_64)
@@ -167,7 +194,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [build, sysroots]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

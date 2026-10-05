@@ -125,7 +125,33 @@ scalino package . --format brew --release-url https://github.com/me/app/releases
 | `docker` | `docker/Dockerfile` + image | `debian:stable-slim` base (`alpine` on musl) |
 | `brew` | `<name>.rb` | covers every tarball found in the output dir |
 
-Metadata comes from `//> using packageName|packageVersion|packageDescription|packageMaintainer|packageLicense|packageHomepage|packageDep|packageFile|packageDockerBase|packageDockerImage|packageReleaseUrl` (see `scalino package --help`). There is no cross-compilation: build each OS/arch on its own CI runner into the same output dir, then run `--format brew` last.
+Metadata comes from `//> using packageName|packageVersion|packageDescription|packageMaintainer|packageLicense|packageHomepage|packageDep|packageFile|packageDockerBase|packageDockerImage|packageReleaseUrl` (see `scalino package --help`). With [cross-compilation](#cross-compilation) one machine can build every target into the same output dir (or build each OS/arch on its own CI runner); run `--format brew` last.
+
+## Cross-compilation
+
+One machine can build binaries for several platforms in a single command:
+
+```sh
+scalino sysroot fetch x86_64-unknown-linux-musl aarch64-unknown-linux-musl   # once
+scalino package app/ -o myapp \
+  --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+# -> myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl
+```
+
+(`//> using nativeTargetTriple "..."` works too, and `--format tar,...` packages each target.) All targets are
+compiled in one linker process, so the program is parsed only once.
+
+| target | from | needs |
+|---|---|---|
+| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot fetch <triple>`, plus `lld` when the host isn't Linux |
+| `x86_64-apple-darwin`, `aarch64-apple-darwin` | macOS | nothing (Xcode's SDK serves both) |
+| anything else (glibc Linux, macOS from Linux, Windows) | any | your own sysroot: `--native-sysroot <triple>=<dir>` |
+
+The Linux targets are fully static (musl), so one binary runs on every distro. A sysroot is the target's libc
+headers and libraries, built by [`build/12-build-sysroot.sh`](build/12-build-sysroot.sh) and published with every
+release; `scalino sysroot fetch` verifies its checksum and installs it under `~/.cache/scalino/sysroots`
+(`$SCALINO_SYSROOT_DIR` overrides, `--from <tarball|url>` installs from a file, `$SCALINO_SYSROOT_URL` mirrors the
+release assets). `run` and `test` only ever build for the host, since the result couldn't be executed here.
 
 ## Hermetic / Nix builds
 

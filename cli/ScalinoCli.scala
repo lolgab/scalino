@@ -433,7 +433,9 @@ object ScalinoCli:
     testOptions: List[String],
     resourceDirs: List[String],
     repositories: List[String],
-    pkg: Map[String, List[String]] = Map.empty
+    pkg: Map[String, List[String]] = Map.empty,
+    nativeTargetTriples: List[String] = Nil,
+    nativeSysroots: List[String] = Nil
   )
 
   private val quotedRe = """"([^"]*)"""".r
@@ -453,6 +455,7 @@ object ScalinoCli:
     "repository", "repositories", "file", "files", "exclude",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativePrune", "nativeTarget",
+    "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -511,6 +514,8 @@ object ScalinoCli:
     var nativeCppCompile = List.empty[String]
     var nativePrune = List.empty[String]
     var nativeTarget = Option.empty[String]
+    var nativeTargetTriples = List.empty[String]
+    var nativeSysroots = List.empty[String]
     var nativeEmbedResources = Option.empty[Boolean]
     var nativeMultithreading = Option.empty[Boolean]
     var nativeDirectCodegen = Option.empty[Boolean]
@@ -570,6 +575,8 @@ object ScalinoCli:
         directiveValues(line, "nativeCppCompile").foreach(vs => nativeCppCompile = nativeCppCompile ++ vs)
         directiveValues(line, "nativePrune").foreach(vs => nativePrune = nativePrune ++ vs)
         directiveValues(line, "nativeTarget").foreach(_.headOption.foreach(v => nativeTarget = Some(v)))
+        directiveValues(line, "nativeTargetTriple", "nativeTargetTriples").foreach(vs => nativeTargetTriples = nativeTargetTriples ++ vs)
+        directiveValues(line, "nativeSysroot").foreach(vs => nativeSysroots = nativeSysroots ++ vs)
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
@@ -585,7 +592,8 @@ object ScalinoCli:
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile, nativePrune,
       nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
-      jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg
+      jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
+      nativeTargetTriples, nativeSysroots
     )
 
   /** scala-cli's three dependency formats:
@@ -2150,6 +2158,10 @@ object ScalinoCli:
     clang: Option[String] = None,
     clangpp: Option[String] = None,
     target: Option[String] = None,
+    // Cross targets, e.g. aarch64-unknown-linux-musl; empty: the host.
+    targetTriples: List[String] = Nil,
+    // `<triple>=<dir>` per cross target
+    sysroots: List[String] = Nil,
     embedResources: Boolean = false,
     multithreading: Boolean = true,
     directCodegen: Boolean = true,
@@ -2171,7 +2183,15 @@ object ScalinoCli:
    *  single-valued settings (matches `explicitMainClass`'s own precedence);
    *  list-valued and boolean settings combine both sources instead, matching
    *  how `options`/`deps` already combine directive and CLI values above. */
+  def targetTriplesOf(directives: Directives, o: RunOpts): List[String] =
+    (directives.nativeTargetTriples ++ o.cliNativeTargetTriples).flatMap(_.split(',').toList).map(_.trim).filter(_.nonEmpty).distinct
+
   def resolveNativeOpts(directives: Directives, o: RunOpts): NativeOpts =
+    // Windows is gated on the target when cross-compiling, else on the host.
+    val triples = targetTriplesOf(directives, o)
+    val windowsTarget =
+      if triples.nonEmpty then triples.exists(t => t.contains("windows") || t.contains("mingw"))
+      else sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
     NativeOpts(
       mode = directives.nativeMode.orElse(o.cliNativeMode),
       gc = directives.nativeGc.orElse(o.cliNativeGc),
@@ -2179,6 +2199,8 @@ object ScalinoCli:
       clang = directives.nativeClang.orElse(o.cliNativeClang),
       clangpp = directives.nativeClangPP.orElse(o.cliNativeClangpp),
       target = directives.nativeTarget.orElse(o.cliNativeTarget),
+      targetTriples = triples,
+      sysroots = directives.nativeSysroots ++ o.cliNativeSysroots,
       embedResources = directives.nativeEmbedResources.getOrElse(false) || o.cliEmbedResources,
       // Default-on, same opt-out shape as directCodegen above:
       // either source wins outright over the default if given explicitly.
@@ -2187,13 +2209,11 @@ object ScalinoCli:
       // wholeBuildGatesOk gates out Windows permanently -- WindowsCompat is
       // unported), with an explicit opt-out via the directive or
       // `--native-direct-codegen=false` -- either one, if given,
-      // wins outright over the OS-based default. No cross-compilation
-      // support exists in scalino today, so the *host* OS doubles as the
-      // target OS here, same pragmatic assumption `Discover`'s other
-      // OS-sniffing already makes.
+      // wins outright over the OS-based default. The OS is the target's
+      // when `--native-target-triple` is given, else the host's.
       directCodegen = directives.nativeDirectCodegen
         .orElse(o.cliNativeDirectCodegen)
-        .getOrElse(!sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")),
+        .getOrElse(!windowsTarget),
       // Default-on everywhere except Windows (untested there), with an explicit
       // opt-out via the directive or `--native-compact-headers=false`. Only
       // takes effect for 64-bit targets linked with the immix GC (see
@@ -2201,7 +2221,7 @@ object ScalinoCli:
       // to regular object headers.
       compactHeaders = directives.nativeCompactHeaders
         .orElse(o.cliNativeCompactHeaders)
-        .getOrElse(!sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")),
+        .getOrElse(!windowsTarget),
       // Default-on, but scalino-linkdriver turns it off when the classpath has
       // a library reading byte arrays through raw pointers (jsoniter-scala-core),
       // unless given explicitly. See NativeConfig.compactByteArrays.
@@ -2284,7 +2304,10 @@ object ScalinoCli:
     incremental: Boolean = true,
     nativeOpts: NativeOpts = NativeOpts(),
     longRunning: Boolean = false,
-    excludeFromLink: Set[String] = Set.empty
+    excludeFromLink: Set[String] = Set.empty,
+    // Where each cross target's binary goes; required when
+    // `nativeOpts.targetTriples` is non-empty (`outFor` serves the host build).
+    outForTriple: (String, String) => Path = (_, _) => Paths.get("unused")
   ): String =
     val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental)
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
@@ -2292,7 +2315,8 @@ object ScalinoCli:
     val mainClass = detectMainClass(compiledDir, explicitMainClass)
     // Same check as handleRunOrCompile's, for the default name (no -o) that
     // is only known now -- still before the (slow) link step.
-    checkBinaryOutPath(outFor(mainClass))
+    if nativeOpts.targetTriples.isEmpty then checkBinaryOutPath(outFor(mainClass))
+    else nativeOpts.targetTriples.foreach(t => checkBinaryOutPath(outForTriple(mainClass, t)))
     val linkDir = Paths.get(".scalino-build").resolve(mainClass).resolve("link")
     val classesDir =
       if excludeFromLink.isEmpty then compiledDir
@@ -2309,6 +2333,8 @@ object ScalinoCli:
       nativeOpts.gc.toList.flatMap(v => List("--gc", v)) ++
       nativeOpts.lto.toList.flatMap(v => List("--lto", v)) ++
       nativeOpts.target.toList.flatMap(v => List("--target", v)) ++
+      nativeOpts.targetTriples.flatMap(v => List("--target-triple", v)) ++
+      nativeOpts.sysroots.flatMap(v => List("--sysroot", v)) ++
       (if nativeOpts.embedResources then List("--embed-resources") else Nil) ++
       (if nativeOpts.multithreading then List("--multithreading") else Nil) ++
       (if incremental then List("--incremental-compilation") else Nil) ++
@@ -2328,14 +2354,14 @@ object ScalinoCli:
     val linkExit = if longRunning then linkIncremental(linkCmd) else runInherited(linkCmd)
     if linkExit != 0 then fail("linking failed")
 
-    val produced = linkDir.resolve(mainClass)
-    val producedLower = linkDir.resolve(mainClass.toLowerCase)
-    val actual = if Files.exists(produced) then produced else producedLower
-    if !Files.exists(actual) then fail(s"expected linked binary at $actual, not found")
-    val out = outFor(mainClass)
-    Files.createDirectories(Option(out.getParent).getOrElse(Paths.get(".")))
-    Files.copy(actual, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-    out.toFile.setExecutable(true)
+    def collect(dir: Path, out: Path): Unit =
+      val candidates = List(mainClass, mainClass.toLowerCase).flatMap(n => List(n, n + ".exe")).map(dir.resolve)
+      val actual = candidates.find(Files.exists(_)).getOrElse(fail(s"expected linked binary at ${candidates.head}, not found"))
+      Files.createDirectories(Option(out.getParent).getOrElse(Paths.get(".")))
+      Files.copy(actual, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+      out.toFile.setExecutable(true)
+    if nativeOpts.targetTriples.isEmpty then collect(linkDir, outFor(mainClass))
+    else nativeOpts.targetTriples.foreach(t => collect(linkDir.resolve(t), outForTriple(mainClass, t)))
     mainClass
 
   // ---------------------------------------------------------------------
@@ -2484,6 +2510,10 @@ object ScalinoCli:
        |                             (`pkg.Class`), package (`pkg.sub`) or method (`pkg.Class#name`) with a
        |                             throw, dropping whatever was reachable only through them (repeatable)
        |  --native-target <target>  app|static|dynamic (app by default)
+       |  --native-target-triple <t> cross-compile for this target triple, e.g. aarch64-unknown-linux-musl
+       |                             (repeatable or comma-separated; one link process builds all of them,
+       |                             `package` only; several targets write `<out>-<triple>`)
+       |  --native-sysroot <t>=<dir> sysroot for cross target <t> (repeatable)
        |  --embed-resources          embed resources into the binary (readable via the Java resources API)
        |  --native-multithreading[=true|false]  Scala Native multithreading support
        |                                        (on by default; pass =false to opt out)
@@ -2542,6 +2572,8 @@ object ScalinoCli:
        |  //> using nativeCppCompile "-flag"
        |  //> using nativePrune "org.http4s.ember.core.h2"   (class, package or Class#method; bodies become a throw)
        |  //> using nativeTarget "application"   (application|library-dynamic|library-static)
+       |  //> using nativeTargetTriple "aarch64-unknown-linux-musl"   (cross target, repeatable)
+       |  //> using nativeSysroot "aarch64-unknown-linux-musl=/path/to/sysroot"
        |  //> using nativeEmbedResources true
        |  //> using nativeMultithreading false   (on by default)
        |  //> using nativeDirectCodegen false   (on by default except on Windows)
@@ -2626,6 +2658,7 @@ object ScalinoCli:
          |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
          |  scalino lock <sources...> [options]    resolve dependencies and write scalino.lock.json
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
+         |  scalino sysroot fetch <triple>...      install the sysroot for cross-compiling to <triple> (see --native-target-triple)
          |  scalino clean                         delete the .scalino-build directory
          |  scalino version                        print version info
          |  scalino --help                         this message
@@ -2644,7 +2677,7 @@ object ScalinoCli:
     )
 
   val HelpCommands: Set[String] =
-    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "version")
+    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "sysroot", "version")
 
   /** `scalino <command> --help`: usage plus only the options/notes that apply to
    *  that command. */
@@ -2685,6 +2718,18 @@ object ScalinoCli:
         head("scalino completions <bash|zsh|fish>", "Print a shell completion script to stdout.") + completionsNote
       case "clean" =>
         head("scalino clean", "Delete the .scalino-build directory.")
+      case "sysroot" =>
+        head("scalino sysroot <fetch|list|path> ...", "Manage the sysroots used to cross-compile (`--native-target-triple`).") +
+          s"""|  scalino sysroot fetch <triple>... [--from <tarball|url>] [--force]
+              |      download and install the sysroot (checksum-verified) into ${Sysroot.cacheRoot}
+              |      (override with $$SCALINO_SYSROOT_DIR; release assets from $$SCALINO_SYSROOT_URL)
+              |  scalino sysroot list           published targets and whether they are installed
+              |  scalino sysroot path <triple>  where an installed sysroot lives
+              |
+              |available: ${Sysroot.Fetchable.mkString(", ")}
+              |Linux targets are static musl binaries that run on any distro. macOS targets need no
+              |sysroot on a Mac (the Xcode SDK serves both architectures).
+              |""".stripMargin
       case "version" =>
         head("scalino version", "Print version info.")
     out.print(text)
@@ -2713,6 +2758,8 @@ object ScalinoCli:
     cliNativeClang: Option[String] = None,
     cliNativeClangpp: Option[String] = None,
     cliNativeTarget: Option[String] = None,
+    cliNativeTargetTriples: List[String] = Nil,
+    cliNativeSysroots: List[String] = Nil,
     cliNativeLinking: List[String] = Nil,
     cliNativeCompile: List[String] = Nil,
     cliNativeCCompile: List[String] = Nil,
@@ -2774,6 +2821,8 @@ object ScalinoCli:
         case "--native-clang" => o = o.copy(cliNativeClang = Some(args(i + 1))); i += 1
         case "--native-clangpp" => o = o.copy(cliNativeClangpp = Some(args(i + 1))); i += 1
         case "--native-target" => o = o.copy(cliNativeTarget = Some(args(i + 1))); i += 1
+        case "--native-target-triple" => o = o.copy(cliNativeTargetTriples = o.cliNativeTargetTriples :+ args(i + 1)); i += 1
+        case "--native-sysroot" => o = o.copy(cliNativeSysroots = o.cliNativeSysroots :+ args(i + 1)); i += 1
         case "--native-linking" => o = o.copy(cliNativeLinking = o.cliNativeLinking :+ args(i + 1)); i += 1
         case "--native-compile" => o = o.copy(cliNativeCompile = o.cliNativeCompile :+ args(i + 1)); i += 1
         case "--native-c-compile" => o = o.copy(cliNativeCCompile = o.cliNativeCCompile :+ args(i + 1)); i += 1
@@ -2845,27 +2894,49 @@ object ScalinoCli:
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
-    val nativeOpts = resolveNativeOpts(directives, o)
+    val nativeOpts0 = resolveNativeOpts(directives, o)
+    // Cross targets need a sysroot each: the one given, else the installed one.
+    val nativeOpts =
+      if mode == "package" && nativeOpts0.targetTriples.nonEmpty then
+        nativeOpts0.copy(sysroots = Sysroot.resolve(nativeOpts0.targetTriples, nativeOpts0.sysroots))
+      else nativeOpts0
 
     mode match
       case "run" =>
+        // Only the host's own binary can be run here.
+        if nativeOpts.targetTriples.exists(t => Packaging.hostFromTriple(t) != Packaging.detectHost()) || nativeOpts.targetTriples.size > 1 then
+          fail(s"run: can't execute a binary for ${nativeOpts.targetTriples.mkString(", ")} on this machine -- use `scalino package`")
+        val hostOpts = nativeOpts.copy(targetTriples = Nil, sysroots = Nil)
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
         runInherited(binPathFor(mainClass).toString :: o.progArgs)
       case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
+        def binPathForTriple(mc: String, t: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(s"bin-$t")
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch, outForTriple = binPathForTriple)
         val meta = Packaging.resolveMeta(directives.pkg, mainClass, o.pkgName, o.pkgVersion, o.releaseUrl)
-        try Packaging.packageAll(o.formats, binPathFor(mainClass), meta, Paths.get(o.out.getOrElse("packages")), o.quiet)
+        try
+          if nativeOpts.targetTriples.isEmpty then
+            Packaging.packageAll(o.formats, binPathFor(mainClass), meta, Paths.get(o.out.getOrElse("packages")), o.quiet)
+          else
+            for t <- nativeOpts.targetTriples do
+              Packaging.packageAll(o.formats, binPathForTriple(mainClass, t), meta, Paths.get(o.out.getOrElse("packages")), o.quiet, Some(t))
         catch case e: java.io.IOException => fail(s"packaging failed: ${e.getMessage}")
         0
       case "package" =>
         def outPathFor(mc: String): Path = Paths.get(o.out.getOrElse(mc.substring(mc.lastIndexOf('.') + 1)))
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch)
-        val outPath = outPathFor(mainClass)
+        // One cross target: -o as given. Several: `<out>-<triple>`.
+        def outPathForTriple(mc: String, t: String): Path =
+          val base = outPathFor(mc)
+          if nativeOpts.targetTriples.size == 1 then base else base.resolveSibling(s"${base.getFileName}-$t")
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch, outForTriple = outPathForTriple)
+        val outPaths =
+          if nativeOpts.targetTriples.isEmpty then List(outPathFor(mainClass)) else nativeOpts.targetTriples.map(outPathForTriple(mainClass, _))
         if !o.quiet then
-          val shown = if outPath.isAbsolute || outPath.startsWith("..") then outPath.toString else "./" + outPath
-          println(s"Wrote ${outPath.toAbsolutePath.normalize}, run it with\n  $shown")
+          for outPath <- outPaths do
+            val shown = if outPath.isAbsolute || outPath.startsWith("..") then outPath.toString else "./" + outPath
+            if nativeOpts.targetTriples.isEmpty then println(s"Wrote ${outPath.toAbsolutePath.normalize}, run it with\n  $shown")
+            else println(s"Wrote ${outPath.toAbsolutePath.normalize}")
         0
       case "compile" =>
         compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)
@@ -3130,13 +3201,13 @@ object ScalinoCli:
   // themselves (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
   // ---------------------------------------------------------------------
 
-  private val completionSubcommands = "run compile package test setup-ide lock clean version completions"
+  private val completionSubcommands = "run compile package test setup-ide lock clean sysroot version completions"
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
-    "--native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
+    "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-optimize -h --help"
 
@@ -3159,7 +3230,7 @@ object ScalinoCli:
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-clang|--native-clangpp|--native-linking| \\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-target-triple|--native-sysroot|--native-clang|--native-clangpp|--native-linking| \\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      COMPREPLY=($$(compgen -f -- "$$cur")); return ;;
        |  esac
@@ -3196,7 +3267,7 @@ object ScalinoCli:
        |    completions) _values 'shell' bash zsh fish; return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-clang|--native-clangpp|--native-linking|\\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-target-triple|--native-sysroot|--native-clang|--native-clangpp|--native-linking|\\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      _files; return ;;
        |  esac
@@ -3300,6 +3371,7 @@ object ScalinoCli:
       case "setup-ide" => handleSetupIde(args.drop(1))
       case "completions" => handleCompletions(args.drop(1))
       case "clean" => handleClean(args.drop(1))
+      case "sysroot" => Sysroot.handle(args.drop(1))
       case "lock" => handleLock(args.drop(1))
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
         handleRunOrCompile("run", args) // implicit `run`, e.g. `scalino Foo.scala`

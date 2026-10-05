@@ -1,6 +1,6 @@
 import scala.scalanative.build._
 import scala.scalanative.util.Scope
-import java.nio.file.Paths
+import java.nio.file.{Path, Paths}
 
 object LinkDriver:
   /** `Logger.default` (used unconditionally before) always prints debug/trace
@@ -28,6 +28,9 @@ object LinkDriver:
     gc: Option[String] = None,
     lto: Option[String] = None,
     target: Option[String] = None,
+    targetTriples: List[String] = Nil,
+    // triple -> sysroot dir, for cross targets
+    sysroots: Map[String, String] = Map.empty,
     embedResources: Boolean = false,
     multithreading: Boolean = false,
     directCodegen: Boolean = false,
@@ -58,6 +61,10 @@ object LinkDriver:
         case "--gc" => o = o.copy(gc = Some(rest(i + 1))); i += 1
         case "--lto" => o = o.copy(lto = Some(rest(i + 1))); i += 1
         case "--target" => o = o.copy(target = Some(rest(i + 1))); i += 1
+        case "--target-triple" => o = o.copy(targetTriples = o.targetTriples :+ rest(i + 1)); i += 1
+        case "--sysroot" =>
+          val Array(t, d) = rest(i + 1).split("=", 2)
+          o = o.copy(sysroots = o.sysroots.updated(t, d)); i += 1
         case "--embed-resources" => o = o.copy(embedResources = true)
         case "--multithreading" => o = o.copy(multithreading = true)
         case "--direct-codegen" => o = o.copy(directCodegen = true)
@@ -177,6 +184,76 @@ object LinkDriver:
           )
       )
 
+    // Cross targets: one Config per `--target-triple`, each in its own
+    // `<workDir>/<triple>` so object caches and binaries never mix. All of
+    // them are linked by this one process, so the process-global NIR parse
+    // cache (patches/scala-native-0047) is shared between targets.
+    def normArch(a: String): String = a match
+      case "arm64" => "aarch64"
+      case "amd64" => "x86_64"
+      case other => other
+    def osOf(t: String): String =
+      if t.contains("darwin") || t.contains("apple") then "macos"
+      else if t.contains("linux") then "linux"
+      else if t.contains("windows") || t.contains("mingw") then "windows"
+      else t
+    // Whether `t` is what clang already produces on this machine. Only then
+    // are `Discover`'s host library/include dirs (/opt/homebrew/lib...) valid.
+    lazy val hostTriple = Discover.targetTriple(Paths.get(args(3)))
+    def isHostTarget(t: String): Boolean =
+      normArch(t.takeWhile(_ != '-')) == normArch(hostTriple.takeWhile(_ != '-')) &&
+        osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl"))
+    /** Link flags for a `scalino sysroot fetch` Linux sysroot `d` (layout in
+     *  build/12-build-sysroot.sh): musl is linked statically, with compiler-rt's
+     *  builtins and crtbegin/crtend instead of libgcc. clang only looks for
+     *  those in its own resource dir, so a private one is assembled next to
+     *  the build: the host clang's builtin headers, the sysroot's runtime libs. */
+    def linuxSysrootLinkFlags(t: String, d: String, targetDir: Path): List[String] =
+      val sysrootAbs = Paths.get(d).toAbsolutePath
+      val sysrootFlag = List(s"--sysroot=$sysrootAbs")
+      val rt = sysrootAbs.resolve("resource").resolve("lib")
+      if !java.nio.file.Files.isDirectory(rt) then sysrootFlag
+      else
+        def run(cmd: String*): String =
+          val p = new ProcessBuilder(cmd*).redirectErrorStream(false).start()
+          val out = new String(p.getInputStream.readAllBytes()).trim
+          if p.waitFor() != 0 then die(s"`${cmd.mkString(" ")}` failed")
+          out
+        val hostInclude = Paths.get(run(args(3), "-print-resource-dir")).resolve("include")
+        // Absolute: clang's own cwd while linking is not ours.
+        val res = targetDir.toAbsolutePath.resolve("clang-resource")
+        java.nio.file.Files.createDirectories(res)
+        run("ln", "-sfn", hostInclude.toString, res.resolve("include").toString)
+        run("ln", "-sfn", rt.toString, res.resolve("lib").toString)
+        sysrootFlag ++ List("-rtlib=compiler-rt", "--unwindlib=none", s"-resource-dir=$res") ++
+          (if t.endsWith("musl") then List("-static") else Nil)
+
+    def forTriple(t: String): Config =
+      val withDir = config.withBaseDir(workDir.resolve(t))
+      if isHostTarget(t) then withDir.withCompilerConfig(_.withTargetTriple(Some(t)))
+      else
+        // Cross target: Discover's host-only lib/include dirs (/opt/homebrew...)
+        // are dropped, the target's sysroot (if any) takes their place.
+        val sysroot = opts.sysroots.get(t)
+        val compileFlags = sysroot.toList.flatMap(d => osOf(t) match
+          case "macos" => List("-isysroot", d)
+          case _ => List(s"--sysroot=$d"))
+        val linkFlags = sysroot.toList.flatMap(d => osOf(t) match
+          case "macos" => List("-isysroot", d)
+          case "linux" => linuxSysrootLinkFlags(t, d, workDir.resolve(t))
+          case _ => List(s"--sysroot=$d"))
+        // Apple's ld can't produce ELF.
+        val lld =
+          if osOf(t) == "linux" && osOf(hostTriple) != "linux" && !opts.linking.exists(_.startsWith("-fuse-ld"))
+          then List("-fuse-ld=lld") else Nil
+        withDir.withCompilerConfig(
+          _.withTargetTriple(Some(t))
+            .withLinkingOptions(linkFlags ++ lld ++ opts.linking)
+            .withCompileOptions(compileFlags ++ opts.compile)
+        )
+    val configs: List[Config] =
+      if opts.targetTriples.isEmpty then List(config) else opts.targetTriples.distinct.map(forTriple)
+
     if opts.longRunning then
       // Same protocol as scala-js-cli's `--longRunning` (scala-js-cli#64):
       // one Scope, one process, kept alive across every relink so the
@@ -199,8 +276,9 @@ object LinkDriver:
           // the next link -- failed builds can leave process-global caches
           // in a half-updated state, so the process isn't reused.
           try
-            val outPath = Build.buildCachedAwait(config)
-            logger.debug(s"LINKED: $outPath")
+            for c <- configs do
+              val outPath = Build.buildCachedAwait(c)
+              logger.debug(s"LINKED: $outPath")
             // Sentinel printed only after a successful link, mirroring
             // scala-js-cli's SCALA_JS_LINKING_DONE -- the caller (ScalinoCli,
             // in watch mode) blocks reading stdout for this exact line
@@ -216,8 +294,9 @@ object LinkDriver:
           continue = stdin.readLine() != null
       }
     else
-      val outPath = Scope.apply[java.nio.file.Path] { (s: Scope) =>
+      Scope.apply[Unit] { (s: Scope) =>
         given Scope = s
-        Build.buildCachedAwait(config)
+        for c <- configs do
+          val outPath = Build.buildCachedAwait(c)
+          logger.debug(s"LINKED: $outPath")
       }
-      logger.debug(s"LINKED: $outPath")

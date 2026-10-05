@@ -12,10 +12,11 @@
 // format is not worth re-implementing, and rpmbuild also computes the
 // shared-library Requires automatically), docker -> `docker`/`podman build`.
 //
-// There is no cross-compilation in this toolchain: a package always holds the
-// binary built on the *host* it runs on (see `detectHost`). Build per-OS/arch
-// on a CI matrix, point every leg at the same output directory, then run
-// `--format brew` last to get one formula covering every tarball found there.
+// A package holds the binary for one target: the host's, or the one given with
+// `--native-target-triple` (see `hostFromTriple`; cross targets need a sysroot,
+// cli/Sysroot.scala). A CI matrix can point every leg at the same output
+// directory, then run `--format brew` last to get one formula covering every
+// tarball found there.
 
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets.UTF_8
@@ -73,16 +74,20 @@ object Packaging:
     val (code, out) = runCaptureStdout(List("uname", flag))
     if code != 0 then fail(s"`uname $flag` failed") else out.trim
 
-  /** The OS/arch/libc of the binary scalino just linked -- always the host's,
-   *  since there is no cross-compilation. `SCALINO_PACKAGE_TRIPLE` overrides
-   *  it (a testing aid, and a way to package a binary built elsewhere). */
+  /** Host for an explicit target triple (`--native-target-triple`, or the
+   *  `SCALINO_PACKAGE_TRIPLE` testing aid). */
+  def hostFromTriple(t: String): Host =
+    val arch = normalizeArch(t.takeWhile(_ != '-'))
+    if t.contains("linux") then Host("linux", arch, if t.endsWith("musl") then "musl" else "gnu")
+    else if t.contains("darwin") || t.contains("apple") then Host("macos", arch, "")
+    else if t.contains("windows") || t.contains("mingw") then Host("windows", arch, "")
+    else fail(s"unsupported target triple '$t': expected a linux, darwin or windows triple")
+
+  /** The OS/arch/libc of the machine scalino runs on. `SCALINO_PACKAGE_TRIPLE`
+   *  overrides it (a testing aid, and a way to package a binary built elsewhere). */
   def detectHost(): Host =
     Option(System.getenv("SCALINO_PACKAGE_TRIPLE")).filter(_.nonEmpty) match
-      case Some(t) =>
-        val arch = normalizeArch(t.takeWhile(_ != '-'))
-        if t.contains("linux") then Host("linux", arch, if t.endsWith("musl") then "musl" else "gnu")
-        else if t.contains("darwin") then Host("macos", arch, "")
-        else fail(s"SCALINO_PACKAGE_TRIPLE='$t': expected a linux or darwin target triple")
+      case Some(t) => hostFromTriple(t)
       case None =>
         val os = uname("-s") match
           case "Linux" => "linux"
@@ -337,12 +342,12 @@ object Packaging:
 
   private def requireLinux(host: Host, fmt: String): Unit =
     if host.os != "linux" then
-      fail(s"--format $fmt needs a Linux binary, but this host builds ${host.triple} binaries -- run this on a Linux machine or CI runner (scalino has no cross-compilation yet)")
+      fail(s"--format $fmt needs a Linux binary, but the target is ${host.triple} -- pass --native-target-triple <arch>-unknown-linux-gnu, or run this on a Linux machine or CI runner")
 
   private def requireGlibc(host: Host, fmt: String): Unit =
     requireLinux(host, fmt)
     if host.libc == "musl" then
-      fail(s"--format $fmt targets glibc distributions, but this host builds musl binaries (${host.triple})")
+      fail(s"--format $fmt targets glibc distributions, but the target is musl (${host.triple})")
 
   // ---------------------------------------------------------------------
   // Formats
@@ -571,8 +576,8 @@ object Packaging:
 
   /** Builds every requested format from the already-linked `binary` into
    *  `outDir`. `brew` always runs last (it indexes the tarballs). */
-  def packageAll(formats: List[String], binary: Path, meta: Meta, outDir: Path, quiet: Boolean): Unit =
-    val host = detectHost()
+  def packageAll(formats: List[String], binary: Path, meta: Meta, outDir: Path, quiet: Boolean, triple: Option[String] = None): Unit =
+    val host = triple.map(hostFromTriple).getOrElse(detectHost())
     Files.createDirectories(outDir)
     def wrote(p: Path): Unit =
       if !quiet then println(s"Wrote ${p.toAbsolutePath.normalize}")
