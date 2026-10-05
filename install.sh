@@ -45,19 +45,50 @@ esac
 
 target="${plat}-${plat_arch}"
 
-if [ "$version" = "latest" ]; then
-  api_url="https://api.github.com/repos/$repo/releases/latest"
+# Authenticated API calls get a much higher rate limit than anonymous ones --
+# shared CI runner IPs routinely exhaust the anonymous quota (HTTP 403).
+gh_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+
+# GET an api.github.com URL, sending the token (if any); dies with a message
+# that tells a rate limit (403/429) apart from "no such release" (404).
+api_get() {
+  local url="$1" out status
+  out="$(mktemp)"
+  local args=(-sSL -o "$out" -w '%{http_code}' -H 'Accept: application/vnd.github+json')
+  [ -z "$gh_token" ] || args+=(-H "Authorization: Bearer $gh_token")
+  status="$(curl "${args[@]}" "$url")" || { rm -f "$out"; die "failed to reach $url"; }
+  if [ "$status" != "200" ]; then
+    rm -f "$out"
+    case "$status" in
+      403|429)
+        die "GitHub API rate limit hit (HTTP $status) querying $url -- set GITHUB_TOKEN (or GH_TOKEN) to authenticate, or pin SCALINO_VERSION (e.g. SCALINO_VERSION=v0.0.16) to skip the API entirely" ;;
+      404)
+        die "no release found at $url (HTTP 404) -- has a release been published yet?" ;;
+      *)
+        die "failed to query $url (HTTP $status)" ;;
+    esac
+  fi
+  cat "$out"; rm -f "$out"
+}
+
+if [ "$version" != "latest" ]; then
+  # Pinned: the release asset names are fixed by .github/workflows/release.yml
+  # (scalino-<tag>-<target>.tar.gz, <tag> keeps its leading "v"), so
+  # build the URL directly -- no api.github.com call, no rate limit.
+  tag="$version"
+  case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+  asset_url="https://github.com/$repo/releases/download/$tag/scalino-${tag}-${target}.tar.gz"
+  echo "install.sh: using pinned $tag release for $target..."
 else
-  api_url="https://api.github.com/repos/$repo/releases/tags/$version"
+  api_url="https://api.github.com/repos/$repo/releases/latest"
+  echo "install.sh: looking up $version release for $target..."
+  release_json="$(api_get "$api_url")"
+
+  asset_url="$(printf '%s' "$release_json" | grep -o "\"browser_download_url\": *\"[^\"]*${target}\\.tar\\.gz\"" | head -1 | sed -E 's/.*"(https[^"]+)"/\1/')"
+  tag="$(printf '%s' "$release_json" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
+
+  [ -n "$asset_url" ] || die "no release asset found for target '$target' in $version -- check https://github.com/$repo/releases"
 fi
-
-echo "install.sh: looking up $version release for $target..."
-release_json="$(curl -fsSL "$api_url")" || die "failed to query $api_url -- has a release been published yet?"
-
-asset_url="$(printf '%s' "$release_json" | grep -o "\"browser_download_url\": *\"[^\"]*${target}\\.tar\\.gz\"" | head -1 | sed -E 's/.*"(https[^"]+)"/\1/')"
-tag="$(printf '%s' "$release_json" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
-
-[ -n "$asset_url" ] || die "no release asset found for target '$target' in $version -- check https://github.com/$repo/releases"
 
 dest_dir="$install_dir/$tag"
 if [ -d "$dest_dir" ]; then
