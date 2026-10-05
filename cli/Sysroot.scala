@@ -5,9 +5,10 @@
 // `scalino sysroot fetch <triple>`, and found automatically by `package` when
 // given `--native-target-triple`.
 //
-// Linux targets are musl, linked statically, so one binary runs on every
-// distro. macOS targets need none from here: the Xcode SDK on a Mac already
-// serves both of its architectures.
+// Linux targets are musl (linked statically, runs on every distro) or gnu
+// (glibc 2.31 from Debian 11, dynamic, runs on any distro with glibc >= 2.31). macOS targets use a small stand-in for Apple's SDK (libSystem stubs +
+// the open source Darwin libc headers); on a Mac itself none is needed, the
+// installed Xcode SDK serves both architectures.
 
 import java.nio.file.{Files, Path, Paths}
 import ScalinoCli.{die, fail, dist, runCaptureStdout, runInherited, sha256Hex}
@@ -15,7 +16,12 @@ import ScalinoCli.{die, fail, dist, runCaptureStdout, runInherited, sha256Hex}
 object Sysroot:
 
   /** Targets with a published sysroot. */
-  val Fetchable: List[String] = List("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl")
+  val Fetchable: List[String] =
+    List(
+      "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+      "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin", "aarch64-apple-darwin",
+      "x86_64-pc-windows-gnu", "aarch64-pc-windows-gnu")
 
   private def env(name: String): Option[String] = Option(System.getenv(name)).filter(_.nonEmpty)
 
@@ -29,8 +35,12 @@ object Sysroot:
    *  (deb/rpm/brew) put theirs. */
   def roots: List[Path] = List(cacheRoot, Paths.get(dist).resolve("sysroots")).distinct
 
+  /** Unix-style sysroots have usr/, mingw ones (Windows) <arch>-w64-mingw32/. */
+  private def looksLikeSysroot(d: Path): Boolean =
+    Files.isDirectory(d.resolve("usr")) || Files.isDirectory(d.resolve("generic-w64-mingw32"))
+
   def find(triple: String): Option[Path] =
-    roots.map(_.resolve(triple)).find(d => Files.isDirectory(d.resolve("usr")))
+    roots.map(_.resolve(triple)).find(looksLikeSysroot)
 
   private def releaseUrl(triple: String): String =
     val base = env("SCALINO_SYSROOT_URL").getOrElse(
@@ -78,7 +88,7 @@ object Sysroot:
       Files.createDirectories(extracted)
       if runInherited(List("tar", "-xzf", tarball.toString, "-C", extracted.toString, "--strip-components=1")) != 0 then
         die(s"sysroot: could not extract $source")
-      if !Files.isDirectory(extracted.resolve("usr")) then die(s"sysroot: $source has no usr/ directory, not a scalino sysroot")
+      if !looksLikeSysroot(extracted) then die(s"sysroot: $source has no usr/ directory, not a scalino sysroot")
       if Files.exists(dest) then deleteRecursively(dest)
       Files.move(extracted, dest)
       println(s"installed sysroot $triple -> $dest")
@@ -101,7 +111,6 @@ object Sysroot:
       else find(t) match
         case Some(dir) => Some(s"$t=$dir")
         case None if Fetchable.contains(t) => fail(s"no sysroot for $t -- run `scalino sysroot fetch $t`")
-        case None if target.os == "macos" => fail(s"building for $t needs a macOS SDK: pass --native-sysroot $t=<path to MacOSX.sdk>")
         case None => fail(s"no sysroot for $t: pass --native-sysroot $t=<dir> (scalino publishes sysroots for ${Fetchable.mkString(", ")})")
     }
     explicit ++ found

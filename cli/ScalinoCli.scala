@@ -2928,7 +2928,9 @@ object ScalinoCli:
         // One cross target: -o as given. Several: `<out>-<triple>`.
         def outPathForTriple(mc: String, t: String): Path =
           val base = outPathFor(mc)
-          if nativeOpts.targetTriples.size == 1 then base else base.resolveSibling(s"${base.getFileName}-$t")
+          val named = if nativeOpts.targetTriples.size == 1 then base else base.resolveSibling(s"${base.getFileName}-$t")
+          // Windows binaries only run with .exe
+          if t.contains("windows") && !named.getFileName.toString.endsWith(".exe") then named.resolveSibling(s"${named.getFileName}.exe") else named
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch, outForTriple = outPathForTriple)
         val outPaths =
           if nativeOpts.targetTriples.isEmpty then List(outPathFor(mainClass)) else nativeOpts.targetTriples.map(outPathForTriple(mainClass, _))

@@ -203,16 +203,14 @@ object LinkDriver:
     def isHostTarget(t: String): Boolean =
       normArch(t.takeWhile(_ != '-')) == normArch(hostTriple.takeWhile(_ != '-')) &&
         osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl"))
-    /** Link flags for a `scalino sysroot fetch` Linux sysroot `d` (layout in
-     *  build/12-build-sysroot.sh): musl is linked statically, with compiler-rt's
-     *  builtins and crtbegin/crtend instead of libgcc. clang only looks for
-     *  those in its own resource dir, so a private one is assembled next to
-     *  the build: the host clang's builtin headers, the sysroot's runtime libs. */
-    def linuxSysrootLinkFlags(t: String, d: String, targetDir: Path): List[String] =
-      val sysrootAbs = Paths.get(d).toAbsolutePath
-      val sysrootFlag = List(s"--sysroot=$sysrootAbs")
-      val rt = sysrootAbs.resolve("resource").resolve("lib")
-      if !java.nio.file.Files.isDirectory(rt) then sysrootFlag
+    /** `-rtlib=compiler-rt -resource-dir=...` for a `scalino sysroot fetch`
+     *  sysroot `d` (layout in build/12-build-sysroot.sh). clang only looks for
+     *  compiler-rt's builtins (and crtbegin/crtend) in its own resource dir,
+     *  so a private one is assembled next to the build: the host clang's
+     *  builtin headers, the sysroot's runtime libs. */
+    def compilerRtFlags(d: java.nio.file.Path, targetDir: Path): List[String] =
+      val rt = d.resolve("resource").resolve("lib")
+      if !java.nio.file.Files.isDirectory(rt) then Nil
       else
         def run(cmd: String*): String =
           val p = new ProcessBuilder(cmd*).redirectErrorStream(false).start()
@@ -225,8 +223,21 @@ object LinkDriver:
         java.nio.file.Files.createDirectories(res)
         run("ln", "-sfn", hostInclude.toString, res.resolve("include").toString)
         run("ln", "-sfn", rt.toString, res.resolve("lib").toString)
-        sysrootFlag ++ List("-rtlib=compiler-rt", "--unwindlib=none", s"-resource-dir=$res") ++
-          (if t.endsWith("musl") then List("-static") else Nil)
+        List("-rtlib=compiler-rt", s"-resource-dir=$res")
+
+    /** Link flags for a Linux sysroot: musl is linked statically, glibc
+     *  dynamically; Scala Native brings its own unwinder. */
+    def linuxSysrootLinkFlags(t: String, d: String, targetDir: Path): List[String] =
+      val sysrootAbs = Paths.get(d).toAbsolutePath
+      val rt = compilerRtFlags(sysrootAbs, targetDir)
+      List(s"--sysroot=$sysrootAbs") ++ rt ++ (if rt.nonEmpty then List("--unwindlib=none") else Nil) ++
+        (if t.endsWith("musl") then List("-static") else Nil)
+
+    /** mingw-w64 sysroot (llvm-mingw's layout): libc++ and libunwind come
+     *  with it, since the Windows runtime is built on C++ exceptions. */
+    def windowsSysrootLinkFlags(d: String, targetDir: Path): List[String] =
+      val sysrootAbs = Paths.get(d).toAbsolutePath
+      List(s"--sysroot=$sysrootAbs", "-stdlib=libc++", "--unwindlib=libunwind", "-static") ++ compilerRtFlags(sysrootAbs, targetDir)
 
     def forTriple(t: String): Config =
       val withDir = config.withBaseDir(workDir.resolve(t))
@@ -235,21 +246,41 @@ object LinkDriver:
         // Cross target: Discover's host-only lib/include dirs (/opt/homebrew...)
         // are dropped, the target's sysroot (if any) takes their place.
         val sysroot = opts.sysroots.get(t)
-        val compileFlags = sysroot.toList.flatMap(d => osOf(t) match
+        // An unversioned darwin triple makes clang assume a pre-10.6 deployment
+        // target and ask the linker for crt1.o; pin a modern one.
+        val macosVersion =
+          if osOf(t) == "macos" && t.endsWith("darwin") then List("-mmacos-version-min=11.0") else Nil
+        val compileFlags = macosVersion ++ sysroot.toList.flatMap(d => osOf(t) match
           case "macos" => List("-isysroot", d)
           case _ => List(s"--sysroot=$d"))
-        val linkFlags = sysroot.toList.flatMap(d => osOf(t) match
+        val linkFlags = macosVersion ++ sysroot.toList.flatMap(d => osOf(t) match
           case "macos" => List("-isysroot", d)
           case "linux" => linuxSysrootLinkFlags(t, d, workDir.resolve(t))
+          case "windows" => windowsSysrootLinkFlags(d, workDir.resolve(t))
           case _ => List(s"--sysroot=$d"))
-        // Apple's ld can't produce ELF.
+        // Scala Native's Windows code declares its own pid_t (MSVC has none);
+        // mingw-w64 defines one too unless _PID_T_ says it is already there.
+        val cDefines = if osOf(t) == "windows" then List("-D_PID_T_") else Nil
+        // C++ only: libc++'s headers shadow the C ones if added for C files too.
+        val cppFlags = sysroot.toList.flatMap(d =>
+          if osOf(t) == "windows" then
+            List("-stdlib=libc++", "-isystem", Paths.get(d).toAbsolutePath.resolve("generic-w64-mingw32/include/c++/v1").toString)
+          else Nil)
+        // Apple's ld only exists on a Mac, and can't produce ELF or PE.
+        val userPicksLinker = opts.linking.exists(o => o.startsWith("-fuse-ld") || o.startsWith("--ld-path"))
         val lld =
-          if osOf(t) == "linux" && osOf(hostTriple) != "linux" && !opts.linking.exists(_.startsWith("-fuse-ld"))
-          then List("-fuse-ld=lld") else Nil
+          if userPicksLinker then Nil
+          // Scala Native turns a literal -fuse-ld=lld into --start-lib/--end-lib,
+          // which lld's MinGW mode rejects: pick the same linker by path.
+          else if osOf(t) == "windows" then List("--ld-path=ld.lld")
+          else if osOf(t) != osOf(hostTriple) then List("-fuse-ld=lld")
+          else Nil
         withDir.withCompilerConfig(
           _.withTargetTriple(Some(t))
             .withLinkingOptions(linkFlags ++ lld ++ opts.linking)
             .withCompileOptions(compileFlags ++ opts.compile)
+            .withCppOptions(cDefines ++ cppFlags ++ opts.cppCompile)
+            .withCOptions(cDefines ++ opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
         )
     val configs: List[Config] =
       if opts.targetTriples.isEmpty then List(config) else opts.targetTriples.distinct.map(forTriple)

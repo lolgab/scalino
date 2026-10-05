@@ -212,11 +212,13 @@ parsed only once.
 | target | from | needs |
 |---|---|---|
 | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot fetch <triple>`, plus `lld` when the host isn't Linux |
-| `x86_64-apple-darwin`, `aarch64-apple-darwin` | macOS | nothing (Xcode's SDK serves both) |
-| anything else (glibc Linux, macOS from Linux, Windows) | any | your own sysroot: `--native-sysroot <triple>=<dir>` |
+| `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | any host | same; glibc 2.31 from Debian 11, runs on any distro with glibc >= 2.31 |
+| `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | nothing on a Mac (Xcode's SDK serves both); elsewhere `scalino sysroot fetch <triple>` plus `lld` |
+| `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot fetch <triple>`, plus `lld` (**experimental**, see below) |
 
-The Linux targets are fully static (musl), so one binary runs on every distro.
-A sysroot holds the target's libc headers and libraries. Sysroots are built by
+The musl targets are fully static, so one binary runs on every distro.
+A sysroot holds the target's libc headers and libraries (for Windows, mingw-w64 with libc++ from the [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) project; for macOS, a stand-in for Apple's SDK: `libSystem`
+stubs and the open source Darwin libc headers, enough for anything that needs no frameworks). Sysroots are built by
 [`build/12-build-sysroot.sh`](build/12-build-sysroot.sh) and published with
 every release. `scalino sysroot fetch` verifies the checksum and installs the
 sysroot under `~/.cache/scalino/sysroots`:
