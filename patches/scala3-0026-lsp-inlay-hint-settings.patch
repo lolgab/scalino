@@ -1,6 +1,8 @@
+diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
+index 77ce2d7d..76f21b02 100644
 --- a/language-server/src/dotty/tools/languageserver/Lsp.scala
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
-@@ -33,7 +33,11 @@
+@@ -33,7 +33,11 @@ object Lsp {
  
    // -- Incoming (client -> server) request/notification params ------------
  
@@ -13,7 +15,7 @@
    final case class DidOpenTextDocumentParams(textDocument: TextDocumentItem)
    final case class TextDocumentContentChangeEvent(range: Option[Range], text: String)
    final case class DidChangeTextDocumentParams(textDocument: TextDocumentIdentifier, contentChanges: List[TextDocumentContentChangeEvent])
-@@ -149,6 +153,38 @@
+@@ -149,6 +153,38 @@ object Lsp {
     *  without ever being parsed into a type at all. */
    private def skipVal(in: JsonReader): Unit = in.skip()
  
@@ -52,7 +54,7 @@
    given positionCodec: JsonValueCodec[Position] = new JsonValueCodec[Position] {
      def nullValue: Position = null
      def decodeValue(in: JsonReader, default: Position): Position =
-@@ -331,21 +367,47 @@
+@@ -331,6 +367,8 @@ object Lsp {
      def decodeValue(in: JsonReader, default: InitializeParams): InitializeParams =
        if (in.isNextToken('{')) {
          var rootUri: String = null
@@ -61,9 +63,10 @@
          if (!in.isNextToken('}')) {
            in.rollbackToken()
            var continue = true
-           while (continue) {
-             in.readKeyAsString() match {
-               case "rootUri" => rootUri = in.readString(null)
+@@ -339,17 +377,41 @@ object Lsp {
+               // jsoniter rejects JSON null when the default is null; clients
+               // (e.g. neovim without a root dir) send `"rootUri": null`.
+               case "rootUri" => rootUri = Option(in.readString("")).filter(_.nonEmpty).orNull
 +              case "initializationOptions" => initializationOptions = readBooleanPaths(in)
 +              case "capabilities" => capabilities = readBooleanPaths(in)
                case _ => skipVal(in)
@@ -76,8 +79,8 @@
 +        InitializeParams(rootUri, initializationOptions, capabilities)
        } else in.readNullOrTokenError(default, '{')
      def encodeValue(x: InitializeParams, out: JsonWriter): Unit = ???
-+  }
-+
+   }
+ 
 +  given didChangeConfigurationParamsCodec: JsonValueCodec[DidChangeConfigurationParams] = new JsonValueCodec[DidChangeConfigurationParams] {
 +    def nullValue: DidChangeConfigurationParams = null
 +    def decodeValue(in: JsonReader, default: DidChangeConfigurationParams): DidChangeConfigurationParams =
@@ -98,12 +101,16 @@
 +        DidChangeConfigurationParams(settings)
 +      } else in.readNullOrTokenError(default, '{')
 +    def encodeValue(x: DidChangeConfigurationParams, out: JsonWriter): Unit = ???
-   }
- 
++  }
++
    given didOpenTextDocumentParamsCodec: JsonValueCodec[DidOpenTextDocumentParams] = new JsonValueCodec[DidOpenTextDocumentParams] {
+     def nullValue: DidOpenTextDocumentParams = null
+     def decodeValue(in: JsonReader, default: DidOpenTextDocumentParams): DidOpenTextDocumentParams =
+diff --git a/language-server/src/dotty/tools/languageserver/Main.scala b/language-server/src/dotty/tools/languageserver/Main.scala
+index fbdda744..340f355b 100644
 --- a/language-server/src/dotty/tools/languageserver/Main.scala
 +++ b/language-server/src/dotty/tools/languageserver/Main.scala
-@@ -140,6 +140,9 @@
+@@ -140,6 +140,9 @@ object Main {
        idleChecker.start()
      }
  
@@ -113,7 +120,7 @@
      def handle(env: IncomingEnvelope): Unit = {
        val isRequest = env.idRaw != null
        try {
-@@ -147,6 +150,8 @@
+@@ -147,6 +150,8 @@ object Main {
          env.method match {
            case "initialize" =>
              val params = readFromArray(env.paramsRaw)(using initializeParamsCodec)
@@ -122,7 +129,7 @@
              val result = server.initialize(params.rootUri)
              sendResult(env.idRaw, writeToArray(result))
            case "initialized" => // no-op notification
-@@ -158,8 +163,17 @@
+@@ -158,8 +163,17 @@ object Main {
              server.didChange(readFromArray(env.paramsRaw)(using didChangeTextDocumentParamsCodec))
            case "textDocument/didClose" =>
              server.didClose(readFromArray(env.paramsRaw)(using didCloseTextDocumentParamsCodec))
