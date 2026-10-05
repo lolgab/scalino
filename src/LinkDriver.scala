@@ -203,8 +203,8 @@ object LinkDriver:
     def isHostTarget(t: String): Boolean =
       normArch(t.takeWhile(_ != '-')) == normArch(hostTriple.takeWhile(_ != '-')) &&
         osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl"))
-    /** `-rtlib=compiler-rt -resource-dir=...` for a `scalino sysroot fetch`
-     *  sysroot `d` (layout in build/12-build-sysroot.sh). clang only looks for
+    /** `-rtlib=compiler-rt -resource-dir=...` for a `scalino sysroot build`
+     *  sysroot `d` (layout in cli/SysrootBuild.scala). clang only looks for
      *  compiler-rt's builtins (and crtbegin/crtend) in its own resource dir,
      *  so a private one is assembled next to the build: the host clang's
      *  builtin headers, the sysroot's runtime libs. */

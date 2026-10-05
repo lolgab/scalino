@@ -86,6 +86,11 @@ echo "lib/$PLUGIN_BASE" > "$DIST/nscplugin.jar.txt"
 cp "$(command -v cs)" "$DIST/scalino-cs"
 chmod +x "$DIST/scalino-cs"
 
+# Data `scalino sysroot build` needs to generate the macOS libSystem stub (see
+# cli/SysrootBuild.scala, build/gen-libsystem-symbols.py).
+mkdir -p "$DIST/share/sysroot"
+cp "$ROOT/build"/libsystem-symbols-*.txt "$DIST/share/sysroot/"
+
 # Build-time-only intermediates (their classes are already baked into the
 # scalino-dotc/scalino-linkdriver binaries) -- not needed at runtime, drop them
 # so they don't end up in release tarballs.

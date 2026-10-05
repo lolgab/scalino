@@ -6,7 +6,7 @@
 writes <out-prefix>-x86_64.txt and <out-prefix>-arm64.txt.
 
 The macOS sysroot needs a libSystem.tbd stub for the linker. Rather than shipping
-the one extracted from Apple's SDK, build/12-build-sysroot.sh writes its own from
+the one extracted from Apple's SDK, `scalino sysroot build` (cli/SysrootBuild.scala) writes its own from
 build/libsystem-symbols-<arch>.txt, which this script produces from Apple's open source
 headers alone:
 

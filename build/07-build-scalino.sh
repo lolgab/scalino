@@ -28,6 +28,10 @@ object BuildInfo:
   val scalaVersion: String = "$SCALA_VERSION"
   val nativeBinaryVersion: String = "$NATIVE_BINARY_VERSION"
   val nativeVersion: String = "$SCALA_NATIVE_VERSION"
+  /** Upstream versions and checksums of what \`scalino sysroot build\` downloads (versions.env). */
+  val sysrootPins: Map[String, String] = Map(
+$(for v in DEBIAN_SNAPSHOT MUSL_DEB_VERSION MUSL_DEV_AMD64_SHA256 MUSL_DEV_ARM64_SHA256 ZIG_VERSION ZIG_SHA256 LLVM_MINGW_VERSION LLVM_MINGW_SHA256 MINGW_W64_LICENSE_TAG MINGW_W64_RUNTIME_LICENSE_SHA256 MINGW_W64_LICENSE_SHA256 GLIBC_DEB_VERSION LINUX_LIBC_DEV_VERSION LIBCLANG_RT_DEB_VERSION GLIBC_LIBC6_AMD64_SHA256 GLIBC_LIBC6_DEV_AMD64_SHA256 LINUX_LIBC_DEV_AMD64_SHA256 GLIBC_LIBC6_ARM64_SHA256 GLIBC_LIBC6_DEV_ARM64_SHA256 LINUX_LIBC_DEV_ARM64_SHA256 LIBCLANG_RT_AMD64_SHA256 LIBCLANG_RT_ARM64_SHA256; do echo "    \"$v\" -> \"${!v}\","; done)
+  )
 EOF
 
 # scalino locates its own dist/ root via a tiny OS-specific native binding
@@ -101,7 +105,7 @@ COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
   -Yretain-trees \
   -d "$CLASSES_DIR" \
-  "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
+  "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$ROOT/cli/SysrootBuild.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
 LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_NATIVE_CP"
 # --mode release-size: v0.0.1 shipped scala-native's *default* Mode (debug --

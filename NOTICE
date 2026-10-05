@@ -83,17 +83,15 @@ LLVM in turn links zstd, reproduced here as its licence asks:
   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
-Cross-compilation sysroots -- scalino-sysroot-<triple>.tar.gz (separate downloads)
+Cross-compilation sysroots -- not distributed
 ================================================================================
 
-`scalino sysroot fetch` downloads sysroots that are separate release assets,
-not part of scalino's own code or its Apache-2.0 licence. They hold third-party
-software (musl, glibc and the Linux kernel headers from Debian, Apple's open
-source Darwin headers via the Zig project, mingw-w64, LLVM's compiler-rt, libc++
-and libunwind), each under its own licence. Every tarball contains these licence
-texts in LICENSES/, a README naming each component and where its source is
-(for glibc, the written offer the LGPL asks for). build/12-build-sysroot.sh
-builds them from checksum-pinned upstream sources.
+scalino does not distribute sysroots. `scalino sysroot build` downloads
+third-party software (musl, glibc, the Linux kernel headers and LLVM's compiler-rt
+from Debian, Apple's open source Darwin headers via the Zig project, mingw-w64,
+libc++ and libunwind from llvm-mingw) onto the user's machine, each under its own
+licence, which is installed in the sysroot's LICENSES/ next to a README naming
+each component and where its source is.
 
 ================================================================================
 Scala 3 (dotty) -- vendor/scala3/NOTICE.md

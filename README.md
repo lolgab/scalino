@@ -109,7 +109,7 @@ scalino package examples/Hello.scala -o hello && ./hello
 | `test` | compile main + test scope, run the tests |
 | `setup-ide` | write the LSP config ([Editor support](#editor-support)) |
 | `lock` | write `scalino.lock.json` ([Hermetic builds](#hermetic--nix-builds)) |
-| `sysroot fetch` | install a cross-compilation sysroot ([Cross-compilation](#cross-compilation)) |
+| `sysroot build` | set up a cross-compilation sysroot ([Cross-compilation](#cross-compilation)) |
 | `clean`, `version`, `completions` | what they say |
 
 - **Sources:** pass files or directories. File order doesn't matter: the entry
@@ -199,7 +199,7 @@ each OS/arch on its own CI runner. Either way, run `--format brew` last.
 One machine can build binaries for several platforms in a single command:
 
 ```sh
-scalino sysroot fetch x86_64-unknown-linux-musl aarch64-unknown-linux-musl   # once
+scalino sysroot build x86_64-unknown-linux-musl aarch64-unknown-linux-musl   # once
 scalino package app/ -o myapp \
   --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 # -> myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl
@@ -211,21 +211,26 @@ parsed only once.
 
 | target | from | needs |
 |---|---|---|
-| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot fetch <triple>`, plus `lld` when the host isn't Linux |
+| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot build <triple>`, plus `lld` when the host isn't Linux |
 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | any host | same; glibc 2.31 from Debian 11, runs on any distro with glibc >= 2.31 |
-| `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | nothing on a Mac (Xcode's SDK serves both); elsewhere `scalino sysroot fetch <triple>` plus `lld` |
-| `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot fetch <triple>`, plus `lld` (**experimental**, see below) |
+| `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | nothing on a Mac (Xcode's SDK serves both); elsewhere `scalino sysroot build <triple>` plus `lld` |
+| `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot build <triple>`, plus `lld` (**experimental**, see below) |
 
 The musl targets are fully static, so one binary runs on every distro.
-A sysroot holds the target's libc headers and libraries (for Windows, mingw-w64 with libc++ from the [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) project; for macOS, a stand-in for Apple's SDK: `libSystem`
-stubs and the open source Darwin libc headers, enough for anything that needs no frameworks). Sysroots are built by
-[`build/12-build-sysroot.sh`](build/12-build-sysroot.sh) and published with
-every release. `scalino sysroot fetch` verifies the checksum and installs the
-sysroot under `~/.cache/scalino/sysroots`:
+A sysroot holds the target's libc headers and libraries. `scalino sysroot build
+<triple>` assembles one on your machine from upstream packages, each checked
+against a pinned sha256 (scalino publishes none), and installs it under
+`~/.cache/scalino/sysroots`. It needs only `curl` and `tar`; nothing is compiled.
+
+| target | assembled from |
+|---|---|
+| musl | Debian's `musl-dev` (unmodified musl) and `libclang-rt-14-dev` (compiler-rt) |
+| gnu | Debian 11's glibc 2.31 and kernel headers, plus the same compiler-rt |
+| macOS | the open source Darwin libc headers from the Zig project's source tarball, and a `libSystem` stub generated from them (a stand-in for Apple's SDK, enough for anything that needs no frameworks) |
+| Windows | mingw-w64 with libc++ from the [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) project (GitHub) |
 
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
-- `--from <tarball|url>` installs from a file or URL.
-- `$SCALINO_SYSROOT_URL` downloads the release assets from a mirror.
+- Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 
 `run` and `test` always build for the host, because the result has to run on
 this machine.

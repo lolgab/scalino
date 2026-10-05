@@ -1,0 +1,22 @@
+diff --git a/javalib/src/main/scala/java/lang/impl/PosixThread.scala b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
+index 01311cd..02a4228 100644
+--- a/javalib/src/main/scala/java/lang/impl/PosixThread.scala
++++ b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
+@@ -460,10 +460,16 @@ private[lang] object PosixThread extends NativeThread.Companion {
+       pthread_attr_init(attrs)
+       val stackSize = stackalloc[CSize]()
+       pthread_attr_getstacksize(attrs, stackSize)
+-      (!stackSize).toLong
++      val osDefault = (!stackSize).toLong
++      // musl's default thread stack is 128K, glibc's 8M. Programs written for
++      // glibc (deep recursion on pool threads, GC marking) overflow the former,
++      // so a binary linked against an unmodified musl gets glibc's size.
++      if (isLinux) Math.max(osDefault, LinuxMinDefaultStackSize) else osDefault
+     }
+   }
+ 
++  private final val LinuxMinDefaultStackSize = 8L * 1024 * 1024
++
+   // PosixThread class state
+   @alwaysinline private def LockOffset = 0
+   @alwaysinline private def ConditionsOffset = pthread_mutex_t_size.toInt

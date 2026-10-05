@@ -2659,7 +2659,7 @@ object ScalinoCli:
          |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
          |  scalino lock <sources...> [options]    resolve dependencies and write scalino.lock.json
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
-         |  scalino sysroot fetch <triple>...      install the sysroot for cross-compiling to <triple> (see --native-target-triple)
+         |  scalino sysroot build <triple>...      set up the sysroot for cross-compiling to <triple> (see --native-target-triple)
          |  scalino clean                         delete the .scalino-build directory
          |  scalino version                        print version info
          |  scalino --help                         this message
@@ -2720,14 +2720,15 @@ object ScalinoCli:
       case "clean" =>
         head("scalino clean", "Delete the .scalino-build directory.")
       case "sysroot" =>
-        head("scalino sysroot <fetch|list|path> ...", "Manage the sysroots used to cross-compile (`--native-target-triple`).") +
-          s"""|  scalino sysroot fetch <triple>... [--from <tarball|url>] [--force]
-              |      download and install the sysroot (checksum-verified) into ${Sysroot.cacheRoot}
-              |      (override with $$SCALINO_SYSROOT_DIR; release assets from $$SCALINO_SYSROOT_URL)
-              |  scalino sysroot list           published targets and whether they are installed
+        head("scalino sysroot <build|list|path> ...", "Manage the sysroots used to cross-compile (`--native-target-triple`).") +
+          s"""|  scalino sysroot build <triple>... [--force]
+              |      assemble the sysroot from upstream packages (checksum-verified; needs curl and tar)
+              |      into ${Sysroot.cacheRoot} (override with $$SCALINO_SYSROOT_DIR; downloads are
+              |      cached in <that>/.sources, or $$SCALINO_SYSROOT_SOURCES, which can be pre-filled)
+              |  scalino sysroot list           supported targets and whether they are installed
               |  scalino sysroot path <triple>  where an installed sysroot lives
               |
-              |available: ${Sysroot.Fetchable.mkString(", ")}
+              |available: ${Sysroot.Supported.mkString(", ")}
               |Linux targets are static musl binaries that run on any distro. macOS targets need no
               |sysroot on a Mac (the Xcode SDK serves both architectures).
               |""".stripMargin

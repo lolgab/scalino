@@ -1,22 +1,23 @@
 // Cross-compilation sysroots: the target's libc headers and runtime libraries,
 // which clang needs to compile and link Scala Native's C runtime for a
-// platform other than the host's. Built by build/12-build-sysroot.sh, published
-// with every release as scalino-sysroot-<triple>.tar.gz, installed by
-// `scalino sysroot fetch <triple>`, and found automatically by `package` when
-// given `--native-target-triple`.
+// platform other than the host's. `scalino sysroot build <triple>`
+// (SysrootBuild.scala) assembles one from upstream packages into the cache;
+// `package` finds it there automatically when given `--native-target-triple`.
 //
 // Linux targets are musl (linked statically, runs on every distro) or gnu
-// (glibc 2.31 from Debian 11, dynamic, runs on any distro with glibc >= 2.31). macOS targets use a small stand-in for Apple's SDK (libSystem stubs +
-// the open source Darwin libc headers); on a Mac itself none is needed, the
-// installed Xcode SDK serves both architectures.
+// (glibc 2.31 from Debian 11, dynamic, runs on any distro with glibc >= 2.31).
+// macOS targets use a small stand-in for Apple's SDK (libSystem stubs + the
+// open source Darwin libc headers); on a Mac itself none is needed, the
+// installed Xcode SDK serves both architectures. Windows targets use
+// llvm-mingw's mingw-w64 data.
 
 import java.nio.file.{Files, Path, Paths}
-import ScalinoCli.{die, fail, dist, runCaptureStdout, runInherited, sha256Hex}
+import ScalinoCli.{die, fail, dist}
 
 object Sysroot:
 
-  /** Targets with a published sysroot. */
-  val Fetchable: List[String] =
+  /** Targets `build` can assemble a sysroot for. */
+  val Supported: List[String] =
     List(
       "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
       "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
@@ -25,7 +26,7 @@ object Sysroot:
 
   private def env(name: String): Option[String] = Option(System.getenv(name)).filter(_.nonEmpty)
 
-  /** Where `fetch` installs. */
+  /** Where `build` installs. */
   def cacheRoot: Path =
     env("SCALINO_SYSROOT_DIR").map(Paths.get(_)).getOrElse(
       env("XDG_CACHE_HOME").map(Paths.get(_)).getOrElse(Paths.get(env("HOME").getOrElse("."), ".cache")).resolve("scalino").resolve("sysroots")
@@ -42,61 +43,6 @@ object Sysroot:
   def find(triple: String): Option[Path] =
     roots.map(_.resolve(triple)).find(looksLikeSysroot)
 
-  private def releaseUrl(triple: String): String =
-    val base = env("SCALINO_SYSROOT_URL").getOrElse(
-      s"https://github.com/lolgab/scalino/releases/download/v${BuildInfo.scalinoVersion}")
-    s"${base.stripSuffix("/")}/scalino-sysroot-$triple.tar.gz"
-
-  private def download(url: String, to: Path): Unit =
-    val code = runInherited(List("curl", "-fsSL", "-o", to.toString, url))
-    if code != 0 then die(s"sysroot: download failed: $url")
-
-  /** Installs the sysroot for `triple` into the cache. `from` is a tarball
-   *  path or URL to use instead of the release asset (offline installs,
-   *  testing a locally built one). */
-  def fetch(triple: String, from: Option[String], force: Boolean): Path =
-    val dest = cacheRoot.resolve(triple)
-    if Files.isDirectory(dest) && !force then
-      println(s"sysroot $triple already installed at $dest (--force to reinstall)")
-      return dest
-    val source = from.getOrElse(releaseUrl(triple))
-    Files.createDirectories(cacheRoot)
-    val tmp = Files.createTempDirectory(cacheRoot, s".fetch-$triple-")
-    try
-      val tarball = tmp.resolve("sysroot.tar.gz")
-      val isUrl = source.startsWith("http://") || source.startsWith("https://")
-      if isUrl then download(source, tarball)
-      else
-        if !Files.exists(Paths.get(source)) then die(s"sysroot: no such file: $source")
-        Files.copy(Paths.get(source), tarball)
-      // The checksum published next to the tarball.
-      val sumFile = tmp.resolve("sysroot.sha256")
-      val haveSum =
-        if isUrl then runCaptureStdout(List("curl", "-fsSL", "-o", sumFile.toString, "-w", "%{http_code}", s"$source.sha256")) match
-          case (0, _) => true
-          case _ => false
-        else
-          val local = Paths.get(s"$source.sha256")
-          if Files.exists(local) then { Files.copy(local, sumFile); true } else false
-      if haveSum then
-        val expected = new String(Files.readAllBytes(sumFile), "UTF-8").trim.takeWhile(!_.isWhitespace)
-        val actual = sha256Hex(Files.readAllBytes(tarball))
-        if expected != actual then die(s"sysroot: checksum mismatch for $source (expected $expected, got $actual)")
-      else if isUrl then die(s"sysroot: no checksum published at $source.sha256")
-      else System.err.println(s"scalino: warning: no $source.sha256 next to the tarball, not verifying it")
-      val extracted = tmp.resolve("x")
-      Files.createDirectories(extracted)
-      if runInherited(List("tar", "-xzf", tarball.toString, "-C", extracted.toString, "--strip-components=1")) != 0 then
-        die(s"sysroot: could not extract $source")
-      if !looksLikeSysroot(extracted) then die(s"sysroot: $source has no usr/ directory, not a scalino sysroot")
-      if Files.exists(dest) then deleteRecursively(dest)
-      Files.move(extracted, dest)
-      println(s"installed sysroot $triple -> $dest")
-      dest
-    finally deleteRecursively(tmp)
-
-  private def deleteRecursively(p: Path): Unit = ScalinoCli.deleteRecursively(p)
-
   /** `--native-sysroot <triple>=<dir>` entries for `triples`: what the user
    *  gave, else what's installed. Fails with the command to run if a target
    *  needs one that isn't there. */
@@ -110,36 +56,24 @@ object Sysroot:
       else if target.os == "macos" && host.os == "macos" then None
       else find(t) match
         case Some(dir) => Some(s"$t=$dir")
-        case None if Fetchable.contains(t) => fail(s"no sysroot for $t -- run `scalino sysroot fetch $t`")
-        case None => fail(s"no sysroot for $t: pass --native-sysroot $t=<dir> (scalino publishes sysroots for ${Fetchable.mkString(", ")})")
+        case None if Supported.contains(t) => fail(s"no sysroot for $t -- run `scalino sysroot build $t`")
+        case None => fail(s"no sysroot for $t: pass --native-sysroot $t=<dir> (`scalino sysroot build` supports ${Supported.mkString(", ")})")
     }
     explicit ++ found
 
   def handle(args: Array[String]): Unit =
     args.toList match
-      case "fetch" :: rest =>
-        var triples = List.empty[String]
-        var from = Option.empty[String]
-        var force = false
-        var i = 0
-        while i < rest.length do
-          rest(i) match
-            case "--from" if i + 1 < rest.length => from = Some(rest(i + 1)); i += 1
-            case "--force" => force = true
-            case f if f.startsWith("-") => die(s"sysroot fetch: unknown option $f")
-            case t => triples = triples :+ t
-          i += 1
-        if triples.isEmpty then die(s"sysroot fetch: expected a target triple, one of: ${Fetchable.mkString(", ")}")
-        if from.isDefined && triples.size != 1 then die("sysroot fetch: --from takes exactly one triple")
-        triples.foreach { t =>
-          if from.isEmpty && !Fetchable.contains(t) then die(s"sysroot fetch: no published sysroot for '$t', available: ${Fetchable.mkString(", ")}")
-          fetch(t, from, force)
-        }
+      case "build" :: rest =>
+        val force = rest.contains("--force")
+        val triples = rest.filterNot(_ == "--force")
+        triples.find(_.startsWith("-")).foreach(o => die(s"sysroot build: unknown option $o"))
+        if triples.isEmpty then die(s"sysroot build: expected a target triple, one of: ${SysrootBuild.Buildable.mkString(", ")}")
+        triples.foreach(SysrootBuild.build(_, force))
       case List("list") =>
-        for t <- Fetchable do
-          println(s"$t  ${find(t).map(_.toString).getOrElse("(not installed -- `scalino sysroot fetch " + t + "`)")}")
+        for t <- Supported do
+          println(s"$t  ${find(t).map(_.toString).getOrElse("(not installed -- `scalino sysroot build " + t + "`)")}")
       case List("path", t) =>
         find(t) match
           case Some(p) => println(p)
           case None => die(s"sysroot: $t is not installed")
-      case _ => die("usage: scalino sysroot <fetch <triple>... [--from <tarball|url>] [--force] | list | path <triple>>")
+      case _ => die("usage: scalino sysroot <build <triple>... [--force] | list | path <triple>>")
