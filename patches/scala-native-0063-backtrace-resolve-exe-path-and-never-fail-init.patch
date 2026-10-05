@@ -1,0 +1,95 @@
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
+@@ -22,7 +22,12 @@
+       isPositionIndependentBinary: Boolean
+   )
+ 
+-  private val dwarfInfo: Option[DwarfInfo] = processFile()
++  // A failure to read debug info must never fail this module's initializer:
++  // a module whose initializer threw stays "initializing" forever, so every
++  // later stack trace in the process would block on it instead of printing.
++  private val dwarfInfo: Option[DwarfInfo] =
++    try processFile()
++    catch { case _: Exception => None }
+ 
+   case class Position(linkageName: CString, filename: String, line: Int)
+   object Position {
+@@ -154,8 +159,38 @@
+   private final val MACHO_MAGIC = 0xcffaedfe
+   private final val ELF_MAGIC = 0x7f454c46
+ 
++  /** argv[0] is only a usable path when it contains a '/'. A program started
++   *  through $PATH gets just its bare name, which would otherwise be looked up
++   *  relative to the current directory. */
++  private def executablePath(): String = {
++    // (link-time and runtime conditions can't be mixed in one expression)
++    if (LinktimeInfo.isLinux) {
++      if (new File("/proc/self/exe").exists()) "/proc/self/exe"
++      else argv0Path()
++    } else argv0Path()
++  }
++
++  private def argv0Path(): String = {
++    val argv0 = ExecInfo.filename
++    if (argv0.contains("/")) argv0
++    else {
++      val path = System.getenv("PATH")
++      val found =
++        if (path == null) None
++        else
++          path
++            .split(File.pathSeparator)
++            .iterator
++            .filter(_.nonEmpty)
++            .map(new File(_, argv0))
++            .find(f => f.isFile() && f.canExecute())
++      found.fold(argv0)(_.getPath())
++    }
++  }
++
+   private def processFile(): Option[DwarfInfo] = {
+-    implicit val bf: BinaryFile = new BinaryFile(new File(ExecInfo.filename))
++    val exePath = executablePath()
++    implicit val bf: BinaryFile = new BinaryFile(new File(exePath))
+     val head = bf.position()
+     val magic = bf.readInt()
+     bf.seek(head)
+@@ -165,12 +200,12 @@
+         if (magic == MACHO_MAGIC) {
+           val macho = MachO.parse(bf)
+           processMacho(macho).orElse {
+-            val basename = new File(ExecInfo.filename).getName()
++            val basename = new File(exePath).getName()
+             // dsymutil `foo` will assemble the debug information into `foo.dSYM/Contents/Resources/DWARF/foo`.
+             // Coulnt't find the official source, but at least libbacktrace locate the dSYM file from this location.
+             // https://github.com/ianlancetaylor/libbacktrace/blob/cdb64b688dda93bbbacbc2b1ccf50ce9329d4748/macho.c#L908
+             val dSymPath =
+-              s"${ExecInfo.filename}.dSYM/Contents/Resources/DWARF/${basename}"
++              s"${exePath}.dSYM/Contents/Resources/DWARF/${basename}"
+             if (new File(dSymPath).exists()) {
+               val dSYMBin: BinaryFile = new BinaryFile(
+                 new File(dSymPath)
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
+@@ -165,8 +165,18 @@
+     catch {
+       case ex: jl.Throwable =>
+         val threadName = "\"" + thread.getName() + "\""
++        // Say what was thrown, and what was being handled: the class name
++        // alone hides the real error. Each step is guarded, the exceptions
++        // may themselves be what is failing to print.
++        def describe(t: jl.Throwable): String =
++          try {
++            val msg = t.getMessage()
++            if (msg == null) t.getClass().getName()
++            else s"${t.getClass().getName()}: $msg"
++          } catch { case _: jl.Throwable => "<unprintable exception>" }
+         System.err.println(
+-          s"\nException: ${ex.getClass().getName()} thrown from the UncaughtExceptionHandler in thread ${threadName}"
++          s"\nException: ${describe(ex)} thrown from the UncaughtExceptionHandler in thread ${threadName}" +
++            s" while handling ${describe(throwable)}"
+         )
+     }
+   }
