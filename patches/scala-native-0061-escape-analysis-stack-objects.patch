@@ -215,7 +215,7 @@
 +    }
 +
 +  val MaxAllocInlineSize: Int =
-+    sys.env.get("SCALANATIVE_INLINE_ALLOC").flatMap(_.toIntOption).filter(_ > 1).getOrElse(64)
++    sys.env.get("SCALANATIVE_INLINE_ALLOC").flatMap(s => scala.util.Try(s.toInt).toOption).filter(_ > 1).getOrElse(64) // not toIntOption: sbt compiles this on Scala 2.12
 +}
 --- /dev/null
 +++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
