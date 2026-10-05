@@ -1,0 +1,33 @@
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
+--- a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
+@@ -276,10 +276,16 @@
+     defines.get(name).map { d =>
+       if (currentCaller != null)
+         callersOf.getOrElseUpdate(name, mutable.Set.empty) += currentCaller
+-      if (!results.contains(name) && !inProgress.contains(name)) analyze(d)
++      // Past MaxDepth, don't recurse (a long call chain overflows the thread's
++      // stack): answer optimistically (bottom) and let runAll's first pass
++      // analyze the callee later -- its publish re-queues this caller via
++      // callersOf, exactly like a recursion cycle.
++      if (!results.contains(name) && !inProgress.contains(name) && depth < MaxDepth) analyze(d)
+       summaries.getOrElse(name, bottomSummary(d.ty.args.size))
+     }
+ 
++  private val MaxDepth = 64
++  private var depth = 0
+   private var analyses = 0
+   private val changeCount = mutable.HashMap.empty[nir.Global.Member, Int]
+   def analyze(defn: nir.Defn.Define): Result = {
+@@ -287,9 +293,11 @@
+     val saved = currentCaller
+     currentCaller = defn.name
+     inProgress += defn.name
++    depth += 1
+     val r =
+       try new FunctionAnalysis(defn).run()
+       finally {
++        depth -= 1
+         inProgress -= defn.name
+         currentCaller = saved
+       }

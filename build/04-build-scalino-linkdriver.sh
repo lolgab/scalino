@@ -205,7 +205,7 @@ if [[ "${#LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}" -eq 0 ]]; then
 fi
 
 "$JAVA" \
-  -XX:MaxRAMPercentage=80.0 \
+  -Xss64m -XX:MaxRAMPercentage=80.0 \
   -cp "$DRIVER_CP" \
     LinkDriver \
     "$(to_native_path "$NATIVE_DRIVER_CP")" \
