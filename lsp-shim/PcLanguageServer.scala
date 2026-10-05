@@ -105,8 +105,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
         // Definitions.init() can't find java.lang.Object at all (same
         // config field DottyLanguageServer already threads through, see
         // its own `config.compilerArguments` usage).
+        // `-color:never`: dotc's reporter output reaches editors' plain-text
+        // log panes (VS Code Output), which don't render ANSI escapes.
         val compilerArgs: List[String] =
-          configs.flatMap(_.compilerArguments).distinct
+          configs.flatMap(_.compilerArguments).distinct :+ "-color:never"
         val built = RawScalaPresentationCompiler(
           buildTargetIdentifier = "scalino",
           classpath = classpath,
@@ -120,7 +122,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
           config = scala.meta.internal.pc.PresentationCompilerConfigImpl(
             _sourcePathMode = scala.meta.pc.SourcePathMode.FULL
           ),
-          sourcePath = () => sourceDirs.asJava
+          sourcePath = () => sourceFilesIn(sourceDirs).asJava
         )
         thisServer.synchronized {
           pc = built
@@ -144,6 +146,20 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
     InitializeResult(capabilities)
   }
+
+  /** The config's `sourceDirectories` are the parents of every project
+   *  source (`setup-ide` collects them from the expanded file list, which
+   *  skips hidden/build dirs). dotc's `-sourcepath` scan is recursive though,
+   *  so handing it a dir like the project root also pulls in `.metals/`,
+   *  `.scalino-build/.../sources/` (the stdlib's own sources, ->
+   *  "duplicate source version import" errors) etc. List each dir's direct
+   *  children instead; the PC accepts individual source files as entries. */
+  private def sourceFilesIn(dirs: Seq[Path]): Seq[Path] =
+    dirs.flatMap { d =>
+      Option(d.toFile.listFiles()).toSeq.flatten
+        .filter(f => f.isFile && (f.getName.endsWith(".scala") || f.getName.endsWith(".java")))
+        .map(_.toPath)
+    }.distinct
 
   /** Warmup (classpath resolution + PC construction) runs on a daemon thread
    *  started from `initialize()` -- requests that land before it finishes
