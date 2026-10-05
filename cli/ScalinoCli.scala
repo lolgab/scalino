@@ -2369,7 +2369,8 @@ object ScalinoCli:
   //   scalino <sources...>                       run (default command, like
   //                                            `scala-cli Foo.scala`)
   //   scalino run <sources...> [options]
-  //   scalino compile <sources...> [options]
+  //   scalino compile [options]      (sources default to `.`; explicit
+  //                                  <sources...> accepted, scala-cli compat)
   //   scalino package <sources...> -o <out> [options]
   //   scalino version / scalino --help
   // options: --main-class X | --dep coord | -S/--scala ver |
@@ -2652,9 +2653,9 @@ object ScalinoCli:
          |${Color.bold("usage:", out)}
          |  scalino <sources...>                   run (default command)
          |  scalino run <sources...> [options]     compile and run
-         |  scalino compile <sources...> [options]   compile only, no link (see build output)
+         |  scalino compile [options]               compile only, no link (see build output)
          |  scalino package <sources...> [options] -o <out>   compile and link a native binary
-         |  scalino test <sources...> [options] [-- <framework args>]   compile and run tests
+         |  scalino test [options] [-- <framework args>]   compile and run tests in the current directory
          |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
          |  scalino lock <sources...> [options]    resolve dependencies and write scalino.lock.json
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
@@ -2694,7 +2695,7 @@ object ScalinoCli:
           opts(oMain + common + oWatch + oProgArgs) +
           nativeHeader + nativeOpts + "\n" + directivesBlock
       case "compile" =>
-        head("scalino compile <sources...> [options]", "Compile only, no link (see build output).") +
+        head("scalino compile [options]", "Compile only, no link (see build output), the current directory by default.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
           opts(common + oWatch) + directivesBlock
       case "package" =>
@@ -2703,7 +2704,7 @@ object ScalinoCli:
           opts(oMain + common + oOut + oPackage + oWatch) +
           nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + packageDirectivesBlock
       case "test" =>
-        head("scalino test <sources...> [options] [-- <framework args>]", "Compile and run tests.") +
+        head("scalino test [options] [-- <framework args>]", "Compile and run tests in the current directory.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
           opts(common + oWatch + oTestFw + oTestOnly + oProgArgs) +
           nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + testNote

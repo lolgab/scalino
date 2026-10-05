@@ -97,7 +97,7 @@ scalino examples/Hello.scala                                                # ru
 scalino run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala  # a real macro
 scalino run examples/ --main-class Hello                                    # a whole directory
 scalino run examples/Hello.scala -w                                         # watch mode
-scalino test .                                                              # munit/utest/scalatest/zio-test
+scalino test                                                                # munit/utest/scalatest/zio-test
 scalino package examples/Hello.scala -o hello && ./hello
 ```
 
