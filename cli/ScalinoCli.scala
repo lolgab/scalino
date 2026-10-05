@@ -2269,6 +2269,10 @@ object ScalinoCli:
     walk("")
     dst
 
+  /** A binary can't be written over an existing directory. */
+  def checkBinaryOutPath(out: Path): Unit =
+    if Files.isDirectory(out) then fail(s"output path '$out' is a directory")
+
   def buildBinary(
     sources: List[Path],
     explicitMainClass: Option[String],
@@ -2286,6 +2290,9 @@ object ScalinoCli:
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
 
     val mainClass = detectMainClass(compiledDir, explicitMainClass)
+    // Same check as handleRunOrCompile's, for the default name (no -o) that
+    // is only known now -- still before the (slow) link step.
+    checkBinaryOutPath(outFor(mainClass))
     val linkDir = Paths.get(".scalino-build").resolve(mainClass).resolve("link")
     val classesDir =
       if excludeFromLink.isEmpty then compiledDir
@@ -2897,6 +2904,14 @@ object ScalinoCli:
     val o = defaultToCwd(parseRunOpts(args))
     if mode == "compile" && o.out.isDefined then
       die("compile: -o/--output is not valid here -- use 'scalino package -o' to produce a binary")
+    // Fail before compiling if the output path can't possibly work.
+    if mode == "package" then
+      val packagesOnly = o.formats.nonEmpty && o.formats != List("binary")
+      o.out.map(Paths.get(_)).foreach { out =>
+        if packagesOnly then
+          if Files.exists(out) && !Files.isDirectory(out) then die(s"output path '$out' is not a directory")
+        else if Files.isDirectory(out) then die(s"output path '$out' is a directory")
+      }
     o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
     val allExpanded = expandSources(o.sources)
     if allExpanded.isEmpty then die("no .scala files found")
@@ -3251,7 +3266,20 @@ object ScalinoCli:
     if lead.nonEmpty && rest.nonEmpty && HoistTargets.contains(rest(0)) then rest(0) +: (lead ++ rest.drop(1))
     else args
 
+  /** Last-resort handler: an exception nothing else caught still has to say
+   *  what it was. Every step is guarded -- the runtime's own uncaught-exception
+   *  path reports only the class name when printing the exception itself throws. */
   def main(rawArgs: Array[String]): Unit =
+    try run(rawArgs)
+    catch case e: Throwable =>
+      def safe[A](a: => A, default: A): A = try a catch case _: Throwable => default
+      val msg = safe(e.getMessage, null)
+      val what = if msg != null then s"${e.getClass.getName}: $msg" else e.getClass.getName
+      System.err.println(Color.error(s"scalino: unexpected error: $what"))
+      safe(e.printStackTrace(), ())
+      sys.exit(1)
+
+  def run(rawArgs: Array[String]): Unit =
     val args = hoistLeadingFlags(extractColorFlag(rawArgs))
     if args.isEmpty then { printUsage(System.err); sys.exit(1) }
     // `scalino <command> --help`: per-command help. Stops at `--` (program/
