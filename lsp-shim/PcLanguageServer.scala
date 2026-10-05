@@ -57,8 +57,12 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
   /** Same on-disk config the old `DottyLanguageServer` backend used to read
    *  (`scalino setup-ide`'s output). */
-  private def loadConfig(rootUri: String): List[ProjectConfig] = {
+  private def loadConfig(clientRootUri: String): List[ProjectConfig] = {
     val IDE_CONFIG_FILE = ".scalino-build/scalino-lsp.json"
+    // Some clients (e.g. neovim with no detected root) send `rootUri: null`.
+    val rootUri =
+      if (clientRootUri != null) clientRootUri
+      else Paths.get("").toAbsolutePath.toUri.toString.stripSuffix("/")
     val configFile = new File(new URI(rootUri + '/' + IDE_CONFIG_FILE))
     if (!configFile.exists)
       throw new java.io.FileNotFoundException(

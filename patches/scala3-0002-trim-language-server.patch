@@ -16,7 +16,7 @@ new file mode 100644
 index 00000000..13f93fea
 --- /dev/null
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,956 @@
 +package dotty.tools
 +package languageserver
 +
@@ -325,7 +325,9 @@ index 00000000..13f93fea
 +          var continue = true
 +          while (continue) {
 +            in.readKeyAsString() match {
-+              case "rootUri" => rootUri = in.readString(null)
++              // jsoniter rejects JSON null when the default is null; clients
++              // (e.g. neovim without a root dir) send `"rootUri": null`.
++              case "rootUri" => rootUri = Option(in.readString("")).filter(_.nonEmpty).orNull
 +              case _ => skipVal(in)
 +            }
 +            continue = in.isNextToken(',')
