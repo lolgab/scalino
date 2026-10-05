@@ -177,7 +177,7 @@ local function setup_ide_prompt(server_cmd, cfg)
   end, {})
 end
 
---- @param opts table|nil { path?: string, args?: string[], env?: table }
+--- @param opts table|nil { path?: string, args?: string[], env?: table, settings?: table }
 function M.setup(opts)
   opts = opts or {}
   local cmd = { resolve_cmd(opts), unpack(opts.args or { "-stdio" }) }
@@ -201,6 +201,9 @@ function M.setup(opts)
         on_dir(root)
       end
     end,
+    -- Sent via workspace/didChangeConfiguration, e.g. inlay hint toggles:
+    -- { inlayHints = { inferredTypes = { enable = false } } }
+    settings = opts.settings,
     cmd_env = vim.tbl_extend("force", { SCALINO_LSP_JAR_URIS = "1" }, opts.env or {}),
   }
   setup_jar_reader()

@@ -70,6 +70,25 @@ pick this directory (`zed-extension/`).
    `vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala`)
    for a full timestamped trace of every request/notification it handled.
 
+## Inlay hint toggles
+
+Each hint kind can be switched off individually (all on by default): `inferredTypes`,
+`typeParameters`, `implicitArguments`, `implicitConversions`, `byNameParameters`,
+`namedParameters`, `hintsInPatternMatch`. The server reads them as
+`inlayHints.<kind>.enable` from `initializationOptions` and from
+`workspace/didChangeConfiguration`, and asks the client to refresh hints when they change.
+
+In Zed, set them under `lsp.scalino-lsp.settings`:
+```json
+{
+  "lsp": {
+    "scalino-lsp": {
+      "settings": { "inlayHints": { "inferredTypes": { "enable": false } } }
+    }
+  }
+}
+```
+
 ## Scope
 
 Diagnostics, hover, definition, completion, references, rename,

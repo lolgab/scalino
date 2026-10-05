@@ -56,6 +56,17 @@ auto-downloaded (see "Scope" below) -- steps 1-3 below are still required.
    project root -- see `Log` in
    `vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala`).
 
+## Inlay hint toggles
+
+Each hint kind can be switched off individually (all on by default): `inferredTypes`,
+`typeParameters`, `implicitArguments`, `implicitConversions`, `byNameParameters`,
+`namedParameters`, `hintsInPatternMatch`. The server reads them as
+`inlayHints.<kind>.enable` from `initializationOptions` and from
+`workspace/didChangeConfiguration`, and asks the client to refresh hints when they change.
+
+In VS Code these are the `scalino-lsp.inlayHints.<kind>.enable` settings
+(Settings UI: search "scalino inlay").
+
 ## Scope
 
 Diagnostics, hover, definition, completion, references, rename,

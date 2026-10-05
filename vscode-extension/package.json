@@ -59,6 +59,41 @@
           "enum": ["off", "messages", "verbose"],
           "default": "off",
           "description": "Trace LSP communication between VS Code and scalino-lsp."
+        },
+        "scalino-lsp.inlayHints.inferredTypes.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inferred types (`val x/*: Int*/ = 1`)."
+        },
+        "scalino-lsp.inlayHints.typeParameters.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inferred type arguments of method calls."
+        },
+        "scalino-lsp.inlayHints.implicitArguments.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show implicit/given arguments passed to method calls."
+        },
+        "scalino-lsp.inlayHints.implicitConversions.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show implicit conversions applied to expressions."
+        },
+        "scalino-lsp.inlayHints.byNameParameters.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show by-name parameter markers (`=>`) on call arguments."
+        },
+        "scalino-lsp.inlayHints.namedParameters.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show parameter names on call arguments."
+        },
+        "scalino-lsp.inlayHints.hintsInPatternMatch.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inferred types in pattern matches."
         }
       }
     }

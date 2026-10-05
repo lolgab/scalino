@@ -218,6 +218,9 @@ export function activate(context: vscode.ExtensionContext): void {
     ],
     initializationOptions: config.get("initializationOptions"),
     synchronize: {
+      // Pushes `scalino-lsp.*` settings (inlay hint toggles) to the server
+      // on startup and whenever they change.
+      configurationSection: SERVER_ID,
       fileEvents: vscode.workspace.createFileSystemWatcher("**/*.scala"),
     },
   };

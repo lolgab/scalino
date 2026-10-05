@@ -1,0 +1,143 @@
+--- a/language-server/src/dotty/tools/languageserver/Lsp.scala
++++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
+@@ -33,7 +33,11 @@
+ 
+   // -- Incoming (client -> server) request/notification params ------------
+ 
+-  final case class InitializeParams(rootUri: String)
++  /** `initializationOptions` and `capabilities` are flattened to
++   *  `dotted.path -> Boolean` (see `readBooleanPaths`): the server only ever
++   *  consults boolean feature toggles and capability flags in them. */
++  final case class InitializeParams(rootUri: String, initializationOptions: Map[String, Boolean], capabilities: Map[String, Boolean])
++  final case class DidChangeConfigurationParams(settings: Map[String, Boolean])
+   final case class DidOpenTextDocumentParams(textDocument: TextDocumentItem)
+   final case class TextDocumentContentChangeEvent(range: Option[Range], text: String)
+   final case class DidChangeTextDocumentParams(textDocument: TextDocumentIdentifier, contentChanges: List[TextDocumentContentChangeEvent])
+@@ -149,6 +153,38 @@
+    *  without ever being parsed into a type at all. */
+   private def skipVal(in: JsonReader): Unit = in.skip()
+ 
++  /** Reads the next JSON value, flattening every boolean leaf into
++   *  `dotted.path -> value` (nested object keys joined with `.`; a client
++   *  that already sends dotted keys like `"inlayHints.inferredTypes.enable"`
++   *  produces the same path as one that nests them). Non-boolean leaves and
++   *  arrays are skipped. */
++  private def readBooleanPaths(in: JsonReader): Map[String, Boolean] = {
++    val out = Map.newBuilder[String, Boolean]
++    def walk(prefix: String): Unit = {
++      val t = in.nextToken()
++      if (t == '{') {
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            val key = in.readKeyAsString()
++            walk(if (prefix.isEmpty) key else prefix + "." + key)
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++      } else if (t == 't' || t == 'f') {
++        in.rollbackToken()
++        out += prefix -> in.readBoolean()
++      } else {
++        in.rollbackToken()
++        in.skip()
++      }
++    }
++    walk("")
++    out.result()
++  }
++
+   given positionCodec: JsonValueCodec[Position] = new JsonValueCodec[Position] {
+     def nullValue: Position = null
+     def decodeValue(in: JsonReader, default: Position): Position =
+@@ -331,21 +367,47 @@
+     def decodeValue(in: JsonReader, default: InitializeParams): InitializeParams =
+       if (in.isNextToken('{')) {
+         var rootUri: String = null
++        var initializationOptions: Map[String, Boolean] = Map.empty
++        var capabilities: Map[String, Boolean] = Map.empty
+         if (!in.isNextToken('}')) {
+           in.rollbackToken()
+           var continue = true
+           while (continue) {
+             in.readKeyAsString() match {
+               case "rootUri" => rootUri = in.readString(null)
++              case "initializationOptions" => initializationOptions = readBooleanPaths(in)
++              case "capabilities" => capabilities = readBooleanPaths(in)
+               case _ => skipVal(in)
+             }
+             continue = in.isNextToken(',')
+           }
+           if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
+         }
+-        InitializeParams(rootUri)
++        InitializeParams(rootUri, initializationOptions, capabilities)
+       } else in.readNullOrTokenError(default, '{')
+     def encodeValue(x: InitializeParams, out: JsonWriter): Unit = ???
++  }
++
++  given didChangeConfigurationParamsCodec: JsonValueCodec[DidChangeConfigurationParams] = new JsonValueCodec[DidChangeConfigurationParams] {
++    def nullValue: DidChangeConfigurationParams = null
++    def decodeValue(in: JsonReader, default: DidChangeConfigurationParams): DidChangeConfigurationParams =
++      if (in.isNextToken('{')) {
++        var settings: Map[String, Boolean] = Map.empty
++        if (!in.isNextToken('}')) {
++          in.rollbackToken()
++          var continue = true
++          while (continue) {
++            in.readKeyAsString() match {
++              case "settings" => settings = readBooleanPaths(in)
++              case _ => skipVal(in)
++            }
++            continue = in.isNextToken(',')
++          }
++          if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
++        }
++        DidChangeConfigurationParams(settings)
++      } else in.readNullOrTokenError(default, '{')
++    def encodeValue(x: DidChangeConfigurationParams, out: JsonWriter): Unit = ???
+   }
+ 
+   given didOpenTextDocumentParamsCodec: JsonValueCodec[DidOpenTextDocumentParams] = new JsonValueCodec[DidOpenTextDocumentParams] {
+--- a/language-server/src/dotty/tools/languageserver/Main.scala
++++ b/language-server/src/dotty/tools/languageserver/Main.scala
+@@ -140,6 +140,9 @@
+       idleChecker.start()
+     }
+ 
++    var inlayHintRefreshSupport = false
++    var refreshRequestId = 0
++
+     def handle(env: IncomingEnvelope): Unit = {
+       val isRequest = env.idRaw != null
+       try {
+@@ -147,6 +150,8 @@
+         env.method match {
+           case "initialize" =>
+             val params = readFromArray(env.paramsRaw)(using initializeParamsCodec)
++            inlayHintRefreshSupport = params.capabilities.getOrElse("workspace.inlayHint.refreshSupport", false)
++            server.updateSettings(params.initializationOptions)
+             val result = server.initialize(params.rootUri)
+             sendResult(env.idRaw, writeToArray(result))
+           case "initialized" => // no-op notification
+@@ -158,8 +163,17 @@
+             server.didChange(readFromArray(env.paramsRaw)(using didChangeTextDocumentParamsCodec))
+           case "textDocument/didClose" =>
+             server.didClose(readFromArray(env.paramsRaw)(using didCloseTextDocumentParamsCodec))
+-          case "textDocument/didSave" | "workspace/didChangeConfiguration" | "workspace/didChangeWatchedFiles" =>
++          case "workspace/didChangeConfiguration" =>
++            val params = readFromArray(env.paramsRaw)(using didChangeConfigurationParamsCodec)
++            if (server.updateSettings(params.settings) && inlayHintRefreshSupport) {
++              // Hint toggles changed: ask the client to re-request inlay hints.
++              refreshRequestId += 1
++              writeFramed(s"""{"jsonrpc":"2.0","id":"scalino-refresh-$refreshRequestId","method":"workspace/inlayHint/refresh"}""".getBytes("UTF-8"))
++            }
++          case "textDocument/didSave" | "workspace/didChangeWatchedFiles" =>
+             () // no-op notifications, matching the previous lsp4j-based implementation
++          case null =>
++            () // response to a server->client request (inlay hint refresh): nothing to do
+           case "textDocument/completion" =>
+             val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
+             sendResult(env.idRaw, writeToArray(server.completion(params)))

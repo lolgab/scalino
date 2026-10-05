@@ -71,6 +71,30 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     readFromArray(Files.readAllBytes(configFile.toPath))(using projectConfigListCodec)
   }
 
+  /** Per-kind inlay hint toggles, named like Metals' `inlayHints.*.enable`
+   *  settings. All on by default. */
+  private val InlayHintSettingKeys = List(
+    "inferredTypes", "typeParameters", "implicitArguments", "implicitConversions",
+    "byNameParameters", "namedParameters", "hintsInPatternMatch")
+  @volatile private var inlayHintToggles: Map[String, Boolean] =
+    InlayHintSettingKeys.map(_ -> true).toMap
+
+  /** Applies `inlayHints.<kind>.enable` flags from `initializationOptions` /
+   *  `workspace/didChangeConfiguration` (flattened to dotted paths, see
+   *  `Lsp.readBooleanPaths`). A path matches when it equals the key or ends
+   *  with `.<key>`, so clients may prefix it with their own section name
+   *  (`scalino-lsp.`, `metals.`, ...). Returns whether any toggle changed. */
+  def updateSettings(flags: Map[String, Boolean]): Boolean = {
+    val updated = InlayHintSettingKeys.map { kind =>
+      val key = s"inlayHints.$kind.enable"
+      val value = flags.collectFirst { case (path, v) if path == key || path.endsWith("." + key) => v }
+      kind -> value.getOrElse(inlayHintToggles(kind))
+    }.toMap
+    val changed = updated != inlayHintToggles
+    inlayHintToggles = updated
+    changed
+  }
+
   def initialize(rootUri: String): InitializeResult = thisServer.synchronized {
     val capabilities = ServerCapabilities(
       textDocumentSync = 1, // Full
@@ -469,20 +493,17 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val rangeParams = CompilerRangeParams(uri, text, positionToOffset(text, params.range.start), positionToOffset(text, params.range.end))
-    // Enable every hint kind PC supports -- there's no separate LSP-level
-    // per-kind toggle in this minimal client model (real Metals exposes these
-    // as user settings; this server always asks for everything and lets the
-    // editor's own inlay-hint UI settings decide what's actually shown).
+    val on = inlayHintToggles
     val hintsParams = CompilerInlayHintsParams(
       rangeParams,
-      inferredTypes = true,
-      typeParameters = true,
-      implicitParameters = true,
+      inferredTypes = on("inferredTypes"),
+      typeParameters = on("typeParameters"),
+      implicitParameters = on("implicitArguments"),
       hintsXRayMode = false,
-      byNameParameters = true,
-      implicitConversions = true,
-      namedParameters = true,
-      hintsInPatternMatch = true,
+      byNameParameters = on("byNameParameters"),
+      implicitConversions = on("implicitConversions"),
+      namedParameters = on("namedParameters"),
+      hintsInPatternMatch = on("hintsInPatternMatch"),
       closingLabels = false)
     requirePc().inlayHints(hintsParams).asScala.map { h =>
       val pos = h.getPosition()

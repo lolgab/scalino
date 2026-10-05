@@ -46,6 +46,10 @@ below) -- `vim.lsp.config`/`vim.lsp.enable` aren't available there.
      config = function()
        require("scalino-lsp").setup({
          -- path = "/absolute/path/to/dist/scalino-lsp", -- only if not on PATH
+         -- Inlay hint toggles (all on by default): inferredTypes, typeParameters,
+         -- implicitArguments, implicitConversions, byNameParameters,
+         -- namedParameters, hintsInPatternMatch
+         -- settings = { inlayHints = { inferredTypes = { enable = false } } },
        })
      end,
    }

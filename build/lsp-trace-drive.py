@@ -173,6 +173,7 @@ def main():
                 "applyEdit": True,
                 "workspaceEdit": {"documentChanges": True, "resourceOperations": ["create", "rename", "delete"]},
                 "didChangeConfiguration": {"dynamicRegistration": True},
+                "inlayHint": {"refreshSupport": True},
                 "didChangeWatchedFiles": {"dynamicRegistration": True},
                 "symbol": {"dynamicRegistration": True, "symbolKind": {"valueSet": list(range(1, 27))}},
                 "executeCommand": {"dynamicRegistration": True},
@@ -333,6 +334,32 @@ def main():
         ok = ok and resp is not None and 'error' not in resp
         if resp is not None and 'error' not in resp:
             print(f"  {len(resp['result'])} inlay hint(s) returned")
+            hints_all = len(resp['result'])
+            ok = ok and hints_all > 0
+
+            section("workspace/didChangeConfiguration: disable every inlay hint kind")
+            kinds = ["inferredTypes", "typeParameters", "implicitArguments", "implicitConversions",
+                     "byNameParameters", "namedParameters", "hintsInPatternMatch"]
+            def settings(enabled):
+                return {"settings": {"scalino-lsp": {"inlayHints": {k: {"enable": enabled} for k in kinds}}}}
+            hint_params = {
+                "textDocument": {"uri": main_uri},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": len(main_lines), "character": 0}},
+            }
+            client.notify("workspace/didChangeConfiguration", settings(False))
+            refresh, _ = client.drain_notifications(lambda n: n.get("method") == "workspace/inlayHint/refresh")
+            print(f"  refresh request from server: {refresh is not None}")
+            ok = ok and refresh is not None
+            resp, elapsed = client.request("textDocument/inlayHint", hint_params)
+            n_off = len(resp['result']) if resp and 'error' not in resp else -1
+            print(f"  {n_off} inlay hint(s) with all kinds disabled")
+            ok = ok and n_off == 0
+
+            client.notify("workspace/didChangeConfiguration", settings(True))
+            resp, elapsed = client.request("textDocument/inlayHint", hint_params)
+            n_on = len(resp['result']) if resp and 'error' not in resp else -1
+            print(f"  {n_on} inlay hint(s) after re-enabling")
+            ok = ok and n_on == hints_all
 
         section("textDocument/semanticTokens/full(Main.scala)")
         resp, elapsed = client.request("textDocument/semanticTokens/full", {"textDocument": {"uri": main_uri}})
