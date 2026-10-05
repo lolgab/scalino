@@ -165,7 +165,7 @@ mkdir -p "$LINK_WORK"
 # for the same NoSuchMethodError-avoidance reason explained there).
 DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
 "$JAVA" \
-  -Xss64m -XX:MaxRAMPercentage=80.0 \
+  -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
   -cp "$DRIVER_CP" \
     LinkDriver \
     "$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
