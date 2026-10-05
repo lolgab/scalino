@@ -38,6 +38,7 @@ import Lsp.given
 class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Unit) { thisServer =>
 
   private var pc: RawScalaPresentationCompiler = null
+  private var warmupError: Throwable = null
   private val buffers: mutable.Map[URI, String] = mutable.Map.empty
 
   /** `didChange` used to recompile+publish synchronously on every keystroke:
@@ -130,6 +131,12 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
           System.err.println(s"PC warmup failed: ${ex.getClass.getName}: ${ex.getMessage}")
           ex.printStackTrace()
           System.err.flush()
+          // Wake blocked requests so they fail fast with the real cause
+          // instead of waiting out the full deadline.
+          thisServer.synchronized {
+            warmupError = ex
+            thisServer.notifyAll()
+          }
       }
     })
     warmup.setDaemon(true)
@@ -146,8 +153,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
    *  ~1s (warm page cache) to several minutes (cold). */
   private def requirePc(): RawScalaPresentationCompiler = thisServer.synchronized {
     val deadline = System.currentTimeMillis() + 180000
-    while (pc == null && System.currentTimeMillis() < deadline)
+    while (pc == null && warmupError == null && System.currentTimeMillis() < deadline)
       thisServer.wait(deadline - System.currentTimeMillis())
+    if (pc == null && warmupError != null)
+      throw new IllegalStateException(s"presentation compiler failed to initialize: ${warmupError.getMessage}", warmupError)
     if (pc == null) throw new IllegalStateException("presentation compiler not yet initialized")
     pc
   }

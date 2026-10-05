@@ -13,6 +13,7 @@
 // dist/ build output (build/08-build-scalino-lsp.sh, or a release tarball).
 // Resolved via `scalino-lsp.path` setting, falling back to a PATH lookup.
 
+import * as cp from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as zlib from "zlib";
@@ -61,6 +62,55 @@ function resolveServerPath(config: vscode.WorkspaceConfiguration): string {
       `or use a release tarball's dist/${SERVER_ID}) and either add dist/ to PATH ` +
       `or set "scalino-lsp.path" in settings.json`,
   );
+}
+
+const IDE_CONFIG_FILE = path.join(".scalino-build", "scalino-lsp.json");
+
+// `scalino` lives next to `scalino-lsp` in dist/ and in install.sh's PATH
+// symlinks, so prefer the sibling of the resolved server, then PATH.
+function resolveScalinoPath(serverPath: string): string | undefined {
+  const sibling = path.join(path.dirname(serverPath), "scalino");
+  if (path.isAbsolute(serverPath) && isExecutable(sibling)) return sibling;
+  return findOnPath("scalino");
+}
+
+function runSetupIde(serverPath: string, folder: string): Thenable<boolean> {
+  const scalino = resolveScalinoPath(serverPath);
+  if (!scalino) {
+    vscode.window.showErrorMessage("scalino not found next to scalino-lsp or on PATH.");
+    return Promise.resolve(false) as Thenable<boolean>;
+  }
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "scalino setup-ide" },
+    () =>
+      new Promise<boolean>((resolve) => {
+        cp.execFile(scalino, ["setup-ide", "."], { cwd: folder }, (err, _out, stderr) => {
+          if (err) {
+            vscode.window.showErrorMessage(`scalino setup-ide failed: ${stderr || err.message}`);
+            resolve(false);
+          } else {
+            resolve(true);
+          }
+        });
+      }),
+  );
+}
+
+// Offer a one-click `scalino setup-ide .` for workspace folders that have
+// no IDE config yet (scalino-lsp can't build a compiler without it).
+async function offerSetupIde(serverPath: string): Promise<void> {
+  const missing = (vscode.workspace.workspaceFolders ?? [])
+    .map((f) => f.uri.fsPath)
+    .filter((dir) => !fs.existsSync(path.join(dir, IDE_CONFIG_FILE)));
+  if (missing.length === 0) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Scalino: no ${IDE_CONFIG_FILE} in ${path.basename(missing[0])}; the language server needs it.`,
+    "Run scalino setup-ide",
+  );
+  if (choice !== "Run scalino setup-ide") return;
+  let ok = true;
+  for (const dir of missing) ok = (await runSetupIde(serverPath, dir)) && ok;
+  if (ok) await client?.restart();
 }
 
 // Minimal read-only zip reader (central directory + raw inflate, no zip64)
@@ -174,6 +224,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   client = new LanguageClient(SERVER_ID, "Scalino", serverOptions, clientOptions);
   client.start();
+  context.subscriptions.push(
+    vscode.commands.registerCommand("scalino-lsp.setupIde", () => offerSetupIde(command)),
+  );
+  void offerSetupIde(command);
 }
 
 export function deactivate(): Thenable<void> | undefined {

@@ -101,6 +101,82 @@ local function setup_jar_reader()
   })
 end
 
+-- scalino-lsp can't build a compiler without `.scalino-build/scalino-lsp.json`.
+-- When a scala buffer's root lacks it, offer to run `scalino setup-ide .`
+-- there and restart the client afterwards. Also exposed as :ScalinoSetupIde.
+local IDE_CONFIG_FILE = ".scalino-build/scalino-lsp.json"
+
+local function resolve_scalino(server_cmd)
+  local sibling = vim.fs.joinpath(vim.fs.dirname(server_cmd), "scalino")
+  if server_cmd:find("/", 1, true) and is_executable(sibling) then
+    return sibling
+  end
+  if is_executable("scalino") then
+    return "scalino"
+  end
+end
+
+local function run_setup_ide(server_cmd, root, cfg)
+  local scalino = resolve_scalino(server_cmd)
+  if not scalino then
+    vim.notify("scalino not found next to scalino-lsp or on PATH", vim.log.levels.ERROR)
+    return
+  end
+  vim.notify("scalino setup-ide: running in " .. root)
+  vim.system({ scalino, "setup-ide", "." }, { cwd = root, text = true }, function(res)
+    vim.schedule(function()
+      if res.code ~= 0 then
+        vim.notify("scalino setup-ide failed: " .. (res.stderr or ""), vim.log.levels.ERROR)
+        return
+      end
+      vim.notify("scalino setup-ide: done, restarting scalino_lsp")
+      for _, c in ipairs(vim.lsp.get_clients({ name = "scalino_lsp" })) do
+        c:stop()
+      end
+      -- on_exit re-attaches open scala buffers; cover the no-client case.
+      reattach_open_buffers(cfg)
+    end)
+  end)
+end
+
+local function setup_ide_prompt(server_cmd, cfg)
+  local group = vim.api.nvim_create_augroup("scalino_lsp_setup_ide", { clear = true })
+  local asked = {}
+  local function check(bufnr, force)
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    if name == "" or name:find("^jar:") then
+      return
+    end
+    local root = vim.fs.root(bufnr, { ".scalino-build", "build.sbt", ".git" })
+    if not root or vim.uv.fs_stat(vim.fs.joinpath(root, IDE_CONFIG_FILE)) then
+      return
+    end
+    if asked[root] and not force then
+      return
+    end
+    asked[root] = true
+    vim.ui.select(
+      { "Run scalino setup-ide", "Not now" },
+      { prompt = "scalino-lsp: no " .. IDE_CONFIG_FILE .. " in " .. root },
+      function(choice)
+        if choice == "Run scalino setup-ide" then
+          run_setup_ide(server_cmd, root, cfg)
+        end
+      end
+    )
+  end
+  vim.api.nvim_create_autocmd("FileType", {
+    group = group,
+    pattern = "scala",
+    callback = function(args)
+      check(args.buf, false)
+    end,
+  })
+  vim.api.nvim_create_user_command("ScalinoSetupIde", function()
+    check(vim.api.nvim_get_current_buf(), true)
+  end, {})
+end
+
 --- @param opts table|nil { path?: string, args?: string[], env?: table }
 function M.setup(opts)
   opts = opts or {}
@@ -131,6 +207,8 @@ function M.setup(opts)
   cfg.on_exit = function(_, _, _)
     reattach_open_buffers(cfg)
   end
+
+  setup_ide_prompt(cmd[1], cfg)
 
   vim.lsp.config("scalino_lsp", cfg)
   vim.lsp.enable("scalino_lsp")

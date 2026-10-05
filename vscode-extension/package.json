@@ -23,6 +23,12 @@
         "aliases": ["Scala"]
       }
     ],
+    "commands": [
+      {
+        "command": "scalino-lsp.setupIde",
+        "title": "Scalino: Run setup-ide"
+      }
+    ],
     "configuration": {
       "type": "object",
       "title": "Scalino",
