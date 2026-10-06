@@ -2003,7 +2003,7 @@ object ScalinoCli:
     classesDir.resolveSibling(classesDir.getFileName.toString + ".incr-manifest")
 
   /** Deletes whatever `classesDir` holds for the given (package, declared
-   *  top-level names) -- `Name.class`/`Name.tasty` plus anything dotc
+   *  top-level names) -- `Name.class`/`Name.tasty`/`Name.nir` plus anything dotc
    *  nests under it (`Name$.class` for an object's static forwarder,
    *  `Name$Inner.class`, ...), matched by filename prefix. Called before
    *  recompiling a changed file (in case a class inside it was renamed or
@@ -2014,7 +2014,7 @@ object ScalinoCli:
     val dir = if pkg.isEmpty then classesDir else pkg.split("\\.").foldLeft(classesDir)(_.resolve(_))
     if Files.exists(dir) then
       names.foreach { n =>
-        Option(dir.toFile.listFiles((_, name) => name == s"$n.class" || name == s"$n.tasty" || name.startsWith(s"$n$$")))
+        Option(dir.toFile.listFiles((_, name) => name == s"$n.class" || name == s"$n.tasty" || name == s"$n.nir" || name.startsWith(s"$n$$")))
           .foreach(_.foreach(f => Files.deleteIfExists(f.toPath)))
       }
 
