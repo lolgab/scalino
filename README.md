@@ -39,11 +39,6 @@ The differences:
 - **One Scala and one Scala Native version**: the ones it was built with
   (`scalino version` prints them). You can't switch versions per project,
   and there are no JVM or Scala.js targets.
-- **Native libraries only.** Only libraries cross-published for Scala Native
-  will link. JVM-only jars resolve and typecheck, but they have no native code
-  to call into.
-- **Honest about gaps.** A command it doesn't implement prints
-  "not implemented" instead of guessing.
 
 ## Install
 
