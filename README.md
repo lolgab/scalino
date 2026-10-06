@@ -194,7 +194,8 @@ each OS/arch on its own CI runner. Either way, run `--format brew` last.
 One machine can build binaries for several platforms in a single command:
 
 ```sh
-scalino sysroot build x86_64-unknown-linux-musl aarch64-unknown-linux-musl   # once
+# missing sysroots are built automatically on first use
+# (or ahead of time: scalino sysroot build <triple>...)
 scalino package app/ -o myapp \
   --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 # -> myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl
@@ -215,7 +216,8 @@ The musl targets are fully static, so one binary runs on every distro.
 A sysroot holds the target's libc headers and libraries. `scalino sysroot build
 <triple>` assembles one on your machine from upstream packages, each checked
 against a pinned sha256 (scalino publishes none), and installs it under
-`~/.cache/scalino/sysroots`. It needs only `curl` and `tar`; nothing is compiled.
+`~/.cache/scalino/sysroots`. `scalino package --native-target-triple` runs it
+automatically for any target without one. It needs only `curl` and `tar`; nothing is compiled.
 
 | target | assembled from |
 |---|---|

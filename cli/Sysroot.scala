@@ -44,8 +44,8 @@ object Sysroot:
     roots.map(_.resolve(triple)).find(looksLikeSysroot)
 
   /** `--native-sysroot <triple>=<dir>` entries for `triples`: what the user
-   *  gave, else what's installed. Fails with the command to run if a target
-   *  needs one that isn't there. */
+   *  gave, else what's installed, else what `SysrootBuild` assembles on the
+   *  spot. Fails for targets it can't build. */
   def resolve(triples: List[String], explicit: List[String]): List[String] =
     val explicitTriples = explicit.map(_.takeWhile(_ != '=')).toSet
     val host = Packaging.detectHost()
@@ -56,7 +56,9 @@ object Sysroot:
       else if target.os == "macos" && host.os == "macos" then None
       else find(t) match
         case Some(dir) => Some(s"$t=$dir")
-        case None if Supported.contains(t) => fail(s"no sysroot for $t -- run `scalino sysroot build $t`")
+        case None if Supported.contains(t) =>
+          println(s"no sysroot for $t -- building it (`scalino sysroot build $t`)")
+          Some(s"$t=${SysrootBuild.build(t, force = false)}")
         case None => fail(s"no sysroot for $t: pass --native-sysroot $t=<dir> (`scalino sysroot build` supports ${Supported.mkString(", ")})")
     }
     explicit ++ found
