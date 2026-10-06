@@ -224,6 +224,9 @@ against a pinned sha256 (scalino publishes none), and installs it under
 | macOS | the open source Darwin libc headers from the Zig project's source tarball, and a `libSystem` stub generated from them (a stand-in for Apple's SDK, enough for anything that needs no frameworks) |
 | Windows | mingw-w64 with libc++ from the [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) project (GitHub) |
 
+- The Windows sysroot's libc++ needs **clang 21 or newer** (older clangs fail on its
+  `#pragma clang attribute` headers); point `--native-clang`/`--native-clangpp` at one if
+  the `clang` on your `PATH` is older.
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 

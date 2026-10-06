@@ -273,7 +273,12 @@ jobs:
           command -v ld.lld  # needed for the macOS and Windows targets
           ./dist/scalino sysroot build "${triples[@]}"
           rm -rf cross-out
+          # The Windows sysroot's libc++ needs clang >= 21; the toolchain
+          # build above pins LLVM 20, so install a newer clang just for this.
+          wget -O /tmp/llvm22.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm22.sh 22
           ./dist/scalino package examples/Hello.scala --native-mode release-fast \
+            --native-clang /usr/lib/llvm-22/bin/clang --native-clangpp /usr/lib/llvm-22/bin/clang++ \
             --native-target-triple "$(IFS=,; echo "${triples[*]}")" \
             -o cross-out/hello
           ls -l cross-out
