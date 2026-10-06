@@ -1,0 +1,23 @@
+diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+index 9fde7e8d..7bb3f0b0 100644
+--- a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
++++ b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+@@ -164,8 +164,16 @@ class PcDefinitionProvider(
+           // In-memory `jar:file:///x-sources.jar!/pkg/X.scala` virtual file
+           // (patches/scala3-0014): its path IS the URI to report.
+           val uriStr = upgraded.file.path
+-          if uriStr.startsWith("jar:") && symPos.exists then List(new Location(uriStr, symPos.toLsp))
+-          else Nil
++          if !symPos.exists then Nil
++          else if uriStr.startsWith("jar:") then List(new Location(uriStr, symPos.toLsp))
++          else
++            // A jar source the editor has open is compiled as a regular
++            // buffer (virtual `file:` path from the LSP shim), which makes
++            // its symbols shadow the classpath ones: `Predef.println`'s
++            // source is then that virtual file, not the `jar:` entry. Report
++            // it as a `file:` URI; the shim maps it back to the `jar:` URI.
++            scala.util.Try(java.nio.file.Paths.get(uriStr).toUri.toString).toOption
++              .map(u => new Location(u, symPos.toLsp)).toList
+         else Nil
+       if fromJarSources.nonEmpty then fromJarSources
+       else
