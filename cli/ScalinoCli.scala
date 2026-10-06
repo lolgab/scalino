@@ -1957,7 +1957,7 @@ object ScalinoCli:
   // changes, it just can't ripple further to a file that only mentions a
   // nested name of its own.
   private val topLevelDeclRe =
-    """(?m)^\s*(?:(?:final|sealed|abstract|open|case)\s+)*(?:class|trait|object|enum|given)\s+([A-Za-z_][A-Za-z0-9_]*)""".r
+    """(?m)^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:final|sealed|abstract|open|case|private|protected|implicit|inline|transparent|opaque|infix)(?:\[\w+\])?\s+)*(?:class|trait|object|enum|given)\s+([A-Za-z_][A-Za-z0-9_]*)""".r
   private val packageRe = """(?m)^\s*package\s+([A-Za-z0-9_.]+)""".r
 
   def extractPackage(text: String): String =
@@ -2042,7 +2042,12 @@ object ScalinoCli:
     // graph below needs a plain-value key it can put in a Set/Queue.
     val texts = sources.map(p => p.toString -> readFile(p)).toMap
     val curHash = texts.view.mapValues(hashKey).toMap
-    val curDeclared = texts.view.mapValues(extractDeclaredNames).toMap
+    // `<File>$package` is where dotc puts top-level defs/vals/types, so it
+    // belongs to the file even though no declaration in the text names it.
+    val curDeclared = texts.map { case (p, t) =>
+      val base = Paths.get(p).getFileName.toString.stripSuffix(".scala").stripSuffix(".sc")
+      p -> (extractDeclaredNames(t) :+ s"$base$$package").distinct
+    }
     val curPkg = texts.view.mapValues(extractPackage).toMap
 
     val fullRebuild = !incremental || prev.isEmpty || prev.exists(_.fingerprint != fingerprint) || !Files.isDirectory(classesDir)
