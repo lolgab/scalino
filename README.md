@@ -206,7 +206,7 @@ parsed only once.
 
 | target | from | needs |
 |---|---|---|
-| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot build <triple>`, plus `lld` when the host isn't Linux |
+| `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot build <triple>`, plus `lld` |
 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | any host | same; glibc 2.31 from Debian 11, runs on any distro with glibc >= 2.31 |
 | `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | nothing on a Mac (Xcode's SDK serves both); elsewhere `scalino sysroot build <triple>` plus `lld` |
 | `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot build <triple>`, plus `lld` (**experimental**, see below) |

@@ -277,7 +277,10 @@ object LinkDriver:
           // Scala Native turns a literal -fuse-ld=lld into --start-lib/--end-lib,
           // which lld's MinGW mode rejects: pick the same linker by path.
           else if osOf(t) == "windows" then List("--ld-path=ld.lld")
-          else if osOf(t) != osOf(hostTriple) then List("-fuse-ld=lld")
+          // GNU ld is single-arch (an x86_64 host's can't write aarch64 ELF), so
+          // every non-host Linux target links with lld too. Apple's ld handles
+          // both Mac architectures.
+          else if osOf(t) != osOf(hostTriple) || osOf(t) == "linux" then List("-fuse-ld=lld")
           else Nil
         withDir.withCompilerConfig(
           _.withTargetTriple(Some(t))
