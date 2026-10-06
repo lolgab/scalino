@@ -122,7 +122,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
       try {
         val configs = loadConfig(rootUri)
         val classpath: Seq[Path] =
-          configs.flatMap(c => c.classDirectory +: c.dependencyClasspath).distinct.map(Paths.get(_))
+          configs.flatMap(_.dependencyClasspath).distinct.map(Paths.get(_))
         val sourceDirs: Seq[Path] =
           configs.flatMap(_.sourceDirectories).distinct.map(Paths.get(_))
         // Includes `-javabootclasspath ...` -- without it dotc's own

@@ -2613,7 +2613,7 @@ object ScalinoCli:
   private def setupIdeNote: String =
     s"""|`setup-ide` writes `.scalino-build/scalino-lsp.json` -- dotty's own
        |pre-Metals IDE config format (compilerArguments/sourceDirectories/
-       |dependencyClasspath/classDirectory), read by dist/scalino-lsp on
+       |dependencyClasspath), read by dist/scalino-lsp on
        |startup. Same command name as scala-cli's `setup-ide`, but a
        |different output file: this toolchain's LSP speaks that format
        |directly, no BSP layer needed.
@@ -3162,16 +3162,13 @@ object ScalinoCli:
     // even though `partitionSources` keeps it out of the actual build.
     val sourceDirectories = (expanded ++ testSources).map(_.toAbsolutePath.getParent.toString).distinct.sorted
     val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
-    val classDirectory = Paths.get(".scalino-build", ".dotty-ide-classes").toAbsolutePath
-    Files.createDirectories(classDirectory)
 
     val json =
       s"""[
          |  {
          |    "compilerArguments": ${jsonArr(compilerArguments)},
          |    "sourceDirectories": ${jsonArr(sourceDirectories)},
-         |    "dependencyClasspath": ${jsonArr(dependencyClasspath)},
-         |    "classDirectory": ${jsonStr(classDirectory.toString)}
+         |    "dependencyClasspath": ${jsonArr(dependencyClasspath)}
          |  }
          |]
          |""".stripMargin
@@ -3179,8 +3176,8 @@ object ScalinoCli:
     // Lives inside .scalino-build/ (patches/scala3-0015 moves scalino-lsp's
     // own DottyLanguageServer.IDE_CONFIG_FILE to match) rather than at the
     // project root as dotty's original ".dotty-ide.json" did, so a project's
-    // .gitignore only needs one entry (.scalino-build/) to cover both this
-    // and classDirectory, not a second one just for this file.
+    // .gitignore only needs one entry (.scalino-build/) to cover it, not a
+    // second one just for this file.
     val configPath = Paths.get(".scalino-build", "scalino-lsp.json")
     Files.write(configPath, json.getBytes("UTF-8"))
     println(s"Wrote configuration file for ide in: ${configPath.toAbsolutePath}")
