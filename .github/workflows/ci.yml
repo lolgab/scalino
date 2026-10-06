@@ -273,7 +273,11 @@ jobs:
           command -v ld.lld  # needed for the macOS and Windows targets
           ./dist/scalino sysroot build "${triples[@]}"
           rm -rf cross-out
-          ./dist/scalino package examples/Hello.scala --native-mode release-fast \
+          # Isolated dir: scalino compiles every .scala under the input's
+          # directory, and the other examples/ projects have their own mains.
+          src="$(mktemp -d)"
+          cp examples/Hello.scala "$src/Hello.scala"
+          ./dist/scalino package "$src/Hello.scala" --native-mode release-fast \
             --native-target-triple "$(IFS=,; echo "${triples[*]}")" \
             -o cross-out/hello
           ls -l cross-out
