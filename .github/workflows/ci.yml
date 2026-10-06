@@ -273,13 +273,14 @@ jobs:
           command -v ld.lld  # needed for the macOS and Windows targets
           ./dist/scalino sysroot build "${triples[@]}"
           rm -rf cross-out
-          # Isolated dir: scalino compiles every .scala under the input's
-          # directory, and the other examples/ projects have their own mains.
+          # Fresh working dir: scalino compiles into ./.scalino-build/_scratch
+          # (incremental), so classes left behind by the smoke tests above
+          # (e.g. escape-analysis/Main) would otherwise count as entry points.
           src="$(mktemp -d)"
           cp examples/Hello.scala "$src/Hello.scala"
-          ./dist/scalino package "$src/Hello.scala" --native-mode release-fast \
+          ( cd "$src" && "$OLDPWD/dist/scalino" package Hello.scala --native-mode release-fast \
             --native-target-triple "$(IFS=,; echo "${triples[*]}")" \
-            -o cross-out/hello
+            -o "$OLDPWD/cross-out/hello" )
           ls -l cross-out
           check() { # <file> <pattern in `file` output>
             f="cross-out/$1"
