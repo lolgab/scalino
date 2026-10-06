@@ -1,9 +1,9 @@
 {
-  "version": "0.0.16",
-  "linux-x86_64": { "sha256": "c708e7af670dee4847ca4fbbcb504a83ae1b8d2e12258e5c6c191f3fa0418dc9" },
-  "linux-arm64":  { "sha256": "4f92e2af12929ced2d82c1fcb50a73f0a3c2aba2b7c04ef443e440837fc65f01" },
-  "macos-x86_64": { "sha256": "dbf27f886e1ac77107693ab3d9f603b23b2ae010823ff192482a9e84af4047a7" },
-  "macos-arm64":  { "sha256": "c92db33c707662d1e06c01ea3afb3eaad286f069898dada84cc3b37e1ba9c56c" },
+  "version": "0.0.17",
+  "linux-x86_64": { "sha256": "507b316ba67b4f1dc0d95c9ea7ea006404ebfb04a1762f78153c28596ccef157" },
+  "linux-arm64":  { "sha256": "ab731590e77dd8ec7abcd15f2e2e59cd278559ea2da0c0d5ae030b7f70d42c3f" },
+  "macos-x86_64": { "sha256": "a962fa20d40f2a9ac5d12e07b7d0c5a68e87ba76b2f338842daf733754dbadb6" },
+  "macos-arm64":  { "sha256": "2a771e117d90054b7814ed5007d778a5b1a71e54e88e5fa812af0b5bce01ef52" },
   "scalaVersion": "3.9.0",
   "stdlibSources": {
     "scala-library":     { "sha256": "6a1405c0b617e51f02a22ff63d6df1e572ab49c158e2aa9bccd0327d1a4ec1cc" },
