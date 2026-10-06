@@ -192,9 +192,8 @@ if command -v codesign >/dev/null 2>&1; then
 fi
 echo "OK: $DIST/scalino-lsp"
 
-echo "== smoke test: build/lsp-trace-drive.py against build/lsp-trace-fixture =="
-[[ -x "$DIST/scalino" ]] || { echo "missing $DIST/scalino -- run build/07-build-scalino.sh first (needed only to regenerate .scalino-build/scalino-lsp.json)" >&2; exit 1; }
-FIXTURE="$ROOT/build/lsp-trace-fixture"
-(cd "$FIXTURE" && "$DIST/scalino" setup-ide Model.scala Greeter.scala Main.scala >/dev/null)
-python3 "$ROOT/build/lsp-trace-drive.py" "$FIXTURE" "$DIST/scalino-lsp" -stdio
-echo "OK: smoke test passed (scalino-lsp handled every endpoint lsp-trace-drive.py exercises)"
+# CI builds this in parallel with 03/03b/07, so dist/scalino doesn't exist
+# yet there; it runs 08b-smoke-lsp.sh afterwards instead.
+if [[ "${SCALINO_SKIP_LSP_SMOKE:-}" != 1 ]]; then
+  ./08b-smoke-lsp.sh
+fi

@@ -1,0 +1,16 @@
+name: Memory watchdog
+description: >
+  Runners killed mid-link report only "received a shutdown signal"; sample
+  memory so the next one shows whether it was memory pressure. Linux only.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == Linux ]]; then
+          # swap as headroom so the runner agent isn't starved/OOM-killed
+          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile && sudo swapon /swapfile || true
+          nohup bash -c 'while sleep 30; do echo "--- $(date -u +%T)"; free -m | sed -n 1,3p; ps -eo rss,comm --sort=-rss | head -4; done' > "$RUNNER_TEMP/mem.log" 2>&1 &
+        fi

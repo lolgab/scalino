@@ -47,7 +47,14 @@ trap restore EXIT
 # Same GITHUB_REF_*/CI unset as 01b -- see its comment for why (scala-native's
 # own release-tag/CI-snapshot version-stamping logic otherwise misfires from
 # this project's own env).
-env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF -u CI sbt nativelib3/publishLocal
+# SCALINO_REUSE_PUBLISHED=1: skip the sbt build when the cached jars are
+# already there -- see 01b.
+_IVY_NATIVELIB="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT"
+if [[ "${SCALINO_REUSE_PUBLISHED:-}" == 1 && -f "$_IVY_NATIVELIB/jars/nativelib_native0.5_3.jar" && -f "$_IVY_NATIVELIB/srcs/nativelib_native0.5_3-sources.jar" ]]; then
+  echo "reusing cached patched nativelib from $_IVY_NATIVELIB"
+else
+  env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF -u CI sbt nativelib3/publishLocal
+fi
 cd - > /dev/null
 
 LOCAL_NATIVELIB_JAR="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/nativelib_native0.5_3.jar"

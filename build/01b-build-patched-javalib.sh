@@ -63,7 +63,16 @@ trap restore EXIT
 # the old jar-extraction workaround covered for it, fatal once that workaround
 # was removed in favor of the patch actually taking effect (see release
 # v0.0.3's CI failure). Works locally already since CI is normally unset.
-env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF -u CI sbt javalib3/publishLocal
+#
+# SCALINO_REUSE_PUBLISHED=1 (set by ci.yml on a cache hit for ~/.ivy2/local/
+# org.scala-native, keyed on everything that determines these jars) skips the
+# ~8 min sbt build when the jars are already there.
+_IVY_JAVALIB="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT"
+if [[ "${SCALINO_REUSE_PUBLISHED:-}" == 1 && -f "$_IVY_JAVALIB/jars/javalib_native0.5_3.jar" && -f "$_IVY_JAVALIB/srcs/javalib_native0.5_3-sources.jar" ]]; then
+  echo "reusing cached patched javalib from $_IVY_JAVALIB"
+else
+  env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF -u CI sbt javalib3/publishLocal
+fi
 cd - > /dev/null
 
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"

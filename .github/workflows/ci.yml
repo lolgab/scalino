@@ -13,53 +13,68 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The toolchain build is split so the two slowest links run side by side:
+#
+#   core  (00b..06: patched javalib/nativelib, scalino-linkdriver, dist/)
+#     |-- dotc  (03, 03b, 07: scalino-dotc + the scalino CLI) + smoke tests
+#     `-- lsp   (08: scalino-lsp; only needs core's output)
+#           `-- finish (LSP smoke test, needs dist/scalino from dotc)
+#
+# core hands its working state to the other two as an artifact
+# (build/ci-state.sh). release.yml still runs the whole thing as one job.
 jobs:
-  build:
-    name: build (${{ matrix.target }})
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          m='{"target":"linux-x86_64","os":"ubuntu-24.04"},{"target":"linux-arm64","os":"ubuntu-24.04-arm"},{"target":"macos-arm64","os":"macos-14"}'
+          # The Intel Mac runner is by far the slowest (~80 min before the
+          # split), so PRs skip it; pushes to main and manual runs keep it.
+          if [[ "${{ github.event_name }}" != pull_request ]]; then
+            m+=',{"target":"macos-x86_64","os":"macos-15-intel"}'
+          fi
+          # Windows x86_64 CI disabled -- see docs/findings.md.
+          echo "matrix={\"include\":[$m]}" >> "$GITHUB_OUTPUT"
+
+  core:
+    name: core (${{ matrix.target }})
+    needs: plan
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental == true }}
+    env:
+      # JVM heap for the link steps; the rest of RAM is needed by clang/LLVM
+      # and the runner agent (80% on the 16 GB Linux runners got the runner
+      # killed). macOS runners have less RAM and need the full 80%.
+      SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: linux-x86_64
-            os: ubuntu-24.04
-          - target: linux-arm64
-            os: ubuntu-24.04-arm
-          - target: macos-x86_64
-            os: macos-15-intel
-          - target: macos-arm64
-            os: macos-14
-          # Windows x86_64 CI disabled -- see docs/findings.md.
-          # - target: windows-x86_64
-          #   os: windows-latest
-          #   experimental: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-build-deps
 
-      - name: Memory watchdog
-        # Runners killed mid-link report only "received a shutdown signal";
-        # sample memory so the next one shows whether it was memory pressure.
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            # swap as headroom so the runner agent isn't starved/OOM-killed
-            sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile \
-              && sudo mkswap /swapfile && sudo swapon /swapfile || true
-            nohup bash -c 'while sleep 30; do echo "--- $(date -u +%T)"; free -m | sed -n 1,3p; ps -eo rss,comm --sort=-rss | head -4; done' > "$RUNNER_TEMP/mem.log" 2>&1 &
-          fi
+      - uses: ./.github/actions/memory-watchdog
 
-      - name: Build toolchain
+      # The patched javalib/nativelib (01b/01c) take ~8 min to build on macOS
+      # and only change with the scala-native patches, so keep what they
+      # publish to ~/.ivy2/local.
+      - name: Cache patched scala-native libs
+        id: sn-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ivy2/local/org.scala-native
+          key: scalino-sn-published-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('patches/scala-native-*.patch', 'versions.env', 'build/01b-build-patched-javalib.sh', 'build/01c-build-patched-nativelib.sh') }}
+
+      - name: Build toolchain (core)
         shell: bash
         env:
-          # JVM heap for the link steps; the rest of RAM is needed by clang/LLVM
-          # and the runner agent (80% on the 16 GB Linux runners got the runner
-          # killed). macOS runners have less RAM and need the full 80%.
-          SCALINO_LINK_RAM_PERCENT: ${{ runner.os == 'Linux' && '55' || '80' }}
-        run: ./build/all.sh
+          SCALINO_REUSE_PUBLISHED: ${{ steps.sn-cache.outputs.cache-hit == 'true' && '1' || '' }}
+        run: ./build/all.sh core
 
       - name: Memory log
         if: always() && runner.os == 'Linux'
@@ -67,6 +82,119 @@ jobs:
         run: |
           tail -40 "$RUNNER_TEMP/mem.log" || true
           sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -10 || true
+
+      - name: Save build state
+        shell: bash
+        run: ./build/ci-state.sh save "$RUNNER_TEMP/state.tgz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ matrix.target }}
+          path: ${{ runner.temp }}/state.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  lsp:
+    name: lsp (${{ matrix.target }})
+    needs: [plan, core]
+    runs-on: ${{ matrix.os }}
+    env:
+      SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - uses: ./.github/actions/memory-watchdog
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: state-${{ matrix.target }}
+          path: ${{ runner.temp }}
+
+      - name: Restore build state
+        shell: bash
+        run: ./build/ci-state.sh restore "$RUNNER_TEMP/state.tgz"
+
+      - name: Build scalino-lsp
+        shell: bash
+        run: ./build/all.sh lsp
+
+      - name: Memory log
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          tail -40 "$RUNNER_TEMP/mem.log" || true
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -10 || true
+
+      # tar, not a bare path: artifact upload drops the executable bit.
+      - name: Package scalino-lsp
+        shell: bash
+        run: tar -C dist -czf "$RUNNER_TEMP/scalino-lsp.tgz" scalino-lsp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsp-${{ matrix.target }}
+          path: ${{ runner.temp }}/scalino-lsp.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  dotc:
+    name: build (${{ matrix.target }})
+    needs: [plan, core]
+    runs-on: ${{ matrix.os }}
+    env:
+      SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - uses: ./.github/actions/memory-watchdog
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: state-${{ matrix.target }}
+          path: ${{ runner.temp }}
+
+      - name: Restore build state
+        shell: bash
+        run: ./build/ci-state.sh restore "$RUNNER_TEMP/state.tgz"
+
+      - name: Build toolchain (scalino-dotc, scalino)
+        shell: bash
+        run: ./build/all.sh dotc
+
+      - name: Memory log
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          tail -40 "$RUNNER_TEMP/mem.log" || true
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -10 || true
+
+      # Taken before the smoke tests so it is the freshly built dist/. tar,
+      # not a bare path: artifact upload drops the executable bit.
+      - name: Package dist
+        shell: bash
+        run: tar -C dist -czf "$RUNNER_TEMP/dist.tgz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
       - name: Smoke test -- plain program
         shell: bash
@@ -169,3 +297,39 @@ jobs:
             echo "$t: $out"
             [[ "$out" == *"ello"* ]] || { echo "unexpected output from $t binary"; exit 1; }
           done
+
+  # scalino-lsp's smoke test drives it through `dist/scalino setup-ide`, so it
+  # can only run once both the lsp and dotc jobs are done.
+  finish:
+    name: finish (${{ matrix.target }})
+    needs: [plan, dotc, lsp]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ runner.temp }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lsp-${{ matrix.target }}
+          path: ${{ runner.temp }}
+
+      - name: Assemble dist
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C dist -xzf "$RUNNER_TEMP/dist.tgz"
+          tar -C dist -xzf "$RUNNER_TEMP/scalino-lsp.tgz"
+
+      - name: Smoke test -- scalino-lsp
+        shell: bash
+        run: ./build/08b-smoke-lsp.sh
