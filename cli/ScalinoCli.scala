@@ -384,8 +384,9 @@ object ScalinoCli:
       1
 
   def deleteRecursively(p: Path): Unit =
-    if Files.exists(p) then
-      if Files.isDirectory(p) then
+    import java.nio.file.LinkOption.NOFOLLOW_LINKS
+    if Files.exists(p, NOFOLLOW_LINKS) then
+      if Files.isDirectory(p, NOFOLLOW_LINKS) then
         Option(p.toFile.listFiles()).foreach(_.foreach(f => deleteRecursively(f.toPath)))
       Files.delete(p)
 
@@ -3199,7 +3200,9 @@ object ScalinoCli:
   // surface is small/stable enough not to need one) covering subcommand
   // names, every long/short option `parseRunOpts`/`main` actually accept,
   // and the handful of options with a closed value set (`--color`,
-  // `--native-mode`, `--native-gc`, `--native-lto`, `--native-target`).
+  // `--native-mode`, `--native-gc`, `--native-lto`, `--native-target`,
+  // `--native-target-triple` -- completed from `Sysroot.Supported`, the same
+  // list `scalino sysroot build` accepts) plus `sysroot`'s own sub-arguments.
   // Same convention as cargo/rustup/scala-cli's own `completions` command:
   // prints the script to stdout, for the user to source or install
   // themselves (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
@@ -3209,11 +3212,14 @@ object ScalinoCli:
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
+  private val completionSysrootActions = "build list path"
+  private def completionTriples: String = Sysroot.Supported.mkString(" ")
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-prune --native-target --embed-resources --native-multithreading " +
-    "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-optimize -h --help"
+    "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-optimize " +
+    "--formats --package-name --package-version -h --help"
 
   private def bashCompletion: String =
     s"""_scalino() {
@@ -3226,15 +3232,28 @@ object ScalinoCli:
        |  case "$$prev" in
        |    --color) COMPREPLY=($$(compgen -W "always auto never" -- "$$cur")); return ;;
        |    --native-mode) COMPREPLY=($$(compgen -W "debug release-fast release-size release-full" -- "$$cur")); return ;;
+       |  if [[ "$${COMP_WORDS[1]}" == sysroot ]]; then
+       |    case $$COMP_CWORD in
+       |      2) COMPREPLY=($$(compgen -W "$completionSysrootActions" -- "$$cur")); return ;;
+       |      *)
+       |        case "$${COMP_WORDS[2]}" in
+       |          build) COMPREPLY=($$(compgen -W "$completionTriples --force" -- "$$cur")); return ;;
+       |          path) COMPREPLY=($$(compgen -W "$completionTriples" -- "$$cur")); return ;;
+       |        esac
+       |        return ;;
+       |    esac
+       |  fi
+       |
        |    --native-gc) COMPREPLY=($$(compgen -W "immix commix boehm none" -- "$$cur")); return ;;
        |    --native-lto) COMPREPLY=($$(compgen -W "none thin full" -- "$$cur")); return ;;
        |    --native-target) COMPREPLY=($$(compgen -W "app static dynamic" -- "$$cur")); return ;;
-       |    --format) COMPREPLY=($$(compgen -W "binary tar deb rpm docker brew" -- "$$cur")); return ;;
-       |    --pkg-name|--pkg-version|--release-url) return ;;
+       |    --native-target-triple) COMPREPLY=($$(compgen -W "$completionTriples" -- "$$cur")); return ;;
+       |    --format|--formats) COMPREPLY=($$(compgen -W "binary tar deb rpm docker brew" -- "$$cur")); return ;;
+       |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-target-triple|--native-sysroot|--native-clang|--native-clangpp|--native-linking| \\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking| \\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      COMPREPLY=($$(compgen -f -- "$$cur")); return ;;
        |  esac
@@ -3263,15 +3282,28 @@ object ScalinoCli:
        |  case "$${words[CURRENT-1]}" in
        |    --color) _values 'color' always auto never; return ;;
        |    --native-mode) _values 'mode' debug release-fast release-size release-full; return ;;
+       |  if [[ "$${words[2]}" == sysroot ]]; then
+       |    case $$CURRENT in
+       |      3) _values 'action' $completionSysrootActions; return ;;
+       |      *)
+       |        case "$${words[3]}" in
+       |          build) _values 'target triple' $completionTriples --force; return ;;
+       |          path) _values 'target triple' $completionTriples; return ;;
+       |        esac
+       |        return ;;
+       |    esac
+       |  fi
+       |
        |    --native-gc) _values 'gc' immix commix boehm none; return ;;
        |    --native-lto) _values 'lto' none thin full; return ;;
        |    --native-target) _values 'target' app static dynamic; return ;;
-       |    --format) _values 'format' binary tar deb rpm docker brew; return ;;
-       |    --pkg-name|--pkg-version|--release-url) return ;;
+       |    --native-target-triple) _values 'target triple' $completionTriples; return ;;
+       |    --format|--formats) _values 'format' binary tar deb rpm docker brew; return ;;
+       |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
        |    completions) _values 'shell' bash zsh fish; return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-target-triple|--native-sysroot|--native-clang|--native-clangpp|--native-linking|\\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking|\\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      _files; return ;;
        |  esac
@@ -3311,10 +3343,17 @@ object ScalinoCli:
        |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l pkg-name -x
        |complete -c scalino -l pkg-version -x
+       |complete -c scalino -l native-target-triple -x -a "$completionTriples"
        |complete -c scalino -l release-url -x
+       |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -n '__fish_seen_subcommand_from completions' -f -a "bash zsh fish"
        |""".stripMargin
+       |complete -c scalino -l package-name -x
+       |complete -c scalino -l package-version -x
 
+       |complete -c scalino -n '__fish_seen_subcommand_from sysroot; and not __fish_seen_subcommand_from $completionSysrootActions' -f -a "$completionSysrootActions"
+       |complete -c scalino -n '__fish_seen_subcommand_from sysroot; and __fish_seen_subcommand_from build path' -f -a "$completionTriples"
+       |complete -c scalino -n '__fish_seen_subcommand_from sysroot; and __fish_seen_subcommand_from build' -l force
   def handleCompletions(args: Array[String]): Unit =
     if args.length != 1 then die("completions: expected exactly one shell argument: bash, zsh, or fish")
     args(0) match
