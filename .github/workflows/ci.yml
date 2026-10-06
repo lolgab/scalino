@@ -93,6 +93,20 @@ jobs:
         shell: bash
         run: ./dist/scalino run examples/interpreter-regressions/Test.scala examples/interpreter-regressions/Foo.scala
 
+      - name: Smoke test -- stack-allocated objects (escape analysis)
+        # Every release mode stack-allocates objects the escape analysis
+        # proves non-escaping. SCALANATIVE_STACK_POISON overwrites a frame's
+        # stack objects when it is left, so a wrong analysis crashes
+        # deterministically instead of reading dead-but-intact stack memory.
+        shell: bash
+        run: |
+          for mode in release-fast release-full; do
+            ./dist/scalino clean   # earlier steps leave other entry points in .scalino-build
+            out="$(SCALANATIVE_STACK_POISON=1 ./dist/scalino run examples/escape-analysis/Main.scala --main-class Main --native-mode "$mode")"
+            echo "$mode: $out"
+            [[ "$out" == *"sum=1412"* ]] || { echo "unexpected output"; exit 1; }
+          done
+
       - name: Smoke test -- dist/ is relocatable (flat, like a release tarball)
         shell: bash
         run: |

@@ -1,0 +1,94 @@
+diff --git a/ImmixGC.c b/ImmixGC.c
+index 732174f..11b69a7 100644
+--- a/ImmixGC.c
++++ b/ImmixGC.c
+@@ -21,7 +21,64 @@
+ #include "nativeThreadTLS.h"
+ #include <assert.h>
+ 
+-void scalanative_afterexit() { Stats_OnExit(heap.stats); }
++
++/* ---- alloc profiler (dev only) ---- */
++#define AP_CAP 131072
++typedef struct { Rtti *info; unsigned long count; unsigned long bytes; } APSlot;
++static APSlot apTable[AP_CAP];
++static int apChecked = 0;
++static const char *apPath = NULL;
++static inline void AP_Record(Rtti *info, size_t size) {
++    if (!apChecked) { apPath = getenv("SCALINO_ALLOC_PROFILE_FILE"); apChecked = 1; }
++    if (apPath == NULL) return;
++    size_t idx = (((size_t)info) >> 4) % AP_CAP;
++    for (int p = 0; p < AP_CAP; p++) {
++        APSlot *s = &apTable[idx];
++        Rtti *cur = __atomic_load_n(&s->info, __ATOMIC_RELAXED);
++        if (cur == NULL) {
++            Rtti *exp = NULL;
++            if (__atomic_compare_exchange_n(&s->info, &exp, info, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) cur = info; else cur = exp;
++        }
++        if (cur == info) {
++            __atomic_fetch_add(&s->count, 1, __ATOMIC_RELAXED);
++            __atomic_fetch_add(&s->bytes, size, __ATOMIC_RELAXED);
++            return;
++        }
++        idx = (idx + 1) % AP_CAP;
++    }
++}
++#define SITE_CAP (1<<21)
++static unsigned long siteCounts[SITE_CAP];
++void scalino_site_hit(int id) { __atomic_fetch_add(&siteCounts[id], 1, __ATOMIC_RELAXED); }
++static void Site_Dump(void) {
++    const char *p = getenv("SCALINO_SITE_FILE");
++    if (!p) return;
++    FILE *f = fopen(p, "w");
++    if (!f) return;
++    for (int i = 0; i < SITE_CAP; i++) if (siteCounts[i]) fprintf(f, "%d %lu\n", i, siteCounts[i]);
++    fclose(f);
++}
++static int AP_Cmp(const void *a, const void *b) {
++    unsigned long x = ((const APSlot *)a)->count, y = ((const APSlot *)b)->count;
++    return x > y ? -1 : x < y ? 1 : 0;
++}
++static void AP_Dump(void) {
++    if (apPath == NULL) return;
++    FILE *f = fopen(apPath, "w");
++    if (!f) return;
++    qsort(apTable, AP_CAP, sizeof(APSlot), AP_Cmp);
++    unsigned long tc = 0, tb = 0;
++    for (int i = 0; i < AP_CAP; i++) { tc += apTable[i].count; tb += apTable[i].bytes; }
++    fprintf(f, "TOTAL %lu %lu\n", tc, tb);
++    for (int i = 0; i < AP_CAP && apTable[i].info != NULL && i < 400; i++) {
++        CharArray *chars = apTable[i].info->rt.name->value;
++        fprintf(f, "%lu %lu ", apTable[i].count, apTable[i].bytes);
++        for (int j = 0; j < chars->header.length; j++) fputc((int)chars->values[j] & 0x7f, f);
++        fputc('\n', f);
++    }
++    fclose(f);
++}
++void scalanative_afterexit() { Stats_OnExit(heap.stats); AP_Dump(); Site_Dump(); }
+ 
+ NOINLINE void scalanative_GC_init() {
+     volatile word_t dummy = 0;
+@@ -42,6 +99,7 @@ NOINLINE void scalanative_GC_init() {
+ 
+ INLINE void *scalanative_GC_alloc(Rtti *info, size_t size) {
+     size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
++    AP_Record(info, size);
+ 
+     assert(size % ALLOCATION_ALIGNMENT == 0);
+ 
+@@ -57,6 +115,7 @@ INLINE void *scalanative_GC_alloc(Rtti *info, size_t size) {
+ 
+ INLINE void *scalanative_GC_alloc_small(Rtti *info, size_t size) {
+     size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
++    AP_Record(info, size);
+ 
+     Object *alloc = (Object *)Allocator_Alloc(&heap, size);
+     Object_SetRtti(alloc, info);
+@@ -65,6 +124,7 @@ INLINE void *scalanative_GC_alloc_small(Rtti *info, size_t size) {
+ 
+ INLINE void *scalanative_GC_alloc_large(Rtti *info, size_t size) {
+     size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
++    AP_Record(info, size);
+ 
+     Object *alloc = (Object *)LargeAllocator_Alloc(&heap, size);
+     Object_SetRtti(alloc, info);

@@ -1,0 +1,1186 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+index 3ba92ad..e6dfeb4 100644
+--- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
++++ b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+@@ -69,12 +69,15 @@ private[scalanative] object ScalaNative {
+                 config.logger.time("Escape analysis report") {
+                   interflow.EscapeAnalysis.report(config, analysis, defns)
+                 }
++              if (interflow.Inline.stats) interflow.Inline.dumpStats(m => config.logger.info(m))
++              if (sys.env.contains("SCALANATIVE_ESCAPE_EXIT")) sys.exit(0)
+               val finalDefns =
+                 if (stackObjectsEnabled(config))
+                   config.logger.time("Analyzing object escapes") {
+                     interflow.EscapeAnalysis.transform(config, analysis, defns)
+                   }
+                 else defns
++              if (sys.env.contains("SCALANATIVE_STACK_EXIT")) sys.exit(0)
+               Link(config, analysis.entries, finalDefns)
+             }
+         }
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+index 1e23d6c..12c709d 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -205,6 +205,7 @@ private[scalanative] object Lower {
+       )
+ 
+       stackObjectSlots.clear()
++      stackObjectBytes.clear()
+       insts.foreach {
+         case inst @ nir.Inst.Let(n, nir.Op.Var(ty), unwind) =>
+           buf.let(n, nir.Op.Stackalloc(ty, one), unwind)(inst.pos, inst.scopeId)
+@@ -213,11 +214,13 @@ private[scalanative] object Lower {
+           val slot = fresh()
+           buf.let(slot, nir.Op.Stackalloc(nir.Type.Long, nir.Val.Int(words.toInt)), nir.Next.None)(inst.pos, inst.scopeId)
+           stackObjectSlots(n.id) = slot
++          stackObjectBytes(n.id) = words * 8L
+         case inst @ nir.Inst.Let(n, op @ nir.Op.Arrayalloc(_, _, Some(nir.Val.Null)), unwind) =>
+           val (_, _, _, total) = stackArrayInfo(op)
+           val slot = fresh()
+           buf.let(slot, nir.Op.Stackalloc(nir.Type.Long, nir.Val.Int(((total + 7) / 8).toInt)), nir.Next.None)(inst.pos, inst.scopeId)
+           stackObjectSlots(n.id) = slot
++          stackObjectBytes(n.id) = ((total + 7) / 8) * 8L
+         case _ => ()
+       }
+ 
+@@ -276,6 +279,7 @@ private[scalanative] object Lower {
+           val retVal =
+             if (v.ty == nir.Type.Unit) optionallyBoxedUnit(v)
+             else genVal(buf, v)
++          genPoisonStackObjects(buf)
+           buf += nir.Inst.Ret(retVal)
+ 
+         case inst @ nir.Inst.Jump(next) =>
+@@ -543,6 +547,7 @@ private[scalanative] object Lower {
+           // Jump to the label and skip unwinding
+           buf.jump(toLabel.id, Seq(exc))
+         case _ =>
++          genPoisonStackObjects(buf)
+           // Invoke scalanative_throw and let exception handling find the handler
+           genOp(buf, fresh(), nir.Op.Call(throwSig, throw_, Seq(exc)))
+           buf.unreachable(nir.Next.None)
+@@ -1668,6 +1673,31 @@ private[scalanative] object Lower {
+     }
+ 
+     private val stackObjectSlots = mutable.LongMap.empty[nir.Local]
++    private val stackObjectBytes = mutable.LongMap.empty[Long]
++
++    /** Debugging aid (SCALANATIVE_STACK_POISON=1 at link time): overwrite
++     *  the stack objects of a frame as it is left, so a (wrongly) surviving
++     *  reference to one faults instead of silently reading dead memory that
++     *  merely has not been reused yet.
++     */
++    private val poisonStackObjects = sys.env.contains("SCALANATIVE_STACK_POISON")
++    private def genPoisonStackObjects(buf: nir.InstructionBuilder)(implicit
++        pos: nir.SourcePosition
++    ): Unit =
++      if (poisonStackObjects)
++        stackObjectSlots.foreach {
++          case (id, slot) =>
++            buf.call(
++              memsetSig,
++              memset,
++              Seq(
++                nir.Val.Local(slot, nir.Type.Ptr),
++                nir.Val.Int(0xa5),
++                nir.Val.Size(stackObjectBytes(id))
++              ),
++              nir.Next.None
++            )(pos, nir.ScopeId.TopLevel)
++        }
+ 
+     /** (array class, element type, length, total size in bytes) of a stack array */
+     private def stackArrayInfo(op: nir.Op.Arrayalloc): (Class, nir.Type, Int, Long) = {
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
+index f5ff3d6..6e075d8 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
+@@ -35,6 +35,11 @@ private[scalanative] object EscapeAnalysis {
+   private final val FromRef = 128
+   // ... and a tracked value is loaded/stored through a raw pointer
+   private final val RawAccessed = 256 // members may be something other than a param
++  // everything reachable through the fields of members (but not the members
++  // themselves) may be stored into global memory
++  private final val ContentsGlobal = 512
++  // members are the receiver of a virtual call
++  private final val Recv = 1024
+ 
+   /** Per-parameter facts, joined over all possible targets of a call. */
+   /** libc functions that never retain pointers passed to them. */
+@@ -44,7 +49,16 @@ private[scalanative] object EscapeAnalysis {
+   )
+ 
+   final class Summary(
++      // the parameter itself (and so everything reachable from it) may be
++      // stored into global memory / captured
+       val escapes: Array[Boolean],
++      // objects reachable through the parameter's fields may be, but the
++      // parameter object itself is not
++      val escDeep: Array[Boolean],
++      // the parameter is the receiver of a virtual call (directly, or by
++      // being passed on to a callee that does), so knowing its exact class
++      // lets the call be resolved
++      val recv: Array[Boolean],
+       val retSelf: Array[Boolean],
+       val retDeep: Array[Boolean],
+       val retFresh: Boolean,
+@@ -52,13 +66,23 @@ private[scalanative] object EscapeAnalysis {
+       val group: Array[Int]
+   )
+ 
++  /** A function analyzed under assumptions about its arguments: `hints` maps
++   *  a parameter index to the exact class the argument is known to have (the
++   *  caller passes a freshly allocated object), which lets the callee resolve
++   *  virtual calls on it precisely instead of assuming an unknown receiver.
++   */
++  final case class Key(name: nir.Global.Member, hints: List[(Int, nir.Global.Top)])
++
+   final case class Candidate(
+       kind: String,
+       escapes: Boolean,
+       inLoop: Boolean,
+       reason: String,
+       id: Long = -1L,
+-      isClass: Boolean = false
++      isClass: Boolean = false,
++      fn: String = "",
++      viaCallee: Key = null,
++      viaIdx: Int = -1
+   )
+ 
+   final class Result(
+@@ -86,7 +110,8 @@ private[scalanative] object EscapeAnalysis {
+       defns: Seq[nir.Defn]
+   ): Seq[nir.Defn] = {
+     implicit val a: ReachabilityAnalysis.Result = analysis
+-    val ea = new EscapeAnalysis(analysis, defns)
++    val siteTable = sys.env.get("SCALANATIVE_SITE_PROFILE")
++    val ea = new EscapeAnalysis(analysis, defns, recordReasons = siteTable.isDefined)
+     ea.runAll()
+     var converted = 0
+     // debugging aids: restrict which classes get stack allocated
+@@ -95,13 +120,27 @@ private[scalanative] object EscapeAnalysis {
+     def allowed(kind: String): Boolean =
+       include.forall(_.findFirstIn(kind).isDefined) &&
+         exclude.forall(_.findFirstIn(kind).isEmpty)
++    // bisecting aid: SCALANATIVE_STACK_HASH=lo:hi:mod keeps only the sites
++    // whose (function, site) hash falls in [lo, hi) modulo mod
++    val hashRange: Option[(Int, Int, Int)] = sys.env.get("SCALANATIVE_STACK_HASH").flatMap { v =>
++      v.split(":") match {
++        case Array(a, b, c) => Some((a.toInt, b.toInt, c.toInt))
++        case _              => None
++      }
++    }
++    def inHashRange(fn: String, id: Long): Boolean =
++      hashRange.forall {
++        case (lo, hi, mod) =>
++          val h = ((scala.util.hashing.MurmurHash3.stringHash(fn + "#" + id) % mod) + mod) % mod
++          h >= lo && h < hi
++      }
+     val out = defns.map {
+       case d: nir.Defn.Define =>
+         val sites = mutable.LongMap.empty[Boolean]
+         val arraySites = mutable.LongMap.empty[Boolean]
+         var budget = MaxStackBytesPerFunction
+         ea.resultOf(d.name).candidates.foreach { c =>
+-          if (c.isClass && !c.escapes && !c.inLoop && allowed(c.kind) &&
++          if (c.isClass && !c.escapes && !c.inLoop && allowed(c.kind) && inHashRange(d.name.show, c.id) &&
+               !StackExcludedNames.contains(c.kind) &&
+               !StackExcludedPrefixes.exists(c.kind.startsWith)) {
+             val name = nir.Global.Top(c.kind)
+@@ -114,7 +153,7 @@ private[scalanative] object EscapeAnalysis {
+                   budget -= bytes
+                   sites(c.id) = true
+                   if (sys.env.contains("SCALANATIVE_STACK_VERBOSE"))
+-                    config.logger.info(s"[escape-site] ${c.kind} in ${d.name.show}")
++                    config.logger.info(s"[escape-site] ${c.kind} in ${d.name.show} #${c.id}")
+                 }
+               case _ => ()
+             }
+@@ -124,7 +163,7 @@ private[scalanative] object EscapeAnalysis {
+         d.insts.foreach {
+           case nir.Inst.Let(n, nir.Op.Arrayalloc(ty, init, None), _)
+               if ea.resultOf(d.name).candidates.exists(c => c.id == n.id && !c.escapes && !c.inLoop) &&
+-                allowed("array:" + ty.show) && ty != nir.Type.Byte =>
++                allowed("array:" + ty.show) && inHashRange(d.name.show, n.id) && ty != nir.Type.Byte =>
+             val len = init match {
+               case nir.Val.Int(l)            => l
+               case nir.Val.ArrayValue(_, vs) => vs.length
+@@ -135,7 +174,7 @@ private[scalanative] object EscapeAnalysis {
+               budget -= bytes
+               arraySites(n.id) = true
+               if (sys.env.contains("SCALANATIVE_STACK_VERBOSE"))
+-                config.logger.info(s"[escape-site] array:${ty.show} len=$len in ${d.name.show}")
++                config.logger.info(s"[escape-site] array:${ty.show} len=$len in ${d.name.show} #${n.id}")
+             }
+           case _ => ()
+         }
+@@ -160,7 +199,55 @@ private[scalanative] object EscapeAnalysis {
+       case d => d
+     }
+     config.logger.info(s"Allocated $converted objects on the stack")
+-    out
++    siteTable.fold(out)(path => instrumentSites(path, ea, out))
++  }
++
++  /** Profiling aid: counts executions of every allocation site candidate.
++   *  Writes a site table to `path` and calls the extern `scalino_site_hit(id)`
++   *  (provided by a profiling build of the GC) before each site.
++   */
++  private def instrumentSites(
++      path: String,
++      ea: EscapeAnalysis,
++      defns: Seq[nir.Defn]
++  ): Seq[nir.Defn] = {
++    val hit = nir.Global.Member(nir.Global.Top("scala.scalanative.runtime.GC$"), nir.Sig.Extern("scalino_site_hit"))
++    val hitTy = nir.Type.Function(Seq(nir.Type.Int), nir.Type.Unit)
++    var nextId = 0
++    val table = new java.io.PrintWriter(path)
++    val out = defns.map {
++      case d: nir.Defn.Define =>
++        val cands = ea.resultOf(d.name).candidates.map(c => c.id -> c).toMap
++        val fresh = nir.Fresh(d.insts)
++        val insts = Seq.newBuilder[nir.Inst]
++        d.insts.foreach {
++          case inst @ nir.Inst.Let(n, op, _)
++              if cands.contains(n.id) &&
++                (op.isInstanceOf[nir.Op.Classalloc] || op.isInstanceOf[nir.Op.Arrayalloc] || op.isInstanceOf[nir.Op.Box]) =>
++            val c = cands(n.id)
++            val stack = op match {
++              case nir.Op.Classalloc(_, Some(nir.Val.Null))    => true
++              case nir.Op.Arrayalloc(_, _, Some(nir.Val.Null)) => true
++              case _                                           => false
++            }
++            val id = nextId
++            nextId += 1
++            table.println(
++              s"$id\t${c.kind}\t${c.escapes}\t${c.inLoop}\t$stack\t${c.reason}\t${d.name.show}"
++            )
++            insts += nir.Inst.Let(
++              fresh(),
++              nir.Op.Call(hitTy, nir.Val.Global(hit, nir.Type.Ptr), Seq(nir.Val.Int(id))),
++              nir.Next.None
++            )(d.pos, nir.ScopeId.TopLevel)
++            insts += inst
++          case inst => insts += inst
++        }
++        d.copy(insts = insts.result())(d.pos)
++      case other => other
++    }
++    table.close()
++    out :+ nir.Defn.Declare(nir.Attrs.None.withIsExtern(true), hit, hitTy)(nir.SourcePosition.NoPosition)
+   }
+ 
+   def report(
+@@ -196,16 +283,66 @@ private[scalanative] object EscapeAnalysis {
+       .sortBy(-_._2).take(60).foreach {
+         case (k, n) => log.info(s"[escape]   reason $n $k")
+       }
++    def shortM(m: nir.Global.Member): String =
++      m.owner.id.split('.').last + "." + (m.sig.unmangled match {
++        case nir.Sig.Method(id, _, _) => id
++        case other                    => other.show.take(30)
++      })
++    def short(k: Key): String =
++      shortM(k.name) + (if (k.hints.isEmpty) "" else k.hints.map { case (i, c) => s"$i=${c.id.split('.').last}" }.mkString("{", ",", "}"))
++    val explainVisited = mutable.HashSet.empty[(Key, Int)]
++    val explainLeaves = mutable.LinkedHashSet.empty[String]
++    def explain(name: Key, idx: Int, depth: Int, path: List[String]): Unit =
++      if (explainVisited.add((name, idx))) {
++        ea.why(name, idx).foreach {
++          case (reason, callee, ci) =>
++            if (callee == null)
++              explainLeaves += (path.reverse.mkString(" > ") + " :: " + reason.take(200))
++            else if (depth > 0) explain(callee, ci, depth - 1, short(callee) + "#" + ci :: path)
++        }
++      }
+     sys.env.get("SCALANATIVE_ESCAPE_KIND_REASONS").foreach { kinds =>
+       kinds.split(";").filter(_.nonEmpty).foreach { k =>
+         val cs = all.filter(c => c.kind == k)
+         log.info(s"[escape-kind] $k sites=${cs.size} eligible=${cs.count(!_.escapes)}")
+-        cs.filter(_.escapes).groupBy(_.reason).toSeq.map { case (r, v) => (r, v.size) }
+-          .sortBy(-_._2).take(8).foreach {
+-            case (r, n) => log.info(s"[escape-kind]    $n ${r.take(200)}")
++        cs.filter(_.escapes).groupBy(_.reason).toSeq
++          .sortBy(-_._2.size).take(10).foreach {
++            case (r, v) =>
++              log.info(s"[escape-kind]    ${v.size} ${r.take(160)}")
++              v.take(2).foreach(c => log.info(s"[escape-kind]         e.g. ${c.fn.take(150)}"))
++              v.find(_.viaCallee != null).foreach { c =>
++                explainVisited.clear(); explainLeaves.clear()
++                explain(c.viaCallee, c.viaIdx, 8, List(short(c.viaCallee) + "#" + c.viaIdx))
++                explainLeaves.take(4).foreach(l => log.info("[escape-kind]         why: " + l.take(400)))
++              }
+           }
+       }
+     }
++    sys.env.get("SCALANATIVE_ESCAPE_WHY").foreach { pats =>
++      val ps = pats.split(",").filter(_.nonEmpty)
++      ea.defines.keysIterator.filter(n => ps.exists(p => n.show.contains(p))).toList.foreach { n =>
++        (0 until ea.paramCount(n)).foreach { i =>
++          if (ea.summaryOf(n).exists(s => s.escapes(i) || s.escDeep(i))) {
++            explainVisited.clear(); explainLeaves.clear()
++            explain(Key(n, Nil), i, 8, List(shortM(n) + "#" + i))
++            log.info(s"[escape-why] ${shortM(n)} param#$i escapes (${explainLeaves.size} leaf reasons):")
++            explainLeaves.take(6).foreach(l => log.info("[escape-why]    " + l))
++          }
++        }
++      }
++    }
++    List[(String, String => Boolean)](
++      ("lambdas", k => k.contains("$Lambda$")),
++      ("anon/iterators", k => k.contains("$$anon$") || k.contains("Iterator")),
++      ("boxes", k => k.startsWith("box:")),
++      ("arrays", k => k.startsWith("array:")),
++      ("option/tuple", k => k == "scala.Some" || k.startsWith("scala.Tuple")),
++      ("cons", k => k.endsWith("$colon$colon"))
++    ).foreach {
++      case (n, f) =>
++        val cs = all.filter(c => f(c.kind))
++        log.info(s"[escape-group] $n sites=${cs.size} eligible=${cs.count(c => !c.escapes && !c.inLoop)}")
++    }
+     top("stack-eligible", noEscNoLoop.toSeq)
+     top("escaping", all.filter(_.escapes).toSeq)
+   }
+@@ -230,12 +367,35 @@ private[scalanative] class EscapeAnalysis(
+ 
+   def resultOf(n: nir.Global.Member): Result = results(n)
+ 
++  /** Experiment knobs (unsound, for measuring what a precision gain would
++   *  be worth): SCALANATIVE_EA_X=monitor,matcherror,throwcap
++   */
++  private val exps: Set[String] =
++    sys.env.get("SCALANATIVE_EA_X").map(_.split(",").toSet).getOrElse(Set.empty)
++  private lazy val throwableCls: Option[Class] =
++    ClassRef.unapply(nir.Global.Top("java.lang.Throwable"))
++  private val throwableOwner = mutable.HashMap.empty[String, Boolean]
++  private def isThrowableOwner(owner: nir.Global.Top): Boolean =
++    throwableOwner.getOrElseUpdate(
++      owner.id,
++      ClassRef.unapply(owner).exists(c => throwableCls.exists(t => c.is(t)))
++    )
++  private def isMonitorOp(name: nir.Global.Member): Boolean =
++    name.owner.id == "scala.scalanative.runtime.package$" &&
++      (name.sig.unmangled match {
++        case nir.Sig.Method(id, _, _) => id == "enterMonitor" || id == "exitMonitor"
++        case _                        => false
++      })
++
+   private val results = mutable.HashMap.empty[nir.Global.Member, Result]
+-  private val summaries = mutable.HashMap.empty[nir.Global.Member, Summary]
+-  private val inProgress = mutable.HashSet.empty[nir.Global.Member]
++  private val summaries = mutable.HashMap.empty[Key, Summary]
++  private val inProgress = mutable.HashSet.empty[Key]
++  private val analyzed = mutable.HashSet.empty[Key]
+ 
+   private def unknownSummary(n: Int): Summary =
+     new Summary(
++      Array.fill(n)(true),
++      Array.fill(n)(true),
+       Array.fill(n)(true),
+       Array.fill(n)(false),
+       Array.fill(n)(false),
+@@ -245,6 +405,8 @@ private[scalanative] class EscapeAnalysis(
+ 
+   private def bottomSummary(n: Int): Summary =
+     new Summary(
++      Array.fill(n)(false),
++      Array.fill(n)(false),
+       Array.fill(n)(false),
+       Array.fill(n)(false),
+       Array.fill(n)(false),
+@@ -254,6 +416,8 @@ private[scalanative] class EscapeAnalysis(
+ 
+   private def sameSummary(a: Summary, b: Summary): Boolean =
+     java.util.Arrays.equals(a.escapes, b.escapes) &&
++      java.util.Arrays.equals(a.escDeep, b.escDeep) &&
++      java.util.Arrays.equals(a.recv, b.recv) &&
+       java.util.Arrays.equals(a.retSelf, b.retSelf) &&
+       java.util.Arrays.equals(a.retDeep, b.retDeep) &&
+       a.retFresh == b.retFresh &&
+@@ -263,45 +427,116 @@ private[scalanative] class EscapeAnalysis(
+   private def fieldKey(n: nir.Global): Int =
+     fieldKeys.getOrElseUpdate(n, fieldKeys.size + 1)
+ 
+-  private val callersOf =
+-    mutable.HashMap.empty[nir.Global.Member, mutable.Set[nir.Global.Member]]
+-  private val queue = mutable.Queue.empty[nir.Global.Member]
+-  private val queued = mutable.HashSet.empty[nir.Global.Member]
+-  private var currentCaller: nir.Global.Member = null
++  private val callersOf = mutable.HashMap.empty[Key, mutable.Set[Key]]
++  private val queue = mutable.Queue.empty[Key]
++  private val queued = mutable.HashSet.empty[Key]
++  private var currentCaller: Key = null
++
++  private val specEnabled = !exps.contains("nospec")
++  // mutation testing aid: re-introduces a fixed soundness bug (see summarize)
++  private val mutateDeepFix = exps.contains("mutate-deepfix")
++  private val MaxSpecs = 150000
++  private val MaxSpecSize = 2500
++  private var specCount = 0
++  private var tSmash, tFinal, tLoops, tCands, tSummarize, tExclusive = 0L
++  private var nestedNanos = 0L
++
++  private def baseKey(n: nir.Global.Member): Key = Key(n, Nil)
++
++  def summaryOf(name: nir.Global.Member): Option[Summary] =
++    summaryOf(baseKey(name))
+ 
+   /** Current summary of callee; analyzes it on demand. Callees in progress
+    *  (recursion) are optimistic (bottom) until the fixpoint pass fixes them.
+    */
+-  def summaryOf(name: nir.Global.Member): Option[Summary] =
+-    defines.get(name).map { d =>
+-      if (currentCaller != null)
+-        callersOf.getOrElseUpdate(name, mutable.Set.empty) += currentCaller
+-      // Past MaxDepth, don't recurse (a long call chain overflows the thread's
+-      // stack): answer optimistically (bottom) and let runAll's first pass
+-      // analyze the callee later -- its publish re-queues this caller via
+-      // callersOf, exactly like a recursion cycle.
+-      if (!results.contains(name) && !inProgress.contains(name) && depth < MaxDepth) analyze(d)
+-      summaries.getOrElse(name, bottomSummary(d.ty.args.size))
++  def summaryOf(key: Key): Option[Summary] =
++    defines.get(key.name).map { d =>
++      if (exps.contains("monitor") && isMonitorOp(key.name)) bottomSummary(d.ty.args.size)
++      else {
++        // Past MaxDepth, don't recurse (a long call chain overflows the thread's
++        // stack): answer optimistically (bottom) and let the worklist analyze
++        // the callee later -- its publish re-queues this caller via callersOf,
++        // exactly like a recursion cycle.
++        if (!analyzed.contains(key) && !inProgress.contains(key)) {
++          if (depth < MaxDepth) analyze(key, d)
++          else if (queued.add(key)) queue.enqueue(key)
++        }
++        // Register the caller only now: analyzing the callee just above
++        // publishes its summary, which would otherwise needlessly re-queue
++        // the caller that is about to use it.
++        if (currentCaller != null)
++          callersOf.getOrElseUpdate(key, mutable.Set.empty) += currentCaller
++        summaries.getOrElse(key, bottomSummary(d.ty.args.size))
++      }
++    }
++
++  /** The key to use for a call of `name` whose arguments have the exact
++   *  classes `hints`: a specialized one if that can matter (some hinted
++   *  parameter escapes in the base summary), else the base one.
++   */
++  private def specKeyFor(
++      name: nir.Global.Member,
++      hints: List[(Int, nir.Global.Top)]
++  ): Key = {
++    val base = baseKey(name)
++    val b = summaryOf(base).get
++    if (hints.isEmpty || !specEnabled) base
++    else {
++      val useful = hints
++        .filter { case (i, _) => i < b.escapes.length && b.recv(i) && (b.escapes(i) || b.escDeep(i)) }
++        .take(4)
++      if (useful.isEmpty || defines(name).insts.size > MaxSpecSize) base
++      else {
++        val key = Key(name, useful)
++        if (analyzed.contains(key) || inProgress.contains(key)) key
++        else if (specCount < MaxSpecs) { specCount += 1; key }
++        else base
++      }
+     }
++  }
++
++  private var whyTarget: Key = null
++  private var whyResult: Map[Int, Seq[(String, Key, Int)]] = Map.empty
++
++  /** Why does parameter `idx` of `key` escape? (debugging aid, needs
++   *  `recordReasons`; re-analyzes it once with explanation capture on).
++   */
++  def why(key: Key, idx: Int): Seq[(String, Key, Int)] = {
++    whyTarget = key
++    whyResult = Map.empty
++    try defines.get(key.name).foreach(d => analyze(key, d))
++    finally whyTarget = null
++    whyResult.getOrElse(idx, Nil)
++  }
++
++  def paramCount(name: nir.Global.Member): Int =
++    defines.get(name).map(_.ty.args.size).getOrElse(0)
+ 
+   private val MaxDepth = 64
+   private var depth = 0
+   private var analyses = 0
+-  private val changeCount = mutable.HashMap.empty[nir.Global.Member, Int]
+-  def analyze(defn: nir.Defn.Define): Result = {
++  private val changeCount = mutable.HashMap.empty[Key, Int]
++  def analyze(key: Key, defn: nir.Defn.Define): Result = {
+     analyses += 1
+     val saved = currentCaller
+-    currentCaller = defn.name
+-    inProgress += defn.name
++    currentCaller = key
++    inProgress += key
+     depth += 1
++    val t0 = System.nanoTime()
++    val savedNested = nestedNanos
++    nestedNanos = 0L
+     val r =
+-      try new FunctionAnalysis(defn).run()
++      try new FunctionAnalysis(defn, key).run()
+       finally {
+         depth -= 1
+-        inProgress -= defn.name
++        inProgress -= key
+         currentCaller = saved
++        val total = System.nanoTime() - t0
++        tExclusive += total - nestedNanos
++        nestedNanos = savedNested + total
+       }
+-    results(defn.name) = r
++    analyzed += key
++    if (key.hints.isEmpty) results(defn.name) = r
+     r
+   }
+ 
+@@ -319,6 +554,8 @@ private[scalanative] class EscapeAnalysis(
+     }
+     new Summary(
+       Array.tabulate(n)(i => a.escapes(i) || b.escapes(i)),
++      Array.tabulate(n)(i => a.escDeep(i) || b.escDeep(i)),
++      Array.tabulate(n)(i => a.recv(i) || b.recv(i)),
+       Array.tabulate(n)(i => a.retSelf(i) || b.retSelf(i)),
+       Array.tabulate(n)(i => a.retDeep(i) || b.retDeep(i)),
+       a.retFresh || b.retFresh,
+@@ -333,7 +570,7 @@ private[scalanative] class EscapeAnalysis(
+     Array.tabulate(group.length)(i => rep(group(i)))
+   }
+ 
+-  private def publish(name: nir.Global.Member, s0: Summary, n: Int): Unit = {
++  private def publish(name: Key, s0: Summary, n: Int): Unit = {
+     val old = summaries.getOrElse(name, bottomSummary(n))
+     val s = joinSummary(old, s0)
+     summaries(name) = s
+@@ -342,7 +579,7 @@ private[scalanative] class EscapeAnalysis(
+       changeCount(name) = c
+       if (c > 40 && c < 46)
+         System.err.println(
+-          s"[escape-osc] ${name.show.take(100)} change#$c\n  old esc=${old.escapes.toSeq} self=${old.retSelf.toSeq} deep=${old.retDeep.toSeq} fresh=${old.retFresh} grp=${old.group.toSeq}\n  new esc=${s.escapes.toSeq} self=${s.retSelf.toSeq} deep=${s.retDeep.toSeq} fresh=${s.retFresh} grp=${s.group.toSeq}"
++          s"[escape-osc] ${name.name.show.take(100)} change#$c\n  old esc=${old.escapes.toSeq} deepesc=${old.escDeep.toSeq} self=${old.retSelf.toSeq} deep=${old.retDeep.toSeq} fresh=${old.retFresh} grp=${old.group.toSeq}\n  new esc=${s.escapes.toSeq} deepesc=${s.escDeep.toSeq} self=${s.retSelf.toSeq} deep=${s.retDeep.toSeq} fresh=${s.retFresh} grp=${s.group.toSeq}"
+         )
+     }
+     if (!sameSummary(old, s))
+@@ -355,20 +592,21 @@ private[scalanative] class EscapeAnalysis(
+   def runAll(): Unit = {
+     val t0 = System.nanoTime()
+     defines.valuesIterator.foreach { d =>
+-      if (!results.contains(d.name)) analyze(d)
++      if (!analyzed.contains(baseKey(d.name))) analyze(baseKey(d.name), d)
+     }
+     val t1 = System.nanoTime()
+     val firstPass = analyses
+     var rounds = 0
+     while (queue.nonEmpty && rounds < 3000000) {
+-      val n = queue.dequeue()
+-      queued -= n
+-      analyze(defines(n))
++      val k = queue.dequeue()
++      queued -= k
++      analyze(k, defines(k.name))
+       rounds += 1
+     }
+     if (sys.env.contains("SCALANATIVE_ESCAPE_STATS"))
+       System.err.println(
+-        s"[escape-stats] defines=${defines.size} firstPass=${firstPass} analyses " +
++        s"[escape-stats] smash=${tSmash / 1000000}ms final=${tFinal / 1000000}ms loops=${tLoops / 1000000}ms cands=${tCands / 1000000}ms summarize=${tSummarize / 1000000}ms exclusive=${tExclusive / 1000000}ms\n" +
++          s"[escape-stats] defines=${defines.size} specs=$specCount firstPass=${firstPass} analyses " +
+           s"in ${(t1 - t0) / 1000000}ms, reanalyses=$rounds in ${(System.nanoTime() - t1) / 1000000}ms"
+       )
+   }
+@@ -381,6 +619,9 @@ private[scalanative] class EscapeAnalysis(
+     case _                      => false
+   }
+ 
++  private val scopeTargets =
++    mutable.HashMap.empty[(nir.Global, nir.Sig), Option[Seq[nir.Global.Member]]]
++
+   private def targetsOf(
+       objTy: nir.Type,
+       sig: nir.Sig
+@@ -390,7 +631,14 @@ private[scalanative] class EscapeAnalysis(
+       case nir.Type.Ref(ClassRef(cls), _, _) if !sig.isVirtual =>
+         cls.resolve(sig).map(Seq(_))
+       case nir.Type.Ref(ScopeRef(scope), _, _) =>
+-        Some(scope.targets(sig).toSeq)
++        // computing the targets walks every implementor: cache it, and
++        // remember megamorphic scopes as unknown right away
++        scopeTargets.getOrElseUpdate(
++          (scope.name, sig), {
++            val ts = scope.targets(sig)
++            if (ts.size > MaxTargets) None else Some(ts.toSeq)
++          }
++        )
+       case _ => None
+     }
+     r.filter(_.nonEmpty)
+@@ -400,7 +648,7 @@ private[scalanative] class EscapeAnalysis(
+   private def tracing(d: nir.Defn.Define): Boolean =
+     tracePat.exists(p => d.name.show.contains(p))
+ 
+-  private class FunctionAnalysis(defn: nir.Defn.Define) {
++  private class FunctionAnalysis(defn: nir.Defn.Define, key: Key) {
+     private val trace = tracing(defn)
+     private def tr(msg: => String): Unit =
+       if (trace) System.err.println("[escape-trace] " + defn.name.show.take(60) + ": " + msg)
+@@ -410,6 +658,21 @@ private[scalanative] class EscapeAnalysis(
+     private var fmap = new Array[mutable.LongMap[Int]](256)
+     private var size = 0
+     private val localNode = mutable.LongMap.empty[Int]
++    // locals whose exact class is known beyond their declared type
++    private val refined = mutable.LongMap.empty[nir.Type]
++    private def tyOfVal(v: nir.Val): nir.Type = v match {
++      case nir.Val.Local(l, ty) => refined.getOrElse(l.id, ty)
++      case _                    => v.ty
++    }
++    private def exactClassOf(v: nir.Val): Option[nir.Global.Top] =
++      tyOfVal(v) match {
++        case nir.Type.Ref(name, true, _) =>
++          ClassRef.unapply(name) match {
++            case Some(c) if !c.attrs.isAbstract && !c.isModule => Some(name)
++            case _                                             => None
++          }
++        case _ => None
++      }
+ 
+     private def fresh(f: Int = 0): Int = {
+       if (size == parent.length) {
+@@ -498,9 +761,42 @@ private[scalanative] class EscapeAnalysis(
+ 
+     private def flag(x: Int, f: Int): Unit = flags(find(x)) |= f
+     private val events = mutable.ArrayBuffer.empty[(Int, () => String)]
+-    private def flagG(x: Int, reason: => String): Unit = {
++    private val evCalls = mutable.ArrayBuffer.empty[(Key, Int)]
++    private val heapEvents = mutable.ArrayBuffer.empty[(Int, String)]
++    private var curPos: nir.SourcePosition = nir.SourcePosition.NoPosition
++    private def flagG(
++        x: Int,
++        reason: => String,
++        callee: Key = null,
++        idx: Int = -1
++    ): Unit = {
+       flag(x, Global)
+-      if (recordReasons) events += ((x, () => reason))
++      if (recordReasons) {
++        val p = curPos
++        events += ((x, () => reason + " @" + p.show))
++        evCalls += ((callee, idx))
++      }
++    }
++    /** Everything reachable through the fields of `x` escapes, `x` itself
++     *  does not.
++     */
++    private def flagD(
++        x: Int,
++        reason: => String,
++        callee: Key = null,
++        idx: Int = -1
++    ): Unit = {
++      flag(x, ContentsGlobal)
++      if (recordReasons) {
++        val p = curPos
++        events += ((x, () => "deep:" + reason + " @" + p.show))
++        evCalls += ((callee, idx))
++      }
++    }
++    /** `x` is a heap object (module, call result, ...). */
++    private def flagH(x: Int, reason: => String): Unit = {
++      flag(x, HeapRoot | NonParam)
++      if (recordReasons) heapEvents += ((x, reason + " @" + curPos.show))
+     }
+ 
+     // ---- value -> node ----
+@@ -551,7 +847,7 @@ private[scalanative] class EscapeAnalysis(
+     private def load(r: Int, p: nir.Val, k: Int = 0): Unit =
+       if (r >= 0) {
+         val pn = nd(p)
+-        if (pn < 0) flag(r, HeapRoot | NonParam)
++        if (pn < 0) flagH(r, "load-from-untracked")
+         else {
+           if (k == 0) flag(pn, RawAccessed)
+           union(r, contentOf(pn, k))
+@@ -578,7 +874,7 @@ private[scalanative] class EscapeAnalysis(
+       case nir.Next.None => ()
+       case nir.Next.Unwind(exc, n) =>
+         val e = nd(exc)
+-        if (e >= 0) { flag(e, HeapRoot | NonParam); flagG(e, "unwind-exc") }
++        if (e >= 0) { flagH(e, "unwind-exc"); flagG(e, "unwind-exc") }
+         nextEdges(n, from)
+       case nir.Next.Case(_, n) => nextEdges(n, from)
+       case nir.Next.Label(id, args) =>
+@@ -605,13 +901,20 @@ private[scalanative] class EscapeAnalysis(
+         case nir.Inst.Label(_, ps) => ps
+         case _                     => Nil
+       }
+-      params.foreach { p =>
+-        val n = nd(p)
+-        if (n >= 0) flag(n, ExtRoot)
++      params.zipWithIndex.foreach {
++        case (p, i) =>
++          val n = nd(p)
++          if (n >= 0) flag(n, ExtRoot)
++          key.hints.foreach {
++            case (hi, cls) if hi == i => refined(p.id.id) = nir.Type.Ref(cls, exact = true, nullable = true)
++            case _                    => ()
++          }
+       }
+ 
+       var cur = -1
+-      insts.foreach {
++      insts.foreach { inst =>
++        curPos = inst.pos
++        inst match {
+         case nir.Inst.Label(_, _) =>
+           cur += 1
+         case nir.Inst.Let(id, op, unwind) =>
+@@ -627,35 +930,92 @@ private[scalanative] class EscapeAnalysis(
+         case nir.Inst.Switch(_, d, cs) =>
+           nextEdges(d, cur); cs.foreach(nextEdges(_, cur))
+         case nir.Inst.Throw(v, u) =>
+-          globalize(v, "throw"); nextEdges(u, cur)
++          if (!exps.contains("throwcap")) globalize(v, "throw")
++          nextEdges(u, cur)
+         case nir.Inst.Unreachable(u) => nextEdges(u, cur)
+         case nir.Inst.LinktimeIf(_, a, b) =>
+           nextEdges(a, cur); nextEdges(b, cur)
++        }
+       }
+ 
++      val tA = System.nanoTime()
+       smashRawViews()
++      val tB = System.nanoTime()
+       finalizeFlags()
++      val tC = System.nanoTime()
+       val loopBlocks = blocksInCycles(blocks)
++      val tD = System.nanoTime()
++      tSmash += tB - tA; tFinal += tC - tB; tLoops += tD - tC
+       cands.foreach { c =>
+         tr(s"cand ${c.kind} id=${c.id} flags=${flags(find(c.node))} root=${find(c.node)}")
+       }
+-      val byRoot = events.groupBy { case (n, _) => find(n) }
++      val byRoot = events.indices.groupBy(k => find(events(k)._1))
++      val heapByRoot = heapEvents.groupBy { case (n, _) => find(n) }
++      // child root -> parent roots, built lazily (reasons only)
++      lazy val rev: mutable.HashMap[Int, mutable.ArrayBuffer[Int]] = {
++        val m = mutable.HashMap.empty[Int, mutable.ArrayBuffer[Int]]
++        var i = 0
++        while (i < size) {
++          if (parent(i) == i && fmap(i) != null)
++            fmap(i).values.foreach { c =>
++              m.getOrElseUpdate(find(c), mutable.ArrayBuffer.empty[Int]) += i
++            }
++          i += 1
++        }
++        m
++      }
++      def ancestorReason(r: Int): (String, Key, Int) = {
++        val seen = mutable.HashSet[Int](r)
++        val q = mutable.Queue[Int](r)
++        var res: (String, Key, Int) = null
++        while (res == null && q.nonEmpty) {
++          val x = q.dequeue()
++          if (x != r) {
++            val ks = byRoot.getOrElse(x, Nil)
++            if (ks.nonEmpty) res = (events(ks.head)._2(), evCalls(ks.head)._1, evCalls(ks.head)._2)
++            else heapByRoot.get(x).foreach(hs => res = ("heap:" + hs.head._2, null, -1))
++          }
++          if (res == null) rev.getOrElse(x, Nil).foreach(pp => if (seen.add(pp)) q.enqueue(pp))
++        }
++        if (res == null) ("global-propagated", null, -1) else res
++      }
+       val candidates = cands.map { c =>
+         val r = find(c.node)
+         val f = flags(r)
+         val esc = (f & (Global | Returned | Ext)) != 0
++        var callee: Key = null
++        var cidx = -1
+         val reason =
+-          if (!esc) ""
++          if (!esc || !recordReasons) { if (esc) "escapes" else "" }
+           else if ((f & Global) != 0)
+-            byRoot.get(r).map(_.head._2()).getOrElse("global-propagated")
++            byRoot.get(r) match {
++              case Some(ks) =>
++                callee = evCalls(ks.head)._1; cidx = evCalls(ks.head)._2
++                events(ks.head)._2()
++              case None =>
++                val (rs, cm, ci) = ancestorReason(r)
++                callee = cm; cidx = ci
++                "anc:" + rs
++            }
+           else if ((f & Returned) != 0) "returned"
+           else "ext(stored into heap/param/call-result)"
+-        Candidate(c.kind, esc, loopBlocks(c.block max 0), reason, c.id, c.isClass)
++        Candidate(c.kind, esc, loopBlocks(c.block max 0), reason, c.id, c.isClass, if (recordReasons) defn.name.show else "", callee, cidx)
+       }
++      val tE = System.nanoTime()
+       summarize(params)
++      tSummarize += System.nanoTime() - tE
++      tCands += tE - tD
+       new Result(candidates.toSeq)
+     }
+ 
++    /** `id` is the same object as `v`: it has the same known exact class. */
++    private def carryRefined(id: nir.Local, v: nir.Val): Unit =
++      v match {
++        case nir.Val.Local(l, _) =>
++          refined.get(l.id).foreach(t => refined(id.id) = t)
++        case _ => ()
++      }
++
+     private def addCand(
+         id: nir.Local,
+         kind: String,
+@@ -701,29 +1061,36 @@ private[scalanative] class EscapeAnalysis(
+           addCand(id, cls.name.id, block, isClass = true)
+         case nir.Op.Classalloc(_, Some(_)) =>
+           val n = res(op.resty)
+-          flag(n, HeapRoot | NonParam)
++          flagH(n, "zone/stack-classalloc")
+         case nir.Op.Classalloc(_, _) =>
+-          flag(res(op.resty), HeapRoot | NonParam)
++          flagH(res(op.resty), "heap-classalloc")
+         case nir.Op.Fieldload(ty, obj, fname) =>
+           if (isTrackedTy(ty)) load(res(ty), obj, fieldKey(fname))
+         case nir.Op.Fieldstore(ty, obj, fname, v) =>
+-          if (isTrackedTy(ty)) store(obj, v, fieldKey(fname))
++          val skip =
++            (exps.contains("matcherror") && fname.owner.id == "scala.MatchError") ||
++              (exps.contains("throwcap") && isThrowableOwner(fname.owner))
++          if (isTrackedTy(ty) && !skip) store(obj, v, fieldKey(fname))
+         case nir.Op.Field(obj, fname) =>
+           // pointer to a single field: its raw content is that field's content
+           val r = res(nir.Type.Ptr)
+           val on = nd(obj)
+           if (on >= 0) union(contentOf(r, 0), contentOf(on, fieldKey(fname)))
+-          else flag(r, HeapRoot | NonParam)
++          else flagH(r, "field-of-untracked")
+         case nir.Op.Method(obj, sig) =>
+           methodOf(id.id) = ((obj, sig))
++          val on = nd(obj)
++          if (on >= 0) flag(on, Recv)
+         case nir.Op.Dynmethod(obj, _) =>
+           globalize(obj, "dynmethod")
+-        case nir.Op.Module(_) =>
+-          flag(res(op.resty), HeapRoot | NonParam)
++        case nir.Op.Module(m) =>
++          flagH(res(op.resty), "module " + m.show)
+         case nir.Op.As(ty, obj) =>
+           unifyVals(res(ty), nd(obj))
++          carryRefined(id, obj)
+         case nir.Op.Copy(v) =>
+           unifyVals(res(v.ty), nd(v))
++          carryRefined(id, v)
+         case nir.Op.Box(ty, obj) =>
+           val kind = ty match {
+             case r: nir.Type.RefKind => "box:" + r.className.id
+@@ -754,9 +1121,9 @@ private[scalanative] class EscapeAnalysis(
+                 vs.foreach { e => if (isTrackedTy(e.ty)) store(nir.Val.Local(id, op.resty), e) }
+               case _ => ()
+             }
+-          } else flag(r, HeapRoot | NonParam)
++          } else flagH(r, "array-nonconst-len")
+         case nir.Op.Arrayalloc(_, init, Some(_)) =>
+-          flag(res(op.resty), HeapRoot | NonParam)
++          flagH(res(op.resty), "zone-array")
+           globalize(init, "zone-array-init")
+         case nir.Op.Arrayload(ty, arr, _) =>
+           if (isTrackedTy(ty)) load(res(ty), arr)
+@@ -780,14 +1147,38 @@ private[scalanative] class EscapeAnalysis(
+           }
+         case _ => None
+       }
+-      if (externId.exists(NonCapturingExterns.contains)) {
++      if (externId.exists(id => id.startsWith("scalanative_atomic_")) &&
++          atomicCall(externId.get, args, resNode)) ()
++      else if (externId.exists(id => id.startsWith("llvm.") || NonCapturingExterns.contains(id))) {
+         if (resNode >= 0) {
+           if (args.nonEmpty && nd(args.head) >= 0) union(resNode, nd(args.head))
+-          else flag(resNode, HeapRoot | NonParam)
++          else flagH(resNode, "extern-result")
+         }
+       } else callResolved(id, ty, ptr, args, resNode)
+     }
+ 
++    /** Models the runtime's atomic externs as plain memory operations on the
++     *  pointed-to memory. Returns false for ones it does not know.
++     */
++    private def atomicCall(id: String, args: Seq[nir.Val], resNode: Int): Boolean = {
++      val op = id.stripPrefix("scalanative_atomic_")
++      if (op.contains("fence")) true
++      else if (op.startsWith("load") && args.nonEmpty) {
++        load(resNode, args(0)); true
++      } else if ((op.startsWith("store") || op.startsWith("init")) && args.size >= 2) {
++        store(args(0), args(1)); true
++      } else if (op.startsWith("compare_exchange") && args.size >= 3) {
++        store(args(0), args(2))
++        val e = nd(args(1)); val p = nd(args(0))
++        if (e >= 0 && p >= 0) union(contentOf(e), contentOf(p))
++        true
++      } else if ((op.startsWith("exchange") || op.startsWith("fetch_")) && args.size >= 2) {
++        store(args(0), args(1))
++        load(resNode, args(0))
++        true
++      } else false
++    }
++
+     private def callResolved(
+         id: nir.Local,
+         ty: nir.Type.Function,
+@@ -800,35 +1191,40 @@ private[scalanative] class EscapeAnalysis(
+         case nir.Val.Local(l, _) =>
+           methodOf.get(l.id).flatMap {
+             case (obj, sig) =>
++              val oty = tyOfVal(obj)
+               val realTy = nir.Type.Ref(
+-                obj.ty match {
++                oty match {
+                   case r: nir.Type.RefKind => r.className
+                   case _                   => nir.Rt.Object.name
+                 },
+-                exact = obj.ty match {
++                exact = oty match {
+                   case r: nir.Type.RefKind => r.isExact
+                   case _                   => false
+                 },
+                 nullable = true
+               )
+-              if (obj.ty.isInstanceOf[nir.Type.RefKind]) targetsOf(realTy, sig)
++              if (oty.isInstanceOf[nir.Type.RefKind]) targetsOf(realTy, sig)
+               else None
+           }
+         case _ => None
+       }
+-      val sums: Option[Seq[Summary]] = targets.filter(_.size <= MaxTargets).flatMap { ts =>
+-        val ss = ts.map { t =>
++      val hints: List[(Int, nir.Global.Top)] =
++        if (!specEnabled) Nil
++        else args.zipWithIndex.flatMap { case (a, i) => exactClassOf(a).map(c => (i, c)) }.toList
++      val keys: Option[Seq[Key]] = targets.filter(_.size <= MaxTargets).flatMap { ts =>
++        val ks = ts.map { t =>
+           defines.get(t) match {
+             case Some(d) if d.ty.args.size == args.size && !d.attrs.isExtern =>
+-              summaryOf(t)
++              Some(specKeyFor(t, hints))
+             case _ => None
+           }
+         }
+-        if (ss.forall(_.isDefined)) Some(ss.map(_.get)) else None
++        if (ks.forall(_.isDefined)) Some(ks.map(_.get)) else None
+       }
++      val sums: Option[Seq[Summary]] = keys.map(_.map(k => summaryOf(k).get))
+       tr(
+         s"call ${ptr.show.take(120)} args=${args.map(_.show.take(30))} targets=${targets
+-          .map(_.map(_.show.take(80)))} sums=${sums.map(_.map(x => (x.escapes.toSeq, x.retSelf.toSeq, x.retDeep.toSeq, x.retFresh, x.group.toSeq)))}"
++          .map(_.map(_.show.take(80)))} sums=${sums.map(_.map(x => (x.escapes.toSeq, x.escDeep.toSeq, x.retSelf.toSeq, x.retDeep.toSeq, x.retFresh, x.group.toSeq)))}"
+       )
+       sums match {
+         case None =>
+@@ -842,7 +1238,7 @@ private[scalanative] class EscapeAnalysis(
+             case _ => "other"
+           })
+           args.foreach(globalize(_, why))
+-          if (resNode >= 0) flag(resNode, HeapRoot | NonParam)
++          if (resNode >= 0) flagH(resNode, "unknown-call-result:" + why)
+         case Some(ss) =>
+           var fresh = resNode >= 0
+           val n = args.size
+@@ -851,8 +1247,12 @@ private[scalanative] class EscapeAnalysis(
+           while (i < n) {
+             val an = argNodes(i)
+             if (an >= 0) {
+-              ss.foreach { s =>
+-                if (s.escapes(i)) flagG(an, "callee-escapes:" + targets.map(_.headOption.map(_.show).getOrElse("?")).getOrElse("?") + "#" + i)
++              if (ss.exists(_.recv(i))) flag(an, Recv)
++              val tsSeq = targets.getOrElse(Nil)
++              ss.zipWithIndex.foreach { case (s, k) =>
++                val ckey = keys.map(_(k)).orNull
++                if (s.escapes(i)) flagG(an, "callee-escapes:" + tsSeq(k).show + "#" + i, ckey, i)
++                else if (s.escDeep(i)) flagD(an, "callee-escapes-deep:" + tsSeq(k).show + "#" + i, ckey, i)
+                 if (s.retSelf(i) && resNode >= 0) union(resNode, an)
+                 if (s.retDeep(i) && resNode >= 0) {
+                   union(resNode, an)
+@@ -875,7 +1275,7 @@ private[scalanative] class EscapeAnalysis(
+           }
+           if (resNode >= 0) {
+             val freshRes = ss.exists(_.retFresh)
+-            if (freshRes) flag(resNode, HeapRoot | NonParam)
++            if (freshRes) flagH(resNode, "fresh-call-result:" + targets.map(_.headOption.map(_.show).getOrElse("?")).getOrElse("?"))
+           }
+       }
+     }
+@@ -914,17 +1314,25 @@ private[scalanative] class EscapeAnalysis(
+         changed = false
+         var i = 0
+         while (i < size) {
+-          if (parent(i) == i && fmap(i) != null) {
++          if (parent(i) == i) {
+             val f = flags(i)
+-            var add = f & (Global | Returned | Ext)
+-            if ((f & (ExtRoot | Ext)) != 0) add |= Ext
+-            if ((f & ExtRoot) != 0) add |= ExtRoot
+-            if ((f & HeapRoot) != 0) add |= Global | HeapRoot
+-            fmap(i).values.toList.foreach { c =>
+-              val rc = find(c)
+-              if ((flags(rc) | add) != flags(rc)) {
+-                flags(rc) |= add
+-                changed = true
++            // contents of a collapsed node are the node itself
++            if ((f & ContentsGlobal) != 0 && (f & Collapsed) != 0 && (f & Global) == 0) {
++              flags(i) |= Global
++              changed = true
++            }
++            if (fmap(i) != null) {
++              var add = f & (Global | Returned | Ext)
++              if ((f & (ExtRoot | Ext)) != 0) add |= Ext
++              if ((f & ExtRoot) != 0) add |= ExtRoot
++              if ((f & HeapRoot) != 0) add |= Global | HeapRoot
++              if ((f & ContentsGlobal) != 0) add |= Global
++              fmap(i).values.toList.foreach { c =>
++                val rc = find(c)
++                if ((flags(rc) | add) != flags(rc)) {
++                  flags(rc) |= add
++                  changed = true
++                }
+               }
+             }
+           }
+@@ -988,6 +1396,8 @@ private[scalanative] class EscapeAnalysis(
+       val retClos = closure(retNode)
+       val retRoot = find(retNode)
+       val escapes = new Array[Boolean](n)
++      val escDeep = new Array[Boolean](n)
++      val recvA = new Array[Boolean](n)
+       val retSelf = new Array[Boolean](n)
+       val retDeep = new Array[Boolean](n)
+       val group = Array.tabulate(n)(identity)
+@@ -995,8 +1405,14 @@ private[scalanative] class EscapeAnalysis(
+       while (i < n) {
+         if (pn(i) >= 0) {
+           val c = clos(i)
+-          if (c.exists(r => (flags(r) & Global) != 0)) escapes(i) = true
+           val root = find(pn(i))
++          if ((flags(root) & Recv) != 0) recvA(i) = true
++          if ((flags(root) & Global) != 0) escapes(i) = true
++          // a node flagged ContentsGlobal may have no content nodes in this
++          // function at all (the callee that leaks them did the loading), so
++          // the flag itself counts, not only Global children
++          else if (c.exists(r => (!mutateDeepFix && (flags(r) & ContentsGlobal) != 0) || (r != root && (flags(r) & Global) != 0)))
++            escDeep(i) = true
+           if (root == retRoot) retSelf(i) = true
+           else if (c.exists(retClos.contains)) retDeep(i) = true
+           var j = 0
+@@ -1013,9 +1429,50 @@ private[scalanative] class EscapeAnalysis(
+         i += 1
+       }
+       val retFresh = (flags(retRoot) & NonParam) != 0
++      if (whyTarget != null && whyTarget == key) {
++        val res = mutable.HashMap.empty[Int, Seq[(String, Key, Int)]]
++        var pi = 0
++        while (pi < n) {
++          if (escapes(pi) || escDeep(pi)) {
++            val out = mutable.LinkedHashSet.empty[(String, Key, Int)]
++            val proot = find(pn(pi))
++            clos(pi).filter(r => (flags(r) & Global) != 0 && (escapes(pi) || r != proot)).foreach { r =>
++              var found = false
++              events.indices.foreach { k =>
++                if (find(events(k)._1) == r && !events(k)._2().startsWith("deep:")) {
++                  out += ((events(k)._2(), evCalls(k)._1, evCalls(k)._2))
++                  found = true
++                }
++              }
++              if (!found) {
++                // Global arrived from an ancestor: heap root or a deep escape
++                var h = 0
++                while (h < size) {
++                  if (parent(h) == h && h != r && closure(h).contains(r)) {
++                    if ((flags(h) & HeapRoot) != 0)
++                      heapEvents.foreach { case (hn, why) =>
++                        if (find(hn) == h) { out += (("via-heap-root: " + why, null, -1)); found = true }
++                      }
++                    events.indices.foreach { k =>
++                      if (find(events(k)._1) == h) {
++                        out += ((events(k)._2(), evCalls(k)._1, evCalls(k)._2)); found = true
++                      }
++                    }
++                  }
++                  h += 1
++                }
++                if (!found) out += (("propagated(no-event)", null, -1))
++              }
++            }
++            res(pi) = out.toSeq.take(6)
++          }
++          pi += 1
++        }
++        whyResult = res.toMap
++      }
+       publish(
+-        defn.name,
+-        new Summary(escapes, retSelf, retDeep, retFresh, canonical(group)),
++        key,
++        new Summary(escapes, escDeep, recvA, retSelf, retDeep, retFresh, canonical(group)),
+         n
+       )
+     }
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Inline.scala b/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
+index 6bc5b5c..8661e9c 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
+@@ -97,6 +97,20 @@ private[interflow] trait Inline { self: Interflow =>
+           }
+         }
+ 
++        if (Inline.stats && allocInline) {
++          val outcome =
++            if (shall && !shallNot) "inlined"
++            else if (isRecursive) "recursive"
++            else if (isDenylisted) "denylisted"
++            else if (noInline) "noinline"
++            else if (isExtern) "extern"
++            else if (calleeTooBig) "calleeTooBig"
++            else if (callerTooBig) "callerTooBig"
++            else if (hasUnwind) "hasUnwind"
++            else if (inlineDepthLimitExceeded) "depth"
++            else "other"
++          Inline.record(outcome, name.show)
++        }
+         shall && !shallNot
+       }
+   }
+@@ -257,7 +271,7 @@ private[interflow] trait Inline { self: Interflow =>
+     }
+ }
+ 
+-private[interflow] object Inline {
++private[scalanative] object Inline {
+ 
+   /** Allocation oriented inlining is on by default in release modes only.
+    *  `SCALANATIVE_INLINE_ALLOC` forces it: `0`/`false` disables it, any other
+@@ -270,6 +284,22 @@ private[interflow] object Inline {
+       case None                      => mode != build.Mode.Debug
+     }
+ 
++  // profiling aid: outcome of allocation-oriented inlining decisions
++  val stats: Boolean = sys.env.contains("SCALANATIVE_INLINE_STATS")
++  private val outcomes = new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicLong]()
++  def record(outcome: String, callee: String): Unit = {
++    outcomes.computeIfAbsent(outcome, _ => new java.util.concurrent.atomic.AtomicLong()).incrementAndGet()
++    if (outcome != "inlined")
++      outcomes.computeIfAbsent(outcome + " " + callee, _ => new java.util.concurrent.atomic.AtomicLong()).incrementAndGet()
++  }
++  def dumpStats(log: String => Unit): Unit = {
++    val it = outcomes.entrySet().iterator()
++    val all = scala.collection.mutable.ArrayBuffer.empty[(String, Long)]
++    while (it.hasNext) { val e = it.next(); all += ((e.getKey, e.getValue.get)) }
++    all.filter(!_._1.contains(" ")).sortBy(-_._2).foreach { case (k, v) => log(s"[inline-stats] $k $v") }
++    all.filter(_._1.contains(" ")).sortBy(-_._2).take(60).foreach { case (k, v) => log(s"[inline-stats]   $k $v".take(260)) }
++  }
++
+   val MaxAllocInlineSize: Int =
+     sys.env.get("SCALANATIVE_INLINE_ALLOC").flatMap(s => scala.util.Try(s.toInt).toOption).filter(_ > 1).getOrElse(64) // not toIntOption: sbt compiles this on Scala 2.12
+ }
