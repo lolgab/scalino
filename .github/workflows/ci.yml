@@ -106,3 +106,52 @@ jobs:
           workdir="$(mktemp -d)"
           cp examples/Hello.scala "$workdir/Hello.scala"
           ( cd "$workdir" && "$pkg/scalino" run Hello.scala )
+
+      # Same flow as the scalino-example release workflow: one Linux host
+      # cross-builds an app for every supported target, using the scalino
+      # just built from this commit (so cross-compilation is tested before a
+      # release, not by it).
+      - name: Cache cross-compilation sysroots
+        if: matrix.target == 'linux-x86_64'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/scalino/sysroots
+          key: scalino-sysroots-${{ hashFiles('versions.env', 'cli/SysrootBuild.scala') }}
+
+      - name: Cross-build -- every target from Linux
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        run: |
+          triples=(
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+            x86_64-apple-darwin aarch64-apple-darwin
+            x86_64-pc-windows-gnu aarch64-pc-windows-gnu
+          )
+          command -v ld.lld  # needed for the macOS and Windows targets
+          ./dist/scalino sysroot build "${triples[@]}"
+          rm -rf cross-out
+          ./dist/scalino package examples/Hello.scala --native-mode release-fast \
+            --native-target-triple "$(IFS=,; echo "${triples[*]}")" \
+            -o cross-out/hello
+          ls -l cross-out
+          check() { # <file> <pattern in `file` output>
+            f="cross-out/$1"
+            [[ -f "$f" ]] || { echo "missing $f"; exit 1; }
+            desc="$(file "$f")"; echo "$desc"
+            [[ "$desc" =~ $2 ]] || { echo "wrong format for $f"; exit 1; }
+          }
+          check hello-x86_64-unknown-linux-musl  'ELF 64-bit.*x86-64'
+          check hello-aarch64-unknown-linux-musl 'ELF 64-bit.*aarch64'
+          check hello-x86_64-unknown-linux-gnu   'ELF 64-bit.*x86-64'
+          check hello-aarch64-unknown-linux-gnu  'ELF 64-bit.*aarch64'
+          check hello-x86_64-apple-darwin        'Mach-O 64-bit.*x86_64'
+          check hello-aarch64-apple-darwin       'Mach-O 64-bit.*arm64'
+          check hello-x86_64-pc-windows-gnu.exe  'PE32\+.*x86-64'
+          check hello-aarch64-pc-windows-gnu.exe 'PE32\+.*Aarch64'
+          # The runner is x86_64 Linux: the two x86_64 Linux binaries must run.
+          for t in musl gnu; do
+            out="$(cross-out/hello-x86_64-unknown-linux-$t)"
+            echo "$t: $out"
+            [[ "$out" == *"ello"* ]] || { echo "unexpected output from $t binary"; exit 1; }
+          done

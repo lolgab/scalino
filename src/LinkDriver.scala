@@ -265,7 +265,11 @@ object LinkDriver:
         val cppFlags = sysroot.toList.flatMap(d =>
           if osOf(t) == "windows" then
             List("-stdlib=libc++", "-isystem", Paths.get(d).toAbsolutePath.resolve("generic-w64-mingw32/include/c++/v1").toString)
-          else Nil)
+          // Only the Windows runtime (eh.cpp) needs C++ std headers. Elsewhere
+          // the sysroot has none, and clang would fall back to the host's
+          // libstdc++ (/usr/include/c++/N on Debian/Ubuntu), which wants glibc's
+          // __GLIBC_PREREQ and breaks libunwind against a musl sysroot.
+          else List("-nostdinc++"))
         // Apple's ld only exists on a Mac, and can't produce ELF or PE.
         val userPicksLinker = opts.linking.exists(o => o.startsWith("-fuse-ld") || o.startsWith("--ld-path"))
         val lld =
