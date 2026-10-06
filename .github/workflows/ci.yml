@@ -235,6 +235,20 @@ jobs:
             [[ "$out" == *"sum=1412"* ]] || { echo "unexpected output"; exit 1; }
           done
 
+      - name: Smoke test -- GC safepoint trampoline (patch 0069)
+        # A thread stopped at a GC yield point must resume with every register,
+        # the flags and the x86_64 red zone intact. The unit test checks the
+        # trampoline directly (Linux x86_64 only); the example checks it end to
+        # end: leaf loops that spill into the red zone while another thread
+        # forces GCs.
+        shell: bash
+        run: |
+          tests/safepoint-trampoline/run.sh
+          ./dist/scalino clean
+          out="$(./dist/scalino run examples/safepoint-trampoline/Main.scala --main-class Main --native-mode release-fast)"
+          echo "$out"
+          [[ "$out" == *"safepoint-trampoline: ok"* ]] || { echo "unexpected output"; exit 1; }
+
       - name: Smoke test -- dist/ is relocatable (flat, like a release tarball)
         shell: bash
         run: |

@@ -2158,3 +2158,21 @@ State when this started: the interprocedural escape analysis (patch 0061, bounde
 - *Boxes*: see above, `Int`/`Boolean`/`Char`/`Float`/unsigned/`Ptr` boxes never allocate (SMI/PtrTag), `Long` boxes are now 0.25M (0.3%), nothing left worth a Lower change.
 - `scala.reflect.ClassTag.apply(Class)` allocates a `GenericClassTag` on every call, 2.3M times (3%): Scala Native's scalalib override removed the `ClassValue` cache. A fix is a cache in a scalalib override, outside the escape analysis.
 - The remaining closures/contexts mostly are real: stored in buffers (`BaseData` lambdas in an `ArrayBuffer`), put in the `Context` store map, or used through a megamorphic call on a *field* (`CheckedIterator.hasNext` calls the wrapped iterator), which would need a heap-type (field class) analysis.
+
+## Intermittent `ArrayIndexOutOfBoundsException: Index N out of bounds for length -1925004801` on Linux x86_64: the GC safepoint trampoline clobbered `%r10` and the red zone (2026-10-06)
+
+**Symptom.** In CI on `ubuntu-24.04` (x86_64 only; v0.0.16 crashed with a segfault, v0.0.17 with this exception), the self-hosted `scalino-linkdriver` died in `java.lang.String.compareTo` called from a sort / red-black tree with `Index N out of bounds for length -1925004801`. Same length (`0x8d42c1ff`) at different sites and versions, intermittent, never on arm64.
+
+**Root cause (not GC, not compact headers).** `SafepointPollTrampoline-x86_64.S` (the stub the SIGSEGV handler redirects a thread to when it hits an armed yield-point page) had two bugs:
+1. It ended with `movq 256(%rsp), %r10 ... jmp *%r10`. `%r10` had just been restored, then overwritten with the resume PC. LLVM allocates `%r10` freely, so any thread stopped at a poll with a live `%r10` resumed with that register replaced by a code address.
+2. The 400-byte frame was written at `%rsp-400`, on top of the 128-byte SysV red zone that leaf functions use for spills. (AArch64 has no red zone in LLVM's default codegen, which is why only x86_64 was affected.)
+
+The constant length is the proof. In the shipped v0.0.17 linkdriver, `String.compareTo`'s loop keeps `string.value` (`target`) in `%r10`, polls (`mov (%r14),%rax; mov (%rax),%rax`), then reads `target.length` with `mov 0x4(%r10),%eax`. After the bad resume `%r10` is the address of the polling instruction, so the "length" is the 4 code bytes at `pc+4`: `ff c1 42 8d` (`inc %r9; lea ...`), i.e. `0x8d42c1ff`. Same loop, same machine code in every version, hence the same value. A second variant in the logs (`Index 1446198218 out of bounds for length 1024` in `IO$Sha1Digest.update`) is the same clobber landing on an index register.
+
+**Fix: patch 0069.** `prepare_redirect` now emulates a `call` that steps over the red zone (`%rsp -= 128 + 8`, interrupted `%rip` stored in the new top slot) and the trampoline returns with `ret $128`, which needs no scratch register and leaves the flags alone. The trampoline also aligns `%rsp` to 16 bytes before calling C (it used to pass on whatever alignment the poll site had). aarch64 is unchanged (it resumes through `x16`; see the open question below).
+
+**Verification (Linux x86_64 container).**
+- `tests/safepoint-trampoline/run.sh`: poll against an armed page with known GPRs/XMM/flags/red zone, through the real `prepare_redirect` + trampoline. Before: `r10 = 0000555555555918`, 16/16 red-zone qwords clobbered. After: passes, aligned and misaligned `%rsp`.
+- `examples/safepoint-trampoline`: leaf loop with 22 live values (spills into the red zone) in 4 threads while another thread calls `System.gc()`. v0.0.17: 230-293 wrong results per run, 3/3 runs. With the 0069 nativelib: `ok (400 checks)`, 3/3.
+- Reproduced the CI failure itself: 5 of 53 clean-directory builds of a snunit hello-world with the unmodified v0.0.17 linkdriver (`--cpus 3`, 3 GB, amd64 container), all with this signature.
+- Real linkdriver with the 0069 trampoline (an `LD_PRELOAD` shim swapping it into the unmodified v0.0.17 binary, same container and project): 0 crashes in the first 50 builds, versus 5 in 53 without it. The linkdriver itself still has to be rebuilt on x86_64 to ship the fix.
