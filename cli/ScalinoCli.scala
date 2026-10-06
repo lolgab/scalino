@@ -383,6 +383,9 @@ object ScalinoCli:
       longRunningLinker = None
       1
 
+  /** Never follows symlinks: a link (even a dangling one) is removed, not its
+   *  target. Build dirs hold links into shared dirs (`clang-resource/lib` ->
+   *  the sysroot's compiler-rt). */
   def deleteRecursively(p: Path): Unit =
     import java.nio.file.LinkOption.NOFOLLOW_LINKS
     if Files.exists(p, NOFOLLOW_LINKS) then
@@ -3209,11 +3212,11 @@ object ScalinoCli:
   // ---------------------------------------------------------------------
 
   private val completionSubcommands = "run compile package test setup-ide lock clean sysroot version completions"
+  private val completionSysrootActions = "build list path"
+  private def completionTriples: String = Sysroot.Supported.mkString(" ")
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
-  private val completionSysrootActions = "build list path"
-  private def completionTriples: String = Sysroot.Supported.mkString(" ")
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
@@ -3229,9 +3232,6 @@ object ScalinoCli:
        |  local subcommands="$completionSubcommands"
        |  local options="$completionOptions"
        |
-       |  case "$$prev" in
-       |    --color) COMPREPLY=($$(compgen -W "always auto never" -- "$$cur")); return ;;
-       |    --native-mode) COMPREPLY=($$(compgen -W "debug release-fast release-size release-full" -- "$$cur")); return ;;
        |  if [[ "$${COMP_WORDS[1]}" == sysroot ]]; then
        |    case $$COMP_CWORD in
        |      2) COMPREPLY=($$(compgen -W "$completionSysrootActions" -- "$$cur")); return ;;
@@ -3244,6 +3244,9 @@ object ScalinoCli:
        |    esac
        |  fi
        |
+       |  case "$$prev" in
+       |    --color) COMPREPLY=($$(compgen -W "always auto never" -- "$$cur")); return ;;
+       |    --native-mode) COMPREPLY=($$(compgen -W "debug release-fast release-size release-full" -- "$$cur")); return ;;
        |    --native-gc) COMPREPLY=($$(compgen -W "immix commix boehm none" -- "$$cur")); return ;;
        |    --native-lto) COMPREPLY=($$(compgen -W "none thin full" -- "$$cur")); return ;;
        |    --native-target) COMPREPLY=($$(compgen -W "app static dynamic" -- "$$cur")); return ;;
@@ -3279,9 +3282,6 @@ object ScalinoCli:
        |  subcommands=($subQuoted)
        |  options=($optQuoted)
        |
-       |  case "$${words[CURRENT-1]}" in
-       |    --color) _values 'color' always auto never; return ;;
-       |    --native-mode) _values 'mode' debug release-fast release-size release-full; return ;;
        |  if [[ "$${words[2]}" == sysroot ]]; then
        |    case $$CURRENT in
        |      3) _values 'action' $completionSysrootActions; return ;;
@@ -3294,6 +3294,9 @@ object ScalinoCli:
        |    esac
        |  fi
        |
+       |  case "$${words[CURRENT-1]}" in
+       |    --color) _values 'color' always auto never; return ;;
+       |    --native-mode) _values 'mode' debug release-fast release-size release-full; return ;;
        |    --native-gc) _values 'gc' immix commix boehm none; return ;;
        |    --native-lto) _values 'lto' none thin full; return ;;
        |    --native-target) _values 'target' app static dynamic; return ;;
@@ -3340,20 +3343,20 @@ object ScalinoCli:
        |complete -c scalino -l native-gc -x -a "immix commix boehm none"
        |complete -c scalino -l native-lto -x -a "none thin full"
        |complete -c scalino -l native-target -x -a "app static dynamic"
+       |complete -c scalino -l native-target-triple -x -a "$completionTriples"
        |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
+       |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l pkg-name -x
        |complete -c scalino -l pkg-version -x
-       |complete -c scalino -l native-target-triple -x -a "$completionTriples"
-       |complete -c scalino -l release-url -x
-       |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"
-       |complete -c scalino -n '__fish_seen_subcommand_from completions' -f -a "bash zsh fish"
-       |""".stripMargin
        |complete -c scalino -l package-name -x
        |complete -c scalino -l package-version -x
-
+       |complete -c scalino -l release-url -x
        |complete -c scalino -n '__fish_seen_subcommand_from sysroot; and not __fish_seen_subcommand_from $completionSysrootActions' -f -a "$completionSysrootActions"
        |complete -c scalino -n '__fish_seen_subcommand_from sysroot; and __fish_seen_subcommand_from build path' -f -a "$completionTriples"
        |complete -c scalino -n '__fish_seen_subcommand_from sysroot; and __fish_seen_subcommand_from build' -l force
+       |complete -c scalino -n '__fish_seen_subcommand_from completions' -f -a "bash zsh fish"
+       |""".stripMargin
+
   def handleCompletions(args: Array[String]): Unit =
     if args.length != 1 then die("completions: expected exactly one shell argument: bash, zsh, or fish")
     args(0) match
