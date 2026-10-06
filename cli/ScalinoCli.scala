@@ -3199,6 +3199,7 @@ object ScalinoCli:
     // .gitignore only needs one entry (.scalino-build/) to cover it, not a
     // second one just for this file.
     val configPath = Paths.get(".scalino-build", "scalino-lsp.json")
+    Files.createDirectories(configPath.getParent)
     Files.write(configPath, json.getBytes("UTF-8"))
     println(s"Wrote configuration file for ide in: ${configPath.toAbsolutePath}")
 
