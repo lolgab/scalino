@@ -2959,9 +2959,20 @@ object ScalinoCli:
    *  simple and portable (no reliance on java.nio.file.WatchService, whose
    *  support in this toolchain's javalib port is unverified). Runs once
    *  immediately, same as scala-cli's `-w`. */
-  def watchLoop(sources: List[Path])(attempt: () => Unit): Unit =
+  def watchLoop(resolve: () => (List[Path], List[Path]))(attempt: List[Path] => Unit): Unit =
+    // Re-resolved every poll: files can be added, renamed or deleted while
+    // watching, so a source list fixed at startup goes stale (and then
+    // crashes reading a path that no longer exists).
     def mtimes(): Map[Path, Long] =
-      sources.filter(Files.exists(_)).map(p => p -> Files.getLastModifiedTime(p).toMillis).toMap
+      val (build, extra) = resolve()
+      (build ++ extra).distinct.flatMap { p =>
+        try Some(p -> Files.getLastModifiedTime(p).toMillis)
+        catch case _: java.io.IOException => None // vanished between listing and stat
+      }.toMap
+    def run(): Unit =
+      val (build, _) = resolve()
+      if build.isEmpty then System.err.println(Color.gray("No .scala files found"))
+      else attempt(build)
     // Same wording scala-cli prints after every iteration, success or failure.
     def watching(): Unit =
       System.err.println(Color.gray("Watching sources, press Ctrl+C to exit, or press Enter to re-run."))
@@ -2972,7 +2983,7 @@ object ScalinoCli:
         val n = System.in.available()
         if n > 0 then { System.in.read(new Array[Byte](n)); true } else false
       catch case _: java.io.IOException => false
-    attempt()
+    run()
     watching()
     var last = mtimes()
     while true do
@@ -2981,7 +2992,7 @@ object ScalinoCli:
       val enter = enterPressed()
       if cur != last || enter then
         last = cur
-        attempt()
+        run()
         watching()
 
   def handleRunOrCompile(mode: String, args: Array[String]): Unit =
@@ -3002,9 +3013,11 @@ object ScalinoCli:
     val (expanded, testSources) = partitionSources(allExpanded)
 
     if o.watch then
-      val watchPaths = expanded ++ expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)))
-      watchLoop(watchPaths) { () =>
-        try buildAndMaybeRun(mode, expanded, o)
+      def resolve() =
+        val srcs = try partitionSources(expandSources(o.sources.filter(Files.exists(_))))._1 catch case _: java.io.IOException => Nil
+        (srcs, expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)).filter(Files.exists(_))))
+      watchLoop(resolve) { current =>
+        try buildAndMaybeRun(mode, current, o)
         catch case BuildFailed(msg) => reportBuildFailure(msg)
       }
     else
@@ -3023,7 +3036,7 @@ object ScalinoCli:
     val expanded = expandSources(o.sources)
     if expanded.isEmpty then die("no .scala files found")
 
-    def attempt(): Int =
+    def attempt(expanded: List[Path]): Int =
       val directives = parseDirectives(expanded)
       directives.scalaVersion.orElse(o.cliScala).foreach { v =>
         if !BuildInfo.scalaVersion.startsWith(v) then
@@ -3109,12 +3122,14 @@ object ScalinoCli:
         runInherited(binPath.toString :: o.progArgs)
 
     if o.watch then
-      watchLoop(expanded) { () =>
-        try attempt()
+      def resolve() =
+        (try expandSources(o.sources.filter(Files.exists(_))) catch case _: java.io.IOException => Nil, Nil)
+      watchLoop(resolve) { current =>
+        try attempt(current)
         catch case BuildFailed(msg) => reportBuildFailure(msg)
       }
     else
-      try sys.exit(attempt())
+      try sys.exit(attempt(expanded))
       catch case BuildFailed(msg) => exitBuildFailure(msg)
 
   /** JSON string/array literals for `.scalino-build/scalino-lsp.json` -- hand-rolled rather
