@@ -150,10 +150,21 @@
             , lockFile ? src + "/scalino.lock.json"
             , sources ? [ "." ]
             , extraArgs ? [ ]  # e.g. [ "--native-mode" "release-fast" ]
+            # C libraries the native code links against. They must be real
+            # derivation inputs so Nix puts their headers/libs (and .pc files)
+            # in the build sandbox.
+            , buildInputs ? [ ]
+            , nativeBuildInputs ? [ ]
+            # pkg-config modules (e.g. [ "gtk4" ]): scalino runs
+            # `pkg-config --cflags/--libs` on them at build time and passes the
+            # result to clang, so no -I/-L flags need computing in Nix.
+            , pkgConfig ? [ ]
             }:
             pkgs.stdenv.mkDerivation {
-              inherit pname version src;
-              nativeBuildInputs = [ self.packages.${system}.default ];
+              inherit pname version src buildInputs;
+              nativeBuildInputs = [ self.packages.${system}.default ]
+                ++ pkgs.lib.optional (pkgConfig != [ ]) pkgs.pkg-config
+                ++ nativeBuildInputs;
               env = {
                 SCALINO_CACHE = "${mkScalinoCache { inherit lockFile; }}";
                 SCALINO_OFFLINE = "1";
@@ -162,7 +173,7 @@
               buildPhase = ''
                 runHook preBuild
                 export HOME="$TMPDIR"
-                scalino package ${pkgs.lib.escapeShellArgs sources} --offline -o app ${pkgs.lib.escapeShellArgs extraArgs}
+                scalino package ${pkgs.lib.escapeShellArgs sources} --offline -o app ${pkgs.lib.escapeShellArgs (pkgs.lib.concatMap (m: [ "--native-pkg-config" m ]) pkgConfig ++ extraArgs)}
                 runHook postBuild
               '';
               installPhase = ''
@@ -179,9 +190,12 @@
           # dependencies re-lock with a writable cache:
           #   SCALINO_OFFLINE=0 SCALINO_CACHE= scalino lock .
           # then let Nix rebuild the shell from the new lockfile.
-          mkScalinoDevShell = { lockFile, packages ? [ ] }:
+          mkScalinoDevShell = { lockFile, packages ? [ ], buildInputs ? [ ], pkgConfig ? [ ] }:
             pkgs.mkShell {
-              packages = [ self.packages.${system}.default ] ++ packages;
+              inherit buildInputs;
+              packages = [ self.packages.${system}.default ]
+                ++ pkgs.lib.optional (pkgConfig != [ ]) pkgs.pkg-config
+                ++ packages;
               env = {
                 SCALINO_CACHE = "${mkScalinoCache { inherit lockFile; withSources = true; }}";
                 SCALINO_OFFLINE = "1";

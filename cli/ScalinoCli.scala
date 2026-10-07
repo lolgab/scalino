@@ -447,7 +447,8 @@ object ScalinoCli:
     repositories: List[String],
     pkg: Map[String, List[String]] = Map.empty,
     nativeTargetTriples: List[String] = Nil,
-    nativeSysroots: List[String] = Nil
+    nativeSysroots: List[String] = Nil,
+    nativePkgConfig: List[String] = Nil
   )
 
   private val quotedRe = """"([^"]*)"""".r
@@ -467,7 +468,7 @@ object ScalinoCli:
     "repository", "repositories", "file", "files", "exclude",
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativePrune", "nativeTarget",
-    "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot",
+    "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot", "nativePkgConfig",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -528,6 +529,7 @@ object ScalinoCli:
     var nativeTarget = Option.empty[String]
     var nativeTargetTriples = List.empty[String]
     var nativeSysroots = List.empty[String]
+    var nativePkgConfig = List.empty[String]
     var nativeEmbedResources = Option.empty[Boolean]
     var nativeMultithreading = Option.empty[Boolean]
     var nativeDirectCodegen = Option.empty[Boolean]
@@ -589,6 +591,7 @@ object ScalinoCli:
         directiveValues(line, "nativeTarget").foreach(_.headOption.foreach(v => nativeTarget = Some(v)))
         directiveValues(line, "nativeTargetTriple", "nativeTargetTriples").foreach(vs => nativeTargetTriples = nativeTargetTriples ++ vs)
         directiveValues(line, "nativeSysroot").foreach(vs => nativeSysroots = nativeSysroots ++ vs)
+        directiveValues(line, "nativePkgConfig").foreach(vs => nativePkgConfig = nativePkgConfig ++ vs)
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
@@ -605,7 +608,7 @@ object ScalinoCli:
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile, nativePrune,
       nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
-      nativeTargetTriples, nativeSysroots
+      nativeTargetTriples, nativeSysroots, nativePkgConfig
     )
 
   /** scala-cli's dependency formats (only `org::name::version` is advertised in
@@ -2216,12 +2219,25 @@ object ScalinoCli:
   def targetTriplesOf(directives: Directives, o: RunOpts): List[String] =
     (directives.nativeTargetTriples ++ o.cliNativeTargetTriples).flatMap(_.split(',').toList).map(_.trim).filter(_.nonEmpty).distinct
 
+  /** `pkg-config <flag> <modules...>` split into clang arguments. Run at build
+   *  time so Nix (or any env with PKG_CONFIG_PATH) needs no hand-computed
+   *  -I/-L lists: whatever pkg-config sees is what clang gets. */
+  def pkgConfig(flag: String, modules: List[String]): List[String] =
+    if modules.isEmpty then Nil
+    else
+      val (code, out) =
+        try runCaptureStdout(List("pkg-config", flag) ++ modules)
+        catch case _: java.io.IOException => fail("--native-pkg-config / nativePkgConfig needs `pkg-config` on PATH")
+      if code != 0 then fail(s"pkg-config $flag ${modules.mkString(" ")} failed (exit $code) -- is each module's .pc file on PKG_CONFIG_PATH?")
+      out.trim.split("\\s+").toList.filter(_.nonEmpty)
+
   def resolveNativeOpts(directives: Directives, o: RunOpts): NativeOpts =
     // Windows is gated on the target when cross-compiling, else on the host.
     val triples = targetTriplesOf(directives, o)
     val windowsTarget =
       if triples.nonEmpty then triples.exists(t => t.contains("windows") || t.contains("mingw"))
       else sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
+    val pkgModules = (directives.nativePkgConfig ++ o.cliNativePkgConfig).distinct
     NativeOpts(
       mode = directives.nativeMode.orElse(o.cliNativeMode),
       gc = directives.nativeGc.orElse(o.cliNativeGc),
@@ -2265,8 +2281,8 @@ object ScalinoCli:
       heapHistogram = directives.nativeHeapHistogram.getOrElse(false) || o.cliNativeHeapHistogram,
       // Default-on, same opt-out shape as multithreading/directCodegen above.
       optimize = directives.nativeOptimize.orElse(o.cliNativeOptimize).getOrElse(true),
-      linking = directives.nativeLinking ++ o.cliNativeLinking,
-      compile = directives.nativeCompile ++ o.cliNativeCompile,
+      linking = directives.nativeLinking ++ o.cliNativeLinking ++ pkgConfig("--libs", pkgModules),
+      compile = directives.nativeCompile ++ o.cliNativeCompile ++ pkgConfig("--cflags", pkgModules),
       cCompile = directives.nativeCCompile ++ o.cliNativeCCompile,
       cppCompile = directives.nativeCppCompile ++ o.cliNativeCppCompile,
       prune = directives.nativePrune ++ o.cliNativePrune
@@ -2533,6 +2549,7 @@ object ScalinoCli:
        |  --native-lto <lto>         none|thin|full (none by default)
        |  --native-clang <path>      path to the clang command (autodetected from PATH by default)
        |  --native-clangpp <path>    path to the clang++ command (autodetected from PATH by default)
+       |  --native-pkg-config <mod>  add `pkg-config --cflags/--libs <mod>` to the compile and link options (repeatable)
        |  --native-linking <opt>     extra option passed to clang verbatim during linking (repeatable)
        |  --native-compile <opt>     extra compile option, all sources (repeatable)
        |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
@@ -2597,6 +2614,7 @@ object ScalinoCli:
        |  //> using nativeLto thin
        |  //> using nativeClang /path/to/clang
        |  //> using nativeClangPP /path/to/clang++
+       |  //> using nativePkgConfig gtk4
        |  //> using nativeLinking -L/opt/homebrew/lib
        |  //> using nativeCompile -flag
        |  //> using nativeCCompile -flag
@@ -2858,6 +2876,7 @@ object ScalinoCli:
     cliNativeCompile: List[String] = Nil,
     cliNativeCCompile: List[String] = Nil,
     cliNativeCppCompile: List[String] = Nil,
+    cliNativePkgConfig: List[String] = Nil,
     cliNativePrune: List[String] = Nil,
     cliEmbedResources: Boolean = false,
     cliNativeMultithreading: Option[Boolean] = None,
@@ -2882,7 +2901,34 @@ object ScalinoCli:
   def defaultToCwd(o: RunOpts): RunOpts =
     if o.sources.isEmpty then o.copy(sources = List(Paths.get("."))) else o
 
-  def parseRunOpts(args: Array[String]): RunOpts =
+  /** Valued options that also accept the `--opt=value` spelling (Nix `extraArgs`
+   *  lists and most other CLIs use it). Boolean `--native-*=true|false` flags
+   *  have their own `=` cases below, so they are not listed here. */
+  private val EqualsValuedOptions = Set(
+    "--main-class", "--output", "--watching", "--watching-path", "--args-file", "--dep", "--dependency",
+    "--compile-dep", "--compile-only-dependency", "--repo", "--repository", "--scala", "--scala-version",
+    "--scalac-option", "--scalac-opt", "--test-framework", "--test-only", "--native-mode", "--native-gc",
+    "--native-lto", "--native-clang", "--native-clangpp", "--native-target", "--native-target-triple",
+    "--native-sysroot", "--native-pkg-config", "--native-linking", "--native-compile", "--native-c-compile", "--native-cpp-compile",
+    "--native-prune", "--format", "--formats", "--pkg-name", "--package-name", "--pkg-version",
+    "--package-version", "--release-url"
+  )
+
+  private def splitEquals(args: Array[String]): Array[String] =
+    val out = Array.newBuilder[String]
+    var inProgArgs = false
+    for a <- args do
+      if inProgArgs then out += a
+      else if a == "--" then { inProgArgs = true; out += a }
+      else
+        val eq = a.indexOf('=')
+        if a.startsWith("--") && eq > 0 && EqualsValuedOptions.contains(a.substring(0, eq)) then
+          out += a.substring(0, eq); out += a.substring(eq + 1)
+        else out += a
+    out.result()
+
+  def parseRunOpts(rawArgs: Array[String]): RunOpts =
+    val args = splitEquals(rawArgs)
     var o = RunOpts()
     var i = 0
     var inProgArgs = false
@@ -2920,6 +2966,7 @@ object ScalinoCli:
         case "--native-linking" => o = o.copy(cliNativeLinking = o.cliNativeLinking :+ args(i + 1)); i += 1
         case "--native-compile" => o = o.copy(cliNativeCompile = o.cliNativeCompile :+ args(i + 1)); i += 1
         case "--native-c-compile" => o = o.copy(cliNativeCCompile = o.cliNativeCCompile :+ args(i + 1)); i += 1
+        case "--native-pkg-config" => o = o.copy(cliNativePkgConfig = o.cliNativePkgConfig :+ args(i + 1)); i += 1
         case "--native-cpp-compile" => o = o.copy(cliNativeCppCompile = o.cliNativeCppCompile :+ args(i + 1)); i += 1
         case "--native-prune" => o = o.copy(cliNativePrune = o.cliNativePrune :+ args(i + 1)); i += 1
         case "--format" | "--formats" =>
@@ -3321,7 +3368,7 @@ object ScalinoCli:
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
-    "--native-cpp-compile --native-prune --native-target --embed-resources --native-multithreading " +
+    "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-optimize " +
     "--formats --package-name --package-version -h --help"
 
