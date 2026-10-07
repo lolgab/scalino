@@ -23,6 +23,10 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Single link/codegen/clang worker: parallel clang on the 2-core runners
+      # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
+      SCALANATIVE_LINK_THREADS: '1'
     strategy:
       fail-fast: false
       matrix:

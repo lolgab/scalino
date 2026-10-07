@@ -45,6 +45,9 @@ jobs:
     needs: plan
     runs-on: ${{ matrix.os }}
     env:
+      # Single link/codegen/clang worker: parallel clang on the 2-core runners
+      # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
+      SCALANATIVE_LINK_THREADS: '1'
       # JVM heap for the link steps; the rest of RAM is needed by clang/LLVM
       # and the runner agent (80% on the 16 GB Linux runners got the runner
       # killed). macOS runners have less RAM and need the full 80%.
@@ -100,6 +103,9 @@ jobs:
     needs: [plan, core]
     runs-on: ${{ matrix.os }}
     env:
+      # Single link/codegen/clang worker: parallel clang on the 2-core runners
+      # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
+      SCALANATIVE_LINK_THREADS: '1'
       SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
     strategy:
       fail-fast: false
@@ -150,6 +156,9 @@ jobs:
     needs: [plan, core]
     runs-on: ${{ matrix.os }}
     env:
+      # Single link/codegen/clang worker: parallel clang on the 2-core runners
+      # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
+      SCALANATIVE_LINK_THREADS: '1'
       SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
     strategy:
       fail-fast: false

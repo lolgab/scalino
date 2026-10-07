@@ -1,0 +1,19 @@
+--- a/tools/src/main/scala/scala/scalanative/build/Build.scala
++++ b/tools/src/main/scala/scala/scalanative/build/Build.scala
+@@ -361,8 +361,15 @@
+     // Fatal errors, e.g. StackOverflowErrors are not propagated by Futures
+     // Use a helper promise to get notified about the underlying problem
+     val promise = Promise[T]()
++    // SCALANATIVE_LINK_THREADS=N caps the link/codegen/clang pool, e.g. 1 on
++    // memory-constrained CI runners where parallel clang invocations OOM.
++    val poolSize = sys.env
++      .get("SCALANATIVE_LINK_THREADS")
++      .flatMap(_.trim.toIntOption)
++      .filter(_ > 0)
++      .getOrElse(Runtime.getRuntime().availableProcessors())
+     val executor = Executors.newFixedThreadPool(
+-      Runtime.getRuntime().availableProcessors(),
++      poolSize,
+       (task: Runnable) => {
+         val thread = Executors.defaultThreadFactory().newThread(task)
+         val defaultExceptionHandler = thread.getUncaughtExceptionHandler()
