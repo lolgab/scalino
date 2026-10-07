@@ -59,16 +59,9 @@ diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativ
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
-@@ -0,0 +1,12 @@
-+#ifndef IMMIX_MARKER_H
-+#define IMMIX_MARKER_H
-+
-+#include "Heap.h"
-+#include "datastructures/Stack.h"
-+
-+void Marker_MarkRoots(Heap *heap, Stack *stack);
-+void Marker_Mark(Heap *heap, Stack *stack);
-+void Marker_Evacuate(Heap *heap, Stack *stack);
+@@ -8,4 +8,5 @@
+ void Marker_Mark(Heap *heap, Stack *stack);
+ void Marker_Evacuate(Heap *heap, Stack *stack);
 +uint64_t Marker_LiveBytes(Heap *heap);
-+
-+#endif // IMMIX_MARKER_H
+ 
+ #endif // IMMIX_MARKER_H
