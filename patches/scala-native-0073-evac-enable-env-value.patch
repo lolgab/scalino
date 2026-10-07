@@ -1,0 +1,28 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -660,16 +660,20 @@
+ 
+ static inline int Evac_enabled(void) {
+     if (!evacEnabledChecked) {
+-        evacEnabledValue = getenv("SCALANATIVE_EVAC_ENABLE") != NULL;
++        // Unset keeps the embedder default (scalanative_gc_set_evac_default);
++        // "0" disables, anything else enables.
++        const char *env = getenv("SCALANATIVE_EVAC_ENABLE");
++        if (env != NULL)
++            evacEnabledValue = env[0] != '0';
+         evacEnabledChecked = 1;
+     }
+     return evacEnabledValue;
+ }
+ 
+ // Lets an embedder (scalino-lsp) opt in programmatically, without requiring
+-// the user to export $SCALANATIVE_EVAC_ENABLE. $SCALANATIVE_EVAC_ENABLE=0
+-// still wins so it can be switched off for debugging. Overrides the cached
+-// getenv result, so it works even if a collection already ran.
++// the user to export $SCALANATIVE_EVAC_ENABLE. An explicit
++// $SCALANATIVE_EVAC_ENABLE (1 or 0) always wins over this default. Overrides
++// the cached result, so it works even if a collection already ran.
+ void scalanative_gc_set_evac_default(int enabled) {
+     const char *env = getenv("SCALANATIVE_EVAC_ENABLE");
+     if (env != NULL)
