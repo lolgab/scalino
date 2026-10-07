@@ -352,6 +352,11 @@ object ScalinoCli:
         existing.foreach(terminateLinker)
         val pb = new JProcessBuilder((argv :+ "--long-running").asJava)
         pb.redirectError(JProcessBuilder.Redirect.INHERIT)
+        // This process lives across many relinks, which fragments the Immix
+        // heap (3.9GB -> 2.6GB watch-mode RSS with compaction); one-shot
+        // links exit before it could pay off, so only enable it here. A
+        // value the user already exported wins.
+        pb.environment().putIfAbsent("SCALANATIVE_EVAC_ENABLE", "1")
         val proc = pb.start()
         val d = LongRunningLinker(
           argv,
