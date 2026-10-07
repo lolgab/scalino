@@ -10,28 +10,28 @@
 class Scalino < Formula
   desc "Scala 3 toolchain that compiles straight to native binaries -- no JVM at any step"
   homepage "https://github.com/lolgab/scalino"
-  version "0.0.17"
+  version "0.0.18"
   license "Apache-2.0"
 
   on_macos do
     on_intel do
       url "https://github.com/lolgab/scalino/releases/download/v#{version}/scalino-v#{version}-macos-x86_64.tar.gz"
-      sha256 "a962fa20d40f2a9ac5d12e07b7d0c5a68e87ba76b2f338842daf733754dbadb6"
+      sha256 "58c04920f898ccde9324a3a497109b41e20590fbbbea6f5d538a2493687e3149"
     end
     on_arm do
       url "https://github.com/lolgab/scalino/releases/download/v#{version}/scalino-v#{version}-macos-arm64.tar.gz"
-      sha256 "2a771e117d90054b7814ed5007d778a5b1a71e54e88e5fa812af0b5bce01ef52"
+      sha256 "5fd35d1f6cee12484f87e9e4bd1d15d0981c810172af40386271c263c32def1c"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/lolgab/scalino/releases/download/v#{version}/scalino-v#{version}-linux-x86_64.tar.gz"
-      sha256 "507b316ba67b4f1dc0d95c9ea7ea006404ebfb04a1762f78153c28596ccef157"
+      sha256 "63184afe4569f77fca358341ba0528a0d7132a5c3ca574ae6e8ed35e1cac0b4a"
     end
     on_arm do
       url "https://github.com/lolgab/scalino/releases/download/v#{version}/scalino-v#{version}-linux-arm64.tar.gz"
-      sha256 "ab731590e77dd8ec7abcd15f2e2e59cd278559ea2da0c0d5ae030b7f70d42c3f"
+      sha256 "3b01df072080d9d5e38c23313a153779c4cce25d295b79aa9777df44e7661de4"
     end
   end
 
