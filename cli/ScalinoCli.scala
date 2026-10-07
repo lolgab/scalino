@@ -2901,34 +2901,7 @@ object ScalinoCli:
   def defaultToCwd(o: RunOpts): RunOpts =
     if o.sources.isEmpty then o.copy(sources = List(Paths.get("."))) else o
 
-  /** Valued options that also accept the `--opt=value` spelling (Nix `extraArgs`
-   *  lists and most other CLIs use it). Boolean `--native-*=true|false` flags
-   *  have their own `=` cases below, so they are not listed here. */
-  private val EqualsValuedOptions = Set(
-    "--main-class", "--output", "--watching", "--watching-path", "--args-file", "--dep", "--dependency",
-    "--compile-dep", "--compile-only-dependency", "--repo", "--repository", "--scala", "--scala-version",
-    "--scalac-option", "--scalac-opt", "--test-framework", "--test-only", "--native-mode", "--native-gc",
-    "--native-lto", "--native-clang", "--native-clangpp", "--native-target", "--native-target-triple",
-    "--native-sysroot", "--native-pkg-config", "--native-linking", "--native-compile", "--native-c-compile", "--native-cpp-compile",
-    "--native-prune", "--format", "--formats", "--pkg-name", "--package-name", "--pkg-version",
-    "--package-version", "--release-url"
-  )
-
-  private def splitEquals(args: Array[String]): Array[String] =
-    val out = Array.newBuilder[String]
-    var inProgArgs = false
-    for a <- args do
-      if inProgArgs then out += a
-      else if a == "--" then { inProgArgs = true; out += a }
-      else
-        val eq = a.indexOf('=')
-        if a.startsWith("--") && eq > 0 && EqualsValuedOptions.contains(a.substring(0, eq)) then
-          out += a.substring(0, eq); out += a.substring(eq + 1)
-        else out += a
-    out.result()
-
-  def parseRunOpts(rawArgs: Array[String]): RunOpts =
-    val args = splitEquals(rawArgs)
+  def parseRunOpts(args: Array[String]): RunOpts =
     var o = RunOpts()
     var i = 0
     var inProgArgs = false
