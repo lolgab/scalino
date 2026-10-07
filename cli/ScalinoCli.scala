@@ -475,9 +475,9 @@ object ScalinoCli:
 
   /** All values on a `//> using <key> ...` line, trying each of `keys` in
    *  turn (so callers can accept e.g. both `dep` and `deps`). Values are
-   *  normally quoted (scala-cli's `"org::name:version"` form), but a lone
-   *  unquoted token (`//> using dep org::name:version`, no quotes) is also
-   *  accepted as a single bare value, matching real scala-cli. */
+   *  either bare (scala-cli's current default: `//> using dep org::name::version`,
+   *  several values separated by whitespace or `, `) or quoted (`"org::name::version"`,
+   *  still accepted). */
   private def directiveValues(line: String, keys: String*): Option[List[String]] =
     keys.iterator.flatMap { k =>
       usingRe(k).findFirstMatchIn(line).map { m =>
@@ -486,7 +486,7 @@ object ScalinoCli:
         if quoted.nonEmpty then quoted
         else rest.trim match
           case "" => Nil
-          case bare => List(bare)
+          case bare => bare.split("""\s*,\s+|\s+""").toList.filter(_.nonEmpty)
       }
     }.nextOption()
 
@@ -600,9 +600,11 @@ object ScalinoCli:
       nativeTargetTriples, nativeSysroots
     )
 
-  /** scala-cli's three dependency formats:
+  /** scala-cli's dependency formats (only `org::name::version` is advertised in
+   *  the help: it's the one that picks the Scala Native artifact):
    *   - `org:name:version`   exact artifact (sbt `%`)              -> unchanged
    *   - `org::name:version`  Scala-version cross (sbt `%%`)        -> `org:name_3:version`
+   *   - `org:::name:version` full Scala-version cross              -> `org:name_3.9.0:version`
    *   - `org::name::version` platform+Scala cross (sbt `%%%`)      -> `org:name_native<binVer>_3:version`
    *  (there is no `org:name::version` form -- scala-cli doesn't have a
    *  "platform-only, not Scala-version" cross suffix, so a lone `::` before
@@ -610,7 +612,13 @@ object ScalinoCli:
    *  and passed through unchanged rather than guessed at.)
    */
   def toCoursierCoord(dep: String): String =
-    dep.split("::") match
+    val full = dep.indexOf(":::")
+    if full >= 0 then
+      val rest = dep.substring(full + 3)
+      val i = rest.indexOf(':')
+      if i < 0 then dep
+      else s"${dep.substring(0, full)}:${rest.substring(0, i)}_${BuildInfo.scalaVersion}:${rest.substring(i + 1)}"
+    else dep.split("::") match
       case Array(_) => dep // no "::" at all: org:name:version, unchanged
       case Array(org, nameAndVersion) =>
         val i = nameAndVersion.indexOf(':')
@@ -2446,17 +2454,17 @@ object ScalinoCli:
 
   private def packageDirectivesBlock: String =
     s"""|packaging directives (for `--format`):
-       |  //> using packageName "my-app"
-       |  //> using packageVersion "1.2.3"
-       |  //> using packageDescription "One-line summary"
+       |  //> using packageName my-app
+       |  //> using packageVersion 1.2.3
+       |  //> using packageDescription "One-line summary"   (quote values containing spaces)
        |  //> using packageMaintainer "Jane Doe <jane@example.com>"
-       |  //> using packageLicense "MIT"
-       |  //> using packageHomepage "https://example.com"
-       |  //> using packageDep "libssl3"             (extra runtime dependency, repeatable; deb/rpm)
-       |  //> using packageFile "./my-app.service:/lib/systemd/system/my-app.service"   (extra installed file)
-       |  //> using packageDockerBase "gcr.io/distroless/cc-debian13"   (default debian:stable-slim, alpine on musl)
-       |  //> using packageDockerImage "ghcr.io/me/my-app"
-       |  //> using packageReleaseUrl "https://github.com/me/my-app/releases/download/v1.2.3"
+       |  //> using packageLicense MIT
+       |  //> using packageHomepage https://example.com
+       |  //> using packageDep libssl3             (extra runtime dependency, repeatable; deb/rpm)
+       |  //> using packageFile ./my-app.service:/lib/systemd/system/my-app.service   (extra installed file)
+       |  //> using packageDockerBase gcr.io/distroless/cc-debian13   (default debian:stable-slim, alpine on musl)
+       |  //> using packageDockerImage ghcr.io/me/my-app
+       |  //> using packageReleaseUrl https://github.com/me/my-app/releases/download/v1.2.3
        |
        |There is no cross-compilation: every package holds the binary built on this host. Build
        |each OS/arch on its own CI runner into the same output dir, then run `--format brew` last.
@@ -2556,34 +2564,34 @@ object ScalinoCli:
   private def directivesBlock: String =
     s"""|directives (in source files), one per line -- `dep`/`options`/etc also
        |accept scala-cli's own longer spellings (`dependency`/`scalacOption`/...):
-       |  //> using dep "org::name:version"
-       |  //> using compileOnly.dep "org::name:version"
-       |  //> using test.dep "org::name:version"    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
-       |  //> using testFramework "fully.qualified.Framework"   (explicit override)
-       |  //> using scala "3.x"
-       |  //> using mainClass "Foo"
-       |  //> using options "-flag1", "-flag2"
-       |  //> using test.scalacOption "-flag"        (test scope only, in addition to `options` above)
-       |  //> using jar "./lib/local.jar"            (add a local jar straight to the classpath)
-       |  //> using resourceDir "./resources"        (dir on the classpath; combine with
+       |  //> using dep org::name::version
+       |  //> using compileOnly.dep org::name::version
+       |  //> using test.dep org::name::version    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
+       |  //> using testFramework fully.qualified.Framework   (explicit override)
+       |  //> using scala 3.x
+       |  //> using mainClass Foo
+       |  //> using options -flag1, -flag2
+       |  //> using test.scalacOption -flag        (test scope only, in addition to `options` above)
+       |  //> using jar ./lib/local.jar            (add a local jar straight to the classpath)
+       |  //> using resourceDir ./resources        (dir on the classpath; combine with
        |                                             --embed-resources/nativeEmbedResources
        |                                             to actually bake its files into the binary)
-       |  //> using repository "https://my.org/maven"   (extra Maven repo, repeatable)
-       |  //> using file "./Other.scala"             (extra source, relative to this file's dir)
-       |  //> using exclude "generated/**"            (glob; drop matching sources, cwd-relative)
-       |  //> using nativeMode "release-fast"
-       |  //> using nativeGc "immix"
-       |  //> using nativeLto "thin"
-       |  //> using nativeClang "/path/to/clang"
-       |  //> using nativeClangPP "/path/to/clang++"
-       |  //> using nativeLinking "-L/opt/homebrew/lib"
-       |  //> using nativeCompile "-flag"
-       |  //> using nativeCCompile "-flag"
-       |  //> using nativeCppCompile "-flag"
-       |  //> using nativePrune "org.http4s.ember.core.h2"   (class, package or Class#method; bodies become a throw)
-       |  //> using nativeTarget "application"   (application|library-dynamic|library-static)
-       |  //> using nativeTargetTriple "aarch64-unknown-linux-musl"   (cross target, repeatable)
-       |  //> using nativeSysroot "aarch64-unknown-linux-musl=/path/to/sysroot"
+       |  //> using repository https://my.org/maven   (extra Maven repo, repeatable)
+       |  //> using file ./Other.scala             (extra source, relative to this file's dir)
+       |  //> using exclude generated/**            (glob; drop matching sources, cwd-relative)
+       |  //> using nativeMode release-fast
+       |  //> using nativeGc immix
+       |  //> using nativeLto thin
+       |  //> using nativeClang /path/to/clang
+       |  //> using nativeClangPP /path/to/clang++
+       |  //> using nativeLinking -L/opt/homebrew/lib
+       |  //> using nativeCompile -flag
+       |  //> using nativeCCompile -flag
+       |  //> using nativeCppCompile -flag
+       |  //> using nativePrune org.http4s.ember.core.h2   (class, package or Class#method; bodies become a throw)
+       |  //> using nativeTarget application   (application|library-dynamic|library-static)
+       |  //> using nativeTargetTriple aarch64-unknown-linux-musl   (cross target, repeatable)
+       |  //> using nativeSysroot aarch64-unknown-linux-musl=/path/to/sysroot
        |  //> using nativeEmbedResources true
        |  //> using nativeMultithreading false   (on by default)
        |  //> using nativeDirectCodegen false   (on by default except on Windows)
@@ -2655,8 +2663,27 @@ object ScalinoCli:
        |targets the one pinned scala-native version it was built for):
        |""".stripMargin
 
+  private val FlagLine = java.util.regex.Pattern.compile(
+    "^(  )((?:-{1,2}[A-Za-z][\\w-]*|--)(?:, -{1,2}[A-Za-z][\\w-]*)*)")
+  private val CommandLine = java.util.regex.Pattern.compile("^(  scalino )(\\S+)")
+
+  /** scala-cli-style help colors: commands bold, option flags yellow. */
+  private def colorizeHelp(text: String, out: java.io.PrintStream): String =
+    if !Color.enabled(out) then text
+    else
+      text.linesWithSeparators.map { line =>
+        val f = FlagLine.matcher(line)
+        val c = CommandLine.matcher(line)
+        if f.find() then
+          val flags = f.group(2).replaceAll("(-{1,2}[A-Za-z][\\w-]*|--)", Color.yellow("$1", out))
+          f.group(1) + flags + line.substring(f.end)
+        else if c.find() && HelpCommands.contains(c.group(2)) then
+          c.group(1) + Color.bold(c.group(2), out) + line.substring(c.end)
+        else line
+      }.mkString
+
   def printUsage(out: java.io.PrintStream): Unit =
-    out.print(
+    out.print(colorizeHelp(
       s"""scalino: a mini scala-cli, self-hosted on scalino (no JVM anywhere)
          |
          |${Color.bold("usage:", out)}
@@ -2683,8 +2710,7 @@ object ScalinoCli:
          |$lockNote
          |$testNote
          |$setupIdeNote
-         |$completionsNote""".stripMargin
-    )
+         |$completionsNote""".stripMargin, out))
 
   val HelpCommands: Set[String] =
     Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "sysroot", "version")
@@ -2743,7 +2769,7 @@ object ScalinoCli:
               |""".stripMargin
       case "version" =>
         head("scalino version", "Print version info.")
-    out.print(text)
+    out.print(colorizeHelp(text, out))
 
 
   case class RunOpts(
@@ -3074,7 +3100,7 @@ object ScalinoCli:
             Files.write(cacheFile, fws.mkString("\n").getBytes("UTF-8"))
             fws
       if frameworkFqcns.isEmpty then
-        fail("no test framework found on the classpath -- add a `//> using test.dep \"org::name:version\"` for " +
+        fail("no test framework found on the classpath -- add a `//> using test.dep \"org::name::version\"` for " +
           "a framework with a scala-native port (e.g. munit, utest, scalatest, zio-test-sbt), or pass --test-framework <class>")
 
       val probeCacheDir = Paths.get(".scalino-build").resolve("test-probe-cache")

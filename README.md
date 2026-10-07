@@ -114,7 +114,14 @@ scalino package examples/Hello.scala -o hello && ./hello
 - **Directives:** scalino understands the usual `//> using` directives:
   `dep`, `test.dep`, `scala`, `mainClass`, `options`, `repository`,
   `resourceDir`, `native*`, and more. Each has an equivalent flag (`--dep`,
-  `-S`, `-O`, `--main-class`, `-w`, `-o`, `-- <args...>`, …).
+  `-S`, `-O`, `--main-class`, `-w`, `-o`, `-- <args...>`, …). Values go
+  unquoted, as in current scala-cli (quotes are still accepted):
+
+  ```scala
+  //> using dep com.lihaoyi::os-lib::0.11.3
+  //> using options -Wunused:all -deprecation
+  //> using nativeMode release-fast
+  ```
 - **Tests:** the test framework is auto-detected from the classpath, so any
   framework with a Scala Native port works. `--test-only <glob>` drops the
   other suites from the link, and `-- <pattern>` is passed through to the
@@ -201,7 +208,7 @@ scalino package app/ -o myapp \
 # -> myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl
 ```
 
-`//> using nativeTargetTriple "..."` works too, and `--format tar,...` packages
+`//> using nativeTargetTriple ...` works too, and `--format tar,...` packages
 each target. All targets are compiled in one linker process, so the program is
 parsed only once.
 
