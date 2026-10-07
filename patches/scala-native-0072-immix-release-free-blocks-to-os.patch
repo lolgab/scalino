@@ -1,0 +1,116 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -266,6 +266,42 @@
+             20 * freeBlockCount < 13 * blockCount);
+ }
+ 
++// Returning memory to the OS: after a collection, runs of completely free
++// blocks hold no data (every allocation path zeroes what it hands out, and
++// the free list lives in BlockMeta, not in the blocks), so their pages can
++// be released. Only worthwhile when evacuation is compacting the live set
++// into few blocks, so it defaults to on with $SCALANATIVE_EVAC_ENABLE /
++// scalanative_gc_set_evac_default; $SCALANATIVE_GC_RELEASE_MEMORY=0/1
++// overrides. Short runs are skipped: they would just fault straight back in.
++#define RELEASE_MIN_RUN_BLOCKS 16
++
++static void Heap_ReleaseFreeBlocks(Heap *heap) {
++    // -1 = unset (follow evacuation, which can be switched on after startup)
++    static int override = -2;
++    if (override == -2) {
++        const char *env = getenv("SCALANATIVE_GC_RELEASE_MEMORY");
++        override = env != NULL ? (env[0] != '0') : -1;
++    }
++    if (override == 0 || (override < 0 && !Marker_EvacEnabled()))
++        return;
++    uint32_t blockCount = heap->blockCount;
++    uint32_t i = 0;
++    while (i < blockCount) {
++        if (!BlockMeta_IsFree(BlockMeta_GetFromIndex(heap->blockMetaStart, i))) {
++            i++;
++            continue;
++        }
++        uint32_t j = i + 1;
++        while (j < blockCount &&
++               BlockMeta_IsFree(BlockMeta_GetFromIndex(heap->blockMetaStart, j)))
++            j++;
++        if (j - i >= RELEASE_MIN_RUN_BLOCKS)
++            memoryReleasePages(heap->heapStart + (size_t)i * WORDS_IN_BLOCK,
++                               (size_t)(j - i) * BLOCK_TOTAL_SIZE);
++        i = j;
++    }
++}
++
+ void Heap_Recycle(Heap *heap) {
+     MutatorThreads_foreach(mutatorThreads, node) {
+         MutatorThread *thread = node->value;
+@@ -337,6 +373,7 @@
+             }
+         }
+     }
++    Heap_ReleaseFreeBlocks(heap);
+     BlockAllocator_SweepDone(&blockAllocator);
+     MutatorThreads_foreach(mutatorThreads, node) {
+         MutatorThread *thread = node->value;
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -678,6 +678,8 @@
+     evacEnabledChecked = 1;
+ }
+ 
++int Marker_EvacEnabled(void) { return Evac_enabled(); }
++
+ // Real live bytes from this cycle's mark tally, or 0 if the tally wasn't
+ // collected (evacuation off) -- callers treat 0 as "unknown".
+ uint64_t Marker_LiveBytes(Heap *heap) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
+@@ -8,5 +8,6 @@
+ void Marker_Mark(Heap *heap, Stack *stack);
+ void Marker_Evacuate(Heap *heap, Stack *stack);
+ uint64_t Marker_LiveBytes(Heap *heap);
++int Marker_EvacEnabled(void);
+ 
+ #endif // IMMIX_MARKER_H
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c
+--- a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c
++++ b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c
+@@ -83,6 +83,25 @@
+ #endif // !_WIN32
+ }
+ 
++// Tells the OS the pages in [addr, addr+size) hold no live data, so their
++// physical memory can be reclaimed. Contents become undefined (zero on Linux);
++// callers must not rely on them. addr/size must be page aligned.
++void memoryReleasePages(void *addr, size_t memorySize) {
++#ifdef _WIN32
++    (void)addr;
++    (void)memorySize;
++#elif defined(__APPLE__)
++    // MADV_FREE_REUSABLE only lowers the footprint accounting; the pages stay
++    // in RSS (what ps/htop show) until memory pressure. Remapping the range
++    // as fresh zero pages drops them immediately.
++    if (mmap(addr, memorySize, HEAP_MEM_PROT, HEAP_MEM_FLAGS | MAP_FIXED,
++             HEAP_MEM_FD, HEAP_MEM_FD_OFFSET) == MAP_FAILED)
++        madvise(addr, memorySize, MADV_FREE_REUSABLE);
++#else
++    madvise(addr, memorySize, MADV_DONTNEED);
++#endif
++}
++
+ bool memoryCommit(void *ref, size_t memorySize) {
+ #ifdef _WIN32
+     return VirtualAlloc(ref, memorySize, MEM_COMMIT, PAGE_READWRITE) != NULL;
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h
+--- a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h
++++ b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h
+@@ -7,6 +7,7 @@
+ 
+ word_t *memoryMap(size_t memorySize);
+ bool memoryCommit(void *ref, size_t memorySize);
++void memoryReleasePages(void *addr, size_t memorySize);
+ 
+ word_t *memoryMapPrealloc(size_t memorySize, size_t doPrealloc);
+ 
