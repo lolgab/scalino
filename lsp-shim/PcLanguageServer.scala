@@ -20,6 +20,15 @@ import com.github.plokhotnyuk.jsoniter_scala.core._
 import Lsp._
 import Lsp.given
 
+import scala.scalanative.unsafe.{extern, CInt}
+
+/** Immix GC hook added by patches/scala-native-0071: opts this process into
+ *  evacuating (compacting) collections unless `SCALANATIVE_EVAC_ENABLE` is
+ *  set explicitly. */
+@extern private object GcTuning {
+  def scalanative_gc_set_evac_default(enabled: CInt): Unit = extern
+}
+
 /** Thin LSP layer over `scala3-presentation-compiler` (Metals' PC engine),
  *  reusing `Main.scala`'s existing JSON-RPC transport and `Lsp.scala`'s
  *  existing jsoniter-scala wire model -- no lsp4j, no Gson, no reflection,
@@ -38,6 +47,7 @@ import Lsp.given
 class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Unit) { thisServer =>
 
   private var pc: RawScalaPresentationCompiler = null
+  private var pcFactory: () => RawScalaPresentationCompiler = null
   private var warmupError: Throwable = null
   private val buffers: mutable.Map[URI, String] = mutable.Map.empty
 
@@ -96,6 +106,9 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   }
 
   def initialize(rootUri: String): InitializeResult = thisServer.synchronized {
+    // The PC's per-completion garbage fragments Immix badly (RSS reached
+    // GBs); compacting collections keep the committed heap near the live set.
+    GcTuning.scalanative_gc_set_evac_default(1)
     val capabilities = ServerCapabilities(
       textDocumentSync = 1, // Full
       documentHighlightProvider = true,
@@ -133,7 +146,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
         // log panes (VS Code Output), which don't render ANSI escapes.
         val compilerArgs: List[String] =
           configs.flatMap(_.compilerArguments).distinct :+ "-color:never"
-        val built = RawScalaPresentationCompiler(
+        val factory = () => RawScalaPresentationCompiler(
           buildTargetIdentifier = "scalino",
           classpath = classpath,
           options = compilerArgs,
@@ -148,7 +161,9 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
           ),
           sourcePath = () => sourceFilesIn(sourceDirs).asJava
         )
+        val built = factory()
         thisServer.synchronized {
+          pcFactory = factory
           pc = built
           thisServer.notifyAll()
         }
@@ -184,6 +199,50 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
         .filter(f => f.isFile && (f.getName.endsWith(".scala") || f.getName.endsWith(".java")))
         .map(_.toPath)
     }.distinct
+
+  /** Every `complete` call makes the PC build a throwaway `InteractiveDriver`
+   *  (see `RawScalaPresentationCompiler.complete`), a few MB of garbage per
+   *  call. Scala Native's Immix heap fragments under that churn and its RSS
+   *  only ever grows, reaching GBs in a long editing session. Recycling the
+   *  PC (fresh driver; the old one becomes garbage together with its symbol
+   *  table and caches) bounds it: when the server has been idle for
+   *  `pcRecycleIdleMillis` after `pcRecycleMinCompletions` completions, or
+   *  hard-capped at `pcRecycleMaxCompletions` regardless of idleness. */
+  private val pcRecycleIdleMillis = 15000L
+  private val pcRecycleMinCompletions = 50
+  private val pcRecycleMaxCompletions = 400
+  private var completionsSincePc = 0
+  private var pendingRecycle: java.util.concurrent.ScheduledFuture[?] = null
+
+  private def recyclePc(): Unit = {
+    if (pcFactory == null || pc == null) return
+    val fresh = pcFactory()
+    // Warm the new driver with the open buffers so the next request doesn't
+    // pay for typechecking them from scratch (results are discarded;
+    // diagnostics for unchanged text are already published).
+    buffers.foreach { case (uri, text) =>
+      try fresh.didChange(CompilerVirtualFileParams(uri, text))
+      catch { case NonFatal(_) => () }
+    }
+    pc = fresh
+    completionsSincePc = 0
+    // Let the GC (evacuating, when enabled) reclaim the old PC's heap now
+    // rather than at the next allocation-triggered cycle.
+    System.gc()
+  }
+
+  private def noteCompletion(): Unit = {
+    completionsSincePc += 1
+    if (pendingRecycle != null) pendingRecycle.cancel(false)
+    if (completionsSincePc >= pcRecycleMaxCompletions) recyclePc()
+    else {
+      val task: Runnable = () => thisServer.synchronized {
+        if (completionsSincePc >= pcRecycleMinCompletions) recyclePc()
+      }
+      pendingRecycle =
+        diagnosticsScheduler.schedule(task, pcRecycleIdleMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+  }
 
   /** Warmup (classpath resolution + PC construction) runs on a daemon thread
    *  started from `initialize()` -- requests that land before it finishes
@@ -373,6 +432,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   def completion(params: TextDocumentPositionParams): CompletionList = thisServer.synchronized {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().complete(offsetParams(uri, params.position), l.CompletionTriggerKind.Invoked)
+    noteCompletion()
     CompletionList(
       isIncomplete = result.isIncomplete(),
       items = result.getItems().asScala.map { item =>

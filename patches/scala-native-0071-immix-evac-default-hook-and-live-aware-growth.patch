@@ -1,0 +1,74 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -247,6 +247,20 @@
+     // process RSS at 94-98.6%, while real live-object bytes stayed at only
+     // 2-7% of committed heap at every sampled cycle -- i.e. growth was being
+     // driven by this ratio alone, not by genuine lack of free space.
++    // With evacuation on, the mark tally gives real live bytes. A mostly
++    // empty but fragmented heap (live set a small fraction of committed
++    // blocks) then needs no growth: evacuation + recycling reclaim the
++    // space, while growing just raises RSS for good. Keep a floor of 10%
++    // free-or-recycled blocks so allocation never starves, and grow as
++    // before once live data exceeds 40% of the heap.
++    uint64_t liveBytes = Marker_LiveBytes(heap);
++    if (liveBytes != 0) {
++        uint64_t heapBytes = (uint64_t)blockCount * BLOCK_TOTAL_SIZE;
++        bool plentyLive = liveBytes * 100 > heapBytes * 40;
++        bool starving =
++            10 * (uint64_t)(freeBlockCount + recycledBlockCount) < blockCount;
++        return plentyLive || starving;
++    }
+     return freeBlockCount * 2 < blockCount ||
+            (4 * unavailableBlockCount > blockCount &&
+             20 * freeBlockCount < 13 * blockCount);
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -666,6 +666,30 @@
+     return evacEnabledValue;
+ }
+ 
++// Lets an embedder (scalino-lsp) opt in programmatically, without requiring
++// the user to export $SCALANATIVE_EVAC_ENABLE. $SCALANATIVE_EVAC_ENABLE=0
++// still wins so it can be switched off for debugging. Overrides the cached
++// getenv result, so it works even if a collection already ran.
++void scalanative_gc_set_evac_default(int enabled) {
++    const char *env = getenv("SCALANATIVE_EVAC_ENABLE");
++    if (env != NULL)
++        return; // explicit user setting always wins
++    evacEnabledValue = enabled != 0;
++    evacEnabledChecked = 1;
++}
++
++// Real live bytes from this cycle's mark tally, or 0 if the tally wasn't
++// collected (evacuation off) -- callers treat 0 as "unknown".
++uint64_t Marker_LiveBytes(Heap *heap) {
++    if (!Evac_enabled() || blockLiveBytes == NULL ||
++        blockLiveBytesCapacity < heap->blockCount)
++        return 0;
++    uint64_t total = 0;
++    for (uint32_t i = 0; i < heap->blockCount; i++)
++        total += blockLiveBytes[i];
++    return total;
++}
++
+ // Blocks under this real live-byte occupancy fraction are evacuated.
+ // Matches the threshold already validated via the stage-1 candidate log.
+ #define EVAC_OCCUPANCY_THRESHOLD 0.35
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
+@@ -0,0 +1,12 @@
++#ifndef IMMIX_MARKER_H
++#define IMMIX_MARKER_H
++
++#include "Heap.h"
++#include "datastructures/Stack.h"
++
++void Marker_MarkRoots(Heap *heap, Stack *stack);
++void Marker_Mark(Heap *heap, Stack *stack);
++void Marker_Evacuate(Heap *heap, Stack *stack);
++uint64_t Marker_LiveBytes(Heap *heap);
++
++#endif // IMMIX_MARKER_H
