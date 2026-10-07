@@ -141,6 +141,9 @@ object ScalinoCli:
     /** scala-cli's plain (non-bold) red/yellow for its `[error]`/`[warn]` tags. */
     def red(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[31m", s, stream)
     def yellow(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[33m", s, stream)
+    def green(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[32m", s, stream)
+    def magenta(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[35m", s, stream)
+    def cyan(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[36m", s, stream)
     /** Plain emphasis, no color -- section headers in `--help` output. */
     def bold(s: String, stream: java.io.PrintStream = System.out): String = paint(BOLD, s, stream)
 
@@ -2667,19 +2670,63 @@ object ScalinoCli:
     "^(  )((?:-{1,2}[A-Za-z][\\w-]*|--)(?:, -{1,2}[A-Za-z][\\w-]*)*)")
   private val CommandLine = java.util.regex.Pattern.compile("^(  scalino )(\\S+)")
 
-  /** scala-cli-style help colors: commands bold, option flags yellow. */
+  private val DirectiveLine = java.util.regex.Pattern.compile(
+    "^(\\s*)(//>)( using )(\\S+)(.*?)((?: {2,}\\(.*)?)$")
+
+  private val InlineCode = java.util.regex.Pattern.compile("`([^`\\n]+)`")
+  private val InlineFlag = "(^|[^\\w/.-])(-{1,2}[A-Za-z][\\w-]*)"
+
+  private def colorizeFlags(t: String, out: java.io.PrintStream, restore: String): String =
+    if !t.contains('-') then t else t.replaceAll(InlineFlag, "$1" + Color.yellow("$2", out) + restore)
+
+  /** Prose inside the help: option flags yellow, inline `code` cyan (backticks
+   *  dropped). `restore` is the ANSI code to resume after each colored span when
+   *  the surrounding text is itself colored. */
+  private def colorizeTicks(t: String, out: java.io.PrintStream, restore: String = ""): String =
+    val m = InlineCode.matcher(t)
+    val sb = new StringBuilder
+    var last = 0
+    while m.find() do
+      sb.append(colorizeFlags(t.substring(last, m.start), out, restore))
+      sb.append(Color.cyan(colorizeFlags(m.group(1), out, "\u001b[36m"), out)).append(restore)
+      last = m.end
+    sb.append(colorizeFlags(t.substring(last), out, restore)).toString
+
+  /** Editor-like colors for a `//> using key value   (note)` example line:
+   *  comment marker gray, `using` magenta, key cyan, value green, note gray. */
+  private def colorizeDirective(m: java.util.regex.Matcher, out: java.io.PrintStream): String =
+    val value = m.group(5)
+    val note = m.group(6)
+    m.group(1) + Color.gray(m.group(2), out) + Color.magenta(m.group(3), out) +
+      Color.cyan(m.group(4), out) + (if value.trim.isEmpty then value else Color.green(value, out)) +
+      (if note.isEmpty then "" else Color.gray(colorizeTicks(note, out, "\u001b[90m"), out))
+
+  /** scala-cli-style help colors: commands bold, option flags yellow,
+   *  `//> using` directives like an editor. */
   private def colorizeHelp(text: String, out: java.io.PrintStream): String =
     if !Color.enabled(out) then text
     else
+      var depth = 0 // inside a directive's multi-line `(note ...)`
+      def parens(t: String) = t.count(_ == '(') - t.count(_ == ')')
       text.linesWithSeparators.map { line =>
+        val body = line.stripLineEnd
+        val eol = line.substring(body.length)
         val f = FlagLine.matcher(line)
         val c = CommandLine.matcher(line)
-        if f.find() then
+        val d = DirectiveLine.matcher(body)
+        if depth > 0 then
+          depth += parens(body)
+          val lead = body.takeWhile(_ == ' ')
+          lead + Color.gray(colorizeTicks(body.substring(lead.length), out, "\u001b[90m"), out) + eol
+        else if d.matches() then
+          depth = math.max(0, parens(d.group(6)))
+          colorizeDirective(d, out) + eol
+        else if f.find() then
           val flags = f.group(2).replaceAll("(-{1,2}[A-Za-z][\\w-]*|--)", Color.yellow("$1", out))
-          f.group(1) + flags + line.substring(f.end)
+          f.group(1) + flags + colorizeTicks(line.substring(f.end), out)
         else if c.find() && HelpCommands.contains(c.group(2)) then
-          c.group(1) + Color.bold(c.group(2), out) + line.substring(c.end)
-        else line
+          c.group(1) + Color.bold(c.group(2), out) + colorizeTicks(line.substring(c.end), out)
+        else colorizeTicks(line, out)
       }.mkString
 
   def printUsage(out: java.io.PrintStream): Unit =
