@@ -8,7 +8,7 @@
 +    // memory-constrained CI runners where parallel clang invocations OOM.
 +    val poolSize = sys.env
 +      .get("SCALANATIVE_LINK_THREADS")
-+      .flatMap(_.trim.toIntOption)
++      .flatMap(v => scala.util.Try(v.trim.toInt).toOption)
 +      .filter(_ > 0)
 +      .getOrElse(Runtime.getRuntime().availableProcessors())
      val executor = Executors.newFixedThreadPool(
