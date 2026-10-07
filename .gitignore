@@ -13,3 +13,5 @@
 /zed-extension/target/
 .zed/
 .DS_Store
+__pycache__/
+*.pyc
