@@ -161,6 +161,7 @@
       <a href="#install">Install</a>
       <a href="#action">In action</a>
       <a href="#benefits">Benefits</a>
+      <a href="#ship">Ship</a>
       <a href="#hermetic">Nix</a>
       <a href="#editors">Editors</a>
       <a href="#status">Status</a>
@@ -239,6 +240,8 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
     <button class="tab" data-panel="a-watch">Watch mode</button>
     <button class="tab" data-panel="a-test">Tests</button>
     <button class="tab" data-panel="a-compile">Build a binary</button>
+    <button class="tab" data-panel="a-cross">Cross-compile</button>
+    <button class="tab" data-panel="a-pkg">Package</button>
     <button class="tab" data-panel="a-ide">Editor setup</button>
   </div>
   <div class="panelwrap">
@@ -256,8 +259,8 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
 }</pre>
       <div class="note">$ scalino run <span class="cm">— expanded by scalino's own from-scratch TASTy tree interpreter, not JVM bytecode execution</span></div></div>
 
-    <div class="panel" id="a-deps"><pre><span class="cm">//&gt; using dep "com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.40.1"</span>
-<span class="cm">//&gt; using compileOnly.dep "com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros::2.40.1"</span>
+    <div class="panel" id="a-deps"><pre><span class="cm">//&gt; using dep com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.40.1</span>
+<span class="cm">//&gt; using compileOnly.dep com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros::2.40.1</span>
 
 <span class="kw">import</span> com.github.plokhotnyuk.jsoniter_scala.macros.*
 <span class="kw">import</span> com.github.plokhotnyuk.jsoniter_scala.core.*
@@ -269,7 +272,7 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
     <div class="panel" id="a-watch"><pre>scalino run -w</pre>
       <div class="note">Rebuilds and reruns on save, with scala-cli-style output (same wording, colors and diagnostics). Builds are incremental: only changed sources recompile. Same flags as scala-cli: <code class="mono">--dep</code>, <code class="mono">-S/--scala</code>, <code class="mono">-O/--scalac-option</code>, <code class="mono">--main-class</code>, <code class="mono">-o/--output</code>. Boolean flags like <code class="mono">-w</code> work before the sub-command, and every command has <code class="mono">--help</code>.</div></div>
 
-    <div class="panel" id="a-test"><pre><span class="cm">//&gt; using test.dep "org.scalameta::munit::1.0.0"</span>
+    <div class="panel" id="a-test"><pre><span class="cm">//&gt; using test.dep org.scalameta::munit::1.0.0</span>
 
 scalino test .
 scalino test . --test-only <span class="st">"*MySuite*"</span></pre>
@@ -277,10 +280,19 @@ scalino test . --test-only <span class="st">"*MySuite*"</span></pre>
 
     <div class="panel" id="a-compile"><pre>scalino package -o hello
 ./hello</pre>
-      <div class="note">A real, standalone native executable — no JVM, no bytecode, nothing to install on the machine that runs it. Tune it with <code class="mono">--native-mode release-fast</code>, <code class="mono">--native-gc</code>, <code class="mono">--native-lto</code>.</div></div>
+      <div class="note">A real, standalone native executable — no JVM, no bytecode, nothing to install on the machine that runs it. Tune it with <code class="mono">--native-mode release-fast</code>, <code class="mono">--native-gc</code>, <code class="mono">--native-lto</code>, or shrink it with <code class="mono">--native-prune</code> (link-time method pruning).</div></div>
+
+    <div class="panel" id="a-cross"><pre>scalino package app/ -o myapp \
+  --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+<span class="cm"># -&gt; myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl</span></pre>
+      <div class="note">One command, several platforms, one linker process — the program is parsed once. Missing sysroots are assembled on first use. Musl targets are fully static, so one binary runs on every distro.</div></div>
+
+    <div class="panel" id="a-pkg"><pre>scalino package . --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
+scalino package . --format brew --release-url https://github.com/me/app/releases/download/v1.2.3</pre>
+      <div class="note">No fpm or dpkg needed. Metadata comes from <code class="mono">//&gt; using packageName|packageVersion|packageDescription|…</code> directives.</div></div>
 
     <div class="panel" id="a-ide"><pre>scalino setup-ide</pre>
-      <div class="note">Generates <code class="mono">.scalino-build/scalino-lsp.json</code>, then <code class="mono">dist/scalino-lsp</code> gives your editor diagnostics, completions, hover, go-to-definition, references, and rename — without Metals' JVM dependency.</div></div>
+      <div class="note">Generates <code class="mono">.scalino-build/scalino-lsp.json</code>, then <code class="mono">scalino-lsp</code> gives your editor diagnostics, completions, hover, go-to-definition, references, and rename — without Metals' JVM dependency. Zed and VS Code offer to run it for you in a project that hasn't been set up.</div></div>
   </div>
 </section>
 
@@ -301,13 +313,41 @@ scalino test . --test-only <span class="st">"*MySuite*"</span></pre>
       <p>Object files come straight from libLLVM's C API — no <code class="mono">.ll</code> text, no per-file clang. Compilation and linking are both incremental, so a rebuild touches only what changed.</p></div>
     <div class="benefit"><div class="icon">▫</div>
       <h3>Lean binaries</h3>
-      <p>4-byte object headers (class id and lock bits in one word) shrink every object and array, on by default. Opt out with <code class="mono">--native-compact-headers=false</code>.</p></div>
+      <p>4-byte object headers (class id and lock bits in one word) shrink every object and array, on by default. Escape analysis moves short-lived objects to the stack, and <code class="mono">--native-prune</code> drops unreachable methods at link time.</p></div>
     <div class="benefit"><div class="icon">#</div>
       <h3>Hermetic builds</h3>
       <p><code class="mono">scalino lock</code> pins every jar by URL and sha256, and <code class="mono">--offline</code> builds with no network. A Nix flake builds on top of it.</p></div>
+    <div class="benefit"><div class="icon">→</div>
+      <h3>Cross-compile from anywhere</h3>
+      <p>Build for Linux (musl and glibc), macOS and Windows from one machine with <code class="mono">--native-target-triple</code>. Sysroots are assembled client-side from pinned upstream packages.</p></div>
+    <div class="benefit"><div class="icon">▣</div>
+      <h3>Ship it packaged</h3>
+      <p><code class="mono">scalino package --format</code> emits tar, deb, rpm, docker and Homebrew artifacts — no extra packaging tools.</p></div>
     <div class="benefit"><div class="icon">$</div>
       <h3>Familiar by design</h3>
       <p>A mini scala-cli, shaped like the real one on purpose — same directives, same flags, same instinct for finding your entry point.</p></div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="ship" class="wrap">
+  <p class="eyebrow">Cross-compile &amp; package</p>
+  <h2>Build once, ship everywhere.</h2>
+  <p class="section-sub">Pass one or more target triples and scalino links them all in a single linker
+    process. A sysroot holds each target's libc headers and libraries;
+    <code class="mono">scalino sysroot build &lt;triple&gt;</code> assembles one on your machine from upstream
+    packages, each checked against a pinned sha256 — it needs only <code class="mono">curl</code> and
+    <code class="mono">tar</code>, nothing is compiled. <code class="mono">scalino package</code> builds missing ones for you.</p>
+  <div class="panelwrap">
+    <div class="panel-head"><span>shell</span><span>targets</span></div>
+    <div class="panel active"><pre>scalino package app/ -o myapp --format tar,deb \
+  --native-target-triple x86_64-unknown-linux-musl,aarch64-apple-darwin
+
+<span class="cm"># linux musl / gnu (glibc &gt;= 2.31), macOS, Windows (mingw, experimental)</span>
+<span class="cm"># x86_64 and aarch64 — from any host</span></pre>
+      <div class="note"><code class="mono">//&gt; using nativeTargetTriple …</code> works too. <code class="mono">run</code> and <code class="mono">test</code> always build for the host. Cross targets need <code class="mono">lld</code> (on a Mac, macOS targets need nothing extra); the Windows sysroot needs clang 21 or newer.</div>
+    </div>
   </div>
 </section>
 
@@ -343,7 +383,8 @@ scalino.lib.${system}.mkScalinoApp {
     the same way as the compiler. It covers diagnostics, completion, hover, go-to-definition (into
     dependency sources read straight from their jars, and into Scala Native's own sources),
     type definition, references, rename, selection ranges, inlay hints, semantic tokens and code actions.
-    It shuts down when idle, and Neovim clients reattach on restart.</p>
+    It shuts down when idle, keeps its memory footprint low (evacuating GC, heap that shrinks back to the OS),
+    lets you toggle inlay hint kinds from editor settings, and Neovim clients reattach on restart.</p>
   <div class="editors">
     <div class="editor"><div class="glyph">Z</div><h4>Zed</h4><p>Published to Zed's extension gallery as "Scalino"</p></div>
     <div class="editor"><div class="glyph">▤</div><h4>VS Code</h4><p>Packaged in <code class="mono">vscode-extension/</code>, not yet on the Marketplace</p></div>
@@ -365,6 +406,9 @@ scalino.lib.${system}.mkScalinoApp {
         <li><code class="mono">scalino-lsp</code>: diagnostics, completion, hover, go-to-definition, type definition, references, rename, inlay hints, semantic tokens, code actions</li>
         <li>Direct LLVM codegen, incremental compile and link, 4-byte object headers, all on by default</li>
         <li><code class="mono">run</code>, <code class="mono">test</code>, <code class="mono">package</code>, <code class="mono">lock</code>, <code class="mono">--offline</code>, shell completions</li>
+        <li>Cross-compilation to Linux, macOS and Windows targets; <code class="mono">package --format</code> for tar, deb, rpm, docker, brew</li>
+        <li>Escape analysis with stack-allocated objects, link-time method pruning, and an evacuating GC that returns memory to the OS</li>
+        <li>Watch mode that survives renames, deletes and failed links; stale outputs purged on incremental rebuilds</li>
         <li>Self-hosted since 2026-09-07 — zero JVM anywhere in the shipped binaries</li>
       </ul>
     </div>
@@ -373,7 +417,8 @@ scalino.lib.${system}.mkScalinoApp {
       <ul>
         <li>Structural quote-type patterns beyond a bare type variable (<code class="mono">case '[List[t]] =&gt;</code>) — the main known macro gap</li>
         <li>VS Code Marketplace listing</li>
-        <li>Windows builds (disabled in releases for now)</li>
+        <li>Windows is experimental (host builds and the mingw cross target)</li>
+        <li>JUnit-style <code class="mono">@Test</code> discovery — frameworks must use <code class="mono">SubclassFingerprint</code> (munit, utest, scalatest, zio-test do)</li>
         <li>Broader third-party library coverage cross-published for scala-native</li>
       </ul>
     </div>
@@ -402,6 +447,7 @@ scalino.lib.${system}.mkScalinoApp {
         <a href="https://github.com/lolgab/scalino/blob/main/packaging/arch/PKGBUILD" target="_blank" rel="noopener">Arch (AUR)</a>
         <a href="https://github.com/lolgab/scalino/blob/main/packaging/nix/flake.nix" target="_blank" rel="noopener">Nix flake</a>
         <a href="https://github.com/lolgab/scalino/blob/main/packaging/homebrew/scalino.rb" target="_blank" rel="noopener">Homebrew formula</a>
+        <a href="https://github.com/lolgab/scalino/blob/main/NOTICE" target="_blank" rel="noopener">NOTICE</a>
       </div>
       <div class="footcol">
         <h5>Builds on</h5>
