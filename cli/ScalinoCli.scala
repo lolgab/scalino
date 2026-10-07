@@ -1969,13 +1969,18 @@ object ScalinoCli:
   // nested name of its own.
   private val topLevelDeclRe =
     """(?m)^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:final|sealed|abstract|open|case|private|protected|implicit|inline|transparent|opaque|infix)(?:\[\w+\])?\s+)*(?:class|trait|object|enum|given)\s+([A-Za-z_][A-Za-z0-9_]*)""".r
-  private val packageRe = """(?m)^\s*package\s+([A-Za-z0-9_.]+)""".r
+  // `@main def foo` makes dotc emit a synthetic top-level class `foo`
+  // (foo.nir/foo.tasty) that no class/object declaration in the text names.
+  private val mainMethodRe =
+    """(?m)^\s*@main(?:\([^)]*\))?\s+(?:(?:private|protected|inline)\s+)*def\s+([A-Za-z_][A-Za-z0-9_]*)""".r
+  private val packageRe ="""(?m)^\s*package\s+([A-Za-z0-9_.]+)""".r
 
   def extractPackage(text: String): String =
     packageRe.findFirstMatchIn(text).map(_.group(1)).getOrElse("")
 
   def extractDeclaredNames(text: String): List[String] =
-    topLevelDeclRe.findAllMatchIn(text).map(_.group(1)).toList.distinct
+    (topLevelDeclRe.findAllMatchIn(text).map(_.group(1)) ++
+      mainMethodRe.findAllMatchIn(text).map(_.group(1))).toList.distinct
 
   /** Whole-project fingerprint: anything that isn't tracked per-file
    *  (dependency classpath, scalac flags, the compiler binary itself)
