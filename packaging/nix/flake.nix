@@ -121,6 +121,35 @@
         # pkgs.fetchurl per jar, linked at its cache-relative path); mkScalinoApp
         # builds with SCALINO_CACHE pointing there and SCALINO_OFFLINE=1.
         lib = rec {
+          # Emit "<kind> <flag>" per line, then rebuild the flags in Nix. The
+          # indirection keeps arbitrary flag text (spaces, quotes, Nix punctuation)
+          # out of Nix's string syntax, where shell-style quoting does not survive.
+          pkgConfigArgs =
+            { name
+            , buildInputs
+            , modules
+            }:
+            let
+              flagFile = pkgs.runCommandCC "${name}-native-flags" {
+                inherit buildInputs;
+                nativeBuildInputs = [ pkgs.pkg-config ];
+                dontFixup = true;
+              } ''
+                for m in ${lib.escapeShellArgs modules}; do
+                  for f in $(pkg-config --cflags "$m"); do echo "c $f"; done
+                  for f in $(pkg-config --libs "$m"); do echo "l $f"; done
+                done > $out
+              '';
+
+              lines = lib.filter (l: l != "") (lib.splitString "\n" (builtins.readFile flagFile));
+
+              toFlag = l:
+                let parts = lib.splitString " " l;
+                in if builtins.head parts == "c"
+                then [ "--native-c-compile" (lib.last parts) ]
+                else [ "--native-linking" (lib.last parts) ];
+            in lib.concatMap toFlag lines;
+
           # withSources also fetches the -sources.jar files `scalino lock`
           # recorded; they land next to their classes jars, which is where
           # scalino-lsp looks (go-to-definition into library code).
@@ -150,10 +179,17 @@
             , lockFile ? src + "/scalino.lock.json"
             , sources ? [ "." ]
             , extraArgs ? [ ]  # e.g. [ "--native-mode" "release-fast" ]
+            , buildInputs ? [ ]        # native libs; also what pkgConfig queries
+            , nativeBuildInputs ? [ ]  # extra build-time tools (pkg-config is added)
+            , pkgConfig ? [ ]          # pkg-config modules: cflags for C sources, libs for linking
             }:
-            pkgs.stdenv.mkDerivation {
-              inherit pname version src;
-              nativeBuildInputs = [ self.packages.${system}.default ];
+            let
+              pkgArgs = lib.optionals (pkgConfig != [ ])
+                (pkgConfigArgs { name = pname; inherit buildInputs; modules = pkgConfig; });
+            in pkgs.clangStdenv.mkDerivation {
+              inherit pname version src buildInputs;
+              nativeBuildInputs = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ]
+                ++ nativeBuildInputs;
               env = {
                 SCALINO_CACHE = "${mkScalinoCache { inherit lockFile; }}";
                 SCALINO_OFFLINE = "1";
@@ -162,7 +198,8 @@
               buildPhase = ''
                 runHook preBuild
                 export HOME="$TMPDIR"
-                scalino package ${pkgs.lib.escapeShellArgs sources} --offline -o app ${pkgs.lib.escapeShellArgs extraArgs}
+                scalino package ${pkgs.lib.escapeShellArgs sources} --offline -o app \
+                  ${pkgs.lib.escapeShellArgs (extraArgs ++ pkgArgs)}
                 runHook postBuild
               '';
               installPhase = ''
