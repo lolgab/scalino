@@ -1,0 +1,1088 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -17,6 +17,7 @@ import dotty.tools.dotc.core.Decorators.*
+ import dotty.tools.dotc.core.Denotations.staticRef
+ import dotty.tools.dotc.core.Flags.*
+ import dotty.tools.dotc.core.NameKinds.FlatName
++import dotty.tools.dotc.core.Mode
+ import dotty.tools.dotc.core.Names.*
+ import dotty.tools.dotc.core.StdNames.*
+ import dotty.tools.dotc.core.Symbols.*
+@@ -73,15 +74,15 @@ import dotty.tools.dotc.core.CyclicReference
+  *  (`Macro_1.scala`/`Test_2.scala`-style) tests from upstream's own suite.
+  *
+  *  ==Known gaps==
+- *  - **Structural quote-TYPE patterns** beyond a bare type variable (e.g.
+- *    `case '[List[t]] => ...`, as opposed to `case '[t] => ...`) are not
+- *    implemented -- only expr quote patterns (`case '{ ... } => ...`, see
+- *    `matchQuoteBody`/`matchQuoteBodyTree`, including lambda-shaped bodies)
+- *    and general `UnApply` (case-class deconstruction, via either a curated
+- *    extractor or the `callUserDefDef` fallback) are covered. Hit a clear
+- *    `StopInterpretation` naming the unsupported pattern shape, not a
+- *    silent wrong answer. (`interpreter/test-fixtures/{i7715,i8746}` exercise
+- *    expr quote patterns, including a lambda-shaped one -- both now pass.)
++ *  - Quote-TYPE patterns of any shape (`case '[t] =>`, `case '[List[t]] =>`,
++ *    `case '[h *: tl] =>`, bounded `type t <: AnyVal`, ...) are supported: see
++ *    `matchStructuralTypePattern` (subtype check with the pattern's type
++ *    variables as GADT constraints, as `QuoteMatcher` does in stock dotc).
++ *    Expr quote patterns (`case '{ ... } =>`, see `matchQuoteBody`/
++ *    `matchQuoteBodyTree`, including lambda-shaped bodies) and general
++ *    `UnApply` (case-class deconstruction, via either a curated extractor or
++ *    the `callUserDefDef` fallback) are covered too. An unsupported pattern
++ *    shape raises a clear `StopInterpretation`, never a silent wrong answer.
+  *  - The `scala.quoted`/`Quotes` API surface is covered by hand as specific
+  *    cases get exercised (see `interpretQuotesApi`), not exhaustively --
+  *    expect to add more as more macro shapes are tried.
+@@ -355,7 +356,12 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // a real method on the result. Same representation `classOf[T]`
+         // already has everywhere else in this interpreter (see `isPrimitive`
+         // below): the real dotc `Type`, not a loadable JVM `Class`.
+-        typeArgs.head
++        // Erased to the plain class type (`classOf[LinkedHashMap[?, ?]]` is
++        // the class `LinkedHashMap`), so it compares `==` to what
++        // `getClass` on an interpreted instance answers (`cls.typeRef`).
++        typeArgs.head match
++          case at: AppliedType if at.typeSymbol.isClass && at.typeSymbol != defn.ArrayClass => at.typeSymbol.typeRef
++          case other => other
+       else if fn.name == nme.asInstanceOf_ || fn.name == nme.asInstanceOfPM then
+         // `$asInstanceOf$` (`asInstanceOfPM`): the synthetic cast the
+         // pattern-matcher's own GADT/type-refinement inserts after a typed
+@@ -434,7 +440,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       else if env.get(fn.symbol).exists(_.isInstanceOf[LocalDef]) then
+         val LocalDef(ddef, closureEnv) = env(fn.symbol).asInstanceOf[LocalDef]: @unchecked
+         val params = ddef.termParamss.flatten.map(_.symbol)
+-        val callEnv = bindNonErased(params, rawArgs).foldLeft(closureEnv)((e, pv) => e.updated(pv._1, pv._2))
++        // Bind the local def's own type parameters to the call site's
++        // concrete type arguments too (as `callUserDefDef` does for a
++        // member def): a quote built inside its body that names `T`
++        // directly (jsoniter's local `genReadLeafClass[T: Type]`, called
++        // with a pattern-bound `st`) otherwise keeps the raw type-param
++        // symbol and the spliced code fails to typecheck against it.
++        val withTypeParams = ddef.leadingTypeParams.map(_.symbol).zip(typeArgs).foldLeft(closureEnv)((e, pv) => e.updated(pv._1, pv._2))
++        val callEnv = bindNonErased(params, rawArgs).foldLeft(withTypeParams)((e, pv) => e.updated(pv._1, pv._2))
+         interpretTree(ddef.rhs)(using callEnv)
+       else if (env.contains(fn.symbol))
+         // `fn.symbol` is a local `val`/parameter bound to an already-
+@@ -675,15 +688,26 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `case '[ft] =>`/`case '[type ft; ft] =>` (matching a `Type[?]`
+       // scrutinee, pre-`QuotePatterns`-phase raw shape -- that phase
+       // normally lowers this into a `TypeMatch.unapply` call, but
+-      // `-Yretain-trees` captures the tree before it runs). Only the
+-      // "bare type variable, no real structural shape" case is handled: a
+-      // single binding whose own symbol *is* the whole pattern body always
+-      // matches, binding it directly to the scrutinee type (our `Type[T]`/
+-      // `TypeRepr` values are the same raw dotc `Type` either way). A real
+-      // structural shape (e.g. `case '[List[t]] =>`) would need genuine
+-      // type-shape unification against `body`, not attempted here.
++      // `-Yretain-trees` captures the tree before it runs). Two shapes:
++      //  - a single binding whose own symbol *is* the whole pattern body (a
++      //    bare type variable) always matches, binding it directly to the
++      //    scrutinee type (our `Type[T]`/`TypeRepr` values are the same raw
++      //    dotc `Type` either way);
++      //  - anything else (`case '[List[t]] =>`, `case '[Int] =>`,
++      //    `case '[(a, b)] =>`, ...) is matched like `QuoteMatcher.treeMatch`
++      //    does at runtime in stock dotc: the scrutinee type must conform
++      //    (`<:<`) to the pattern's shape, with the pattern's type variables
++      //    registered as GADT constraints so the subtype check solves for
++      //    them (see `matchStructuralTypePattern`).
++      val rawScrutType = scrutinee match
++        case ti: scala.quoted.runtime.impl.TypeImpl => ti.typeTree.tpe
++        case t: Type => t
++        case other =>
++          throw new StopInterpretation(
++            em"Interpreter (own implementation): type quote pattern matched against a non-type scrutinee ${other.getClass.getName}: ${pat.show}",
++            pat.srcPos)
+       bindings match
+-        case (b: Bind) :: Nil if body.symbol == b.symbol =>
++        case (b: Bind) :: Nil if body.symbol == b.symbol && isUnboundedTypeVar(b.symbol) =>
+           // Normalize to a raw `Type` before binding: `scrutinee` can be
+           // EITHER a bare `Type` (e.g. from `TypeRepr.of[X]`) or a
+           // `TypeImpl` wrapper (`TypeReprMethods.asType`'s own return
+@@ -698,14 +722,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           // pattern variable into the final spliced-in tree -- surfacing
+           // downstream as a type mismatch against the wrong (unconstrained)
+           // type.
+-          val rawType = scrutinee match
+-            case ti: scala.quoted.runtime.impl.TypeImpl => ti.typeTree.tpe
+-            case other => other
+-          Some(env.updated(b.symbol, rawType))
++          Some(env.updated(b.symbol, rawScrutType))
+         case _ =>
+-          throw new StopInterpretation(
+-            em"Interpreter (own implementation) does not support structural quote-type patterns yet (only a bare type-variable pattern like `case '[t] =>`): ${pat.show}",
+-            pat.srcPos)
++          matchStructuralTypePattern(bindings.collect { case b: Bind => b.symbol }, body.tpe, rawScrutType)
++            .map(solved => solved.foldLeft(env)((e, kv) => e.updated(kv._1, kv._2)))
+     case QuotePattern(bindings, body, _) =>
+       // `case '{ ... } =>` (matching an `Expr[?]` scrutinee structurally --
+       // e.g. every custom string-interpolator macro's own
+@@ -909,6 +929,180 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+               case t: dotty.tools.dotc.core.Types.TypeBounds => Some(List(t.lo, t.hi))
+               case _ => None
+             }
++            // The remaining `quotes.reflect` TypeRepr-shape extractors, each
++            // exactly `QuotesImpl`'s own `unapply` over the real dotc `Type`.
++            case "ConstantType" => Some {
++              case t: dotty.tools.dotc.core.Types.ConstantType => Some(List(t.value))
++              case _ => None
++            }
++            case "TypeRef" => Some {
++              case t: dotty.tools.dotc.core.Types.TypeRef => Some(List(t.prefix, t.name.toString))
++              case _ => None
++            }
++            case "SuperType" => Some {
++              case t: dotty.tools.dotc.core.Types.SuperType => Some(List(t.thistpe, t.supertpe))
++              case _ => None
++            }
++            case "Refinement" => Some {
++              case t: dotty.tools.dotc.core.Types.RefinedType => Some(List(t.parent, t.refinedName.toString, t.refinedInfo))
++              case _ => None
++            }
++            case "MatchType" => Some {
++              case t: dotty.tools.dotc.core.Types.MatchType => Some(List(t.bound, t.scrutinee, t.cases))
++              case _ => None
++            }
++            case "ByNameType" => Some {
++              case t: dotty.tools.dotc.core.Types.ExprType => Some(List(t.resType))
++              case _ => None
++            }
++            case "ParamRef" => Some {
++              case t: dotty.tools.dotc.core.Types.ParamRef => Some(List(t.binder, Int.box(t.paramNum)))
++              case _ => None
++            }
++            case "ThisType" => Some {
++              case t: dotty.tools.dotc.core.Types.ThisType => Some(List(t.tref))
++              case _ => None
++            }
++            case "RecursiveThis" => Some {
++              case t: dotty.tools.dotc.core.Types.RecThis => Some(List(t.binder))
++              case _ => None
++            }
++            case "RecursiveType" => Some {
++              case t: dotty.tools.dotc.core.Types.RecType => Some(List(t.underlying))
++              case _ => None
++            }
++            case "MethodType" => Some {
++              case t: dotty.tools.dotc.core.Types.MethodType => Some(List(t.paramNames.map(_.toString), t.paramInfos, t.resType))
++              case _ => None
++            }
++            case "PolyType" => Some {
++              case t: dotty.tools.dotc.core.Types.PolyType => Some(List(t.paramNames.map(_.toString), t.paramInfos, t.resType))
++              case _ => None
++            }
++            case "TypeLambda" => Some {
++              case t: dotty.tools.dotc.core.Types.HKTypeLambda => Some(List(t.paramNames.map(_.toString), t.paramInfos, t.resType))
++              case _ => None
++            }
++            case "MatchCase" => Some {
++              case t: dotty.tools.dotc.core.Types.AppliedType if t.tycon.isRef(defn.MatchCaseClass) => Some(t.args)
++              case _ => None
++            }
++            case "NoPrefix" => Some {
++              case t: dotty.tools.dotc.core.Types.NoPrefix.type => Some(Nil)
++              case _ => None
++            }
++            case "FlexibleType" => Some {
++              case t: dotty.tools.dotc.core.Types.FlexibleType => Some(List(t.hi))
++              case _ => None
++            }
++            // Tree-shape extractors (`QuotesImpl`'s own `unapply`s over the
++            // real `tpd` nodes).
++            case "TypedOrTest" => Some {
++              case t: Typed @unchecked => Some(List(t.expr, t.tpt))
++              case _ => None
++            }
++            case "Wildcard" => Some {
++              case t: Ident if t.name == nme.WILDCARD => Some(Nil)
++              case _ => None
++            }
++            case "WildcardTypeTree" => Some {
++              case t: Ident @unchecked if t.name == nme.WILDCARD && t.isType => Some(Nil)
++              case _ => None
++            }
++            case "This" => Some {
++              case t: This @unchecked => Some(List(if t.qual.isEmpty then None else Some(t.qual.name.toString)))
++              case _ => None
++            }
++            case "Super" => Some {
++              case t: Super @unchecked => Some(List(t.qual, if t.mix.isEmpty then None else Some(t.mix.name.toString)))
++              case _ => None
++            }
++            case "TypeIdent" => Some {
++              case t: Ident @unchecked if t.isType => Some(List(t.name.toString))
++              case _ => None
++            }
++            case "TypeSelect" => Some {
++              case t: Select @unchecked if t.isType => Some(List(t.qualifier, t.name.toString))
++              case _ => None
++            }
++            case "TypeProjection" => Some {
++              case t: Select @unchecked if t.isType => Some(List(t.qualifier, t.name.toString))
++              case _ => None
++            }
++            case "Singleton" => Some {
++              case t: SingletonTypeTree @unchecked => Some(List(t.ref))
++              case _ => None
++            }
++            case "Refined" => Some {
++              case t: RefinedTypeTree @unchecked => Some(List(t.tpt, t.refinements))
++              case _ => None
++            }
++            case "Applied" => Some {
++              case t: AppliedTypeTree @unchecked => Some(List(t.tpt, t.args))
++              case _ => None
++            }
++            case "Annotated" => Some {
++              case t: Annotated @unchecked => Some(List(t.arg, t.annot))
++              case _ => None
++            }
++            case "ByName" => Some {
++              case t: ByNameTypeTree @unchecked => Some(List(t.result))
++              case _ => None
++            }
++            case "LambdaTypeTree" => Some {
++              case t: LambdaTypeTree @unchecked => Some(List(t.tparams, t.body))
++              case _ => None
++            }
++            case "TypeBind" => Some {
++              case t: Bind @unchecked if t.isType => Some(List(t.name.toString, t.body))
++              case _ => None
++            }
++            case "TypeBlock" => Some {
++              case t: Block @unchecked if t.isType => Some(List(t.stats, t.expr))
++              case _ => None
++            }
++            case "TypeBoundsTree" => Some {
++              case t: TypeBoundsTree @unchecked => Some(List(t.lo, t.hi))
++              case _ => None
++            }
++            case "TypeCaseDef" => Some {
++              case t: CaseDef @unchecked if t.pat.isType => Some(List(t.pat, t.body))
++              case _ => None
++            }
++            case "MatchTypeTree" => Some {
++              case t: MatchTypeTree @unchecked => Some(List(if t.bound.isEmpty then None else Some(t.bound), t.selector, t.cases))
++              case _ => None
++            }
++            case "Unapply" => Some {
++              case t: UnApply @unchecked => Some(List(t.fun, t.implicits, t.patterns))
++              case _ => None
++            }
++            case "Alternatives" => Some {
++              case t: Alternative @unchecked => Some(List(t.trees))
++              case _ => None
++            }
++            case "Import" => Some {
++              case t: Import @unchecked => Some(List(t.expr, t.selectors))
++              case _ => None
++            }
++            case "Export" => Some {
++              case t: Export @unchecked => Some(List(t.expr, t.selectors))
++              case _ => None
++            }
++            case "PackageClause" => Some {
++              case t: PackageDef @unchecked => Some(List(t.pid, t.stats))
++              case _ => None
++            }
++            case "TypeDef" => Some {
++              case t: TypeDef @unchecked => Some(List(t.name.toString, t.rhs))
++              case _ => None
++            }
++            case "ClassDef" => Some {
++              case t: TypeDef @unchecked if t.isClassDef =>
++                val rhs = t.rhs.asInstanceOf[Template]
++                Some(List(t.name.toString, rhs.constr, rhs.parents, if rhs.self.isEmpty then None else Some(rhs.self), rhs.body))
++              case _ => None
++            }
+             // `quotes.reflect.TermRef.unapply(x): (TypeRepr, String)` --
+             // real dotc `TermRef.prefix`/`.name`, `.name` converted from
+             // the real internal `Name` to the public API's plain `String`.
+@@ -1062,6 +1256,27 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             // below) -- real semantics faithfully ported, minus excluding
+             // pattern-context trees (`PatternTree`), which a real macro's
+             // own term-shaped scrutinee never actually is.
++            // `quotes.reflect.{Boolean,Byte,...,String}Constant`: a `Constant`
++            // is one dotc `Constants.Constant`, discriminated by `tag`; the
++            // `...TypeTest` checks the tag, the extractor yields the value
++            // (`ClassOfConstant`: the `Type`).
++            case name if constantTypeTestTag(name).isDefined =>
++              val tag = constantTypeTestTag(name).get
++              Some {
++                case c: dotty.tools.dotc.core.Constants.Constant if c.tag == tag => Some(List(c))
++                case _ => None
++              }
++            case name if constantExtractorTag(name).isDefined =>
++              val tag = constantExtractorTag(name).get
++              Some {
++                case c: dotty.tools.dotc.core.Constants.Constant if c.tag == tag =>
++                  import dotty.tools.dotc.core.Constants.{ClazzTag, NullTag, UnitTag}
++                  // `NullConstant()`/`UnitConstant()` extract nothing (a
++                  // `Boolean`-returning `unapply`).
++                  if tag == NullTag || tag == UnitTag then Some(Nil)
++                  else Some(List(if tag == ClazzTag then c.typeValue else c.value.asInstanceOf[Object]))
++                case _ => None
++              }
+             case "TermTypeTest" => Some {
+               case t: SeqLiteral => Some(List(t))
+               case t: Inlined => Some(List(t))
+@@ -1449,6 +1664,42 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+   private def matchesSymbol(patSym: Symbol, scrutSym: Symbol, termAliases: Map[Symbol, Symbol]): Boolean =
+     patSym == scrutSym || termAliases.get(patSym).contains(scrutSym)
+ 
++  /** A pattern type variable with no bounds beyond `Nothing <: t <: Any`
++   *  (`case '[t] =>`): matches any scrutinee type. A bounded one
++   *  (`case '[type t <: AnyVal; t] =>`) has to go through the real subtype
++   *  check in `matchStructuralTypePattern`.
++   */
++  private def isUnboundedTypeVar(sym: Symbol)(using Context): Boolean =
++    sym.info match
++      case TypeBounds(lo, hi) => lo.isRef(defn.NothingClass) && hi.isRef(defn.AnyClass)
++      case _ => false
++
++  /** Structural quote-TYPE pattern (`case '[List[t]] =>`): mirrors what
++   *  `QuoteMatcher.treeMatch` does for a lowered `TypeMatch.unapply` in stock
++   *  dotc. The pattern's type variables (`holeSyms`, the quote pattern's
++   *  `Bind` symbols) are registered as GADT constraints in a fresh context,
++   *  the scrutinee must then conform to the pattern's type under that
++   *  constraint, and each variable is approximated from what the subtype
++   *  check inferred for it (its lower bound, or upper bound for a
++   *  `fromAbove` variable). The fresh GADT state keeps the constraints from
++   *  leaking into the ambient context.
++   */
++  private def matchStructuralTypePattern(holeSyms: List[Symbol], patType: Type, scrutType: Type)(using Context): Option[Map[Symbol, Type]] =
++    val ctx1 = ctx.fresh.setFreshGADTBounds.addMode(Mode.GadtConstraintInference)
++    if holeSyms.nonEmpty then ctx1.gadtState.addToConstraint(holeSyms)(using ctx1)
++    inContext(ctx1) {
++      val matches = scrutType.widenTermRefExpr <:< patType
++      if debugMatchEnabled then
++        Console.err.println(s"[matchStructuralTypePattern] patType=${patType.show} scrutType=${scrutType.show} holes=${holeSyms.mkString(",")} matches=$matches")
++      if !matches then None
++      else Some(holeSyms.map { sym =>
++        val fromAbove = sym.hasAnnotation(defn.QuotedRuntimePatterns_fromAboveAnnot)
++        val bounds = ctx1.gadt.fullBounds(sym)(using ctx1)
++        val approx: Type = if bounds == null then sym.info.bounds.hi else if fromAbove then bounds.hi else bounds.lo
++        sym -> approx
++      }.toMap)
++    }
++
+   /** Structurally unifies a splice pattern's type ascription (e.g. `Encoder[h]`,
+    *  `Encoder[EmptyTuple]`, `Encoder[ht *: t]`) against the scrutinee
+    *  expression's own real, statically-known type, solving for `bindingSyms`
+@@ -1500,6 +1751,31 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       Console.err.println(s"[unifyPatternType] patType=${patType.show} scrutType=${scrutType.show} bindingSyms=${bindingSyms.mkString(",")} result=$result")
+     result
+ 
++  private def constantTag(kind: String): Option[Int] =
++    import dotty.tools.dotc.core.Constants.*
++    kind match
++      case "Boolean" => Some(BooleanTag)
++      case "Byte" => Some(ByteTag)
++      case "Short" => Some(ShortTag)
++      case "Int" => Some(IntTag)
++      case "Long" => Some(LongTag)
++      case "Float" => Some(FloatTag)
++      case "Double" => Some(DoubleTag)
++      case "Char" => Some(CharTag)
++      case "String" => Some(StringTag)
++      case "ClassOf" => Some(ClazzTag)
++      case "Null" => Some(NullTag)
++      case "Unit" => Some(UnitTag)
++      case _ => None
++
++  /** `StringConstantTypeTest` -> `StringTag`. */
++  private def constantTypeTestTag(name: String): Option[Int] =
++    if name.endsWith("ConstantTypeTest") then constantTag(name.stripSuffix("ConstantTypeTest")) else None
++
++  /** `StringConstant` (the `unapply` extractor) -> `StringTag`. */
++  private def constantExtractorTag(name: String): Option[Int] =
++    if name.endsWith("Constant") then constantTag(name.stripSuffix("Constant")) else None
++
+   private def typeTestClass(name: String): Option[Class[?]] = name match
+     case "ConstantTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.ConstantType])
+     case "NamedTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.NamedType])
+@@ -1981,6 +2257,33 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case (key: String) :: Nil => Some(System.getenv(key))
+         case Nil => Some(System.getenv())
+         case _ => None
++    // `java.lang.Character`'s static classification/case-mapping methods
++    // (jsoniter-scala's name mappers -- snake_case, kebab-case, ... --
++    // walk the field name char by char at macro-expansion time).
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "Character" then
++      (fn.name.toString, args) match
++        case ("isLowerCase", (c: Character) :: Nil) => Some(Boolean.box(Character.isLowerCase(c.charValue)))
++        case ("isUpperCase", (c: Character) :: Nil) => Some(Boolean.box(Character.isUpperCase(c.charValue)))
++        case ("isDigit", (c: Character) :: Nil) => Some(Boolean.box(Character.isDigit(c.charValue)))
++        case ("isLetter", (c: Character) :: Nil) => Some(Boolean.box(Character.isLetter(c.charValue)))
++        case ("isLetterOrDigit", (c: Character) :: Nil) => Some(Boolean.box(Character.isLetterOrDigit(c.charValue)))
++        case ("isWhitespace", (c: Character) :: Nil) => Some(Boolean.box(Character.isWhitespace(c.charValue)))
++        case ("isSpaceChar", (c: Character) :: Nil) => Some(Boolean.box(Character.isSpaceChar(c.charValue)))
++        case ("isAlphabetic", (c: Integer) :: Nil) => Some(Boolean.box(Character.isAlphabetic(c.intValue)))
++        case ("isJavaIdentifierStart", (c: Character) :: Nil) => Some(Boolean.box(Character.isJavaIdentifierStart(c.charValue)))
++        case ("isJavaIdentifierPart", (c: Character) :: Nil) => Some(Boolean.box(Character.isJavaIdentifierPart(c.charValue)))
++        case ("toLowerCase", (c: Character) :: Nil) => Some(Character.valueOf(Character.toLowerCase(c.charValue)))
++        case ("toUpperCase", (c: Character) :: Nil) => Some(Character.valueOf(Character.toUpperCase(c.charValue)))
++        case ("toLowerCase", (c: Integer) :: Nil) => Some(Int.box(Character.toLowerCase(c.intValue)))
++        case ("toUpperCase", (c: Integer) :: Nil) => Some(Int.box(Character.toUpperCase(c.intValue)))
++        case ("toString", (c: Character) :: Nil) => Some(Character.toString(c.charValue))
++        case ("valueOf", (c: Character) :: Nil) => Some(c)
++        case ("getNumericValue", (c: Character) :: Nil) => Some(Int.box(Character.getNumericValue(c.charValue)))
++        case ("forDigit", (d: Integer) :: (r: Integer) :: Nil) => Some(Character.valueOf(Character.forDigit(d, r)))
++        case ("compare", (a: Character) :: (b: Character) :: Nil) => Some(Int.box(Character.compare(a.charValue, b.charValue)))
++        case ("isHighSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isHighSurrogate(c.charValue)))
++        case ("isLowSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isLowSurrogate(c.charValue)))
++        case _ => None
+     // A handful of common `java.lang.{Integer,Long}` real JDK-native
+     // static parsing methods -- no Scala source ever, but exercised by
+     // e.g. ip4s's own literal-validation macros hand-parsing numbers at
+@@ -1998,6 +2301,31 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case ("Integer", "bitCount", (x: Integer) :: Nil) => Some(Int.box(Integer.bitCount(x)))
+         case ("Integer", "rotateLeft", (x: Integer) :: (d: Integer) :: Nil) => Some(Int.box(Integer.rotateLeft(x, d)))
+         case ("Integer", "rotateRight", (x: Integer) :: (d: Integer) :: Nil) => Some(Int.box(Integer.rotateRight(x, d)))
++        case ("Integer", "highestOneBit", (x: Integer) :: Nil) => Some(Int.box(Integer.highestOneBit(x)))
++        case ("Integer", "lowestOneBit", (x: Integer) :: Nil) => Some(Int.box(Integer.lowestOneBit(x)))
++        case ("Integer", "signum", (x: Integer) :: Nil) => Some(Int.box(Integer.signum(x)))
++        case ("Integer", "reverse", (x: Integer) :: Nil) => Some(Int.box(Integer.reverse(x)))
++        case ("Integer", "toString", (x: Integer) :: Nil) => Some(Integer.toString(x))
++        case ("Integer", "toString", (x: Integer) :: (r: Integer) :: Nil) => Some(Integer.toString(x, r))
++        case ("Integer", "toHexString", (x: Integer) :: Nil) => Some(Integer.toHexString(x))
++        case ("Integer", "toBinaryString", (x: Integer) :: Nil) => Some(Integer.toBinaryString(x))
++        case ("Integer", "valueOf", (x: Integer) :: Nil) => Some(x)
++        case ("Integer", "valueOf", (x: String) :: Nil) => Some(Int.box(Integer.parseInt(x)))
++        case ("Integer", "hashCode", (x: Integer) :: Nil) => Some(Int.box(x.intValue))
++        case ("Integer", "max", (x: Integer) :: (y: Integer) :: Nil) => Some(Int.box(Integer.max(x, y)))
++        case ("Integer", "min", (x: Integer) :: (y: Integer) :: Nil) => Some(Int.box(Integer.min(x, y)))
++        case ("Integer", "sum", (x: Integer) :: (y: Integer) :: Nil) => Some(Int.box(Integer.sum(x, y)))
++        case ("Long", "highestOneBit", (x: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.highestOneBit(x)))
++        case ("Long", "lowestOneBit", (x: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.lowestOneBit(x)))
++        case ("Long", "numberOfLeadingZeros", (x: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.numberOfLeadingZeros(x)))
++        case ("Long", "numberOfTrailingZeros", (x: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.numberOfTrailingZeros(x)))
++        case ("Long", "bitCount", (x: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.bitCount(x)))
++        case ("Long", "signum", (x: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.signum(x)))
++        case ("Long", "toString", (x: java.lang.Long) :: Nil) => Some(java.lang.Long.toString(x))
++        case ("Long", "toHexString", (x: java.lang.Long) :: Nil) => Some(java.lang.Long.toHexString(x))
++        case ("Long", "valueOf", (x: java.lang.Long) :: Nil) => Some(x)
++        case ("Long", "max", (x: java.lang.Long) :: (y: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.max(x, y)))
++        case ("Long", "min", (x: java.lang.Long) :: (y: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.min(x, y)))
+         case ("Long", "parseLong", (s: String) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.parseLong(s)))
+         case ("Long", "parseLong", (s: String) :: (radix: Integer) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.parseLong(s, radix)))
+         case ("Long", "compare", (x: java.lang.Long) :: (y: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.compare(x, y)))
+@@ -2243,6 +2571,22 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // base-class-folding alone doesn't cover lexical outer-class nesting).
+     val base = receiver match
+       case Some(inst: InterpretedInstance) => inst.outerEnv
++      // A `ModuleValue` for an `object` nested inside a CLASS (not a
++      // top-level/static one) has no instance of its own to carry the
++      // enclosing instance's `this`, but its members still reference it
++      // (e.g. the synthetic companion `apply` of a case class nested in
++      // `JsonCodecMakerInstance`, whose `new Inner(..)` needs
++      // `JsonCodecMakerInstance.this` as the new instance's outer). The
++      // module is only ever reached from code running inside that
++      // enclosing instance, so the ambient env still binds it: carry over
++      // just those enclosing-class bindings.
++      case Some(ModuleValue(cls)) if cls.exists && !cls.isStatic =>
++        var acc = emptyEnv
++        var c = cls.owner.enclosingClass
++        while c.exists && !c.is(Package) do
++          summon[Env].get(c).foreach(v => acc = bindThis(acc, c, v))
++          c = c.owner.enclosingClass
++        acc
+       case _ => emptyEnv
+     // Bind the callee's OWN type-parameter symbols to the concrete argument
+     // `Type`s too (same shape as term params just below) -- needed so a
+@@ -2840,6 +3184,13 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    *  `ApplyModule.apply`, or interpreted library code) structurally expects
+    *  a real `List`.
+    */
++  /** A varargs/array argument value as a `List` (host `Array`, `Seq`). */
++  private def asArrayLike(v: Object): List[Object] = v match
++    case a: Array[Object] @unchecked => a.toList
++    case s: scala.collection.Seq[Object @unchecked] => s.toList
++    case other if other != null && other.getClass.isArray => (0 until java.lang.reflect.Array.getLength(other)).map(java.lang.reflect.Array.get(other, _)).toList
++    case _ => Nil
++
+   private def asObjectList(v: Object): List[Object] = v match
+     case s: scala.collection.Seq[Object @unchecked] => s.toList
+     case inst: InterpretedInstance if inst.cls.name.toString == "::" =>
+@@ -3059,6 +3410,26 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             case "MIN_VALUE" => Some(Character.valueOf(Character.MIN_VALUE))
+             case "MAX_VALUE" => Some(Character.valueOf(Character.MAX_VALUE))
+             case _ => None
++        case "MathContext" =>
++          // `java.math.MathContext`'s preset constants (jsoniter-scala's
++          // `BigDecimal` precision handling reads `DECIMAL128`).
++          sym.name.toString match
++            case "DECIMAL32" => Some(java.math.MathContext.DECIMAL32)
++            case "DECIMAL64" => Some(java.math.MathContext.DECIMAL64)
++            case "DECIMAL128" => Some(java.math.MathContext.DECIMAL128)
++            case "UNLIMITED" => Some(java.math.MathContext.UNLIMITED)
++            case _ => None
++        case "RoundingMode" =>
++          sym.name.toString match
++            case "UP" => Some(java.math.RoundingMode.UP)
++            case "DOWN" => Some(java.math.RoundingMode.DOWN)
++            case "CEILING" => Some(java.math.RoundingMode.CEILING)
++            case "FLOOR" => Some(java.math.RoundingMode.FLOOR)
++            case "HALF_UP" => Some(java.math.RoundingMode.HALF_UP)
++            case "HALF_DOWN" => Some(java.math.RoundingMode.HALF_DOWN)
++            case "HALF_EVEN" => Some(java.math.RoundingMode.HALF_EVEN)
++            case "UNNECESSARY" => Some(java.math.RoundingMode.UNNECESSARY)
++            case _ => None
+         case "File" =>
+           // `java.io.File.separator`/`.separatorChar`/`.pathSeparator`/
+           // `.pathSeparatorChar` -- real JDK-native platform-dependent
+@@ -3152,14 +3523,16 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // QuotesImpl source, QuotesImpl.scala:1157) -- the Type[T] evidence
+         // is a real TypeImpl we already hold.
+         import scala.quoted.runtime.impl.TypeImpl
+-        args.collectFirst { case t: TypeImpl => t.typeTree }
++        // The `Type[T]` evidence is sometimes the raw dotc `Type` itself
++        // (bound by a call path that never wrapped it) -- same value.
++        args.collectFirst { case t: TypeImpl => t.typeTree; case t: Type => tpd.TypeTree(t) }
+ 
+       case "of" if fn.owner.name.toString == "TypeReprModule" =>
+         // TypeReprModule#of[T](using Type[T]): TypeRepr = tp.typeTree.tpe
+         // (real QuotesImpl source, QuotesImpl.scala:1816-1817) -- same
+         // Type[T]-evidence-as-TypeImpl story as TypeTreeModule#of above.
+         import scala.quoted.runtime.impl.TypeImpl
+-        args.collectFirst { case t: TypeImpl => t.typeTree.tpe }
++        args.collectFirst { case t: TypeImpl => t.typeTree.tpe; case t: Type => t }
+ 
+       case "current" if fn.owner.name.toString == "SourceFileModule" =>
+         // SourceFileModule#current = ctx.compilationUnit.source (real source,
+@@ -3325,7 +3698,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case "baseClasses" if fn.owner.name.toString == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.baseClasses }
+       case "typeArgs" if fn.owner.name.toString == "TypeReprMethods" =>
+-        args.headOption.collect { case t: Type => t match { case AppliedType(_, targs) => targs; case _ => Nil } }
++        args.headOption.collect { case t: Type =>
++          def targsOf(t: Type): List[Type] = t match
++            case AppliedType(_, targs) => targs
++            case AnnotatedType(parent, _) => targsOf(parent)
++            case FlexibleType(underlying, _) => targsOf(underlying)
++            case _ => Nil
++          targsOf(t)
++        }
+       case "appliedTo" if fn.owner.name.toString == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (targ: Type) :: Nil => Some(t.appliedTo(targ))
+@@ -3346,6 +3726,50 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             val memberInfo = if t.typeSymbol.isClass then member.info.substThis(t.classSymbol.asClass, t) else member.info
+             Some(memberInfo.asSeenFrom(t, member.owner))
+           case _ => None
++      // Remaining `TypeReprMethods` members, same definitions as `QuotesImpl`.
++      case "baseType" if fn.owner.name.toString == "TypeReprMethods" =>
++        args match
++          case (t: Type) :: (cls: Symbol) :: Nil => Some(t.baseType(cls))
++          case _ => None
++      case "widenByName" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type => t.widenExpr }
++      case "widenTermRefByName" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type =>
++          t.widenTermRefExpr match
++            case dotty.tools.dotc.core.Types.ClassInfo(prefix, sym, _, _, _) => prefix.select(sym)
++            case other => other
++        }
++      case "dealiasKeepOpaques" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type => t.dealiasKeepOpaques }
++      case "isFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type => Boolean.box(defn.isFunctionNType(t)) }
++      case "isContextFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type => Boolean.box(defn.isContextFunctionType(t)) }
++      case "isErasedFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type =>
++          Boolean.box(t match
++            case defn.PolyFunctionOf(mt) =>
++              mt match
++                case mt: MethodType => mt.hasErasedParams
++                case pt: PolyType => pt.resType match
++                  case m: MethodType => m.hasErasedParams
++                  case _ => false
++                case _ => false
++            case _ => false)
++        }
++      case "isDependentFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type =>
++          val noRefinement = t.dropDependentRefinement
++          Boolean.box(noRefinement != t && defn.isNonRefinedFunction(noRefinement))
++        }
++      case "isTupleN" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type => Boolean.box(defn.isTupleNType(t)) }
++      case "select" if fn.owner.name.toString == "TypeReprMethods" =>
++        args match
++          case (t: Type) :: (sym: Symbol) :: Nil => Some(t.select(sym))
++          case _ => None
++      case "seal" if fn.owner.name.toString == "TypeReprMethods" =>
++        args.headOption.collect { case t: Type => new scala.quoted.runtime.impl.TypeImpl(tpd.TypeTree(t), SpliceScope.getCurrent) }
+       case "derivesFrom" if fn.owner.name.toString == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (cls: Symbol) :: Nil => Some(Boolean.box(t.derivesFrom(cls)))
+@@ -3656,6 +4080,22 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         args match { case (v: java.lang.Boolean) :: Nil => Some(Constant(v.booleanValue)); case _ => None }
+       case "apply" if fn.owner.name.toString == "StringConstantModule" =>
+         args match { case (v: String) :: Nil => Some(Constant(v)); case _ => None }
++      case "apply" if fn.owner.name.toString == "ByteConstantModule" =>
++        args match { case (v: java.lang.Byte) :: Nil => Some(Constant(v.byteValue)); case _ => None }
++      case "apply" if fn.owner.name.toString == "ShortConstantModule" =>
++        args match { case (v: java.lang.Short) :: Nil => Some(Constant(v.shortValue)); case _ => None }
++      case "apply" if fn.owner.name.toString == "LongConstantModule" =>
++        args match { case (v: java.lang.Long) :: Nil => Some(Constant(v.longValue)); case _ => None }
++      case "apply" if fn.owner.name.toString == "FloatConstantModule" =>
++        args match { case (v: java.lang.Float) :: Nil => Some(Constant(v.floatValue)); case _ => None }
++      case "apply" if fn.owner.name.toString == "DoubleConstantModule" =>
++        args match { case (v: java.lang.Double) :: Nil => Some(Constant(v.doubleValue)); case _ => None }
++      case "apply" if fn.owner.name.toString == "CharConstantModule" =>
++        args match { case (v: java.lang.Character) :: Nil => Some(Constant(v.charValue)); case _ => None }
++      case "apply" if fn.owner.name.toString == "UnitConstantModule" =>
++        Some(Constant(()))
++      case "apply" if fn.owner.name.toString == "ClassOfConstantModule" =>
++        args match { case (v: Type) :: Nil => Some(Constant(v)); case _ => None }
+       case "apply" if fn.owner.name.toString == "NullConstantModule" =>
+         Some(Constant(null))
+       case "apply" if fn.owner.name.toString == "DefDefModule" =>
+@@ -3750,13 +4190,20 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         args match
+           case (t: Type) :: Nil => Some(ctx.typer.inferImplicitArg(t, pos.span))
+           case _ => None
++      // Plain accessors of the typed-tree `*Methods` extension traits
++      // (`quotes.reflect.Apply(...)`.fun, `Block`.statements, ...): the
++      // `self` tree is the first (and only receiver) argument, the answer is
++      // the matching field of the underlying dotc `tpd` node (what
++      // `QuotesImpl` itself returns).
++      case name if fn.owner.name.toString.endsWith("Methods") && treeAccessor(fn.owner.name.toString, name, args).isDefined =>
++        treeAccessor(fn.owner.name.toString, name, args)
+       case "tree" if fn.owner.name.toString == "ImplicitSearchSuccessMethods" =>
+         args.headOption.collect { case t: Tree => t }
+       case "explanation" if fn.owner.name.toString == "ImplicitSearchFailureMethods" =>
+         args.headOption.collect { case t: Tree => t.tpe.asInstanceOf[dotty.tools.dotc.typer.Implicits.SearchFailureType].explanation }
+ 
+       case name if fn.owner.name.toString == "defnModule" =>
+-        defnConstant(name)
++        defnConstant(name).orElse(defnMethod(name, args))
+ 
+       case "ofMacroExpansion" if fn.owner.name.toString == "PositionModule" =>
+         Some(pos.sourcePos)
+@@ -3838,7 +4285,15 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // class's own plain `WeakHashMap`-backed fallback implementation.
+       case "forName" if fn.owner.name.toString.stripSuffix("$") == "Class" && fn.owner.is(JavaDefined) =>
+         val name = args.headOption.collect { case s: String => s }.getOrElse("")
+-        throw new ClassNotFoundException(name)
++        // Exception: a Scala standard-library module class (`scala.Some$`,
++        // ...), which jsoniter-scala's compile-time config evaluator
++        // (`NameMapper`'s JVM-reflection path, e.g. for
++        // `withDiscriminatorFieldName(Some("type"))`) looks up by name to
++        // call `apply` on. Those are already loaded in this very process.
++        if name.startsWith("scala.") && name.endsWith("$") then
++          try Some(Class.forName(name))
++          catch case _: ClassNotFoundException | _: LinkageError => throw new ClassNotFoundException(name)
++        else throw new ClassNotFoundException(name)
+       case name if fn.owner.name.toString.stripSuffix("$") == "Math" =>
+         args.map {
+           case i: Integer => i.intValue
+@@ -4020,9 +4475,122 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             Some(tpd.cpy.DefDef(original)(name.toTermName, paramss.asInstanceOf[List[tpd.ParamClause]], tpt, rhsOpt.getOrElse(tpd.EmptyTree)))
+           case _ => None
+ 
+-      case _ => None
++      case _ => moduleConstructor(fn.owner.name.toString, fn.name.toString, args)
+   end interpretQuotesApi
+ 
++  /** `quotes.reflect.*Module#apply`/`#copy` for the tree and TypeRepr
++   *  constructors not covered by a dedicated case in `interpretQuotesApi`;
++   *  each mirrors the matching definition in `QuotesImpl` (positions
++   *  default to the macro expansion's, as `withDefaultPos` does there).
++   */
++  private def moduleConstructor(owner: String, name: String, args: List[Object]): Option[Object] =
++    import dotty.tools.dotc.core.{Types => T}
++    import dotty.tools.dotc.ast.untpd
++    def trees(o: Object): List[Tree] = asObjectList(o).asInstanceOf[List[Tree]]
++    def types(o: Object): List[Type] = asObjectList(o).asInstanceOf[List[Type]]
++    def opt(o: Object): Option[Object] = o.asInstanceOf[Option[Object]]
++    def optTree(o: Object): Tree = opt(o) match { case Some(t: Tree) => t; case _ => tpd.EmptyTree }
++    def optIdent(o: Object): untpd.Ident = opt(o) match { case Some(n: String) => untpd.Ident(n.toTypeName); case _ => untpd.EmptyTypeIdent }
++    def pos0[X <: Tree](t: X): X = t.withSpan(pos.span).asInstanceOf[X]
++    (owner, name, args) match
++      case ("PackageClauseModule", "apply", (pid: Tree) :: stats :: Nil) => Some(pos0(tpd.PackageDef(pid.asInstanceOf[tpd.RefTree], trees(stats))))
++      case ("PackageClauseModule", "copy", (orig: Tree) :: (pid: Tree) :: stats :: Nil) => Some(tpd.cpy.PackageDef(orig)(pid.asInstanceOf[tpd.RefTree], trees(stats)))
++      case ("ImportModule", "apply", (expr: Tree) :: sels :: Nil) => Some(pos0(tpd.Import(expr, asObjectList(sels).asInstanceOf[List[untpd.ImportSelector]])))
++      case ("ImportModule", "copy", (orig: Tree) :: (expr: Tree) :: sels :: Nil) => Some(tpd.cpy.Import(orig)(expr, asObjectList(sels).asInstanceOf[List[untpd.ImportSelector]]))
++      case ("TypeDefModule", "apply", (sym: Symbol) :: Nil) => Some(pos0(tpd.TypeDef(sym.asType)))
++      case ("TypeDefModule", "copy", (orig: Tree) :: (n: String) :: (rhs: Tree) :: Nil) => Some(tpd.cpy.TypeDef(orig)(n.toTypeName, rhs))
++      case ("ThisModule", "apply", (cls: Symbol) :: Nil) => Some(pos0(tpd.This(cls.asClass)))
++      case ("ThisModule", "copy", (orig: Tree) :: q :: Nil) =>
++        Some(tpd.cpy.This(orig)(opt(q) match { case Some(n: String) => untpd.Ident(n.toTypeName); case _ => untpd.EmptyTypeIdent }))
++      case ("NamedArgModule", "apply", (n: String) :: (arg: Tree) :: Nil) => Some(pos0(tpd.NamedArg(n.toTermName, arg)))
++      case ("NamedArgModule", "copy", (orig: Tree) :: (n: String) :: (arg: Tree) :: Nil) => Some(tpd.cpy.NamedArg(orig)(n.toTermName, arg))
++      case ("SuperModule", "apply", (qual: Tree) :: mix :: Nil) => Some(pos0(tpd.Super(qual, optIdent(mix), NoSymbol)))
++      case ("SuperModule", "copy", (orig: Tree) :: (qual: Tree) :: mix :: Nil) => Some(tpd.cpy.Super(orig)(qual, optIdent(mix)))
++      case ("TypedOrTestModule", "apply", (expr: Tree) :: (tpt: Tree) :: Nil) => Some(pos0(tpd.Typed(expr, tpt)))
++      case ("TypedOrTestModule", "copy", (orig: Tree) :: (expr: Tree) :: (tpt: Tree) :: Nil) => Some(tpd.cpy.Typed(orig)(expr, tpt))
++      case ("ClosureModule", "apply", (meth: Tree) :: tpe :: Nil) =>
++        Some(pos0(tpd.Closure(Nil, meth, opt(tpe) match { case Some(t: Type) => tpd.TypeTree(t); case _ => tpd.EmptyTree })))
++      case ("ClosureModule", "copy", (orig: Tree) :: (meth: Tree) :: tpe :: Nil) =>
++        Some(tpd.cpy.Closure(orig)(Nil, meth, opt(tpe) match { case Some(t: Type) => tpd.TypeTree(t); case _ => tpd.EmptyTree }))
++      case ("SummonFromModule", "apply", cases :: Nil) => Some(pos0(tpd.Match(tpd.EmptyTree, asObjectList(cases).asInstanceOf[List[CaseDef]])))
++      case ("TryModule", "apply", (expr: Tree) :: cases :: fin :: Nil) =>
++        Some(pos0(tpd.Try(expr, asObjectList(cases).asInstanceOf[List[CaseDef]], optTree(fin))))
++      case ("TryModule", "copy", (orig: Tree) :: (expr: Tree) :: cases :: fin :: Nil) =>
++        Some(tpd.cpy.Try(orig)(expr, asObjectList(cases).asInstanceOf[List[CaseDef]], optTree(fin)))
++      case ("ReturnModule", "apply", (expr: Tree) :: (from: Symbol) :: Nil) => Some(pos0(tpd.Return(expr, from)))
++      case ("ReturnModule", "copy", (orig: Tree) :: (expr: Tree) :: (from: Symbol) :: Nil) => Some(tpd.cpy.Return(orig)(expr, tpd.ref(from)))
++      case ("InlinedModule", "apply", call :: bindings :: (expansion: Tree) :: Nil) =>
++        Some(pos0(tpd.Inlined(optTree(call), asObjectList(bindings).asInstanceOf[List[tpd.MemberDef]], expansion)))
++      case ("InlinedModule", "copy", (orig: Inlined) :: call :: bindings :: (expansion: Tree) :: Nil) =>
++        Some(tpd.cpy.Inlined(orig)(optTree(call), asObjectList(bindings).asInstanceOf[List[tpd.MemberDef]], expansion))
++      case ("SelectOuterModule", "apply", (qual: Tree) :: (n: String) :: (levels: Integer) :: Nil) =>
++        Some(pos0(tpd.Select(qual, dotty.tools.dotc.core.NameKinds.OuterSelectName(n.toTermName, levels.intValue))))
++      case ("SelectOuterModule", "copy", (orig: Tree) :: (qual: Tree) :: (n: String) :: (levels: Integer) :: Nil) =>
++        Some(tpd.cpy.Select(orig)(qual, dotty.tools.dotc.core.NameKinds.OuterSelectName(n.toTermName, levels.intValue)))
++      case ("WhileModule", "apply", (cond: Tree) :: (body: Tree) :: Nil) => Some(pos0(tpd.WhileDo(cond, body)))
++      case ("WhileModule", "copy", (orig: Tree) :: (cond: Tree) :: (body: Tree) :: Nil) => Some(tpd.cpy.WhileDo(orig)(cond, body))
++      case ("TypeIdentModule", "apply", (sym: Symbol) :: Nil) =>
++        assert(sym.isType, s"Expected a type symbol, but got $sym")
++        Some(pos0(tpd.ref(sym)))
++      case ("TypeIdentModule", "copy", (orig: Tree) :: (n: String) :: Nil) => Some(tpd.cpy.Ident(orig)(n.toTypeName))
++      case ("TypeSelectModule" | "TypeProjectionModule", "apply", (qual: Tree) :: (n: String) :: Nil) => Some(pos0(tpd.Select(qual, n.toTypeName)))
++      case ("TypeSelectModule" | "TypeProjectionModule", "copy", (orig: Tree) :: (qual: Tree) :: (n: String) :: Nil) => Some(tpd.cpy.Select(orig)(qual, n.toTypeName))
++      case ("SingletonModule", "apply", (ref: Tree) :: Nil) => Some(pos0(tpd.SingletonTypeTree(ref)))
++      case ("SingletonModule", "copy", (orig: Tree) :: (ref: Tree) :: Nil) => Some(tpd.cpy.SingletonTypeTree(orig)(ref))
++      case ("RefinedModule", "apply", (tpt: Tree) :: refs :: (cls: Symbol) :: Nil) => Some(pos0(tpd.RefinedTypeTree(tpt, trees(refs), cls.asClass)))
++      case ("RefinedModule", "copy", (orig: Tree) :: (tpt: Tree) :: refs :: Nil) => Some(tpd.cpy.RefinedTypeTree(orig)(tpt, trees(refs)))
++      case ("AppliedModule", "apply", (tpt: Tree) :: targs :: Nil) => Some(pos0(tpd.AppliedTypeTree(tpt, trees(targs))))
++      case ("AppliedModule", "copy", (orig: Tree) :: (tpt: Tree) :: targs :: Nil) => Some(tpd.cpy.AppliedTypeTree(orig)(tpt, trees(targs)))
++      case ("AnnotatedModule", "apply", (arg: Tree) :: (annot: Tree) :: Nil) => Some(pos0(tpd.Annotated(arg, annot)))
++      case ("AnnotatedModule", "copy", (orig: Tree) :: (arg: Tree) :: (annot: Tree) :: Nil) => Some(tpd.cpy.Annotated(orig)(arg, annot))
++      case ("MatchTypeTreeModule", "apply", bound :: (sel: Tree) :: cases :: Nil) => Some(pos0(tpd.MatchTypeTree(optTree(bound), sel, asObjectList(cases).asInstanceOf[List[CaseDef]])))
++      case ("MatchTypeTreeModule", "copy", (orig: Tree) :: bound :: (sel: Tree) :: cases :: Nil) =>
++        Some(tpd.cpy.MatchTypeTree(orig)(optTree(bound), sel, asObjectList(cases).asInstanceOf[List[CaseDef]]))
++      case ("ByNameModule", "apply", (res: Tree) :: Nil) => Some(pos0(tpd.ByNameTypeTree(res)))
++      case ("ByNameModule", "copy", (orig: Tree) :: (res: Tree) :: Nil) => Some(tpd.cpy.ByNameTypeTree(orig)(res))
++      case ("LambdaTypeTreeModule", "apply", tparams :: (body: Tree) :: Nil) => Some(pos0(tpd.LambdaTypeTree(asObjectList(tparams).asInstanceOf[List[TypeDef]], body)))
++      case ("LambdaTypeTreeModule", "copy", (orig: Tree) :: tparams :: (body: Tree) :: Nil) =>
++        Some(tpd.cpy.LambdaTypeTree(orig)(asObjectList(tparams).asInstanceOf[List[TypeDef]], body))
++      case ("TypeBlockModule", "apply", aliases :: (tpt: Tree) :: Nil) => Some(pos0(tpd.Block(trees(aliases), tpt)))
++      case ("TypeBlockModule", "copy", (orig: Tree) :: aliases :: (tpt: Tree) :: Nil) => Some(tpd.cpy.Block(orig)(trees(aliases), tpt))
++      case ("TypeBoundsTreeModule", "apply", (lo: Tree) :: (hi: Tree) :: Nil) => Some(pos0(tpd.TypeBoundsTree(lo, hi)))
++      case ("TypeBoundsTreeModule", "copy", (orig: Tree) :: (lo: Tree) :: (hi: Tree) :: Nil) => Some(tpd.cpy.TypeBoundsTree(orig)(lo, hi, tpd.EmptyTree))
++      case ("WildcardTypeTreeModule", "apply", (tpe: Type) :: Nil) => Some(pos0(tpd.Underscore(tpe)))
++      case ("TypeCaseDefModule", "apply", (pat: Tree) :: (rhs: Tree) :: Nil) => Some(tpd.CaseDef(pat, tpd.EmptyTree, rhs))
++      case ("TypeCaseDefModule", "copy", (orig: Tree) :: (pat: Tree) :: (rhs: Tree) :: Nil) => Some(tpd.cpy.CaseDef(orig)(pat, tpd.EmptyTree, rhs))
++      case ("UnapplyModule", "apply", (fun: Tree) :: impls :: pats :: Nil) => Some(pos0(tpd.UnApply(fun, trees(impls), trees(pats), defn.NothingType)))
++      case ("UnapplyModule", "copy", (orig: Tree) :: (fun: Tree) :: impls :: pats :: Nil) => Some(pos0(tpd.cpy.UnApply(orig)(fun, trees(impls), trees(pats))))
++      case ("AlternativesModule", "apply", pats :: Nil) => Some(pos0(tpd.Alternative(trees(pats))))
++      case ("AlternativesModule", "copy", (orig: Tree) :: pats :: Nil) => Some(tpd.cpy.Alternative(orig)(trees(pats)))
++      case ("TermParamClauseModule" | "TypeParamClauseModule", "apply", params :: Nil) => Some(asObjectList(params))
++      case ("SimpleSelectorModule", "apply", (n: String) :: Nil) => Some(pos0(untpd.ImportSelector(untpd.Ident(n.toTermName))))
++      case ("RenameSelectorModule", "apply", (from: String) :: (to: String) :: Nil) => Some(pos0(untpd.ImportSelector(untpd.Ident(from.toTermName), untpd.Ident(to.toTermName))))
++      case ("OmitSelectorModule", "apply", (n: String) :: Nil) => Some(pos0(untpd.ImportSelector(untpd.Ident(n.toTermName), untpd.Ident(nme.WILDCARD))))
++      case ("GivenSelectorModule", "apply", bound :: Nil) =>
++        Some(pos0(untpd.ImportSelector(untpd.Ident(nme.EMPTY), bound = opt(bound) match { case Some(t: Tree) => untpd.TypedSplice(t); case _ => untpd.EmptyTree })))
++      // TypeRepr constructors
++      case ("ConstantTypeModule", "apply", (c: Constant) :: Nil) => Some(T.ConstantType(c))
++      case ("TermRefModule", "apply", (qual: Type) :: (n: String) :: Nil) => Some(T.TermRef(qual, n.toTermName))
++      case ("SuperTypeModule", "apply", (th: Type) :: (su: Type) :: Nil) => Some(T.SuperType(th, su))
++      case ("RefinementModule", "apply", (parent: Type) :: (n: String) :: (info: Type) :: Nil) =>
++        Some(T.RefinedType(parent, if info.isInstanceOf[T.TypeBounds] then n.toTypeName else n.toTermName, info))
++      case ("AppliedTypeModule", "apply", (tycon: Type) :: targs :: Nil) => Some(T.AppliedType(tycon, types(targs)))
++      case ("AnnotatedTypeModule", "apply", (underlying: Type) :: (annot: Tree) :: Nil) =>
++        Some(T.AnnotatedType(underlying, dotty.tools.dotc.core.Annotations.Annotation(annot)))
++      case ("AndTypeModule", "apply", (l: Type) :: (r: Type) :: Nil) => Some(T.AndType(l, r))
++      case ("OrTypeModule", "apply", (l: Type) :: (r: Type) :: Nil) => Some(T.OrType(l, r, soft = false))
++      case ("MatchTypeModule", "apply", (bound: Type) :: (scrut: Type) :: cases :: Nil) => Some(T.MatchType(bound, scrut, types(cases)))
++      case ("ByNameTypeModule", "apply", (u: Type) :: Nil) => Some(T.ExprType(u))
++      case ("RecursiveTypeModule", "apply", (f: Function1[Object, Object] @unchecked) :: Nil) =>
++        Some(T.RecType(rt => f(rt).asInstanceOf[Type]))
++      case ("PolyTypeModule", "apply", names :: (bounds: Function1[Object, Object] @unchecked) :: (res: Function1[Object, Object] @unchecked) :: Nil) =>
++        Some(T.PolyType(asObjectList(names).map(_.toString.toTypeName))(pt => asObjectList(bounds(pt)).asInstanceOf[List[T.TypeBounds]], pt => res(pt).asInstanceOf[Type]))
++      case ("TypeLambdaModule", "apply", names :: (bounds: Function1[Object, Object] @unchecked) :: (res: Function1[Object, Object] @unchecked) :: Nil) =>
++        Some(T.HKTypeLambda(asObjectList(names).map(_.toString.toTypeName))(tl => asObjectList(bounds(tl)).asInstanceOf[List[T.TypeBounds]], tl => res(tl).asInstanceOf[Type]))
++      case ("MatchCaseModule", "apply", (pat: Type) :: (rhs: Type) :: Nil) => Some(T.AppliedType(defn.MatchCaseClass.typeRef, List(pat, rhs)))
++      case ("FlexibleTypeModule", "apply", (tp: Type) :: Nil) => Some(T.FlexibleType(tp))
++      case _ => None
++
+   // Maps every member of the public `scala.quoted.Quotes#FlagsModule` API
+   // (`quotes.reflect.Flags.X`) to its real dotc `FlagSet` constant -- was
+   // curated on demand as specific macro shapes got exercised (only the
+@@ -4104,6 +4672,100 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     case "NoneModule" => Some(defn.NoneModule)
+     case "SomeModule" => Some(defn.SomeClass.companionModule)
+     case "ProductClass" => Some(defn.ProductClass)
++    case "RootPackage" => Some(defn.RootPackage)
++    case "RootClass" => Some(defn.RootClass)
++    case "EmptyPackageClass" => Some(defn.EmptyPackageClass)
++    case "ScalaPackage" => Some(defn.ScalaPackageVal)
++    case "ScalaPackageClass" => Some(defn.ScalaPackageClass)
++    case "MatchableClass" => Some(defn.MatchableClass)
++    case "PredefModule" => Some(defn.ScalaPredefModule)
++    case "Predef_classOf" => Some(defn.Predef_classOf)
++    case "JavaLangPackage" => Some(defn.JavaLangPackageVal)
++    case "ArrayModule" => Some(defn.ArrayModule)
++    case "Array_apply" => Some(defn.Array_apply)
++    case "Array_clone" => Some(defn.Array_clone)
++    case "Array_length" => Some(defn.Array_length)
++    case "Array_update" => Some(defn.Array_update)
++    case "RepeatedParamClass" => Some(defn.RepeatedParamClass)
++    case "RepeatedAnnot" => Some(defn.RepeatedAnnot)
++    case "PolyFunctionClass" => Some(defn.PolyFunctionClass)
++    case "ScalaNumericValueClasses" =>
++      Some(List(defn.ByteClass, defn.ShortClass, defn.IntClass, defn.LongClass, defn.FloatClass, defn.DoubleClass, defn.CharClass))
++    case "ScalaPrimitiveValueClasses" =>
++      Some(defn.UnitClass :: defn.BooleanClass :: List(defn.ByteClass, defn.ShortClass, defn.IntClass, defn.LongClass, defn.FloatClass, defn.DoubleClass, defn.CharClass))
++    case _ => None
++
++  /** Field accessors of the `quotes.reflect` tree `*Methods` traits, as in
++   *  `QuotesImpl` (`tpd` node fields, `Option` for the optional ones).
++   *  `None` when `owner`/`name` isn't one of these or `args` isn't a matching
++   *  tree.
++   */
++  private def treeAccessor(owner: String, name: String, args: List[Object]): Option[Object] =
++    def mkName(n: Name): String = n.toString
++    (owner, name, args) match
++      case ("ApplyMethods", "fun", (t: Apply) :: Nil) => Some(t.fun)
++      case ("ApplyMethods", "args", (t: Apply) :: Nil) => Some(t.args)
++      case ("TypeApplyMethods", "fun", (t: TypeApply) :: Nil) => Some(t.fun)
++      case ("TypeApplyMethods", "args", (t: TypeApply) :: Nil) => Some(t.args)
++      case ("SelectMethods", "qualifier", (t: Select) :: Nil) => Some(t.qualifier)
++      case ("SelectMethods", "name", (t: Select) :: Nil) => Some(mkName(t.name))
++      case ("IdentMethods", "name", (t: Ident) :: Nil) => Some(mkName(t.name))
++      case ("LiteralMethods", "constant", (t: Literal) :: Nil) => Some(t.const)
++      case ("TypedMethods", "expr", (t: Typed) :: Nil) => Some(t.expr)
++      case ("TypedMethods", "tpt", (t: Typed) :: Nil) => Some(t.tpt)
++      case ("BlockMethods", "statements", (t: Block) :: Nil) => Some(t.stats)
++      case ("BlockMethods", "expr", (t: Block) :: Nil) => Some(t.expr)
++      case ("InlinedMethods", "call", (t: Inlined) :: Nil) => Some(if t.call.isEmpty then None else Some(t.call))
++      case ("InlinedMethods", "bindings", (t: Inlined) :: Nil) => Some(t.bindings)
++      case ("InlinedMethods", "body", (t: Inlined) :: Nil) => Some(t.expansion)
++      case ("IfMethods", "cond", (t: If) :: Nil) => Some(t.cond)
++      case ("IfMethods", "thenp", (t: If) :: Nil) => Some(t.thenp)
++      case ("IfMethods", "elsep", (t: If) :: Nil) => Some(t.elsep)
++      case ("IfMethods", "isInline", (t: If) :: Nil) => Some(Boolean.box(t.isInline))
++      case ("MatchMethods", "scrutinee", (t: Match) :: Nil) => Some(t.selector)
++      case ("MatchMethods", "cases", (t: Match) :: Nil) => Some(t.cases)
++      case ("MatchMethods", "isInline", (t: Match) :: Nil) => Some(Boolean.box(t.isInline))
++      case ("NamedArgMethods", "name", (t: NamedArg) :: Nil) => Some(mkName(t.name))
++      case ("NamedArgMethods", "value", (t: NamedArg) :: Nil) => Some(t.arg)
++      case ("AssignMethods", "lhs", (t: Assign) :: Nil) => Some(t.lhs)
++      case ("AssignMethods", "rhs", (t: Assign) :: Nil) => Some(t.rhs)
++      case ("NewMethods", "tpt", (t: New) :: Nil) => Some(t.tpt)
++      case ("ReturnMethods", "expr", (t: Return) :: Nil) => Some(t.expr)
++      case ("ReturnMethods", "from", (t: Return) :: Nil) => Some(t.from.symbol)
++      case ("WhileMethods", "cond", (t: WhileDo) :: Nil) => Some(t.cond)
++      case ("WhileMethods", "body", (t: WhileDo) :: Nil) => Some(t.body)
++      case ("TryMethods", "body", (t: Try) :: Nil) => Some(t.expr)
++      case ("TryMethods", "cases", (t: Try) :: Nil) => Some(t.cases)
++      case ("TryMethods", "finalizer", (t: Try) :: Nil) => Some(if t.finalizer.isEmpty then None else Some(t.finalizer))
++      case ("RepeatedMethods", "elems", (t: SeqLiteral) :: Nil) => Some(t.elems)
++      case ("RepeatedMethods", "elemtpt", (t: SeqLiteral) :: Nil) => Some(t.elemtpt)
++      case ("TypeProjectionMethods", "qualifier", (t: Select) :: Nil) => Some(t.qualifier)
++      case ("TypeProjectionMethods", "name", (t: Select) :: Nil) => Some(mkName(t.name))
++      case ("TypeIdentMethods", "name", (t: Ident) :: Nil) => Some(mkName(t.name))
++      case ("TypeSelectMethods", "qualifier", (t: Select) :: Nil) => Some(t.qualifier)
++      case ("TypeSelectMethods", "name", (t: Select) :: Nil) => Some(mkName(t.name))
++      case ("SingletonMethods", "ref", (t: SingletonTypeTree) :: Nil) => Some(t.ref)
++      case ("RefinedMethods", "tpt", (t: RefinedTypeTree) :: Nil) => Some(t.tpt)
++      case ("RefinedMethods", "refinements", (t: RefinedTypeTree) :: Nil) => Some(t.refinements)
++      case ("AppliedMethods", "tpt", (t: AppliedTypeTree) :: Nil) => Some(t.tpt)
++      case ("AppliedMethods", "args", (t: AppliedTypeTree) :: Nil) => Some(t.args)
++      case ("AnnotatedMethods", "arg", (t: Annotated) :: Nil) => Some(t.arg)
++      case ("AnnotatedMethods", "annotation", (t: Annotated) :: Nil) => Some(t.annot)
++      case _ => None
++
++  /** The parameterised members of `quotes.reflect.defn` (the nullary ones are
++   *  `defnConstant`'s); same definitions as `QuotesImpl`'s `defn` object.
++   */
++  private def defnMethod(name: String, args: List[Object]): Option[Object] = (name, args) match
++    case ("isTupleClass", (sym: Symbol) :: Nil) => Some(Boolean.box(defn.isTupleClass(sym)))
++    case ("TupleClass", (arity: Integer) :: Nil) => Some(defn.TupleType(arity.intValue).nn.classSymbol.asClass)
++    case ("FunctionClass", (arity: Integer) :: Nil) => Some(defn.FunctionSymbol(arity.intValue, false))
++    case ("FunctionClass", (arity: Integer) :: (isImplicit: java.lang.Boolean) :: Nil) =>
++      Some(defn.FunctionSymbol(arity.intValue, isImplicit.booleanValue))
++    case ("FunctionClass", (arity: Integer) :: (isImplicit: java.lang.Boolean) :: (isErased: java.lang.Boolean) :: Nil) =>
++      if isErased.booleanValue then
++        throw new Exception("Erased function classes are not supported. Use a refined `scala.PolyFunction`")
++      Some(defn.FunctionSymbol(arity.intValue, isImplicit.booleanValue))
+     case _ => None
+ 
+   private def isExprMethodsOwner(sym: Symbol): Boolean =
+@@ -4270,6 +4932,29 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (m: java.util.regex.Matcher, "appendReplacement", List(sb: java.lang.StringBuilder @unchecked, r: String)) => Some(m.appendReplacement(sb, r))
+       case (m: java.util.regex.Matcher, "appendTail", List(sb: java.lang.StringBuilder @unchecked)) => Some(m.appendTail(sb))
+       case (sb: java.lang.StringBuilder, "toString", Nil) => Some(sb.toString)
++      case (mc: java.math.MathContext, "getPrecision", Nil) => Some(Int.box(mc.getPrecision))
++      case (mc: java.math.MathContext, "getRoundingMode", Nil) => Some(mc.getRoundingMode)
++      // The rest of the commonly used `java.lang.StringBuilder` surface
++      // (name-mapper style char-by-char string building at expansion time).
++      case (sb: java.lang.StringBuilder, "append", (v: Character) :: Nil) => Some(sb.append(v.charValue))
++      case (sb: java.lang.StringBuilder, "append", (v: String) :: Nil) => Some(sb.append(v))
++      case (sb: java.lang.StringBuilder, "append", (v: Integer) :: Nil) => Some(sb.append(v.intValue))
++      case (sb: java.lang.StringBuilder, "append", (v: java.lang.Long) :: Nil) => Some(sb.append(v.longValue))
++      case (sb: java.lang.StringBuilder, "append", (v: java.lang.Boolean) :: Nil) => Some(sb.append(v.booleanValue))
++      case (sb: java.lang.StringBuilder, "append", (v: java.lang.Double) :: Nil) => Some(sb.append(v.doubleValue))
++      case (sb: java.lang.StringBuilder, "append", (v: Object) :: Nil) => Some(sb.append(String.valueOf(v)))
++      case (sb: java.lang.StringBuilder, "length", Nil) => Some(Int.box(sb.length))
++      case (sb: java.lang.StringBuilder, "isEmpty", Nil) => Some(Boolean.box(sb.isEmpty))
++      case (sb: java.lang.StringBuilder, "charAt", (i: Integer) :: Nil) => Some(Character.valueOf(sb.charAt(i)))
++      case (sb: java.lang.StringBuilder, "setLength", (n: Integer) :: Nil) => sb.setLength(n); Some(().asInstanceOf[Object])
++      case (sb: java.lang.StringBuilder, "setCharAt", (i: Integer) :: (c: Character) :: Nil) => sb.setCharAt(i, c.charValue); Some(().asInstanceOf[Object])
++      case (sb: java.lang.StringBuilder, "deleteCharAt", (i: Integer) :: Nil) => Some(sb.deleteCharAt(i))
++      case (sb: java.lang.StringBuilder, "insert", (i: Integer) :: (c: Character) :: Nil) => Some(sb.insert(i.intValue, c.charValue))
++      case (sb: java.lang.StringBuilder, "insert", (i: Integer) :: (v: String) :: Nil) => Some(sb.insert(i.intValue, v))
++      case (sb: java.lang.StringBuilder, "reverse", Nil) => Some(sb.reverse)
++      case (sb: java.lang.StringBuilder, "indexOf", (v: String) :: Nil) => Some(Int.box(sb.indexOf(v)))
++      case (sb: java.lang.StringBuilder, "substring", (a: Integer) :: Nil) => Some(sb.substring(a))
++      case (sb: java.lang.StringBuilder, "substring", (a: Integer) :: (b: Integer) :: Nil) => Some(sb.substring(a, b))
+       // `java.io.PrintStream` (`System.out`/`System.err`, see
+       // `javaStaticFieldConstant`'s own `"System"` case): real JDK-native
+       // methods, no retained Scala source ever. Curated by the overloads a
+@@ -4345,7 +5030,24 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (r, "getClass", Nil)
+           if !r.isInstanceOf[InterpretedInstance] && !r.isInstanceOf[ModuleValue] && !r.isInstanceOf[dotty.tools.dotc.core.Types.Type] =>
+         Some(r.getClass)
++      // `this.getClass` on an interpreted instance: its class, in the same
++      // (erased `Type`) representation `classOf[T]` uses.
++      // `ClassTag.apply(cls)`'s interpreted `GenericClassTag`: the class it
++      // was built from is its sole constructor field.
++      case (inst: InterpretedInstance, "runtimeClass", Nil) if inst.fields.contains("runtimeClass") || inst.fields.contains("runtimeClass1") =>
++        inst.fields.get("runtimeClass").orElse(inst.fields.get("runtimeClass1"))
++      case (inst: InterpretedInstance, "getClass", Nil) if inst.cls.isClass => Some(inst.cls.typeRef)
+       case (c: Class[?], "isArray", Nil) => Some(Boolean.box(c.isArray))
++      // The slice of `java.lang.reflect` jsoniter-scala's compile-time
++      // config evaluator needs on real, already-loaded host classes.
++      case (c: Class[?], "getField", (n: String) :: Nil) => Some(c.getField(n))
++      case (c: Class[?], "getMethod", (n: String) :: rest) =>
++        val classes = rest.headOption.map(asArrayLike).getOrElse(Nil).collect { case k: Class[?] => k }
++        Some(c.getMethod(n, classes*))
++      case (f: java.lang.reflect.Field, "get", (o: Object) :: Nil) => Some(f.get(o))
++      case (f: java.lang.reflect.Field, "get", null :: Nil) => Some(f.get(null))
++      case (m: java.lang.reflect.Method, "invoke", o :: rest) =>
++        Some(m.invoke(o, rest.headOption.map(asArrayLike).getOrElse(Nil).asInstanceOf[List[Object]]*))
+       case (c: Class[?], "isPrimitive", Nil) => Some(Boolean.box(c.isPrimitive))
+       case (c: Class[?], "getComponentType", Nil) => Some(c.getComponentType)
+       case (s: scala.collection.Seq[Object] @unchecked, "sum", _) => Some(s.reduceOption(numericPlus).getOrElse(0.asInstanceOf[Object])) // ignores the `Numeric[T]` evidence arg
+@@ -4461,6 +5163,15 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           case _ => NoSymbol
+         if moduleClass.exists then Some(ModuleValue(moduleClass)) else None
+       case (s: scala.collection.Seq[Object] @unchecked, "toList", Nil) => Some(s.toList)
++      // `xs.toArray[B](using ClassTag[B])` on a collection (host or an
++      // interpreted one such as `LinkedHashMap`): every element is a boxed
++      // `Object` here, so a plain `Array[Object]` is the faithful result,
++      // whatever the `ClassTag` is (it is only ever consulted for the
++      // element type, which the interpreter doesn't distinguish).
++      case (r, "toArray", (_: Object) :: Nil) if !r.getClass.isArray && (r.isInstanceOf[IterableOnce[?]] || r.isInstanceOf[InterpretedInstance]) =>
++        r match
++          case it: IterableOnce[Object @unchecked] => Some(it.iterator.toArray[Object])
++          case other => Some(forceIterable(other).toArray[Object])
+       case (s: scala.collection.Seq[Object] @unchecked, "toSet", Nil) => Some(s.toSet)
+       case (s: scala.collection.Seq[Object] @unchecked, "toVector", Nil) => Some(s.toVector)
+       case (s: scala.collection.Seq[Object] @unchecked, "indexOf", (v: Object) :: Nil) => Some(Int.box(s.indexOf(v)))
+@@ -4517,6 +5228,23 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (s: String, "indexOf", (v: String) :: Nil) => Some(Int.box(s.indexOf(v)))
+       case (s: String, "indexOf", (v: Integer) :: Nil) => Some(Int.box(s.indexOf(v)))
+       case (s: String, "lastIndexOf", (v: String) :: Nil) => Some(Int.box(s.lastIndexOf(v)))
++      case (s: String, "indexOf", (v: Character) :: Nil) => Some(Int.box(s.indexOf(v.charValue)))
++      case (s: String, "lastIndexOf", (v: Character) :: Nil) => Some(Int.box(s.lastIndexOf(v.charValue)))
++      case (s: String, "lastIndexOf", (v: Integer) :: Nil) => Some(Int.box(s.lastIndexOf(v.intValue)))
++      case (s: String, "indexOf", (v: String) :: (from: Integer) :: Nil) => Some(Int.box(s.indexOf(v, from)))
++      case (s: String, "indexOf", (v: Character) :: (from: Integer) :: Nil) => Some(Int.box(s.indexOf(v.charValue, from)))
++      case (s: String, "lastIndexOf", (v: String) :: (from: Integer) :: Nil) => Some(Int.box(s.lastIndexOf(v, from)))
++      case (s: String, "lastIndexOf", (v: Character) :: (from: Integer) :: Nil) => Some(Int.box(s.lastIndexOf(v.charValue, from)))
++      case (s: String, "startsWith", (v: String) :: (from: Integer) :: Nil) => Some(Boolean.box(s.startsWith(v, from)))
++      case (s: String, "isBlank", Nil) => Some(Boolean.box(s.isBlank))
++      case (s: String, "strip", Nil) => Some(s.strip)
++      case (s: String, "replaceAll", (a: String) :: (b: String) :: Nil) => Some(s.replaceAll(a, b))
++      case (s: String, "replace", (a: Character) :: (b: Character) :: Nil) => Some(s.replace(a.charValue, b.charValue))
++      case (s: String, "matches", (re: String) :: Nil) => Some(Boolean.box(s.matches(re)))
++      case (s: String, "concat", (v: String) :: Nil) => Some(s.concat(v))
++      case (s: String, "compareTo", (v: String) :: Nil) => Some(Int.box(s.compareTo(v)))
++      case (s: String, "hashCode", Nil) => Some(Int.box(s.hashCode))
++      case (s: String, "intern", Nil) => Some(s.intern)
+       case (s: String, "startsWith", (v: String) :: Nil) => Some(Boolean.box(s.startsWith(v)))
+       // Seen via cats-parse's own `Rep0Impl`/literal-matching machinery,
+       // reached through http4s's `uri"..."` literal macro.
+@@ -4555,7 +5283,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (o: Option[Object] @unchecked, "isDefined", Nil) => Some(Boolean.box(o.isDefined))
+       case (o: Option[Object] @unchecked, "isEmpty", Nil) => Some(Boolean.box(o.isEmpty))
+       case (o: Option[Object] @unchecked, "get", Nil) => Some(o.get)
+-      case (o: Option[Object] @unchecked, "getOrElse", (default: Object) :: Nil) => Some(o.getOrElse(default))
++      // `getOrElse`/`orElse`/`fold`'s default arguments are by-name: they
++      // arrive as `ByNameArg` thunks and must only be forced when needed.
++      case (o: Option[Object] @unchecked, "getOrElse", (default: Object) :: Nil) =>
++        Some(o.getOrElse(default match { case b: ByNameArg => b.force(); case v => v }))
+       case (o: Option[Object] @unchecked, "map", (f: Function1[Object, Object] @unchecked) :: Nil) => Some(o.map(f))
+       case (o: Option[Object] @unchecked, "contains", (v: Object) :: Nil) => Some(Boolean.box(o.contains(v)))
+       case (o: Option[Object] @unchecked, "exists", (f: Function1[Object, Object] @unchecked) :: Nil) =>
+@@ -4563,11 +5294,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (o: Option[Object] @unchecked, "foreach", (f: Function1[Object, Object] @unchecked) :: Nil) =>
+         o.foreach(f); Some(().asInstanceOf[Object])
+       case (o: Option[Object] @unchecked, "fold", (ifEmpty: Object) :: (f: Function1[Object, Object] @unchecked) :: Nil) =>
+-        Some(o.fold(ifEmpty)(f))
++        Some(o.fold(ifEmpty match { case b: ByNameArg => b.force(); case v => v })(f))
+       case (o: Option[Object] @unchecked, "flatMap", (f: Function1[Object, Option[Object] @unchecked] @unchecked) :: Nil) =>
+         Some(o.flatMap(f))
+-      case (o: Option[Object] @unchecked, "orElse", (other: Option[Object] @unchecked) :: Nil) =>
+-        Some(o.orElse(other))
++      case (o: Option[Object] @unchecked, "orElse", (other: Object) :: Nil) =>
++        Some(o.orElse(other match { case b: ByNameArg => b.force().asInstanceOf[Option[Object]]; case v => v.asInstanceOf[Option[Object]] }))
+       case (o: Option[Object] @unchecked, "toList", Nil) => Some(o.toList)
+       case (o: Option[Option[Object] @unchecked] @unchecked, "flatten", Nil) => Some(o.flatten)
+       // `Symbol#asType`/`asTerm`/`asClass` (dotc core.Symbols.scala): trivial
+@@ -4587,7 +5318,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // exists for them, `<special-ops>` in error messages), so they need a
+       // direct case here rather than falling through to `resolveExternalDefTree`.
+       case (a: Array[Object] @unchecked, "apply", (i: Integer) :: Nil) => Some(a(i))
+-      case (a: Array[Object] @unchecked, "update", (i: Integer) :: (v: Object) :: Nil) =>
++      // Primitive host arrays (`Array[Char]`, `Array[Int]`, ...): not
++      // `Array[Object]`s, so the cases above miss them and dispatch would
++      // fall into `Array`'s own stub body (`throw new Error()`).
++      case (a, "apply", (i: Integer) :: Nil) if a.getClass.isArray => Some(java.lang.reflect.Array.get(a, i.intValue))
++      case (a, "update", (i: Integer) :: v :: Nil) if a.getClass.isArray =>
++        java.lang.reflect.Array.set(a, i.intValue, v); Some(().asInstanceOf[Object])
++      case (a, "length", Nil) if a.getClass.isArray => Some(Int.box(java.lang.reflect.Array.getLength(a)))
++      case (a: Array[Object] @unchecked, "update", (i: Integer) :: v :: Nil) =>
+         a(i) = v; Some(().asInstanceOf[Object])
+       case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
+       // `mutable.IndexedSeq#update` (e.g. `ArrayBuffer#update`): unlike
+@@ -4858,6 +5596,20 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             case "+" => a + b; case "-" => a - b; case "*" => a * b
+             case "/" => a / b; case "%" => a % b
+           if wide then java.lang.Long.valueOf(r) else Int.box(r.toInt)
++        // Shifts take their result type (and shift-distance masking, 5 vs 6
++        // bits) from the LEFT operand only, and `>>>` on an `Int` must
++        // shift the 32-bit pattern -- not a sign-extended `Long`.
++        case "<<" | ">>" | ">>>" if bothIntegral =>
++          val dist = asL(y).toInt
++          x match
++            case l: java.lang.Long =>
++              val a = l.longValue
++              java.lang.Long.valueOf(op match
++                case "<<" => a << dist; case ">>" => a >> dist; case _ => a >>> dist)
++            case _ =>
++              val a = asL(x).toInt
++              Int.box(op match
++                case "<<" => a << dist; case ">>" => a >> dist; case _ => a >>> dist)
+         case "&" | "|" | "^" | "<<" | ">>" | ">>>" if bothIntegral =>
+           val (a, b) = (asL(x), asL(y))
+           val r = op match
+diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+--- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+@@ -394,7 +394,18 @@ object Splicer {
+ 
+       // Interpret level -1 `Type.of[T]`
+       case Apply(TypeApply(fn, quoted :: Nil), _) if fn.symbol == defn.QuotedTypeModule_of =>
+-        new TypeImpl(quoted.changeNonLocalOwners(ctx.owner), SpliceScope.getCurrent)
++        // `quoted` is usually a type parameter of the macro implementation
++        // (`Type.of[T]` with `T: Type`) or a quote-pattern-bound type
++        // variable (`Type.of[t]` under `case '[List[t]] =>`): `env` binds
++        // those symbols to the concrete `Type` they were instantiated or
++        // solved to, but the tree itself still names the symbol. Substitute,
++        // as the term-quote case above does, so the resulting `Type[T]`
++        // carries the real type (it's what `case '[List[t]]` then matches).
++        val typeBindings = env.iterator.collect { case (sym, tp: Type) => (sym, tp) }.toList
++        val quoted1 =
++          if typeBindings.isEmpty then quoted
++          else new TreeTypeMap(typeMap = _.subst(typeBindings.map(_._1), typeBindings.map(_._2))).transform(quoted)
++        new TypeImpl(quoted1.changeNonLocalOwners(ctx.owner), SpliceScope.getCurrent)
+ 
+       case _ =>
+         if Interpreter.debugEnabled && tree.isInstanceOf[tpd.Apply] && tree.show.length < 60 then

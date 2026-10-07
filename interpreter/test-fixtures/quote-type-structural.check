@@ -1,0 +1,19 @@
+Int
+List[Int]
+List of String
+Option[Option[Boolean]]
+other
+Map String -> Int
+Pair Int , String
+Array of Double
+Either String | List of Long
+Seq of Char
+AnyVal Long
+List()
+None
+null
+Int,String,Boolean
+
+same Int
+same <none>
+not a pair

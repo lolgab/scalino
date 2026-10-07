@@ -174,11 +174,15 @@ the right value but `.show` renders through dotc's own pretty-printer rather
 than the exact printer real macros get, so output differs in detail).
 
 **Known gaps** (see the `Interpreter` class doc comment for specifics):
-- Structural quote-*type* patterns beyond a bare type variable (e.g.
-  `case '[List[t]] => ...`, as opposed to `case '[t] => ...`) aren't
-  implemented. Quote-*expr* patterns (`case '{ ... } => ...`) and general
-  `UnApply` (case-class deconstruction) are both covered — see "General
-  quote-pattern matching" below.
+- ~~Structural quote-*type* patterns~~ — done (patch 0028, 2026-10-07):
+  `case '[List[t]]`, `'[h *: tl]`, bounded type vars etc. match via a subtype
+  check with GADT-constrained pattern variables, as stock `QuoteMatcher` does.
+  Fixture `interpreter/test-fixtures/quote-type-structural`. Same patch also
+  fills in much of the `quotes.reflect` surface jsoniter-scala's
+  `JsonCodecMaker.make` needs; verified against stock-JVM output on a
+  35-field case class (collections, enums, ADTs, tuples, Either, BigDecimal,
+  java.time, recursion, >32 fields). `readFromString` on Scala Native is still
+  blocked by the separate `lub(unit, bool)` issue below.
 - `Tree#show` uses dotc's default printer, not the exact printer real macros
   get by default (`reflect.Printer.TreeCode`) — correct interpretation, but
   detail-level string differences are possible.
@@ -1917,7 +1921,7 @@ Picked back up item 9's long-standing "still-open gap" (`undefined: x.addOne # -
 
 **Verified end to end**: the minimal `User(name, devices: Seq[Int])` repro's `writeToString`/`readFromString` round-trip now works (`{"name":"bob","devices":[1,2,3]}` / `User(bob,List(1, 2, 3))`, exit 0, 3/3 consistent runs). A richer, more realistic case (`Person` with a nested `Address` case class, `Option[String]`, `List[String]`, `Map[String,Int]`, `Boolean`, and an escaped-quote string field) confirms `writeToString` alone -- the full ENCODE side -- works completely for this shape. `examples/Hello.scala` and `examples/interpreter-regressions` still compile and run clean (regression check, not full test-suite coverage -- `scalino test` has no test framework wired into this scratch fixture).
 
-**New, separate, still-open gap found this session: `readFromString` (the DECODE side) crashes even for the simplest possible case (`case class Foo(active: Boolean)`), and this is NOT an interpreter/macro-expansion bug at all.** Root-caused to `vendor/scala-native/tools/.../linker/Sub.scala`'s own `lub` (least-upper-bound) function -- stock, unpatched scala-native code -- which has no case for merging two different PRIMITIVE value types (`nir.Type.Unit`, `nir.Type.Bool`) at an NIR-level control-flow join point (it handles `RefKind`/`RefKind`, `Nothing`+anything, and `Null`/`Ptr`, falling through to `util.unsupported(s"lub(${lty.show}, ${rty.show})")` for anything else): `scala.scalanative.util.UnsupportedException: lub(unit, bool)`, thrown from `scala.scalanative.interflow.MergeProcessor.mergePhi` during the NATIVE LINK/OPTIMIZE step (`Opt.opt` -> `Visit.visitMethod`), well after the macro has already fully, correctly expanded -- i.e. this is a Scala Native NIR-optimizer bug in the interflow phi-merging logic, a completely different subsystem from every fix above. A handwritten (non-jsoniter) `while({ ...; cond }) ()` loop assigning a `Boolean` var, mimicking jsoniter's own decoder loop idiom, compiles and runs fine -- so it's something more specific about the actual generated decoder tree shape (likely a particular branch merge inside the required-fields-bitmask check jsoniter's decoders use, not the while-loop shape alone) that has not yet been isolated. Stopped here per explicit instruction, rather than continuing into `nscplugin`/`GenNIR`/`interflow` territory unprompted -- a materially different, unexplored part of the toolchain.
+**Correction (2026-10-07): the `readFromString` / `lub(unit, bool)` failure was NOT a Scala Native bug.** Dumping the offending method's NIR (`T$package$.$d0$1`, the generated decoder) showed `varstore %7 <_active> : var[bool], unit` -- the macro-generated initial value of a `var _active: Boolean` was `()`. Cause: `fieldInfo.defaultValue.getOrElse(genNullValue(...))` -- `Option#getOrElse`'s by-name default arrives in the interpreter as a `ByNameArg` thunk, and the intrinsic returned the thunk itself instead of forcing it (same for `orElse`/`fold`), so the spliced `ValDef` got a bogus right-hand side. Interflow then tried to merge that Unit with real Bool values. Fixed in patches/scala3-0028 (force the thunk). With it, the unmodified linker with the optimizer ON links and runs the `Foo(active: Boolean)` repro (`Foo(true)`) and the 35-field `JW.scala` round-trip, byte-identical to the JVM-compiled output. Workaround for older binaries: `--native-optimize=false`.
 
 **Files changed**: `patches/scala3-0010-cache-interp-debug-env-check.patch` (regenerated to include Bugs 1/2/3/5, all in `Interpreter.scala`/`Splicer.scala`, the same two files this patch already covered); new `patches/scala3-0021-tasty-invalid-tag-diagnostic.patch` (Bug 4's fix, plus a permanent, unconditional-but-rare diagnostic left in `TreeUnpickler.scala`'s `readSimpleType` fallback -- guarded by checking the tag against `TastyFormat`'s own valid-constant-tag set, not by `SCALINO_INTERP_DEBUG`, specifically because this bug's own investigation showed that gating it behind the heavier debug-logging path can mask a timing-sensitive bug like this one). Both patches verified to apply cleanly, in the full existing sequence alongside every other `patches/scala3-*.patch`, against a fresh worktree of vendor/scala3's pristine base commit (`777528f1`, Scala 3.9.0 LTS release) -- and the resulting files were diffed byte-for-byte against the actual working tree used for all testing above, confirming no drift between what was tested and what got committed.
 

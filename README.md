@@ -155,16 +155,13 @@ What's verified to work:
   inline/quote macros. Macros are expanded by a from-scratch TASTy-tree
   interpreter instead of dotc's usual approach of running bytecode on a JVM.
   It's tested against macro fixtures taken from upstream's own test suite.
-  Quote-expression patterns (`case '{ ... } =>`, lambda bodies included) and
+  Quote-expression and quote-type patterns (`case '{ ... } =>`, `case '[List[t]] =>`) and
   case-class/`UnApply` deconstruction work.
 - **The LSP**, on hand-written projects, on a real multi-package third-party
   project, and end to end in Zed.
 
 Known gaps:
 
-- **Structural quote-type patterns** beyond a bare type variable
-  (`case '[List[t]] =>`, as opposed to `case '[t] =>`). This is the main known
-  macro gap.
 - **JUnit-style `@Test` discovery.** Test frameworks have to use
   `SubclassFingerprint`, which munit, utest, scalatest and zio-test-sbt all do.
 - **Windows** is experimental.
@@ -264,8 +261,15 @@ scalino.lib.${system}.mkScalinoApp {
   pname = "myapp";
   src = ./.;                       # contains scalino.lock.json
   # extraArgs = [ "--native-mode" "release-fast" ];
+  # C libraries: buildInputs puts them in the sandbox, pkgConfig makes scalino
+  # run `pkg-config --cflags/--libs` on each module at build time.
+  # buildInputs = [ pkgs.gtk4 pkgs.graphene ];
+  # pkgConfig = [ "gtk4" ];
 }
 ```
+
+Outside Nix, the same thing is `//> using nativePkgConfig gtk4` or
+`--native-pkg-config gtk4`.
 
 This fetches every locked jar with `pkgs.fetchurl` and builds offline. Re-run
 `scalino lock` whenever dependencies change. The flake supports x86_64/aarch64
