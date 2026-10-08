@@ -426,7 +426,7 @@ diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/s
 +        case ("toUpperCase", (c: Integer) :: Nil) => Some(Int.box(Character.toUpperCase(c.intValue)))
 +        case ("toString", (c: Character) :: Nil) => Some(Character.toString(c.charValue))
 +        case ("valueOf", (c: Character) :: Nil) => Some(c)
-+        case ("getNumericValue", (c: Character) :: Nil) => Some(Int.box(Character.getNumericValue(c.charValue)))
++        case ("getNumericValue", (c: Character) :: Nil) => Some(Int.box(Character.digit(c.charValue, 36)))
 +        case ("forDigit", (d: Integer) :: (r: Integer) :: Nil) => Some(Character.valueOf(Character.forDigit(d, r)))
 +        case ("compare", (a: Character) :: (b: Character) :: Nil) => Some(Int.box(Character.compare(a.charValue, b.charValue)))
 +        case ("isHighSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isHighSurrogate(c.charValue)))
