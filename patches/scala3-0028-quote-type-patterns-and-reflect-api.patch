@@ -934,7 +934,7 @@ diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/s
        // `java.io.PrintStream` (`System.out`/`System.err`, see
        // `javaStaticFieldConstant`'s own `"System"` case): real JDK-native
        // methods, no retained Scala source ever. Curated by the overloads a
-@@ -4345,7 +5030,24 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -4345,7 +5030,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        case (r, "getClass", Nil)
            if !r.isInstanceOf[InterpretedInstance] && !r.isInstanceOf[ModuleValue] && !r.isInstanceOf[dotty.tools.dotc.core.Types.Type] =>
          Some(r.getClass)
@@ -946,16 +946,6 @@ diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/s
 +        inst.fields.get("runtimeClass").orElse(inst.fields.get("runtimeClass1"))
 +      case (inst: InterpretedInstance, "getClass", Nil) if inst.cls.isClass => Some(inst.cls.typeRef)
        case (c: Class[?], "isArray", Nil) => Some(Boolean.box(c.isArray))
-+      // The slice of `java.lang.reflect` jsoniter-scala's compile-time
-+      // config evaluator needs on real, already-loaded host classes.
-+      case (c: Class[?], "getField", (n: String) :: Nil) => Some(c.getField(n))
-+      case (c: Class[?], "getMethod", (n: String) :: rest) =>
-+        val classes = rest.headOption.map(asArrayLike).getOrElse(Nil).collect { case k: Class[?] => k }
-+        Some(c.getMethod(n, classes*))
-+      case (f: java.lang.reflect.Field, "get", (o: Object) :: Nil) => Some(f.get(o))
-+      case (f: java.lang.reflect.Field, "get", null :: Nil) => Some(f.get(null))
-+      case (m: java.lang.reflect.Method, "invoke", o :: rest) =>
-+        Some(m.invoke(o, rest.headOption.map(asArrayLike).getOrElse(Nil).asInstanceOf[List[Object]]*))
        case (c: Class[?], "isPrimitive", Nil) => Some(Boolean.box(c.isPrimitive))
        case (c: Class[?], "getComponentType", Nil) => Some(c.getComponentType)
        case (s: scala.collection.Seq[Object] @unchecked, "sum", _) => Some(s.reduceOption(numericPlus).getOrElse(0.asInstanceOf[Object])) // ignores the `Numeric[T]` evidence arg
