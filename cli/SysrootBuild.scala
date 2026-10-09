@@ -6,6 +6,9 @@
 // compiled. Versions and checksums come from versions.env (via
 // BuildInfo.sysrootPins).
 //
+// Also the addons: static C libraries (OpenSSL's libcrypto) a classpath dependency
+// links through `@link`, installed next to the sysroots (see `buildAddon`).
+//
 // Needs only `curl` and `tar` (with xz support) on PATH. Downloads are kept in
 // <sysroots>/.sources, or $SCALINO_SYSROOT_SOURCES, so a directory pre-seeded
 // with the upstream files works offline.
@@ -28,7 +31,7 @@ object SysrootBuild:
       .getOrElse(Sysroot.cacheRoot.resolve(".sources"))
 
   /** `name` from `url`, checked against `sha256`; cached in `sources`. */
-  private def download(url: String, name: String, sha256: String): Path =
+  private def download(url: String, name: String, sha256: String, headers: List[String] = Nil): Path =
     Files.createDirectories(sources)
     val f = sources.resolve(name)
     if Files.exists(f) then
@@ -36,7 +39,7 @@ object SysrootBuild:
       Files.delete(f)
     val part = sources.resolve(name + ".part")
     println(s"downloading $url")
-    if runInherited(List("curl", "-fsSL", "-o", part.toString, url)) != 0 then
+    if runInherited(List("curl", "-fsSL") ++ headers.flatMap(h => List("-H", h)) ++ List("-o", part.toString, url)) != 0 then
       die(s"sysroot build: download failed: $url (or put $name in $sources)")
     val actual = sha256Hex(Files.readAllBytes(part))
     if actual != sha256 then
@@ -76,10 +79,10 @@ object SysrootBuild:
   private def addLicense(out: Path, from: Path, name: String): Unit =
     copy(from, out.resolve("LICENSES").resolve(name))
 
-  private def writeReadme(out: Path, triple: String, body: String): Unit =
+  private def writeReadme(out: Path, triple: String, body: String, what: String = "sysroot"): Unit =
     val dir = Files.createDirectories(out.resolve("LICENSES"))
     val text =
-      s"""scalino sysroot for $triple (built by `scalino sysroot build` from scalino ${BuildInfo.scalinoVersion}).
+      s"""scalino $what for $triple (built by `scalino sysroot build` from scalino ${BuildInfo.scalinoVersion}).
          |
          |This is NOT part of scalino's own Apache-2.0 licensed code: it is third-party software,
          |each component under its own licence, whose text is in this directory's LICENSES/.
@@ -318,3 +321,96 @@ object SysrootBuild:
     rm(out.resolve(mw).resolve("bin"))
     rm(out.resolve(mw).resolve("share"))
     rm(out.resolve("generic-w64-mingw32").resolve("share"))
+
+  // ---- addons --------------------------------------------------------------
+
+  /** Installs static `lib` (see `Sysroot.Addons`) for `triple` into the cache:
+   *  the .a files in `lib/`, `include/`, `LICENSES/`, and `linkflags` (system libraries the
+   *  static archives need, one line) when there are any. */
+  def buildAddon(lib: String, triple: String, force: Boolean): Path =
+    if !Sysroot.Addons.contains(lib) then die(s"sysroot build: unknown library '$lib', one of: ${Sysroot.Addons.keys.toList.sorted.mkString(", ")}")
+    if !Buildable.contains(triple) then die(s"sysroot build: unknown target '$triple', one of: ${Buildable.mkString(", ")}")
+    val dest = Sysroot.addonDir(lib, triple)
+    if Files.isDirectory(dest) && !force then return dest
+    Files.createDirectories(Sysroot.cacheRoot)
+    val work = Files.createTempDirectory(Sysroot.cacheRoot, s".build-$lib-$triple-")
+    try
+      val out = Files.createDirectories(work.resolve(s"scalino-$lib-$triple"))
+      installOpenssl(triple, triple.takeWhile(_ != '-'), work, out)
+      rm(dest)
+      Files.createDirectories(dest.getParent)
+      Files.move(out, dest)
+      println(s"installed static $lib for $triple -> $dest")
+      dest
+    finally ScalinoCli.deleteRecursively(work)
+
+  private def copyTree(from: Path, to: Path): Unit =
+    for p <- walk(from) if Files.isRegularFile(p) do copy(p, to.resolve(from.relativize(p).toString))
+
+  private def installOpenssl(triple: String, arch: String, work: Path, out: Path): Unit =
+    val ex = Files.createDirectories(work.resolve("extracted"))
+    def libs(dir: Path): Unit = for l <- List("libcrypto.a", "libssl.a") do copy(dir.resolve(l), out.resolve("lib").resolve(l))
+    def linkFlags(flags: String): Unit = Files.write(out.resolve("linkflags"), (flags + "\n").getBytes(UTF_8))
+    val (components, source) =
+      if triple.endsWith("linux-musl") then
+        val ver = pin("OPENSSL_ALPINE_VERSION")
+        val key = arch.toUpperCase
+        for (pkg, k) <- List("openssl-libs-static" -> "STATIC", "openssl-dev" -> "DEV") do
+          val apk = download(s"https://dl-cdn.alpinelinux.org/alpine/${pin("OPENSSL_ALPINE_BRANCH")}/main/$arch/$pkg-$ver.apk",
+            s"$pkg-$ver-$arch.apk", pin(s"OPENSSL_ALPINE_${k}_${key}_SHA256"))
+          // An .apk is concatenated gzip'd tars (signature, control, data); the first two only add dotfiles.
+          tar("-xzf", apk.toString, "-C", ex.toString)
+        libs(ex.resolve("usr/lib"))
+        copyTree(ex.resolve("usr/include/openssl"), out.resolve("include/openssl"))
+        val lv = pin("OPENSSL_ALPINE_LICENSE_VERSION")
+        addLicense(out, download(s"https://raw.githubusercontent.com/openssl/openssl/openssl-$lv/LICENSE.txt", s"openssl-LICENSE-$lv.txt",
+          pin("OPENSSL_ALPINE_LICENSE_SHA256")), "openssl-LICENSE.txt")
+        (s"openssl-libs-static, openssl-dev $ver (Alpine ${pin("OPENSSL_ALPINE_BRANCH")}, OpenSSL $lv)  libcrypto.a, libssl.a built for musl, and headers: Apache-2.0, see openssl-LICENSE.txt.",
+         "https://pkgs.alpinelinux.org/package/" + pin("OPENSSL_ALPINE_BRANCH") + "/main/" + arch + "/openssl, https://www.openssl.org")
+      else if triple.endsWith("linux-gnu") then
+        val ver = pin("OPENSSL_DEBIAN_VERSION")
+        val debArch = if arch == "x86_64" then "amd64" else "arm64"
+        val deb = s"libssl-dev_${ver}_$debArch.deb"
+        unpackDeb(download(s"$snapshot/o/openssl/$deb", deb, pin(s"OPENSSL_DEBIAN_${debArch.toUpperCase}_SHA256")), ex)
+        val ma = s"$arch-linux-gnu"
+        libs(ex.resolve("usr/lib").resolve(ma))
+        copyTree(ex.resolve("usr/include/openssl"), out.resolve("include/openssl"))
+        // configuration.h and opensslconf.h differ per architecture
+        copyTree(ex.resolve("usr/include").resolve(ma).resolve("openssl"), out.resolve("include/openssl"))
+        addLicense(out, ex.resolve("usr/share/doc/libssl-dev/copyright"), "debian-libssl-dev-copyright")
+        (s"libssl-dev $ver (Debian 12, OpenSSL 3.0)  libcrypto.a, libssl.a and headers, unmodified: Apache-2.0, see debian-libssl-dev-copyright.",
+         "https://tracker.debian.org/pkg/openssl, https://www.openssl.org")
+      else if triple.endsWith("apple-darwin") then
+        val ver = pin("OPENSSL_BREW_VERSION")
+        val (key, tag) = if arch == "x86_64" then ("X86_64", "sonoma") else ("ARM64", "arm64_sonoma")
+        val sha = pin(s"OPENSSL_BREW_${key}_SHA256")
+        // ghcr.io serves Homebrew's public bottles to an anonymous bearer token ("QQ==")
+        val bottle = download(s"https://ghcr.io/v2/homebrew/core/openssl/3/blobs/sha256:$sha", s"openssl-brew-$ver-$tag.tar.gz", sha,
+          List("Authorization: Bearer QQ=="))
+        tar("-xzf", bottle.toString, "-C", ex.toString, "--strip-components=2")
+        libs(ex.resolve("lib"))
+        copyTree(ex.resolve("include/openssl"), out.resolve("include/openssl"))
+        addLicense(out, ex.resolve("LICENSE.txt"), "openssl-LICENSE.txt")
+        (s"openssl@3 $ver (Homebrew bottle $tag)  libcrypto.a, libssl.a and headers, unmodified: Apache-2.0, see openssl-LICENSE.txt.",
+         "https://formulae.brew.sh/formula/openssl@3, https://www.openssl.org")
+      else
+        val ver = pin("OPENSSL_MSYS2_VERSION")
+        val (env, pkgArch) = if arch == "x86_64" then ("clang64", "x86_64") else ("clangarm64", "aarch64")
+        val f = s"mingw-w64-clang-$pkgArch-openssl-$ver-any.pkg.tar.zst"
+        val pkg = download(s"https://repo.msys2.org/mingw/$env/$f", f, pin(s"OPENSSL_MSYS2_${pkgArch.toUpperCase}_SHA256"))
+        // zstd: bsdtar reads it itself, GNU tar needs the zstd program
+        tar("-xf", pkg.toString, "-C", ex.toString, s"$env/lib/libcrypto.a", s"$env/lib/libssl.a", s"$env/include/openssl", s"$env/share/licenses/openssl")
+        libs(ex.resolve(env).resolve("lib"))
+        // Windows libraries are often @link'ed by their file name (scala-native-crypto: "libcrypto"),
+        // which makes lld look for liblibcrypto.a
+        for l <- List("crypto", "ssl") do copy(out.resolve(s"lib/lib$l.a"), out.resolve(s"lib/liblib$l.a"))
+        copyTree(ex.resolve(env).resolve("include/openssl"), out.resolve("include/openssl"))
+        addLicense(out, ex.resolve(env).resolve("share/licenses/openssl/LICENSE"), "openssl-LICENSE.txt")
+        // what libcrypto.a calls into: sockets, the certificate store, entropy and the window station (RAND)
+        linkFlags("-lws2_32 -lgdi32 -ladvapi32 -lcrypt32 -luser32")
+        (s"mingw-w64-$env-openssl $ver (MSYS2)  libcrypto.a, libssl.a and headers, unmodified: Apache-2.0, see openssl-LICENSE.txt.",
+         "https://packages.msys2.org/base/mingw-w64-openssl, https://www.openssl.org")
+    writeReadme(out, triple,
+      s"""Components:
+         |  $components
+         |Source: $source""".stripMargin, what = "static OpenSSL")

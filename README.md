@@ -233,6 +233,12 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
 - The Windows sysroot's libc++ needs **clang 21 or newer** (older clangs fail on its
   `#pragma clang attribute` headers); point `--native-clang`/`--native-clangpp` at one if
   the `clang` on your `PATH` is older.
+- Dependencies that link OpenSSL's `libcrypto` through `@link("crypto")` (`scala-native-crypto`,
+  `fs2-core`, `http4s-crypto`, `smithy4s-aws-kernel`, `skunk-core`, also when only transitive) get a
+  **static** OpenSSL 3 for every cross target, installed next to the sysroot on first use
+  (`scalino sysroot build <triple> --with openssl` does it ahead of time). A host target keeps using
+  the system's. Packages are prebuilt and checksum-verified: Alpine (musl), Debian 12 (gnu), MSYS2
+  (Windows, needs a `tar` that reads zstd) and Homebrew's `openssl@3` bottle (macOS).
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 

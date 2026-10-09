@@ -31,6 +31,8 @@ object LinkDriver:
     targetTriples: List[String] = Nil,
     // triple -> sysroot dir, for cross targets
     sysroots: Map[String, String] = Map.empty,
+    // triple -> static library dirs (lib/, include/, optional linkflags), for cross targets
+    libAddons: Map[String, List[String]] = Map.empty,
     embedResources: Boolean = false,
     multithreading: Boolean = false,
     directCodegen: Boolean = false,
@@ -65,6 +67,9 @@ object LinkDriver:
         case "--sysroot" =>
           val Array(t, d) = rest(i + 1).split("=", 2)
           o = o.copy(sysroots = o.sysroots.updated(t, d)); i += 1
+        case "--lib-addon" =>
+          val Array(t, d) = rest(i + 1).split("=", 2)
+          o = o.copy(libAddons = o.libAddons.updated(t, o.libAddons.getOrElse(t, Nil) :+ d)); i += 1
         case "--embed-resources" => o = o.copy(embedResources = true)
         case "--multithreading" => o = o.copy(multithreading = true)
         case "--direct-codegen" => o = o.copy(directCodegen = true)
@@ -250,10 +255,20 @@ object LinkDriver:
         // target and ask the linker for crt1.o; pin a modern one.
         val macosVersion =
           if osOf(t) == "macos" && t.endsWith("darwin") then List("-mmacos-version-min=11.0") else Nil
+        // Static libraries (OpenSSL's libcrypto...) the sysroot lacks. `linkflags`: system
+        // libraries their archives call into, written by `scalino sysroot build`.
+        val addons = opts.libAddons.getOrElse(t, Nil).map(Paths.get(_).toAbsolutePath)
+        // C sources only: clang warns about an unused -isystem for every .ll file
+        val addonCompile = addons.flatMap(d => List("-isystem", d.resolve("include").toString))
+        val addonLink = addons.flatMap { d =>
+          val flags = d.resolve("linkflags")
+          List("-L" + d.resolve("lib")) ++
+            (if java.nio.file.Files.exists(flags) then new String(java.nio.file.Files.readAllBytes(flags), "UTF-8").trim.split("\\s+").toList.filter(_.nonEmpty) else Nil)
+        }
         val compileFlags = macosVersion ++ sysroot.toList.flatMap(d => osOf(t) match
           case "macos" => List("-isysroot", d)
           case _ => List(s"--sysroot=$d"))
-        val linkFlags = macosVersion ++ sysroot.toList.flatMap(d => osOf(t) match
+        val linkFlags = macosVersion ++ addonLink ++ sysroot.toList.flatMap(d => osOf(t) match
           case "macos" => List("-isysroot", d)
           case "linux" => linuxSysrootLinkFlags(t, d, workDir.resolve(t))
           case "windows" => windowsSysrootLinkFlags(d, workDir.resolve(t))
@@ -287,7 +302,7 @@ object LinkDriver:
             .withLinkingOptions(linkFlags ++ lld ++ opts.linking)
             .withCompileOptions(compileFlags ++ opts.compile)
             .withCppOptions(cDefines ++ cppFlags ++ opts.cppCompile)
-            .withCOptions(cDefines ++ opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
+            .withCOptions(cDefines ++ addonCompile ++ opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
         )
     val configs: List[Config] =
       if opts.targetTriples.isEmpty then List(config) else opts.targetTriples.distinct.map(forTriple)

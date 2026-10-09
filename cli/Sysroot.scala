@@ -63,14 +63,70 @@ object Sysroot:
     }
     explicit ++ found
 
+  // ---- addons: static C libraries ------------------------------------------
+
+  /** Static libraries a sysroot doesn't have, by name, with the artifacts that
+   *  link them through `@link` (as `/<artifact>_native` in a classpath path).
+   *  `scalino sysroot build` installs one under `<root>/addons/<lib>/<triple>`
+   *  (lib/, include/, optionally `linkflags`), and `package` hands every
+   *  cross target's to the link driver when the classpath has one of these. */
+  val Addons: Map[String, List[String]] = Map(
+    "openssl" -> List(
+      "scala-native-crypto", // com.github.lolgab::scala-native-crypto
+      "fs2-core", // fs2.hashing
+      "http4s-crypto", // org.http4s::http4s-crypto, behind http4s-core
+      "smithy4s-aws-kernel", // com.disneystreaming.smithy4s
+      "skunk-core"))
+
+  def addonDir(lib: String, triple: String): Path = cacheRoot.resolve("addons").resolve(lib).resolve(triple)
+
+  def findAddon(lib: String, triple: String): Option[Path] =
+    roots.map(_.resolve("addons").resolve(lib).resolve(triple)).find(d => Files.isDirectory(d.resolve("lib")))
+
+  /** The addons `classpath` (jar paths) asks for. */
+  def neededAddons(classpath: String): List[String] =
+    val entries = classpath.split(java.io.File.pathSeparator).toList.map(_.replace('\\', '/'))
+    Addons.toList.sortBy(_._1).collect {
+      case (lib, artifacts) if entries.exists(e => artifacts.exists(a => e.contains(s"/${a}_native"))) => lib
+    }
+
+  /** `--native-lib-addon <triple>=<dir>` entries: for each cross target in
+   *  `triples`, the addons `classpath` needs, installed on the spot when
+   *  missing. A host target links the system's copy. */
+  def resolveAddons(triples: List[String], classpath: String): List[String] =
+    val libs = neededAddons(classpath)
+    val host = Packaging.detectHost()
+    for
+      t <- triples.distinct
+      if libs.nonEmpty && Supported.contains(t) && Packaging.hostFromTriple(t) != host
+      lib <- libs
+    yield
+      val dir = findAddon(lib, t).getOrElse {
+        println(s"no static $lib for $t -- installing it (`scalino sysroot build $t --with $lib`)")
+        SysrootBuild.buildAddon(lib, t, force = false)
+      }
+      s"$t=$dir"
+
   def handle(args: Array[String]): Unit =
     args.toList match
       case "build" :: rest =>
-        val force = rest.contains("--force")
-        val triples = rest.filterNot(_ == "--force")
-        triples.find(_.startsWith("-")).foreach(o => die(s"sysroot build: unknown option $o"))
-        if triples.isEmpty then die(s"sysroot build: expected a target triple, one of: ${SysrootBuild.Buildable.mkString(", ")}")
-        triples.foreach(SysrootBuild.build(_, force))
+        var force = false
+        var libs = List.empty[String]
+        val triples = List.newBuilder[String]
+        var i = 0
+        while i < rest.length do
+          rest(i) match
+            case "--force" => force = true
+            case "--with" =>
+              if i + 1 >= rest.length then die("sysroot build: --with needs a library name")
+              libs = libs :+ rest(i + 1); i += 1
+            case o if o.startsWith("-") => die(s"sysroot build: unknown option $o")
+            case t => triples += t
+          i += 1
+        val ts = triples.result()
+        if ts.isEmpty then die(s"sysroot build: expected a target triple, one of: ${SysrootBuild.Buildable.mkString(", ")}")
+        ts.foreach(SysrootBuild.build(_, force))
+        for t <- ts; l <- libs do SysrootBuild.buildAddon(l, t, force)
       case List("list") =>
         for t <- Supported do
           println(s"$t  ${find(t).map(_.toString).getOrElse("(not installed -- `scalino sysroot build " + t + "`)")}")
@@ -78,4 +134,4 @@ object Sysroot:
         find(t) match
           case Some(p) => println(p)
           case None => die(s"sysroot: $t is not installed")
-      case _ => die("usage: scalino sysroot <build <triple>... [--force] | list | path <triple>>")
+      case _ => die("usage: scalino sysroot <build <triple>... [--force] [--with <lib>] | list | path <triple>>")

@@ -2195,6 +2195,8 @@ object ScalinoCli:
     targetTriples: List[String] = Nil,
     // `<triple>=<dir>` per cross target
     sysroots: List[String] = Nil,
+    // `<triple>=<dir>` per static library a cross target links (Sysroot.Addons)
+    libAddons: List[String] = Nil,
     embedResources: Boolean = false,
     multithreading: Boolean = true,
     directCodegen: Boolean = true,
@@ -2381,6 +2383,7 @@ object ScalinoCli:
       nativeOpts.target.toList.flatMap(v => List("--target", v)) ++
       nativeOpts.targetTriples.flatMap(v => List("--target-triple", v)) ++
       nativeOpts.sysroots.flatMap(v => List("--sysroot", v)) ++
+      nativeOpts.libAddons.flatMap(v => List("--lib-addon", v)) ++
       (if nativeOpts.embedResources then List("--embed-resources") else Nil) ++
       (if nativeOpts.multithreading then List("--multithreading") else Nil) ++
       (if incremental then List("--incremental-compilation") else Nil) ++
@@ -2831,10 +2834,12 @@ object ScalinoCli:
         head("scalino clean", "Delete the .scalino-build directory.")
       case "sysroot" =>
         head("scalino sysroot <build|list|path> ...", "Manage the sysroots used to cross-compile (`--native-target-triple`).") +
-          s"""|  scalino sysroot build <triple>... [--force]
+          s"""|  scalino sysroot build <triple>... [--force] [--with <lib>]
               |      assemble the sysroot from upstream packages (checksum-verified; needs curl and tar)
               |      into ${Sysroot.cacheRoot} (override with $$SCALINO_SYSROOT_DIR; downloads are
               |      cached in <that>/.sources, or $$SCALINO_SYSROOT_SOURCES, which can be pre-filled)
+              |      --with <lib> also installs static <lib> for them (${Sysroot.Addons.keys.toList.sorted.mkString(", ")}); `package` does that by itself
+              |      when the classpath has a dependency that links it (e.g. http4s-crypto, fs2-core, skunk-core)
               |  scalino sysroot list           supported targets and whether they are installed
               |  scalino sysroot path <triple>  where an installed sysroot lives
               |
@@ -3012,7 +3017,9 @@ object ScalinoCli:
     // Cross targets need a sysroot each: the one given, else the installed one.
     val nativeOpts =
       if mode == "package" && nativeOpts0.targetTriples.nonEmpty then
-        nativeOpts0.copy(sysroots = Sysroot.resolve(nativeOpts0.targetTriples, nativeOpts0.sysroots))
+        nativeOpts0.copy(
+          sysroots = Sysroot.resolve(nativeOpts0.targetTriples, nativeOpts0.sysroots),
+          libAddons = Sysroot.resolveAddons(nativeOpts0.targetTriples, extraClasspath))
       else nativeOpts0
 
     mode match
