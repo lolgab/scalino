@@ -2,10 +2,14 @@ diff --git a/javalib/src/main/scala/java/nio/file/Files.scala b/javalib/src/main
 index 1bbaf8a..94f769d 100644
 --- a/javalib/src/main/scala/java/nio/file/Files.scala
 +++ b/javalib/src/main/scala/java/nio/file/Files.scala
-@@ -750,11 +750,38 @@ object Files {
+@@ -750,11 +750,49 @@ object Files {
      getAttribute(path, "posix:permissions", options)
        .asInstanceOf[Set[PosixFilePermission]]
  
++  private final val ProbeDirectory = 0
++  private final val ProbeRegular = 1
++  private final val ProbeSymlink = 2
++
 +  /* Tests the file type of `path` with a plain stat/lstat. The attribute view
 +   * reports a missing path by throwing, which captures a stack trace; probes
 +   * such as the ones in Files.copy hit missing paths constantly. Paths that
@@ -14,7 +18,7 @@ index 1bbaf8a..94f769d 100644
 +  private def probeFileType(
 +      path: Path,
 +      options: Array[LinkOption],
-+      test: stat.mode_t => Boolean
++      fileType: Int
 +  )(fallback: => Boolean): Boolean = {
 +    if (isWindows) fallback
 +    else if (path.getFileSystem().provider().getScheme() != "file") fallback
@@ -27,7 +31,14 @@ index 1bbaf8a..94f769d 100644
 +          if (options.contains(LinkOption.NOFOLLOW_LINKS))
 +            stat.lstat(cpath, buf)
 +          else stat.stat(cpath, buf)
-+        err == 0 && test(buf.st_mode)
++        err == 0 && {
++          val mode = buf.st_mode
++          fileType match {
++            case ProbeDirectory => stat.S_ISDIR(mode) == 1
++            case ProbeRegular   => stat.S_ISREG(mode) == 1
++            case _              => stat.S_ISLNK(mode) == 1
++          }
++        }
 +      }
 +  }
 +
@@ -36,7 +47,7 @@ index 1bbaf8a..94f769d 100644
 -      val attrs = readAttributes(path, classOf[BasicFileAttributes], options)
 -      attrs != null && attrs.isDirectory()
 -    } catch { case _: IOException => false }
-+    probeFileType(path, options, stat.S_ISDIR(_) == 1) {
++    probeFileType(path, options, ProbeDirectory) {
 +      try {
 +        val attrs = readAttributes(path, classOf[BasicFileAttributes], options)
 +        attrs != null && attrs.isDirectory()
@@ -45,7 +56,7 @@ index 1bbaf8a..94f769d 100644
  
    def isExecutable(path: Path): Boolean =
      path.toFile().canExecute()
-@@ -765,25 +792,27 @@ object Files {
+@@ -765,25 +803,27 @@ object Files {
    def isReadable(path: Path): Boolean =
      path.toFile().canRead()
  
@@ -56,7 +67,7 @@ index 1bbaf8a..94f769d 100644
 -    } catch { case _: IOException => false }
 -  }
 +  def isRegularFile(path: Path, options: Array[LinkOption]): Boolean =
-+    probeFileType(path, options, stat.S_ISREG(_) == 1) {
++    probeFileType(path, options, ProbeRegular) {
 +      try {
 +        val attrs = readAttributes(path, classOf[BasicFileAttributes], options)
 +        attrs != null && attrs.isRegularFile()
@@ -77,7 +88,7 @@ index 1bbaf8a..94f769d 100644
 -    } catch { case _: IOException => false }
 +  def isSymbolicLink(path: Path): Boolean = {
 +    val noFollow = Array(LinkOption.NOFOLLOW_LINKS)
-+    probeFileType(path, noFollow, stat.S_ISLNK(_) == 1) {
++    probeFileType(path, noFollow, ProbeSymlink) {
 +      try {
 +        val attrs =
 +          readAttributes(path, classOf[BasicFileAttributes], noFollow)
