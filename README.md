@@ -22,7 +22,7 @@ EOF
 
 scalino Hello.scala                          # compile + run
 scalino package Hello.scala -o hello && ./hello
-scalino setup-ide .                          # then open the folder in Zed / VS Code / Neovim
+scalino setup-ide                          # then open the folder in Zed / VS Code / Neovim
 ```
 
 The only other thing you need is `clang` (see [Install](#install)).
@@ -175,8 +175,8 @@ verified, blocked or still to do.
 need fpm or dpkg; `.rpm` uses `rpmbuild`, and docker uses `docker`/`podman`:
 
 ```sh
-scalino package . --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
-scalino package . --format brew --release-url https://github.com/me/app/releases/download/v1.2.3
+scalino package --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
+scalino package --format brew --release-url https://github.com/me/app/releases/download/v1.2.3
 ```
 
 | format | output | notes |
@@ -246,8 +246,8 @@ hash is declared up front. So dependencies need a lockfile that something else
 can fetch beforehand:
 
 ```sh
-scalino lock .          # writes scalino.lock.json: per jar, path + URL + sha256
-scalino run . --offline # builds from the lock + local cache only, never the network
+scalino lock           # writes scalino.lock.json: per jar, path + URL + sha256
+scalino run --offline  # builds from the lock + local cache only, never the network
 ```
 
 While `scalino.lock.json` exists, builds take their classpath from it instead

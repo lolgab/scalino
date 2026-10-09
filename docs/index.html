@@ -274,8 +274,8 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
 
     <div class="panel" id="a-test"><pre><span class="cm">//&gt; using test.dep org.scalameta::munit::1.0.0</span>
 
-scalino test .
-scalino test . --test-only <span class="st">"*MySuite*"</span></pre>
+scalino test
+scalino test --test-only <span class="st">"*MySuite*"</span></pre>
       <div class="note">Finds munit, utest, scalatest and zio-test automatically. <code class="mono">--test-only &lt;glob&gt;</code> links only the selected test classes, so the rest never reach the binary.</div></div>
 
     <div class="panel" id="a-compile"><pre>scalino package -o hello
@@ -287,8 +287,8 @@ scalino test . --test-only <span class="st">"*MySuite*"</span></pre>
 <span class="cm"># -&gt; myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl</span></pre>
       <div class="note">One command, several platforms, one linker process — the program is parsed once. Missing sysroots are assembled on first use. Musl targets are fully static, so one binary runs on every distro.</div></div>
 
-    <div class="panel" id="a-pkg"><pre>scalino package . --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
-scalino package . --format brew --release-url https://github.com/me/app/releases/download/v1.2.3</pre>
+    <div class="panel" id="a-pkg"><pre>scalino package --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
+scalino package --format brew --release-url https://github.com/me/app/releases/download/v1.2.3</pre>
       <div class="note">No fpm or dpkg needed. Metadata comes from <code class="mono">//&gt; using packageName|packageVersion|packageDescription|…</code> directives.</div></div>
 
     <div class="panel" id="a-ide"><pre>scalino setup-ide</pre>
@@ -361,8 +361,8 @@ scalino package . --format brew --release-url https://github.com/me/app/releases
     <code class="mono">--offline</code> (or <code class="mono">SCALINO_OFFLINE=1</code>) builds from it and the local cache only.</p>
   <div class="panelwrap">
     <div class="panel-head"><span>shell / nix</span><span>scalino.lock.json</span></div>
-    <div class="panel active"><pre>scalino lock .          <span class="cm"># per jar: path + URL + sha256</span>
-scalino run . --offline <span class="cm"># lock + local cache only</span>
+    <div class="panel active"><pre>scalino lock           <span class="cm"># per jar: path + URL + sha256</span>
+scalino run --offline  <span class="cm"># lock + local cache only</span>
 
 <span class="cm"># flake.nix</span>
 scalino.lib.${system}.mkScalinoApp {
