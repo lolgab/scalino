@@ -65,8 +65,9 @@ object Sysroot:
 
   // ---- addons: static C libraries ------------------------------------------
 
-  /** Static libraries a sysroot doesn't have, by name, with the artifacts that
-   *  link them through `@link` (as `/<artifact>_native` in a classpath path).
+  /** Static libraries a sysroot doesn't have, by name, with what links them
+   *  through `@link`: an artifact (as `/<artifact>_native` in a classpath path) or, when it has a `/`,
+   *  a classpath path fragment.
    *  `scalino sysroot build` installs one under `<root>/addons/<lib>/<triple>`
    *  (lib/, include/, optionally `linkflags`), and `package` hands every
    *  cross target's to the link driver when the classpath has one of these. */
@@ -76,7 +77,25 @@ object Sysroot:
       "fs2-core", // fs2.hashing
       "http4s-crypto", // org.http4s::http4s-crypto, behind http4s-core
       "smithy4s-aws-kernel", // com.disneystreaming.smithy4s
-      "skunk-core"))
+      "skunk-core"),
+    "idn2" -> List(
+      "sttp/model/core_native"), // sttp-model's IDN support (idn2_to_ascii_8z)
+    "s2n" -> List(
+      "fs2-io"), // fs2.io.net.tls, so also skunk and http4s-ember; not on Windows (upstream has no port)
+    "curl" -> List(
+      "sttp/client3/core_native", "sttp/client4/core_native", // sttp's curl backend
+      "scala-native-loop", "libcurl"))
+
+  /** Addons a library needs installed and linked with it. */
+  def addonDeps(lib: String, triple: String): List[String] = lib match
+    case "s2n" => List("openssl")
+    case "curl" => if triple.contains("windows") then List("openssl", "idn2") else List("openssl")
+    case _ => Nil
+
+  def withDeps(libs: List[String], triple: String): List[String] = (libs ++ libs.flatMap(addonDeps(_, triple))).distinct
+
+  /** Targets a library has no build for: skipped silently, since the link only fails if its code is reached. */
+  def addonSupports(lib: String, triple: String): Boolean = !(lib == "s2n" && triple.contains("windows"))
 
   def addonDir(lib: String, triple: String): Path = cacheRoot.resolve("addons").resolve(lib).resolve(triple)
 
@@ -87,7 +106,7 @@ object Sysroot:
   def neededAddons(classpath: String): List[String] =
     val entries = classpath.split(java.io.File.pathSeparator).toList.map(_.replace('\\', '/'))
     Addons.toList.sortBy(_._1).collect {
-      case (lib, artifacts) if entries.exists(e => artifacts.exists(a => e.contains(s"/${a}_native"))) => lib
+      case (lib, triggers) if entries.exists(e => triggers.exists(t => e.contains(if t.contains("/") then t else s"/${t}_native"))) => lib
     }
 
   /** `--native-lib-addon <triple>=<dir>` entries: for each cross target in
@@ -99,7 +118,8 @@ object Sysroot:
     for
       t <- triples.distinct
       if libs.nonEmpty && Supported.contains(t) && Packaging.hostFromTriple(t) != host
-      lib <- libs
+      lib <- withDeps(libs, t)
+      if addonSupports(lib, t)
     yield
       val dir = findAddon(lib, t).getOrElse {
         println(s"no static $lib for $t -- installing it (`scalino sysroot build $t --with $lib`)")
@@ -126,7 +146,7 @@ object Sysroot:
         val ts = triples.result()
         if ts.isEmpty then die(s"sysroot build: expected a target triple, one of: ${SysrootBuild.Buildable.mkString(", ")}")
         ts.foreach(SysrootBuild.build(_, force))
-        for t <- ts; l <- libs do SysrootBuild.buildAddon(l, t, force)
+        for t <- ts; l <- withDeps(libs, t) if addonSupports(l, t) do SysrootBuild.buildAddon(l, t, force)
       case List("list") =>
         for t <- Supported do
           println(s"$t  ${find(t).map(_.toString).getOrElse("(not installed -- `scalino sysroot build " + t + "`)")}")

@@ -239,6 +239,15 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
   (`scalino sysroot build <triple> --with openssl` does it ahead of time). A host target keeps using
   the system's. Packages are prebuilt and checksum-verified: Alpine (musl), Debian 12 (gnu), MSYS2
   (Windows, needs a `tar` that reads zstd) and Homebrew's `openssl@3` bottle (macOS).
+- The same mechanism ships other static C libraries, installed when a classpath dependency links them
+  (also transitively) and installable ahead of time with `scalino sysroot build <triple> --with <lib>`:
+  `idn2` (sttp-model; libidn2 and libunistring, from the same package sources; LGPL, so a program
+  that links it statically must let its users relink), `s2n` (fs2-io, so skunk and http4s-ember too;
+  not on Windows, where s2n-tls has no port) and `curl` (sttp's curl backend). s2n-tls and libcurl
+  have no static packages, so they are **compiled** on your machine with the `clang` and `llvm-ar`
+  on your `PATH` (about a minute per target, once); both need the OpenSSL addon, installed with them,
+  and set `SSL_CERT_FILE` to the system's CA bundle at startup unless you have. libcurl is built with
+  HTTP(S) over OpenSSL and zlib only (Windows: MSYS2's full build).
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 

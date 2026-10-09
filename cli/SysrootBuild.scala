@@ -336,7 +336,12 @@ object SysrootBuild:
     val work = Files.createTempDirectory(Sysroot.cacheRoot, s".build-$lib-$triple-")
     try
       val out = Files.createDirectories(work.resolve(s"scalino-$lib-$triple"))
-      installOpenssl(triple, triple.takeWhile(_ != '-'), work, out)
+      val arch = triple.takeWhile(_ != '-')
+      lib match
+        case "openssl" => installOpenssl(triple, arch, work, out)
+        case "idn2" => installIdn2(triple, arch, work, out)
+        case "s2n" => installS2n(triple, work, out)
+        case "curl" => installCurl(triple, work, out)
       rm(dest)
       Files.createDirectories(dest.getParent)
       Files.move(out, dest)
@@ -414,3 +419,308 @@ object SysrootBuild:
       s"""Components:
          |  $components
          |Source: $source""".stripMargin, what = "static OpenSSL")
+
+  /** libidn2 (what sttp-model's `idn2_to_ascii_8z` is) and the libraries its archive calls into:
+   *  libunistring everywhere, libiconv on Windows, libintl/libiconv/CoreFoundation on macOS. */
+  private def installIdn2(triple: String, arch: String, work: Path, out: Path): Unit =
+    val ex = Files.createDirectories(work.resolve("extracted"))
+    val key = arch.toUpperCase
+    def libs(dir: Path, names: String*): Unit =
+      for l <- names do copy(dir.resolve(s"lib$l.a"), out.resolve("lib").resolve(s"lib$l.a"))
+    def linkFlags(flags: String): Unit = Files.write(out.resolve("linkflags"), (flags + "\n").getBytes(UTF_8))
+    // Alpine's packages carry no licence text: the upstream ones, from the tags.
+    def upstreamLicenses(): Unit =
+      val v = pin("IDN2_LICENSE_VERSION")
+      val uv = pin("UNISTRING_LICENSE_VERSION")
+      for (f, k) <- List("COPYING.LESSERv3" -> "IDN2_LICENSE_LESSER_SHA256", "COPYING.unicode" -> "IDN2_LICENSE_UNICODE_SHA256") do
+        addLicense(out, download(s"https://gitlab.com/libidn/libidn2/-/raw/v$v/$f", s"libidn2-$v-$f", pin(k)), s"libidn2-$f")
+      addLicense(out, download(s"https://git.savannah.gnu.org/cgit/libunistring.git/plain/COPYING.LIB?h=v$uv", s"libunistring-$uv-COPYING.LIB",
+        pin("UNISTRING_LICENSE_SHA256")), "libunistring-COPYING.LIB")
+    // A linker stub for a system library: the symbols the static archives import from it.
+    def tbd(name: String, installName: String, symbols: List[String]): Unit =
+      val text =
+        s"""--- !tapi-tbd
+           |tbd-version:     4
+           |targets:         [ x86_64-macos, arm64-macos ]
+           |install-name:    '$installName'
+           |current-version: 1
+           |exports:
+           |  - targets:         [ x86_64-macos, arm64-macos ]
+           |    symbols:         [ ${symbols.mkString(", ")} ]
+           |...
+           |""".stripMargin
+      Files.createDirectories(out.resolve("lib"))
+      Files.write(out.resolve("lib").resolve(s"lib$name.tbd"), text.getBytes(UTF_8))
+    val (components, source) =
+      if triple.endsWith("linux-musl") then
+        val branch = pin("OPENSSL_ALPINE_BRANCH")
+        for (pkg, ver, k) <- List(
+            ("libidn2-static", pin("IDN2_ALPINE_VERSION"), "IDN2_ALPINE_STATIC"),
+            ("libidn2-dev", pin("IDN2_ALPINE_VERSION"), "IDN2_ALPINE_DEV"),
+            ("libunistring-static", pin("UNISTRING_ALPINE_VERSION"), "UNISTRING_ALPINE_STATIC")) do
+          val apk = download(s"https://dl-cdn.alpinelinux.org/alpine/$branch/main/$arch/$pkg-$ver.apk", s"$pkg-$ver-$arch.apk", pin(s"${k}_${key}_SHA256"))
+          tar("-xzf", apk.toString, "-C", ex.toString)
+        libs(ex.resolve("usr/lib"), "idn2", "unistring")
+        copy(ex.resolve("usr/include/idn2.h"), out.resolve("include/idn2.h"))
+        upstreamLicenses()
+        linkFlags("-lunistring")
+        (s"libidn2-static, libidn2-dev ${pin("IDN2_ALPINE_VERSION")}, libunistring-static ${pin("UNISTRING_ALPINE_VERSION")} (Alpine $branch)  libidn2.a, libunistring.a built for musl, and idn2.h: LGPL-3.0-or-later (libidn2 also GPL-2.0-or-later), see libidn2-COPYING.* and libunistring-COPYING.LIB.",
+         "https://pkgs.alpinelinux.org/package/" + branch + "/main/" + arch + "/libidn2, https://www.gnu.org/software/libidn/")
+      else if triple.endsWith("linux-gnu") then
+        val debArch = if arch == "x86_64" then "amd64" else "arm64"
+        for (pkg, dir, ver, k) <- List(
+            ("libidn2-dev", "libi/libidn2", pin("IDN2_DEBIAN_VERSION"), "IDN2_DEBIAN"),
+            ("libunistring-dev", "libu/libunistring", pin("UNISTRING_DEBIAN_VERSION"), "UNISTRING_DEBIAN")) do
+          val deb = s"${pkg}_${ver}_$debArch.deb"
+          unpackDeb(download(s"$snapshot/$dir/$deb", deb, pin(s"${k}_${debArch.toUpperCase}_SHA256")), ex)
+        libs(ex.resolve("usr/lib").resolve(s"$arch-linux-gnu"), "idn2", "unistring")
+        copy(ex.resolve("usr/include/idn2.h"), out.resolve("include/idn2.h"))
+        addLicense(out, ex.resolve("usr/share/doc/libidn2-dev/copyright"), "debian-libidn2-dev-copyright")
+        addLicense(out, ex.resolve("usr/share/doc/libunistring-dev/copyright"), "debian-libunistring-dev-copyright")
+        linkFlags("-lunistring")
+        (s"libidn2-dev ${pin("IDN2_DEBIAN_VERSION")}, libunistring-dev ${pin("UNISTRING_DEBIAN_VERSION")} (Debian 12)  libidn2.a, libunistring.a and idn2.h, unmodified: LGPL-3.0-or-later (libidn2 also GPL-2.0-or-later), see debian-*-copyright.",
+         "https://tracker.debian.org/pkg/libidn2, https://tracker.debian.org/pkg/libunistring")
+      else if triple.endsWith("apple-darwin") then
+        val (k, tag) = if arch == "x86_64" then ("X86_64", "sonoma") else ("ARM64", "arm64_sonoma")
+        val bottles = for (formula, pfx) <- List("libidn2" -> "IDN2", "libunistring" -> "UNISTRING", "gettext" -> "GETTEXT") yield
+          val ver = pin(s"${pfx}_BREW_VERSION")
+          val sha = pin(s"${pfx}_BREW_${k}_SHA256")
+          val b = download(s"https://ghcr.io/v2/homebrew/core/$formula/blobs/sha256:$sha", s"$formula-brew-$ver-$tag.tar.gz", sha, List("Authorization: Bearer QQ=="))
+          tar("-xzf", b.toString, "-C", ex.toString)
+          formula -> ex.resolve(formula).resolve(ver)
+        val dirs = bottles.toMap
+        libs(dirs("libidn2").resolve("lib"), "idn2")
+        libs(dirs("libunistring").resolve("lib"), "unistring")
+        libs(dirs("gettext").resolve("lib"), "intl")
+        copy(dirs("libidn2").resolve("include/idn2.h"), out.resolve("include/idn2.h"))
+        addLicense(out, dirs("libidn2").resolve("COPYING.LESSERv3"), "libidn2-COPYING.LESSERv3")
+        addLicense(out, dirs("libidn2").resolve("COPYING.unicode"), "libidn2-COPYING.unicode")
+        addLicense(out, dirs("libunistring").resolve("COPYING.LIB"), "libunistring-COPYING.LIB")
+        addLicense(out, dirs("gettext").resolve("COPYING"), "gettext-COPYING")
+        // libintl and libunistring import from these; every Mac has them, the sysroot's stubs do not
+        tbd("iconv", "/usr/lib/libiconv.2.dylib", List("_iconv", "_iconv_open", "_iconv_close"))
+        tbd("CoreFoundation", "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+          List("___CFConstantStringClassReference", "_CFArrayGetCount", "_CFArrayGetValueAtIndex", "_CFGetTypeID", "_CFLocaleCopyPreferredLanguages",
+            "_CFPreferencesCopyAppValue", "_CFRelease", "_CFStringGetCString", "_CFStringGetTypeID", "_kCFPreferencesCurrentApplication"))
+        linkFlags("-lunistring -lintl -liconv -lCoreFoundation")
+        (s"libidn2 ${pin("IDN2_BREW_VERSION")}, libunistring ${pin("UNISTRING_BREW_VERSION")}, gettext ${pin("GETTEXT_BREW_VERSION")} (Homebrew bottles $tag)  libidn2.a, libunistring.a, libintl.a and idn2.h, unmodified: LGPL-3.0-or-later (libidn2 also GPL-2.0-or-later; libintl LGPL-2.1-or-later), see libidn2-COPYING.*, libunistring-COPYING.LIB, gettext-COPYING.\n  lib/libiconv.tbd, libCoreFoundation.tbd generated by scalino: symbol names only, linker stubs for the system's libiconv and CoreFoundation.",
+         "https://formulae.brew.sh/formula/libidn2, https://formulae.brew.sh/formula/libunistring, https://formulae.brew.sh/formula/gettext")
+      else
+        val env = if arch == "x86_64" then "clang64" else "clangarm64"
+        val pkgs = List(("libidn2", pin("IDN2_MSYS2_VERSION"), "IDN2"), ("libunistring", pin("UNISTRING_MSYS2_VERSION"), "UNISTRING"), ("libiconv", pin("ICONV_MSYS2_VERSION"), "ICONV"))
+        for (pkg, ver, k) <- pkgs do
+          val f = s"mingw-w64-clang-$arch-$pkg-$ver-any.pkg.tar.zst"
+          val p = download(s"https://repo.msys2.org/mingw/$env/$f", f, pin(s"${k}_MSYS2_${key}_SHA256"))
+          // only the static archive: the .dll.a import libraries next to it would win a -l lookup
+          tar("-xf", p.toString, "-C", ex.toString, s"$env/lib/$pkg.a") // zstd, see installOpenssl
+          if pkg == "libiconv" then tar("-xf", p.toString, "-C", ex.toString, s"$env/share/licenses/libiconv")
+          if pkg == "libidn2" then tar("-xf", p.toString, "-C", ex.toString, s"$env/include/idn2.h")
+        libs(ex.resolve(env).resolve("lib"), "idn2", "unistring", "iconv")
+        copy(ex.resolve(env).resolve("include/idn2.h"), out.resolve("include/idn2.h"))
+        upstreamLicenses() // MSYS2's libidn2 and libunistring packages carry none
+        for f <- walk(ex.resolve(env).resolve("share/licenses/libiconv")) if Files.isRegularFile(f) do
+          addLicense(out, f, s"msys2-libiconv-${f.getFileName}")
+        linkFlags("-lunistring -liconv")
+        (s"mingw-w64-$env libidn2 ${pin("IDN2_MSYS2_VERSION")}, libunistring ${pin("UNISTRING_MSYS2_VERSION")}, libiconv ${pin("ICONV_MSYS2_VERSION")} (MSYS2)  static archives and idn2.h, unmodified: LGPL-3.0-or-later (libidn2 also GPL-2.0-or-later; libiconv LGPL-2.0-or-later), see libidn2-COPYING.*, libunistring-COPYING.LIB, msys2-libiconv-*.",
+         "https://packages.msys2.org/base/mingw-w64-libidn2")
+    writeReadme(out, triple,
+      s"""Components:
+         |  $components
+         |Source: $source
+         |These libraries are LGPL: a static link means the linked program must let its users relink it
+         |(distribute the object files or this addon's archives alongside, or link dynamically).""".stripMargin, what = "static libidn2")
+
+  // ---- addons built from source (s2n-tls, libcurl) ---------------------------
+
+  /** What `scalino sysroot build` compiles with: the host's clang, and llvm-ar (next to clang: Homebrew,
+   *  apt's llvm-N/bin; or on PATH. Apple's ar can't index ELF objects). */
+  private def clangAndAr(): (String, String) =
+    val clang = ScalinoCli.findOnPath("clang")
+    val ar = Option(Paths.get(clang).toRealPath().getParent.resolve("llvm-ar")).filter(Files.isExecutable(_)).map(_.toString)
+      .getOrElse(ScalinoCli.findOnPath("llvm-ar"))
+    (clang, ar)
+
+  /** clang flags for compiling C for `triple` against its sysroot (the link driver's compile flags) and
+   *  the OpenSSL addon's headers. */
+  private def targetFlags(triple: String, sysroot: Path, ssl: Path): List[String] =
+    List(s"--target=$triple") ++
+      (if triple.contains("apple") then List("-isysroot", sysroot.toString, "-mmacos-version-min=11.0") else List(s"--sysroot=$sysroot")) ++
+      List("-I" + ssl.resolve("include"))
+
+  /** Compiles every file of `sources` with `clang flags` (in parallel) into `objs`; dies with the first errors. */
+  private def compileAll(clang: String, flags: List[String], sources: List[Path], objs: Path, what: String): List[Path] =
+    val pool = java.util.concurrent.Executors.newFixedThreadPool(Runtime.getRuntime.availableProcessors().max(1))
+    val results =
+      try
+        sources.zipWithIndex.map { (c, i) =>
+          pool.submit(new java.util.concurrent.Callable[(Path, Int, String)]:
+            def call() =
+              val o = objs.resolve(f"$i%04d-${c.getFileName}.o")
+              val (code, output) = ScalinoCli.runCaptureAll(clang :: flags ++ List("-c", c.toString, "-o", o.toString))
+              (o, code, output))
+        }.map(_.get())
+      finally pool.shutdown()
+    val failed = results.filter(_._2 != 0)
+    if failed.nonEmpty then die(s"sysroot build: compiling $what failed:\n${failed.take(3).map(_._3).mkString("\n")}")
+    results.map(_._1)
+
+  /** The static OpenSSL's built-in CA directory is the packager's (Homebrew's /usr/local/etc/openssl@3,
+   *  Debian's /usr/lib/ssl...), which most machines lack. Appended to a source file that is always linked
+   *  (so the archive member holding it is pulled in): point OpenSSL at the system's CA bundle, unless the
+   *  user already chose one. */
+  private def addCaBundleConstructor(file: Path): Unit =
+    Files.write(file, (new String(Files.readAllBytes(file), UTF_8) +
+      """
+        |
+        |/* scalino: default CA bundle, see `scalino sysroot build` */
+        |#include <stdlib.h>
+        |#include <unistd.h>
+        |__attribute__((constructor)) static void scalino_default_ca_bundle(void)
+        |{
+        |    static const char *const bundles[] = {
+        |        "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem",
+        |        "/etc/pki/tls/cacert.pem", "/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt" };
+        |    if (getenv("SSL_CERT_FILE") != NULL || getenv("SSL_CERT_DIR") != NULL) return;
+        |    for (unsigned i = 0; i < sizeof(bundles) / sizeof(bundles[0]); i++) {
+        |        if (access(bundles[i], R_OK) == 0) { setenv("SSL_CERT_FILE", bundles[i], 0); return; }
+        |    }
+        |}
+        |""".stripMargin).getBytes(UTF_8))
+
+  private def archive(ar: String, lib: Path, objs: List[Path]): Unit =
+    Files.createDirectories(lib.getParent)
+    if ScalinoCli.runInherited(List(ar, "rcs", lib.toString) ++ objs.map(_.toString)) != 0 then die(s"sysroot build: $ar failed")
+
+  /** s2n-tls, compiled: the sources' own feature probes (tests/features) pick the -D flags, every
+   *  library source goes through clang for `triple`, and llvm-ar makes libs2n.a. Links against the OpenSSL addon's libcrypto. */
+  private def installS2n(triple: String, work: Path, out: Path): Unit =
+    if triple.contains("windows") then die("sysroot build: s2n-tls does not support Windows")
+    val ssl = buildAddon("openssl", triple, force = false)
+    val sysroot = Sysroot.find(triple).getOrElse(build(triple, force = false))
+    val ver = pin("S2N_VERSION")
+    val tarball = download(s"https://github.com/aws/s2n-tls/archive/refs/tags/v$ver.tar.gz", s"s2n-tls-$ver.tar.gz", pin("S2N_SHA256"))
+    val src = Files.createDirectories(work.resolve("s2n"))
+    tar("-xzf", tarball.toString, "-C", src.toString, "--strip-components=1")
+    addCaBundleConstructor(src.resolve("tls/s2n_config.c"))
+    val (clang, ar) = clangAndAr()
+    val target = targetFlags(triple, sysroot, ssl)
+    def flagsOf(f: Path): List[String] = new String(Files.readAllBytes(f), UTF_8).split("\\s+").toList.filter(_.nonEmpty)
+    val features = src.resolve("tests/features")
+    val global = flagsOf(features.resolve("GLOBAL.flags"))
+    val prelude = List("-I" + src, "-include", src.resolve("utils/s2n_prelude.h").toString)
+    println(s"s2n-tls $ver: probing $triple")
+    val defines = walk(features).filter(_.getFileName.toString.endsWith(".c")).sortBy(_.toString).flatMap { c =>
+      val name = c.getFileName.toString.stripSuffix(".c")
+      val (code, _) = ScalinoCli.runCaptureAll(clang :: target ++ prelude ++ List("-c") ++ global ++ flagsOf(features.resolve(s"$name.flags")) ++ List(c.toString, "-o", "/dev/null"))
+      if code == 0 then Some(s"-D$name=1") else None
+    }
+    val sources = List("crypto", "error", "stuffer", "utils", "tls").flatMap(d => walk(src.resolve(d))).filter(_.getFileName.toString.endsWith(".c")).sortBy(_.toString)
+    println(s"s2n-tls $ver: compiling ${sources.size} files for $triple")
+    // -w: s2n's own warnings (it builds with -Werror in its CI), nothing for us to act on
+    val flags = target ++ prelude ++ List("-std=gnu99", "-O2", "-fPIC", "-w", "-I" + src.resolve("api"), "-DS2N_BUILD_RELEASE=1") ++ defines
+    archive(ar, out.resolve("lib/libs2n.a"), compileAll(clang, flags, sources, Files.createDirectories(work.resolve("s2n-obj")), s"s2n-tls for $triple"))
+    copy(src.resolve("api/s2n.h"), out.resolve("include/s2n.h"))
+    for h <- walk(src.resolve("api/unstable")) if Files.isRegularFile(h) do copy(h, out.resolve("include/s2n/unstable").resolve(h.getFileName.toString))
+    addLicense(out, src.resolve("LICENSE"), "s2n-tls-LICENSE")
+    addLicense(out, src.resolve("NOTICE"), "s2n-tls-NOTICE")
+    // its libcrypto is the OpenSSL addon's (which `package` passes along)
+    Files.write(out.resolve("linkflags"), "-lcrypto\n".getBytes(UTF_8))
+    writeReadme(out, triple,
+      s"""Components:
+         |  s2n-tls $ver  libs2n.a compiled by scalino from the source (clang, -O2) for $triple, and its public headers:
+         |  Apache-2.0, see s2n-tls-LICENSE and s2n-tls-NOTICE. Needs the OpenSSL addon's libcrypto. One addition: a
+         |  constructor in tls/s2n_config.c that sets SSL_CERT_FILE to the system's CA bundle when neither it nor
+         |  SSL_CERT_DIR is set (the static OpenSSL's built-in CA path is its packager's).
+         |Source: https://github.com/aws/s2n-tls""".stripMargin, what = "static s2n-tls")
+
+  /** libcurl on Linux and macOS, compiled: HTTP(S) with OpenSSL (the addon's), no zlib/brotli/zstd/HTTP2/
+   *  libssh/idn/psl so nothing else has to be linked. curl's configure can't run for a cross target, so
+   *  lib/curl_config.h is one scalino ships (build/curl_config-*.h, from a real configure run). */
+  private def installCurl(triple: String, work: Path, out: Path): Unit =
+    if triple.contains("windows") then return installCurlWindows(triple, work, out)
+    val ssl = buildAddon("openssl", triple, force = false)
+    val sysroot = Sysroot.find(triple).getOrElse(build(triple, force = false))
+    val ver = pin("CURL_VERSION")
+    val tarball = download(s"https://curl.se/download/curl-$ver.tar.xz", s"curl-$ver.tar.xz", pin("CURL_SHA256"))
+    val src = Files.createDirectories(work.resolve("curl"))
+    tar("-xf", tarball.toString, "-C", src.toString, "--strip-components=1")
+    val apple = triple.contains("apple")
+    val musl = triple.endsWith("linux-musl")
+    val data = Paths.get(dist).resolve("share").resolve("sysroot")
+    val config = readLines(data.resolve(if apple then "curl_config-darwin.h" else "curl_config-linux.h"))
+      // musl's sysroot has no linux/ headers
+      .filterNot(l => musl && l.contains("HAVE_LINUX_TCP_H"))
+    Files.write(src.resolve("lib/curl_config.h"), (config.mkString("\n") + "\n").getBytes(UTF_8))
+    if apple then
+      // the IPv6-literal workaround that needs the SystemConfiguration framework (headers and stub we don't have)
+      val h = src.resolve("lib/curl_setup.h")
+      val text = new String(Files.readAllBytes(h), UTF_8)
+      val from = "     defined(USE_IPV6)\n#    define CURL_MACOS_CALL_COPYPROXIES 1"
+      if !text.contains(from) then die("sysroot build: curl_setup.h is not what scalino's patch expects (a curl bump?)")
+      Files.write(h, text.replace(from, "     0 && defined(USE_IPV6)\n#    define CURL_MACOS_CALL_COPYPROXIES 1").getBytes(UTF_8))
+    addCaBundleConstructor(src.resolve("lib/easy.c"))
+    // zlib, whose objects go into libcurl.a too
+    val zver = pin("ZLIB_VERSION")
+    val zsrc = Files.createDirectories(work.resolve("zlib"))
+    tar("-xzf", download(s"https://github.com/madler/zlib/releases/download/v$zver/zlib-$zver.tar.gz", s"zlib-$zver.tar.gz", pin("ZLIB_SHA256")).toString,
+      "-C", zsrc.toString, "--strip-components=1")
+    val (clang, ar) = clangAndAr()
+    val zlibFiles = List("adler32", "compress", "crc32", "deflate", "gzclose", "gzlib", "gzread", "gzwrite", "infback", "inffast", "inflate", "inftrees", "trees", "uncompr", "zutil")
+      .map(f => zsrc.resolve(s"$f.c"))
+    val sources = walk(src.resolve("lib")).filter(_.getFileName.toString.endsWith(".c")).sortBy(_.toString)
+    println(s"curl $ver, zlib $zver: compiling ${sources.size + zlibFiles.size} files for $triple")
+    val os = if apple then Nil else List("-D_GNU_SOURCE", if musl then "-DHAVE_POSIX_STRERROR_R=1" else "-DHAVE_GLIBC_STRERROR_R=1")
+    val zflags = List("-DZ_PREFIX", "-DZ_HAVE_UNISTD_H=1", "-I" + zsrc)
+    val common = targetFlags(triple, sysroot, ssl) ++ os ++ List("-O2", "-fPIC", "-w") ++ zflags
+    val flags = common ++ List("-DHAVE_CONFIG_H", "-DHAVE_LIBZ=1", "-DBUILDING_LIBCURL", "-DCURL_STATICLIB", "-I" + src.resolve("include"), "-I" + src.resolve("lib"))
+    val objs = Files.createDirectories(work.resolve("curl-obj"))
+    archive(ar, out.resolve("lib/libcurl.a"),
+      compileAll(clang, flags, sources, objs, s"curl for $triple") ++
+        compileAll(clang, common, zlibFiles, Files.createDirectories(work.resolve("zlib-obj")), s"zlib for $triple"))
+    addLicense(out, zsrc.resolve("LICENSE"), "zlib-LICENSE")
+    for h <- walk(src.resolve("include/curl")) if Files.isRegularFile(h) && h.getFileName.toString.endsWith(".h") do copy(h, out.resolve("include/curl").resolve(h.getFileName.toString))
+    addLicense(out, src.resolve("COPYING"), "curl-COPYING")
+    Files.write(out.resolve("linkflags"), "-lssl -lcrypto\n".getBytes(UTF_8))
+    writeReadme(out, triple,
+      s"""Components:
+         |  curl $ver  libcurl.a compiled by scalino from the source (clang, -O2) for $triple, with its public headers:
+         |  the curl licence (MIT-like), see curl-COPYING. HTTP(S), FTP... over the OpenSSL addon's libcrypto/libssl; no
+         |  brotli, zstd, HTTP/2, libssh, libpsl or IDN; zlib $zver is compiled into libcurl.a (Z_PREFIX'd), see zlib-LICENSE. Additions: a constructor in lib/easy.c that sets
+         |  SSL_CERT_FILE to the system's CA bundle when neither it nor SSL_CERT_DIR is set${if apple then "; curl_setup.h's macOS IPv6 literal workaround (SystemConfiguration) is switched off" else ""}.
+         |Source: https://curl.se""".stripMargin, what = "static libcurl")
+
+  /** libcurl on Windows: curl's own Windows configuration only supports MSVC, so MSYS2's static build, with
+   *  everything it was built with (HTTP/2, HTTP/3, SSH, brotli, zstd, zlib, PSL). OpenSSL and libidn2 are the
+   *  addons'. */
+  private def installCurlWindows(triple: String, work: Path, out: Path): Unit =
+    val ex = Files.createDirectories(work.resolve("extracted"))
+    val arch = triple.takeWhile(_ != '-')
+    val env = if arch == "x86_64" then "clang64" else "clangarm64"
+    val key = arch.toUpperCase
+    val pkgs = List(
+      "curl" -> List("libcurl"), "libssh2" -> List("libssh2"), "zlib" -> List("libz"), "brotli" -> List("libbrotlicommon", "libbrotlidec"),
+      "zstd" -> List("libzstd"), "nghttp2" -> List("libnghttp2"), "ngtcp2" -> List("libngtcp2", "libngtcp2_crypto_ossl"),
+      "nghttp3" -> List("libnghttp3"), "libpsl" -> List("libpsl"))
+    for (pkg, libs) <- pkgs do
+      val ver = pin(s"${pkg.toUpperCase}_MSYS2_VERSION")
+      val f = s"mingw-w64-clang-$arch-$pkg-$ver-any.pkg.tar.zst"
+      val p = download(s"https://repo.msys2.org/mingw/$env/$f", f, pin(s"${pkg.toUpperCase}_MSYS2_${key}_SHA256"))
+      // only the static archives: the .dll.a import libraries next to them would win a -l lookup. zstd, see installOpenssl
+      tar(List("-xf", p.toString, "-C", ex.toString) ++ libs.map(l => s"$env/lib/$l.a") ++ List(s"$env/share/licenses/$pkg")*)
+      for l <- libs do copy(ex.resolve(env).resolve(s"lib/$l.a"), out.resolve("lib").resolve(s"$l.a"))
+      for f <- walk(ex.resolve(env).resolve("share/licenses").resolve(pkg)) if Files.isRegularFile(f) do addLicense(out, f, s"msys2-$pkg-${f.getFileName}")
+      if pkg == "curl" then
+        tar("-xf", p.toString, "-C", ex.toString, s"$env/include/curl")
+        copyTree(ex.resolve(env).resolve("include/curl"), out.resolve("include/curl"))
+    // Windows bindings @link the file name ("libcurl"), which makes lld look for liblibcurl.a
+    copy(out.resolve("lib/libcurl.a"), out.resolve("lib/liblibcurl.a"))
+    // what MSYS2's libcurl.pc lists (Libs.private), the OpenSSL/idn2 addons' libraries among them
+    Files.write(out.resolve("linkflags"),
+      ("-lssh2 -lidn2 -lssl -lcrypto -lz -lbrotlidec -lbrotlicommon -lzstd -lnghttp2 -lngtcp2_crypto_ossl -lngtcp2 -lnghttp3 -lpsl " +
+        "-lwldap32 -lbcrypt -ladvapi32 -lcrypt32 -lsecur32 -lws2_32 -liphlpapi\n").getBytes(UTF_8))
+    writeReadme(out, triple,
+      s"""Components:
+         |  mingw-w64-$env curl ${pin("CURL_MSYS2_VERSION")}, libssh2, zlib, brotli, zstd, nghttp2, ngtcp2, nghttp3, libpsl (MSYS2)
+         |  static archives and curl's headers, unmodified; each under its own licence, see msys2-*.
+         |  Needs the OpenSSL and libidn2 addons.
+         |Source: https://packages.msys2.org/base/mingw-w64-curl""".stripMargin, what = "static libcurl")

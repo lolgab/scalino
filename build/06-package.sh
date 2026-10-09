@@ -89,7 +89,7 @@ chmod +x "$DIST/scalino-cs"
 # Data `scalino sysroot build` needs to generate the macOS libSystem stub (see
 # cli/SysrootBuild.scala, build/gen-libsystem-symbols.py).
 mkdir -p "$DIST/share/sysroot"
-cp "$ROOT/build"/libsystem-symbols-*.txt "$DIST/share/sysroot/"
+cp "$ROOT/build"/libsystem-symbols-*.txt "$ROOT/build"/curl_config-*.h "$DIST/share/sysroot/"
 
 # Build-time-only intermediates (their classes are already baked into the
 # scalino-dotc/scalino-linkdriver binaries) -- not needed at runtime, drop them
