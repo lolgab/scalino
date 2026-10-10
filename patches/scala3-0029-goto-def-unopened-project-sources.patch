@@ -9,7 +9,7 @@ diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.
  import dotty.tools.pc.utils.InteractiveEnrichments.*
  
  import org.eclipse.lsp4j.Location
-@@ -179,8 +180,43 @@
+@@ -179,7 +180,43 @@
        else
          val fromJavalibNative = javalibNativeSourceFallback(symbol)
          if fromJavalibNative.nonEmpty then fromJavalibNative
@@ -51,6 +51,6 @@ diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.
 +            else new Range(new Position(0, 0), new Position(0, 0))
 +          List(new Location(uriStr, range))
 +    catch case scala.util.control.NonFatal(_) => Nil
- 
++
    /** `java.*` symbols (java.lang.Object, java.util.ArrayList, ...) typecheck
     *  against `dist/java.base.jar` -- real OpenJDK-compiled classfiles fed to
