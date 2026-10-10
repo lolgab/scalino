@@ -3265,18 +3265,25 @@ object ScalinoCli:
     val (expanded, testSources) = partitionSources(allExpanded)
     if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
 
-    val directives = parseDirectives(expanded)
-    val allDeps = (directives.deps ++ o.cliDeps).distinct
-    val repos = (directives.repositories ++ o.cliRepositories).distinct
+    // One IDE project per compilation scope, mirroring buildBinary (main) and
+    // handleTest (main + test together, test sources seeing main's). Declared
+    // per project, not as one merged classpath, so test-only dependencies stay
+    // invisible to main code. `platform`/`dependsOn` are what a future
+    // multi-target layout (say a native backend and a js frontend, each with
+    // its own main/test pair) extends: more entries, each with its own
+    // classpath and compiler arguments, no change to the format or to
+    // scalino-lsp's per-project routing.
+    val mainDirectives = parseDirectives(expanded)
+    val allDirectives = if testSources.isEmpty then mainDirectives else parseDirectives(allExpanded)
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
-    val compileOnlyDeps = (directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
+    val repos = (allDirectives.repositories ++ mainDirectives.repositories ++ o.cliRepositories).distinct
+    val mainDeps = (mainDirectives.deps ++ o.cliDeps).distinct
+    val testDeps = (allDirectives.testDeps ++ mainDirectives.testDeps).distinct
+    val compileOnlyDeps = (mainDirectives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
     val extraCompileOnlyClasspath = resolveDeps(compileOnlyDeps, depsCache, repos)
-    fetchSourcesBestEffort((allDeps ++ compileOnlyDeps).distinct, depsCache, repos)
+    fetchSourcesBestEffort((mainDeps ++ (if testSources.isEmpty then Nil else testDeps) ++ compileOnlyDeps).distinct, depsCache, repos)
     fetchStdlibSourcesBestEffort()
-    val options = directives.options ++ o.cliOptions
 
-    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
     // Unlike buildBinary, deliberately drop -Xplugin/-Xplugin-require:scalanative here:
     // InteractiveCompiler (vendor/scala3 dotc.interactive) hardcodes its own phases
     // list (Parser/TyperPhase/SetRootTree/CookComments only, no backend/scalanative
@@ -3284,24 +3291,40 @@ object ScalinoCli:
     // nscplugin's classes -- so requiring the plugin here always fails to load it
     // reflectively and every request after `initialize` (which needs a driver built
     // from these arguments) times out, regardless of native-image or not.
-    val compilerArguments =
-      List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ options
-
-    // Unlike buildBinary/run (main-scope only), the IDE config also covers
-    // testSources -- an editor should get diagnostics/completion in test/ code too,
-    // even though `partitionSources` keeps it out of the actual build.
-    val sourceDirectories = (expanded ++ testSources).map(_.toAbsolutePath.getParent.toString).distinct.sorted
-    val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
-
-    val json =
-      s"""[
-         |  {
+    def project(
+        id: String, dependsOn: List[String], sources: List[Path], classpathParts: List[String], options: List[String]
+    ): String =
+      val cc = computeCompileClasspath(classpathParts.filter(_.nonEmpty).mkString(CP_SEP), extraCompileOnlyClasspath)
+      val compilerArguments = List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ options
+      val sourceDirectories = sources.map(_.toAbsolutePath.getParent.toString).distinct.sorted
+      val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
+      s"""  {
+         |    "id": ${jsonStr(id)},
+         |    "platform": "native",
+         |    "dependsOn": ${jsonArr(dependsOn)},
          |    "compilerArguments": ${jsonArr(compilerArguments)},
          |    "sourceDirectories": ${jsonArr(sourceDirectories)},
          |    "dependencyClasspath": ${jsonArr(dependencyClasspath)}
-         |  }
-         |]
-         |""".stripMargin
+         |  }""".stripMargin
+
+    val mainCp = resolveDeps(mainDeps, depsCache, repos)
+    val mainProject = project(
+      "main", Nil, expanded,
+      List(mainCp) ++ mainDirectives.jars ++ mainDirectives.resourceDirs,
+      mainDirectives.options ++ o.cliOptions)
+    val projects =
+      if testSources.isEmpty then List(mainProject)
+      else
+        // Same classpath handleTest compiles tests with: main's, plus
+        // test.dep, plus the test sources' own jars/resources.
+        val testCp = List(
+          resolveDeps((allDirectives.deps ++ o.cliDeps).distinct, depsCache, repos),
+          resolveDeps(testDeps, depsCache, repos)) ++ allDirectives.jars ++ allDirectives.resourceDirs
+        List(
+          mainProject,
+          project("test", List("main"), testSources, testCp,
+            allDirectives.options ++ o.cliOptions ++ allDirectives.testOptions))
+    val json = projects.mkString("[\n", ",\n", "\n]\n")
 
     // Lives inside .scalino-build/ (patches/scala3-0015 moves scalino-lsp's
     // own DottyLanguageServer.IDE_CONFIG_FILE to match) rather than at the

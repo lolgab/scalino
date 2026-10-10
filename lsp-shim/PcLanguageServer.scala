@@ -46,8 +46,27 @@ import scala.scalanative.unsafe.{extern, CInt}
  */
 class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Unit) { thisServer =>
 
-  private var pc: RawScalaPresentationCompiler = null
-  private var pcFactory: () => RawScalaPresentationCompiler = null
+  /** One entry per project in `.scalino-build/scalino-lsp.json` (e.g. an
+   *  app's main and test scopes, later one per platform). Each owns its own
+   *  presentation compiler, built lazily on the first request for one of its
+   *  files -- a second PC is a second symbol table, so a project nobody
+   *  touches costs nothing. */
+  private final class Project(
+      val id: String,
+      val config: ProjectConfig,
+      /** Directories whose direct children are this project's own sources. */
+      val sourceDirs: Seq[Path],
+      /** `sourceDirs` plus those of every project this one (transitively)
+       *  depends on: dependencies are typechecked from source, no class
+       *  output needed. */
+      val sourcePathDirs: Seq[Path]) {
+    var pc: RawScalaPresentationCompiler = null
+    var factory: () => RawScalaPresentationCompiler = null
+    var completionsSincePc = 0
+    var pendingRecycle: java.util.concurrent.ScheduledFuture[?] = null
+  }
+  /** Empty until the config is loaded; never empty afterwards. */
+  private var projects: List[Project] = Nil
   private var warmupError: Throwable = null
   /** Set when the workspace has no `.scalino-build/scalino-lsp.json`, i.e. it
    *  never ran `scalino setup-ide`. Not an error: the server stays idle and
@@ -61,7 +80,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
       // A request racing the warmup thread must learn whether the workspace
       // is configured before deciding (requirePc waits for the same signal).
       val deadline = System.currentTimeMillis() + 180000
-      while (pc == null && warmupError == null && !unconfigured && System.currentTimeMillis() < deadline)
+      while (projects.isEmpty && warmupError == null && !unconfigured && System.currentTimeMillis() < deadline)
         thisServer.wait(deadline - System.currentTimeMillis())
       if (unconfigured) empty else body
     }
@@ -149,39 +168,14 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
     val warmup = new Thread(() => {
       try {
-        val configs = loadConfig(rootUri)
-        val classpath: Seq[Path] =
-          configs.flatMap(_.dependencyClasspath).distinct.map(Paths.get(_))
-        val sourceDirs: Seq[Path] =
-          configs.flatMap(_.sourceDirectories).distinct.map(Paths.get(_))
-        // Includes `-javabootclasspath ...` -- without it dotc's own
-        // Definitions.init() can't find java.lang.Object at all (same
-        // config field DottyLanguageServer already threads through, see
-        // its own `config.compilerArguments` usage).
-        // `-color:never`: dotc's reporter output reaches editors' plain-text
-        // log panes (VS Code Output), which don't render ANSI escapes.
-        val compilerArgs: List[String] =
-          configs.flatMap(_.compilerArguments).distinct :+ "-color:never"
-        val factory = () => RawScalaPresentationCompiler(
-          buildTargetIdentifier = "scalino",
-          classpath = classpath,
-          options = compilerArgs,
-          // Without this, sourcePathMode defaults to DISABLED and sourceDirs
-          // below is plumbed through but never used: the InteractiveDriver
-          // only ever typechecks files the editor explicitly opens
-          // (didOpen/didChange), so a symbol defined in a sibling source file
-          // that hasn't been opened yet fails to resolve -- looks exactly
-          // like "not all files in the source dirs get compiled".
-          config = scala.meta.internal.pc.PresentationCompilerConfigImpl(
-            _sourcePathMode = scala.meta.pc.SourcePathMode.FULL
-          ),
-          sourcePath = () => sourceFilesIn(sourceDirs).asJava
-        )
-        val built = factory()
+        val loaded = buildProjects(loadConfig(rootUri))
         thisServer.synchronized {
-          pcFactory = factory
-          pc = built
+          projects = loaded
           thisServer.notifyAll()
+          // Warm the first project (its PC is what a client's first request
+          // most likely needs); the rest are built on demand.
+          ensurePc(loaded.head)
+          ()
         }
       } catch {
         case ex: java.io.FileNotFoundException if ex.getMessage != null && ex.getMessage.contains(".scalino-build/scalino-lsp.json") =>
@@ -223,6 +217,71 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
         .map(_.toPath)
     }.distinct
 
+  private def buildProjects(configs: List[ProjectConfig]): List[Project] = {
+    if (configs.isEmpty) throw new IllegalStateException(".scalino-build/scalino-lsp.json lists no projects")
+    def absDirs(c: ProjectConfig): Seq[Path] =
+      c.sourceDirectories.map(d => Paths.get(d).toAbsolutePath.normalize).distinct
+    // Configs written before multi-project support have no `id`.
+    val ids = configs.zipWithIndex.map { case (c, i) =>
+      Option(c.id).getOrElse(if (configs.size == 1) "main" else s"project-$i")
+    }
+    val byId = ids.zip(configs).toMap
+    def closure(id: String, seen: Set[String]): List[String] =
+      if (seen(id)) Nil
+      else id :: byId.get(id).toList.flatMap(_.dependsOn).flatMap(closure(_, seen + id))
+    ids.zip(configs).map { case (id, c) =>
+      val pathDirs = closure(id, Set.empty).distinct.flatMap(i => absDirs(byId(i))).distinct
+      new Project(id, c, absDirs(c), pathDirs)
+    }
+  }
+
+  /** The project a document belongs to: the one listing the file's parent
+   *  directory, else the one with the deepest source directory above it
+   *  (a file created since `setup-ide` ran), else the project with the
+   *  largest classpath (documents with no project of their own, such as
+   *  dependency sources opened from a jar -- the broadest classpath is the
+   *  one most likely to resolve their imports). */
+  private def projectFor(uri: URI): Project = {
+    val ps = projects
+    val parent: Option[Path] =
+      if (uri.getScheme != "file") None
+      else try Option(Paths.get(uri).toAbsolutePath.normalize.getParent) catch { case NonFatal(_) => None }
+    parent.flatMap { dir =>
+      ps.find(_.sourceDirs.contains(dir)).orElse {
+        val above = for (p <- ps; d <- p.sourceDirs if dir.startsWith(d)) yield (p, d.getNameCount)
+        above.sortBy(-_._2).headOption.map(_._1)
+      }
+    }.getOrElse(ps.maxBy(_.config.dependencyClasspath.size))
+  }
+
+  private def ensurePc(project: Project): RawScalaPresentationCompiler = {
+    if (project.pc == null) {
+      val cfg = project.config
+      // Includes `-javabootclasspath ...` -- without it dotc's own
+      // Definitions.init() can't find java.lang.Object at all.
+      // `-color:never`: dotc's reporter output reaches editors' plain-text
+      // log panes (VS Code Output), which don't render ANSI escapes.
+      val factory = () => RawScalaPresentationCompiler(
+        buildTargetIdentifier = project.id,
+        classpath = cfg.dependencyClasspath.distinct.map(Paths.get(_)),
+        options = cfg.compilerArguments.distinct :+ "-color:never",
+        // Without this, sourcePathMode defaults to DISABLED and sourcePath
+        // below is plumbed through but never used: the InteractiveDriver
+        // only ever typechecks files the editor explicitly opens
+        // (didOpen/didChange), so a symbol defined in a sibling source file
+        // that hasn't been opened yet fails to resolve -- looks exactly
+        // like "not all files in the source dirs get compiled".
+        config = scala.meta.internal.pc.PresentationCompilerConfigImpl(
+          _sourcePathMode = scala.meta.pc.SourcePathMode.FULL
+        ),
+        sourcePath = () => sourceFilesIn(project.sourcePathDirs).asJava
+      )
+      project.factory = factory
+      project.pc = factory()
+    }
+    project.pc
+  }
+
   /** Every `complete` call makes the PC build a throwaway `InteractiveDriver`
    *  (see `RawScalaPresentationCompiler.complete`), a few MB of garbage per
    *  call. Scala Native's Immix heap fragments under that churn and its RSS
@@ -234,35 +293,35 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private val pcRecycleIdleMillis = 15000L
   private val pcRecycleMinCompletions = 50
   private val pcRecycleMaxCompletions = 400
-  private var completionsSincePc = 0
-  private var pendingRecycle: java.util.concurrent.ScheduledFuture[?] = null
 
-  private def recyclePc(): Unit = {
-    if (pcFactory == null || pc == null) return
-    val fresh = pcFactory()
-    // Warm the new driver with the open buffers so the next request doesn't
-    // pay for typechecking them from scratch (results are discarded;
+  private def recyclePc(project: Project): Unit = {
+    if (project.factory == null || project.pc == null) return
+    val fresh = project.factory()
+    // Warm the new driver with the project's open buffers so the next request
+    // doesn't pay for typechecking them from scratch (results are discarded;
     // diagnostics for unchanged text are already published).
     buffers.foreach { case (uri, text) =>
-      try fresh.didChange(CompilerVirtualFileParams(uri, text))
-      catch { case NonFatal(_) => () }
+      if (projectFor(uri) eq project)
+        try fresh.didChange(CompilerVirtualFileParams(uri, text))
+        catch { case NonFatal(_) => () }
     }
-    pc = fresh
-    completionsSincePc = 0
+    project.pc = fresh
+    project.completionsSincePc = 0
     // Let the GC (evacuating, when enabled) reclaim the old PC's heap now
     // rather than at the next allocation-triggered cycle.
     System.gc()
   }
 
-  private def noteCompletion(): Unit = {
-    completionsSincePc += 1
-    if (pendingRecycle != null) pendingRecycle.cancel(false)
-    if (completionsSincePc >= pcRecycleMaxCompletions) recyclePc()
+  private def noteCompletion(uri: URI): Unit = {
+    val project = projectFor(uri)
+    project.completionsSincePc += 1
+    if (project.pendingRecycle != null) project.pendingRecycle.cancel(false)
+    if (project.completionsSincePc >= pcRecycleMaxCompletions) recyclePc(project)
     else {
       val task: Runnable = () => thisServer.synchronized {
-        if (completionsSincePc >= pcRecycleMinCompletions) recyclePc()
+        if (project.completionsSincePc >= pcRecycleMinCompletions) recyclePc(project)
       }
-      pendingRecycle =
+      project.pendingRecycle =
         diagnosticsScheduler.schedule(task, pcRecycleIdleMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
   }
@@ -273,14 +332,14 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
    *  here instead of failing outright. 30s was too tight: observed real PC
    *  warmup (classpath scanning over ~20+ real jars) taking anywhere from
    *  ~1s (warm page cache) to several minutes (cold). */
-  private def requirePc(): RawScalaPresentationCompiler = thisServer.synchronized {
+  private def requirePc(uri: URI): RawScalaPresentationCompiler = thisServer.synchronized {
     val deadline = System.currentTimeMillis() + 180000
-    while (pc == null && warmupError == null && System.currentTimeMillis() < deadline)
+    while (projects.isEmpty && warmupError == null && System.currentTimeMillis() < deadline)
       thisServer.wait(deadline - System.currentTimeMillis())
-    if (pc == null && warmupError != null)
+    if (projects.isEmpty && warmupError != null)
       throw new IllegalStateException(s"presentation compiler failed to initialize: ${warmupError.getMessage}", warmupError)
-    if (pc == null) throw new IllegalStateException("presentation compiler not yet initialized")
-    pc
+    if (projects.isEmpty) throw new IllegalStateException("presentation compiler not yet initialized")
+    ensurePc(projectFor(uri))
   }
 
   /** Convert an `Lsp.Position` (line/character) to a raw text offset --
@@ -432,7 +491,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }
 
   private def publishDiagnosticsFor(uri: URI, uriString: String): Unit = {
-    val diags = requirePc().didChange(CompilerVirtualFileParams(uri, textOf(uri)))
+    val diags = requirePc(uri).didChange(CompilerVirtualFileParams(uri, textOf(uri)))
     val lspDiags = diags.asScala.map { d =>
       val severity = Option(d.getSeverity()).map(_.getValue()).getOrElse(1)
       val (code, codeDescription) = Option(d.getCode()).map(eitherToString).flatMap(formatDiagnosticCode) match {
@@ -449,13 +508,13 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     buffers.remove(uri)
     bufferVersions.remove(uri)
     pendingDiagnostics.remove(uri).foreach(_.cancel(false))
-    requirePc().didClose(uri)
+    Option(projectFor(uri).pc).foreach(_.didClose(uri))
   }
 
   def completion(params: TextDocumentPositionParams): CompletionList = guarded(CompletionList(false, Nil)) {
     val uri = pcUri(params.textDocument.uri)
-    val result = requirePc().complete(offsetParams(uri, params.position), l.CompletionTriggerKind.Invoked)
-    noteCompletion()
+    val result = requirePc(uri).complete(offsetParams(uri, params.position), l.CompletionTriggerKind.Invoked)
+    noteCompletion(uri)
     CompletionList(
       isIncomplete = result.isIncomplete(),
       items = result.getItems().asScala.map { item =>
@@ -484,38 +543,97 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
   def definition(params: TextDocumentPositionParams): List[Location] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
-    val result = requirePc().definition(offsetParams(uri, params.position))
+    val result = requirePc(uri).definition(offsetParams(uri, params.position))
     result.locations().asScala.map(toLocation).toList
+  }
+
+  /** References of the symbol at `pos`, split into those in `uri` itself and
+   *  those in other files. presentation-compiler only ever searches the one
+   *  file it is handed (Metals drives it from its own index, which this
+   *  server doesn't have), so the rest is done here the way Metals does it:
+   *  resolve the symbol(s) at the cursor to semanticdb names, then ask for
+   *  that name in every other source of the connected projects (those
+   *  related through `dependsOn`, in either direction: a rename in `main`
+   *  must reach `test`, and a use in `test` must find the `main` definition),
+   *  each asked of the compiler of the project owning that file. Files whose
+   *  text doesn't mention the identifier are skipped without typechecking
+   *  them. File-local symbols never leave their file. */
+  private def workspaceReferences(uri: URI, pos: Position, includeDeclaration: Boolean): (List[Location], List[Location]) = {
+    val text = textOf(uri)
+    val offset = positionToOffset(text, pos)
+    val originResults = requirePc(uri).references(PcReferencesRequest(
+      CompilerVirtualFileParams(uri, text), includeDeclaration, JEither.forLeft(Integer.valueOf(offset)))).asScala.toList
+    val here = originResults.flatMap(_.locations().asScala).map(toLocation)
+    val symbols = originResults.map(_.symbol()).distinct.filterNot(_.startsWith("local"))
+    if (symbols.isEmpty) return (here, Nil)
+
+    val isIdentChar = (c: Char) => Character.isUnicodeIdentifierPart(c)
+    var start = math.min(offset, text.length)
+    var end = start
+    while (start > 0 && isIdentChar(text.charAt(start - 1))) start -= 1
+    while (end < text.length && isIdentChar(text.charAt(end))) end += 1
+    val word = text.substring(start, end)
+
+    val owner = projectFor(uri)
+    // Connected component of the dependsOn graph, undirected.
+    val related = scala.collection.mutable.LinkedHashSet[Project](owner)
+    var grew = true
+    while (grew) {
+      grew = false
+      for (a <- projects; b <- related.toList if !related(a) && (a.config.dependsOn.contains(b.id) || b.config.dependsOn.contains(a.id))) {
+        related += a
+        grew = true
+      }
+    }
+    val candidates = related.toList.flatMap(p => sourceFilesIn(p.sourceDirs)).distinct.filter(_.toUri != uri)
+    val others = candidates.flatMap { file =>
+      val fileUri = file.toUri
+      try {
+        val fileText = buffers.getOrElse(fileUri, new String(Files.readAllBytes(file), "UTF-8"))
+        if (word.nonEmpty && !fileText.contains(word)) Nil
+        else {
+          val pcForFile = requirePc(fileUri)
+          symbols.flatMap { symbol =>
+            pcForFile.references(PcReferencesRequest(
+              CompilerVirtualFileParams(fileUri, fileText), includeDeclaration, JEither.forRight(symbol))).asScala
+              .flatMap(_.locations().asScala).map(toLocation)
+          }
+        }
+      } catch { case NonFatal(_) => Nil }
+    }
+    (here, others.distinct)
   }
 
   def references(params: ReferenceParams): List[Location] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
-    val text = textOf(uri)
-    val offset = positionToOffset(text, params.position)
-    val request = PcReferencesRequest(
-      CompilerVirtualFileParams(uri, text),
-      params.context.includeDeclaration,
-      JEither.forLeft(Integer.valueOf(offset))
-    )
-    val results = requirePc().references(request)
-    results.asScala.flatMap(_.locations().asScala).map(toLocation).toList
+    val (here, others) = workspaceReferences(uri, params.position, params.context.includeDeclaration)
+    here ++ others
   }
 
+  /** For the file the rename was requested in, the PC's own rename is
+   *  preferred (it knows about backticks, named arguments, ...), but it only
+   *  handles file-local symbols and answers nothing for the rest, so then
+   *  that file's references stand in for it. Every other file's occurrences
+   *  come from `workspaceReferences`. */
   def rename(params: RenameParams): WorkspaceEdit = guarded(WorkspaceEdit(Map.empty)) {
     val uri = pcUri(params.textDocument.uri)
-    val edits = requirePc().rename(offsetParams(uri, params.position), params.newName)
-    WorkspaceEdit(Map(params.textDocument.uri -> edits.asScala.map(toTextEdit).toList))
+    val pcEdits = requirePc(uri).rename(offsetParams(uri, params.position), params.newName).asScala.map(toTextEdit).toList
+    val (here, others) = workspaceReferences(uri, params.position, includeDeclaration = true)
+    def asEdits(locs: List[Location]) = locs.map(loc => TextEdit(loc.range, params.newName))
+    val ownEdits = if (pcEdits.nonEmpty) pcEdits else asEdits(here)
+    val otherEdits = others.groupBy(_.uri).map { case (u, locs) => u -> asEdits(locs) }
+    WorkspaceEdit(otherEdits + (params.textDocument.uri -> ownEdits))
   }
 
   def documentHighlight(params: TextDocumentPositionParams): List[DocumentHighlight] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
-    val result = requirePc().documentHighlight(offsetParams(uri, params.position))
+    val result = requirePc(uri).documentHighlight(offsetParams(uri, params.position))
     result.asScala.map(h => DocumentHighlight(toRange(h.getRange()), Option(h.getKind()).map(_.getValue()).getOrElse(1))).toList
   }
 
   def hover(params: TextDocumentPositionParams): Option[Hover] = guarded(None) {
     val uri = pcUri(params.textDocument.uri)
-    val result = requirePc().hover(offsetParams(uri, params.position))
+    val result = requirePc(uri).hover(offsetParams(uri, params.position))
     result.toScala.map { sig =>
       val h = sig.toLsp()
       val contents = h.getContents()
@@ -529,7 +647,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
   def signatureHelp(params: TextDocumentPositionParams): SignatureHelp = guarded(SignatureHelp(Nil, -1, -1)) {
     val uri = pcUri(params.textDocument.uri)
-    val result = requirePc().signatureHelp(offsetParams(uri, params.position))
+    val result = requirePc(uri).signatureHelp(offsetParams(uri, params.position))
     SignatureHelp(
       signatures = result.getSignatures().asScala.map { sig =>
         SignatureInformation(
@@ -555,13 +673,13 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
 
   def typeDefinition(params: TextDocumentPositionParams): List[Location] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
-    val result = requirePc().typeDefinition(offsetParams(uri, params.position))
+    val result = requirePc(uri).typeDefinition(offsetParams(uri, params.position))
     result.locations().asScala.map(toLocation).toList
   }
 
   def prepareRename(params: TextDocumentPositionParams): Option[Range] = guarded(None) {
     val uri = pcUri(params.textDocument.uri)
-    requirePc().prepareRename(offsetParams(uri, params.position)).toScala.map(toRange)
+    requirePc(uri).prepareRename(offsetParams(uri, params.position)).toScala.map(toRange)
   }
 
   def selectionRange(params: SelectionRangeParams): List[Lsp.SelectionRange] = guarded(Nil) {
@@ -569,7 +687,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     val offsets: List[OffsetParams] = params.positions.map(pos => offsetParams(uri, pos))
     def convert(sr: l.SelectionRange): Lsp.SelectionRange =
       Lsp.SelectionRange(toRange(sr.getRange()), Option(sr.getParent()).map(convert))
-    requirePc().selectionRange(offsets.asJava).asScala.map(convert).toList
+    requirePc(uri).selectionRange(offsets.asJava).asScala.map(convert).toList
   }
 
   def inlayHint(params: InlayHintParams): List[Lsp.InlayHint] = guarded(Nil) {
@@ -588,7 +706,20 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
       namedParameters = on("namedParameters"),
       hintsInPatternMatch = on("hintsInPatternMatch"),
       closingLabels = false)
-    requirePc().inlayHints(hintsParams).asScala.map { h =>
+    // presentation-compiler folds each child of the requested range separately
+    // and the children overlap (a call and its own arguments), so one hint --
+    // `[Int, Int]`, `(using ...)` -- can come back once per enclosing tree;
+    // editors render each copy. Identical position + text + kind is one hint.
+    val rawHints = requirePc(uri).inlayHints(hintsParams).asScala.toList
+    def hintLabel(h: l.InlayHint): String = Option(h.getLabel()) match {
+      case None => ""
+      case Some(e) if e.isLeft() => e.getLeft()
+      case Some(e) => e.getRight().asScala.map(_.getValue()).mkString
+    }
+    rawHints.distinctBy { h =>
+      val p = h.getPosition()
+      (p.getLine(), p.getCharacter(), hintLabel(h), Option(h.getKind()).map(_.getValue()))
+    }.map { h =>
       val pos = h.getPosition()
       // Real lsp4j 1.0.0 types `label` as `Either<String, List<InlayHintLabelPart>>` --
       // presentation-compiler really does build the `List` shape for composite
@@ -628,7 +759,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   def semanticTokens(params: DocumentSymbolParams): Lsp.SemanticTokens = guarded(Lsp.SemanticTokens(Nil)) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
-    val nodes = requirePc().semanticTokens(CompilerVirtualFileParams(uri, text)).asScala.toList.sortBy(n => (n.start(), n.end()))
+    val nodes = requirePc(uri).semanticTokens(CompilerVirtualFileParams(uri, text)).asScala.toList.sortBy(n => (n.start(), n.end()))
     val data = List.newBuilder[Int]
     var idx = 0
     var line = 0
@@ -671,7 +802,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     val startOffset = positionToOffset(text, params.range.start)
     val endOffset = positionToOffset(text, params.range.end)
     val cursorParams = CompilerOffsetParams(uri, text, startOffset)
-    val compiler = requirePc()
+    val compiler = requirePc(uri)
 
     def tryEdits(id: String, target: OffsetParams, payload: java.util.Optional[OffsetParams] = java.util.Optional.empty()): List[TextEdit] =
       try compiler.codeAction(target, id, payload).asScala.map(toTextEdit).toList

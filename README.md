@@ -141,7 +141,13 @@ selection ranges, code actions, and diagnostics. It's built on dotty's
 presentation compiler and runs without a JVM.
 
 1. Run `scalino setup-ide <sources...>`. This writes
-   `.scalino-build/scalino-lsp.json`.
+   `.scalino-build/scalino-lsp.json`: one project for the main scope and,
+   when there are `test/` sources, a second one that depends on it. Test
+   dependencies (`//> using test.dep`) are only visible to the test project.
+   Each project gets its own compiler, started on first use. The file is an
+   array of `{id, platform, dependsOn, compilerArguments, sourceDirectories,
+   dependencyClasspath}`, so further targets (say a js frontend) are more
+   entries, not a new format.
 2. Install the client for your editor (each directory's README has the steps):
    - **Zed:** [`zed-extension/`](zed-extension/), published in Zed's gallery as "Scalino".
    - **VS Code:** [`vscode-extension/`](vscode-extension/), installed locally for now (it's not on the Marketplace yet).

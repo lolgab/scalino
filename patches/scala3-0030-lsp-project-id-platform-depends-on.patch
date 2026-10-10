@@ -1,0 +1,43 @@
+diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
+--- a/language-server/src/dotty/tools/languageserver/Lsp.scala
++++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
+@@ -132,7 +132,10 @@
+     compilerArguments: List[String],
+     sourceDirectories: List[String],
+     dependencyClasspath: List[String],
+-    classDirectory: String)
++    classDirectory: String,
++    id: String = null,
++    platform: String = "native",
++    dependsOn: List[String] = Nil)
+ 
+   // -- JSON-RPC envelopes ---------------------------------------------------
+ 
+@@ -1131,6 +1134,9 @@
+         var sourceDirectories: List[String] = Nil
+         var dependencyClasspath: List[String] = Nil
+         var classDirectory: String = null
++        var id: String = null
++        var platform: String = "native"
++        var dependsOn: List[String] = Nil
+         if (!in.isNextToken('}')) {
+           in.rollbackToken()
+           var continue = true
+@@ -1140,13 +1146,16 @@
+               case "sourceDirectories" => sourceDirectories = decodeStringList(in)
+               case "dependencyClasspath" => dependencyClasspath = decodeStringList(in)
+               case "classDirectory" => classDirectory = in.readString(null)
++              case "id" => id = in.readString(null)
++              case "platform" => platform = in.readString("native")
++              case "dependsOn" => dependsOn = decodeStringList(in)
+               case _ => skipVal(in)
+             }
+             continue = in.isNextToken(',')
+           }
+           if (!in.isCurrentToken('}')) in.objectEndOrCommaError()
+         }
+-        ProjectConfig(compilerArguments, sourceDirectories, dependencyClasspath, classDirectory)
++        ProjectConfig(compilerArguments, sourceDirectories, dependencyClasspath, classDirectory, id, platform, dependsOn)
+       } else in.readNullOrTokenError(default, '{')
+     def encodeValue(x: ProjectConfig, out: JsonWriter): Unit = ???
+   }
