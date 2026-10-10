@@ -89,3 +89,10 @@ ___toupper
 ___isctype
 ___wcwidth
 _dispatch_once
+# Plain names of symbols whose headers only declare a suffixed asm label (_realpath$DARWIN_EXTSN):
+# code that declares the function itself (Scala Native's @extern libc bindings) references the plain one.
+_realpath
+_syslog
+_dispatch_assert_queue
+_dispatch_assert_queue_not
+_dispatch_queue_create_with_target
