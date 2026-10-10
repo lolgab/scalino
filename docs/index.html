@@ -346,7 +346,7 @@ scalino package --format brew --release-url https://github.com/me/app/releases/d
 
 <span class="cm"># linux musl / gnu (glibc &gt;= 2.31), macOS, Windows (mingw, experimental)</span>
 <span class="cm"># x86_64 and aarch64 — from any host</span></pre>
-      <div class="note"><code class="mono">//&gt; using nativeTargetTriple …</code> works too. <code class="mono">run</code> and <code class="mono">test</code> always build for the host. Cross targets need <code class="mono">lld</code> (on a Mac, macOS targets need nothing extra); the Windows sysroot needs clang 21 or newer.</div>
+      <div class="note"><code class="mono">//&gt; using nativeTargetTriple …</code> works too. <code class="mono">run</code> and <code class="mono">test</code> always build for the host. Cross targets link with <code class="mono">lld</code>, downloaded automatically when it isn't on PATH; the Windows sysroot needs clang 21 or newer.</div>
     </div>
   </div>
 </section>

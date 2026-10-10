@@ -322,6 +322,41 @@ object SysrootBuild:
     rm(out.resolve(mw).resolve("share"))
     rm(out.resolve("generic-w64-mingw32").resolve("share"))
 
+  // ---- lld -------------------------------------------------------------------
+
+  /** An `ld.lld` that runs on this host, for cross links when the system has none: taken from
+   *  llvm-mingw's host tarball (statically linked, one binary for every target format) and kept
+   *  in the sysroot cache. None when llvm-mingw has no build for this host. */
+  def hostLld(host: Packaging.Host): Option[Path] =
+    val ver = pin("LLVM_MINGW_VERSION")
+    val (suffix, sha) = (host.os, host.arch, host.libc) match
+      case ("linux", "x86_64", "gnu") => ("ubuntu-22.04-x86_64", pin("LLVM_MINGW_SHA256"))
+      case ("linux", "aarch64", "gnu") => ("ubuntu-22.04-aarch64", pin("LLVM_MINGW_LINUX_AARCH64_SHA256"))
+      case ("macos", _, _) => ("macos-universal", pin("LLVM_MINGW_MACOS_UNIVERSAL_SHA256"))
+      case _ => return None
+    val home = Sysroot.cacheRoot.resolve("tools").resolve(s"lld-llvm-mingw-$ver-$suffix")
+    val dest = home.resolve("bin").resolve("ld.lld")
+    if Files.isExecutable(dest) then return Some(dest)
+    val lm = s"llvm-mingw-$ver-ucrt-$suffix"
+    val tarball = download(s"https://github.com/mstorsjo/llvm-mingw/releases/download/$ver/$lm.tar.xz", s"$lm.tar.xz", sha)
+    Files.createDirectories(Sysroot.cacheRoot)
+    val work = Files.createTempDirectory(Sysroot.cacheRoot, ".build-lld-")
+    try
+      // lld links the shared libLLVM next to it (rpath ../lib); its names carry the LLVM version
+      val (_, listing) = ScalinoCli.runCaptureStdout(List("tar", "-tf", tarball.toString))
+      val libLlvm = listing.linesIterator.map(_.trim).filter(l => l.startsWith(s"$lm/lib/libLLVM") && !l.endsWith("/")).toList
+      if libLlvm.isEmpty then die(s"sysroot build: no libLLVM in $lm")
+      tar((List("-xf", tarball.toString, "-C", work.toString, "--strip-components=1", s"$lm/bin/lld", s"$lm/LICENSE.TXT") ++ libLlvm)*)
+      // lld picks its flavor from argv[0], so the extracted `lld` is installed under the name ld.lld
+      Files.move(work.resolve("bin/lld"), work.resolve("bin/ld.lld"))
+      Files.move(work.resolve("LICENSE.TXT"), work.resolve("llvm-LICENSE.TXT"))
+      rm(home)
+      Files.createDirectories(home.getParent)
+      Files.move(work, home)
+      println(s"installed lld -> $dest")
+      Some(dest)
+    finally ScalinoCli.deleteRecursively(work)
+
   // ---- addons --------------------------------------------------------------
 
   /** Installs static `lib` (see `Sysroot.Addons`) for `triple` into the cache:

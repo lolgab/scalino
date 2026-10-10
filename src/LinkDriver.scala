@@ -33,6 +33,8 @@ object LinkDriver:
     sysroots: Map[String, String] = Map.empty,
     // triple -> static library dirs (lib/, include/, optional linkflags), for cross targets
     libAddons: Map[String, List[String]] = Map.empty,
+    // ld.lld to link with when the system has none (cli/Sysroot.ensureLld)
+    ldPath: Option[String] = None,
     embedResources: Boolean = false,
     multithreading: Boolean = false,
     directCodegen: Boolean = false,
@@ -70,6 +72,7 @@ object LinkDriver:
         case "--lib-addon" =>
           val Array(t, d) = rest(i + 1).split("=", 2)
           o = o.copy(libAddons = o.libAddons.updated(t, o.libAddons.getOrElse(t, Nil) :+ d)); i += 1
+        case "--ld-path" => o = o.copy(ldPath = Some(rest(i + 1))); i += 1
         case "--embed-resources" => o = o.copy(embedResources = true)
         case "--multithreading" => o = o.copy(multithreading = true)
         case "--direct-codegen" => o = o.copy(directCodegen = true)
@@ -205,6 +208,10 @@ object LinkDriver:
     // Whether `t` is what clang already produces on this machine. Only then
     // are `Discover`'s host library/include dirs (/opt/homebrew/lib...) valid.
     lazy val hostTriple = Discover.targetTriple(Paths.get(args(3)))
+    lazy val hasLld: Boolean =
+      sys.env.getOrElse("PATH", "").split(java.io.File.pathSeparator).exists { d =>
+        d.nonEmpty && List("ld.lld", "ld.lld.exe").exists(n => java.nio.file.Files.isExecutable(Paths.get(d, n)))
+      }
     def isHostTarget(t: String): Boolean =
       normArch(t.takeWhile(_ != '-')) == normArch(hostTriple.takeWhile(_ != '-')) &&
         osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl"))
@@ -287,15 +294,21 @@ object LinkDriver:
           else List("-nostdinc++"))
         // Apple's ld only exists on a Mac, and can't produce ELF or PE.
         val userPicksLinker = opts.linking.exists(o => o.startsWith("-fuse-ld") || o.startsWith("--ld-path"))
+        val needsLld = !userPicksLinker &&
+          (osOf(t) == "windows" || osOf(t) != osOf(hostTriple) || osOf(t) == "linux")
+        // clang's own "invalid linker name in argument '-fuse-ld=lld'" says nothing useful
+        if needsLld && !hasLld && opts.ldPath.isEmpty then
+          throw new RuntimeException(
+            s"linking for $t needs lld (ld.lld) on PATH: install it (apt install lld, brew install lld) or pass -fuse-ld=/--ld-path via linking options")
         val lld =
           if userPicksLinker then Nil
           // Scala Native turns a literal -fuse-ld=lld into --start-lib/--end-lib,
           // which lld's MinGW mode rejects: pick the same linker by path.
-          else if osOf(t) == "windows" then List("--ld-path=ld.lld")
+          else if osOf(t) == "windows" then List(s"--ld-path=${opts.ldPath.getOrElse("ld.lld")}")
           // GNU ld is single-arch (an x86_64 host's can't write aarch64 ELF), so
           // every non-host Linux target links with lld too. Apple's ld handles
           // both Mac architectures.
-          else if osOf(t) != osOf(hostTriple) || osOf(t) == "linux" then List("-fuse-ld=lld")
+          else if osOf(t) != osOf(hostTriple) || osOf(t) == "linux" then "-fuse-ld=lld" :: opts.ldPath.map(p => s"--ld-path=$p").toList
           else Nil
         withDir.withCompilerConfig(
           _.withTargetTriple(Some(t))

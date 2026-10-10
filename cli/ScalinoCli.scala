@@ -2197,6 +2197,7 @@ object ScalinoCli:
     sysroots: List[String] = Nil,
     // `<triple>=<dir>` per static library a cross target links (Sysroot.Addons)
     libAddons: List[String] = Nil,
+    ldPath: Option[String] = None,
     embedResources: Boolean = false,
     multithreading: Boolean = true,
     directCodegen: Boolean = true,
@@ -2384,6 +2385,7 @@ object ScalinoCli:
       nativeOpts.targetTriples.flatMap(v => List("--target-triple", v)) ++
       nativeOpts.sysroots.flatMap(v => List("--sysroot", v)) ++
       nativeOpts.libAddons.flatMap(v => List("--lib-addon", v)) ++
+      nativeOpts.ldPath.toList.flatMap(v => List("--ld-path", v)) ++
       (if nativeOpts.embedResources then List("--embed-resources") else Nil) ++
       (if nativeOpts.multithreading then List("--multithreading") else Nil) ++
       (if incremental then List("--incremental-compilation") else Nil) ++
@@ -3019,7 +3021,8 @@ object ScalinoCli:
       if mode == "package" && nativeOpts0.targetTriples.nonEmpty then
         nativeOpts0.copy(
           sysroots = Sysroot.resolve(nativeOpts0.targetTriples, nativeOpts0.sysroots),
-          libAddons = Sysroot.resolveAddons(nativeOpts0.targetTriples, extraClasspath))
+          libAddons = Sysroot.resolveAddons(nativeOpts0.targetTriples, extraClasspath),
+          ldPath = Sysroot.ensureLld(nativeOpts0.targetTriples))
       else nativeOpts0
 
     mode match

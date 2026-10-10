@@ -63,6 +63,22 @@ object Sysroot:
     }
     explicit ++ found
 
+  /** The `ld.lld` for a build to `triples`, when one is needed and the system has none on PATH:
+   *  GNU ld is single-arch and Apple's ld only exists on a Mac, so every target that isn't the host's own
+   *  (and every Linux one) links with lld. Downloaded on first use, like the sysroots. */
+  def ensureLld(triples: List[String]): Option[String] =
+    val host = Packaging.detectHost()
+    val needed = triples.exists { t =>
+      val target = Packaging.hostFromTriple(t)
+      target != host && !(target.os == "macos" && host.os == "macos") || target.os == "linux"
+    }
+    val onPath = Option(System.getenv("PATH")).getOrElse("").split(java.io.File.pathSeparator).exists(d =>
+      d.nonEmpty && List("ld.lld", "ld.lld.exe").exists(n => Files.isExecutable(Paths.get(d, n))))
+    if !needed || onPath then None
+    else
+      println("no ld.lld on PATH -- fetching one")
+      SysrootBuild.hostLld(host).map(_.toString)
+
   // ---- addons: static C libraries ------------------------------------------
 
   /** Static libraries a sysroot doesn't have, by name, with what links them
@@ -146,7 +162,13 @@ object Sysroot:
         val ts = triples.result()
         if ts.isEmpty then die(s"sysroot build: expected a target triple, one of: ${SysrootBuild.Buildable.mkString(", ")}")
         ts.foreach(SysrootBuild.build(_, force))
+        ensureLld(ts)
         for t <- ts; l <- withDeps(libs, t) if addonSupports(l, t) do SysrootBuild.buildAddon(l, t, force)
+      case List("lld") =>
+        val host = Packaging.detectHost()
+        SysrootBuild.hostLld(host) match
+          case Some(p) => println(p)
+          case None => die(s"sysroot lld: no prebuilt lld for ${host.triple}, install lld with your package manager")
       case List("list") =>
         for t <- Supported do
           println(s"$t  ${find(t).map(_.toString).getOrElse("(not installed -- `scalino sysroot build " + t + "`)")}")
@@ -154,4 +176,4 @@ object Sysroot:
         find(t) match
           case Some(p) => println(p)
           case None => die(s"sysroot: $t is not installed")
-      case _ => die("usage: scalino sysroot <build <triple>... [--force] [--with <lib>] | list | path <triple>>")
+      case _ => die("usage: scalino sysroot <build <triple>... [--force] [--with <lib>] | lld | list | path <triple>>")
