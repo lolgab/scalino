@@ -49,6 +49,22 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private var pc: RawScalaPresentationCompiler = null
   private var pcFactory: () => RawScalaPresentationCompiler = null
   private var warmupError: Throwable = null
+  /** Set when the workspace has no `.scalino-build/scalino-lsp.json`, i.e. it
+   *  never ran `scalino setup-ide`. Not an error: the server stays idle and
+   *  answers every request with an empty result, so a project that doesn't
+   *  use scalino doesn't get a toast per request. */
+  @volatile private var unconfigured = false
+
+  /** Serialized request body; empty result when the workspace is unconfigured. */
+  private def guarded[A](empty: => A)(body: => A): A =
+    thisServer.synchronized {
+      // A request racing the warmup thread must learn whether the workspace
+      // is configured before deciding (requirePc waits for the same signal).
+      val deadline = System.currentTimeMillis() + 180000
+      while (pc == null && warmupError == null && !unconfigured && System.currentTimeMillis() < deadline)
+        thisServer.wait(deadline - System.currentTimeMillis())
+      if (unconfigured) empty else body
+    }
   private val buffers: mutable.Map[URI, String] = mutable.Map.empty
 
   /** `didChange` used to recompile+publish synchronously on every keystroke:
@@ -168,6 +184,13 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
           thisServer.notifyAll()
         }
       } catch {
+        case ex: java.io.FileNotFoundException if ex.getMessage != null && ex.getMessage.contains(".scalino-build/scalino-lsp.json") =>
+          System.err.println(s"scalino-lsp: ${ex.getMessage}; language features disabled for this workspace")
+          System.err.flush()
+          thisServer.synchronized {
+            unconfigured = true
+            thisServer.notifyAll()
+          }
         case ex: Throwable =>
           System.err.println(s"PC warmup failed: ${ex.getClass.getName}: ${ex.getMessage}")
           ex.printStackTrace()
@@ -365,14 +388,14 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private def eitherToString(e: JEither[String, ?]): String =
     if (e == null) "" else if (e.isLeft()) e.getLeft() else String.valueOf(e.getRight())
 
-  def didOpen(params: DidOpenTextDocumentParams): Unit = thisServer.synchronized {
+  def didOpen(params: DidOpenTextDocumentParams): Unit = guarded(()) {
     val document = params.textDocument
     val uri = pcUri(document.uri)
     buffers(uri) = document.text
     if (!document.uri.startsWith("jar:")) publishDiagnosticsFor(uri, document.uri)
   }
 
-  def didChange(params: DidChangeTextDocumentParams): Unit = thisServer.synchronized {
+  def didChange(params: DidChangeTextDocumentParams): Unit = guarded(()) {
     val document = params.textDocument
     val uri = pcUri(document.uri)
     val change = params.contentChanges.head
@@ -421,7 +444,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     publishDiagnostics(uriString, lspDiags)
   }
 
-  def didClose(params: DidCloseTextDocumentParams): Unit = thisServer.synchronized {
+  def didClose(params: DidCloseTextDocumentParams): Unit = guarded(()) {
     val uri = pcUri(params.textDocument.uri)
     buffers.remove(uri)
     bufferVersions.remove(uri)
@@ -429,7 +452,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     requirePc().didClose(uri)
   }
 
-  def completion(params: TextDocumentPositionParams): CompletionList = thisServer.synchronized {
+  def completion(params: TextDocumentPositionParams): CompletionList = guarded(CompletionList(false, Nil)) {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().complete(offsetParams(uri, params.position), l.CompletionTriggerKind.Invoked)
     noteCompletion()
@@ -459,13 +482,13 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     )
   }
 
-  def definition(params: TextDocumentPositionParams): List[Location] = thisServer.synchronized {
+  def definition(params: TextDocumentPositionParams): List[Location] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().definition(offsetParams(uri, params.position))
     result.locations().asScala.map(toLocation).toList
   }
 
-  def references(params: ReferenceParams): List[Location] = thisServer.synchronized {
+  def references(params: ReferenceParams): List[Location] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val offset = positionToOffset(text, params.position)
@@ -478,19 +501,19 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     results.asScala.flatMap(_.locations().asScala).map(toLocation).toList
   }
 
-  def rename(params: RenameParams): WorkspaceEdit = thisServer.synchronized {
+  def rename(params: RenameParams): WorkspaceEdit = guarded(WorkspaceEdit(Map.empty)) {
     val uri = pcUri(params.textDocument.uri)
     val edits = requirePc().rename(offsetParams(uri, params.position), params.newName)
     WorkspaceEdit(Map(params.textDocument.uri -> edits.asScala.map(toTextEdit).toList))
   }
 
-  def documentHighlight(params: TextDocumentPositionParams): List[DocumentHighlight] = thisServer.synchronized {
+  def documentHighlight(params: TextDocumentPositionParams): List[DocumentHighlight] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().documentHighlight(offsetParams(uri, params.position))
     result.asScala.map(h => DocumentHighlight(toRange(h.getRange()), Option(h.getKind()).map(_.getValue()).getOrElse(1))).toList
   }
 
-  def hover(params: TextDocumentPositionParams): Option[Hover] = thisServer.synchronized {
+  def hover(params: TextDocumentPositionParams): Option[Hover] = guarded(None) {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().hover(offsetParams(uri, params.position))
     result.toScala.map { sig =>
@@ -504,7 +527,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }
   }
 
-  def signatureHelp(params: TextDocumentPositionParams): SignatureHelp = thisServer.synchronized {
+  def signatureHelp(params: TextDocumentPositionParams): SignatureHelp = guarded(SignatureHelp(Nil, -1, -1)) {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().signatureHelp(offsetParams(uri, params.position))
     SignatureHelp(
@@ -530,18 +553,18 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   def symbol(params: WorkspaceSymbolParams): List[SymbolInformation] = Nil
   def implementation(params: TextDocumentPositionParams): List[Location] = Nil
 
-  def typeDefinition(params: TextDocumentPositionParams): List[Location] = thisServer.synchronized {
+  def typeDefinition(params: TextDocumentPositionParams): List[Location] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val result = requirePc().typeDefinition(offsetParams(uri, params.position))
     result.locations().asScala.map(toLocation).toList
   }
 
-  def prepareRename(params: TextDocumentPositionParams): Option[Range] = thisServer.synchronized {
+  def prepareRename(params: TextDocumentPositionParams): Option[Range] = guarded(None) {
     val uri = pcUri(params.textDocument.uri)
     requirePc().prepareRename(offsetParams(uri, params.position)).toScala.map(toRange)
   }
 
-  def selectionRange(params: SelectionRangeParams): List[Lsp.SelectionRange] = thisServer.synchronized {
+  def selectionRange(params: SelectionRangeParams): List[Lsp.SelectionRange] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val offsets: List[OffsetParams] = params.positions.map(pos => offsetParams(uri, pos))
     def convert(sr: l.SelectionRange): Lsp.SelectionRange =
@@ -549,7 +572,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     requirePc().selectionRange(offsets.asJava).asScala.map(convert).toList
   }
 
-  def inlayHint(params: InlayHintParams): List[Lsp.InlayHint] = thisServer.synchronized {
+  def inlayHint(params: InlayHintParams): List[Lsp.InlayHint] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val rangeParams = CompilerRangeParams(uri, text, positionToOffset(text, params.range.start), positionToOffset(text, params.range.end))
@@ -602,7 +625,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
    *  scan over the buffer converting each node's start offset to
    *  line/character (nodes are sorted by position first since the encoding
    *  requires monotonically increasing positions). */
-  def semanticTokens(params: DocumentSymbolParams): Lsp.SemanticTokens = thisServer.synchronized {
+  def semanticTokens(params: DocumentSymbolParams): Lsp.SemanticTokens = guarded(Lsp.SemanticTokens(Nil)) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val nodes = requirePc().semanticTokens(CompilerVirtualFileParams(uri, text)).asScala.toList.sortBy(n => (n.start(), n.end()))
@@ -642,7 +665,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
    *  `RawScalaPresentationCompiler`, only "try it and see what edits (if
    *  any) come back", so a thrown exception is treated the same as an empty
    *  result. */
-  def codeAction(params: CodeActionParams): List[Lsp.CodeAction] = thisServer.synchronized {
+  def codeAction(params: CodeActionParams): List[Lsp.CodeAction] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
     val startOffset = positionToOffset(text, params.range.start)
