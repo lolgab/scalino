@@ -1,0 +1,56 @@
+diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+--- a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
++++ b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+@@ -20,6 +20,7 @@
+ import dotty.tools.dotc.interactive.InteractiveDriver
+ import dotty.tools.dotc.util.SourceFile
+ import dotty.tools.dotc.util.SourcePosition
++import dotty.tools.dotc.util.Spans.{NoSpan, Span}
+ import dotty.tools.pc.utils.InteractiveEnrichments.*
+ 
+ import org.eclipse.lsp4j.Location
+@@ -179,8 +180,43 @@
+       else
+         val fromJavalibNative = javalibNativeSourceFallback(symbol)
+         if fromJavalibNative.nonEmpty then fromJavalibNative
+-        else search.definition(semanticdbSymbol, uri).asScala.toList
++        else
++          val fromProject = projectSourceFallback(symbol)
++          if fromProject.nonEmpty then fromProject
++          else search.definition(semanticdbSymbol, uri).asScala.toList
+ 
++  /** A symbol defined in a project source file the editor has not opened:
++   *  `-Ylogical-package-loading` resolves it from the source path, but no
++   *  tree is retained for it, so `Symbol.source`/`sourcePos` can come back
++   *  empty and the branches above find nothing. Complete the symbol, then
++   *  locate it through its associated file and own span.
++   */
++  private def projectSourceFallback(symbol: Symbol)(using ctx: Context): List[Location] =
++    try
++      symbol.ensureCompleted()
++      val file = symbol.associatedFile
++      if file == null || file.file == null then Nil
++      else
++        val name = file.name
++        if !(name.endsWith(".scala") || name.endsWith(".java")) then Nil
++        else
++          val uriStr = file.file.toPath.toUri.toString
++          val sf = ctx.getSource(file)
++          // The file was never typed, so the symbol has no span: find its
++          // declaration by name in the text instead, falling back to the top.
++          val span =
++            if symbol.span.exists then symbol.span
++            else
++              val declName = java.util.regex.Pattern.quote(symbol.name.toString.stripSuffix("$"))
++              val decl = java.util.regex.Pattern.compile(
++                s"\\b(?:object|class|trait|enum|def|val|var|type|given)\\s+(?:`)?($declName)\\b")
++              val m = decl.matcher(new String(sf.content()))
++              if m.find() then Span(m.start(1)) else NoSpan
++          val range =
++            if span.exists then sf.atSpan(span).toLsp
++            else new Range(new Position(0, 0), new Position(0, 0))
++          List(new Location(uriStr, range))
++    catch case scala.util.control.NonFatal(_) => Nil
+ 
+   /** `java.*` symbols (java.lang.Object, java.util.ArrayList, ...) typecheck
+    *  against `dist/java.base.jar` -- real OpenJDK-compiled classfiles fed to
