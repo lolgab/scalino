@@ -142,8 +142,8 @@ index 164cfee..7b88a92 100644
 +#define SN_MCTX_SIZE sizeof(mcontext_t)
 +#define SN_UC_MCTX(uc) ((void *)&(uc)->uc_mcontext)
 +#define SN_UC_GET_SP(uc) ((uintptr_t)(uc)->uc_mcontext.sp)
-+#define SN_UC_SET_SP(uc, sp)                                                   \
-+    ((uc)->uc_mcontext.sp = (uint64_t)(uintptr_t)(sp))
++#define SN_UC_SET_SP(uc, val)                                                  \
++    ((uc)->uc_mcontext.sp = (uint64_t)(uintptr_t)(val))
 +#endif
 +#define SN_RED_ZONE 128
 +#define SN_ALIGN16(x) (((x) + 15) & ~(uintptr_t)15)
