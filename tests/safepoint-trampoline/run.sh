@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for the x86_64 GC safepoint trampoline (patch 0069), no Scala Native build needed.
+# Unit test for the GC safepoint trampoline (x86_64: patch 0069, aarch64: patch 0074), no Scala Native build needed.
 #
 # poll_test.S loads known values into every GPR, three XMM registers, the flags and the 128-byte
 # red zone, then does a poll load against an armed (PROT_NONE) page. The SIGSEGV handler calls the
@@ -14,14 +14,18 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 dir="${1:-$root/vendor/scala-native/nativelib/src/main/resources/scala-native/gc/shared}"
 cc="${CLANG:-clang}"
+arch=x86_64
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) ;;
-  *) echo "skipped: the x86_64 trampoline test only runs on Linux x86_64"; exit 0 ;;
+  Linux-aarch64|Linux-arm64|Darwin-arm64) arch=aarch64 ;;
+  *) echo "skipped: the trampoline test only runs on Linux x86_64 and Linux/macOS arm64"; exit 0 ;;
 esac
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 flags=(-O1 -g -DSCALANATIVE_MULTITHREADING_ENABLED -DSCALANATIVE_GC_USE_YIELDPOINT_TRAPS -DSCALANATIVE_GC_IMMIX -I"$here/stubs" -I"$dir")
+suffix=""; [[ "$arch" == aarch64 ]] && suffix="_aarch64"
 "$cc" "${flags[@]}" -c "$dir/SafepointPollTrampoline.c" -o "$tmp/tramp_c.o"
-"$cc" "${flags[@]}" -c "$dir/SafepointPollTrampoline-x86_64.S" -o "$tmp/tramp_s.o"
-"$cc" "${flags[@]}" -c "$here/poll_test.S" -o "$tmp/poll_test.o"
-"$cc" "${flags[@]}" "$here/test.c" "$tmp/tramp_c.o" "$tmp/tramp_s.o" "$tmp/poll_test.o" -Wl,-z,noexecstack -o "$tmp/tt"
+"$cc" "${flags[@]}" -c "$dir/SafepointPollTrampoline-$arch.S" -o "$tmp/tramp_s.o"
+"$cc" "${flags[@]}" -c "$here/poll_test$suffix.S" -o "$tmp/poll_test.o"
+extra=(); [[ "$(uname -s)" == Linux ]] && extra=(-Wl,-z,noexecstack)
+"$cc" "${flags[@]}" "$here/test$suffix.c" "$tmp/tramp_c.o" "$tmp/tramp_s.o" "$tmp/poll_test.o" "${extra[@]}" -o "$tmp/tt"
 "$tmp/tt"

@@ -112,7 +112,7 @@ index 2401c1e..9d87856 100644
  #else
  .text
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
-index 164cfee..7b88a92 100644
+index 164cfee..c3f6afd 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
 @@ -93,6 +93,69 @@ void scalanative_gc_safepoint_poll_trampoline(void);
@@ -185,15 +185,22 @@ index 164cfee..7b88a92 100644
  bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
  #ifndef SN_UC_UNSUPPORTED
      MutatorThread *self = (MutatorThread *)mutatorThread;
-@@ -101,7 +164,14 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
+@@ -101,7 +164,21 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
      ucontext_t *uc = (ucontext_t *)uap;
      uintptr_t pc = SN_UC_GET_PC(uc);
      self->safepointResumePc = pc;
 -#if defined(__x86_64__)
 +#if defined(__aarch64__)
 +    /* Save the whole context below the red zone and run the trampoline below
-+     * the copy; see sn_resumeTrapHandler. */
++     * the copy; see sn_resumeTrapHandler. The kernel built the signal frame
++     * (which holds `uc`) right below the red zone, so the copy must go below
++     * this handler's own frame, not into the frame it is copying from. If the
++     * handler runs on an alternate stack the frame is elsewhere and the copy
++     * can sit right below the red zone. */
 +    uintptr_t base = (SN_UC_GET_SP(uc) - SN_RED_ZONE) & ~(uintptr_t)15;
++    uintptr_t here = (uintptr_t)__builtin_frame_address(0);
++    if (here < base && base - here < ((uintptr_t)1 << 20))
++        base = (here - 512) & ~(uintptr_t)15;
 +    uintptr_t copy = base - SN_ALIGN16(SN_MCTX_SIZE);
 +    memcpy((void *)copy, SN_UC_MCTX(uc), SN_MCTX_SIZE);
 +    SN_UC_SET_SP(uc, copy);
