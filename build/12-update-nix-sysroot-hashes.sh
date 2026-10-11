@@ -55,8 +55,14 @@ out=packaging/nix/sysroot-sources.json
     echo "== $t" >&2
     src="$work/src-$t"
     mkdir -p "$src"
-    SCALINO_SYSROOT_DIR="$work/root-$t" SCALINO_SYSROOT_SOURCES="$src" \
-      "$scalino" sysroot build "$t" --with openssl --with idn2 --with s2n --with curl >&2
+    # upstream hosts (savannah's cgit in older releases) fail now and then;
+    # finished downloads are cached in $src, so a retry only repeats the rest
+    for attempt in 1 2 3 4; do
+      SCALINO_SYSROOT_DIR="$work/root-$t" SCALINO_SYSROOT_SOURCES="$src" \
+        "$scalino" sysroot build "$t" --with openssl --with idn2 --with s2n --with curl >&2 && break
+      [ "$attempt" = 4 ] && { echo "sysroot build for $t failed" >&2; exit 1; }
+      echo "retrying ($attempt)" >&2; sleep 20
+    done
     find "$src" -name '*.part' -delete
     hash="$(nix hash path --type sha256 "$src")"
     rm -rf "$work/root-$t" "$src"

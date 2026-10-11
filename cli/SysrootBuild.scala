@@ -469,7 +469,7 @@ object SysrootBuild:
       val uv = pin("UNISTRING_LICENSE_VERSION")
       for (f, k) <- List("COPYING.LESSERv3" -> "IDN2_LICENSE_LESSER_SHA256", "COPYING.unicode" -> "IDN2_LICENSE_UNICODE_SHA256") do
         addLicense(out, download(s"https://gitlab.com/libidn/libidn2/-/raw/v$v/$f", s"libidn2-$v-$f", pin(k)), s"libidn2-$f")
-      addLicense(out, download(s"https://git.savannah.gnu.org/cgit/libunistring.git/plain/COPYING.LIB?h=v$uv", s"libunistring-$uv-COPYING.LIB",
+      addLicense(out, download(s"https://raw.githubusercontent.com/gnu-mirror-unofficial/libunistring/0b9fc52683d1de46282f84083639f89379e9a204/COPYING.LIB", s"libunistring-$uv-COPYING.LIB",
         pin("UNISTRING_LICENSE_SHA256")), "libunistring-COPYING.LIB")
     // A linker stub for a system library: the symbols the static archives import from it.
     def tbd(name: String, installName: String, symbols: List[String]): Unit =

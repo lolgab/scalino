@@ -169,10 +169,20 @@
           # app); mkScalinoSysroot only installs the ones an app asks for.
           allSysrootAddons = [ "openssl" "idn2" "s2n" "curl" ];
 
-          # clang + llvm-ar compile the s2n/curl addons for the *target*, so the
-          # clang must not be the usual wrapper (which injects the builder's glibc
-          # headers); lld links cross targets.
-          sysrootTools = with pkgs; [ gnutar gzip xz zstd lld llvmPackages.clangNoLibc llvm ];
+          # clang + llvm-ar compile the s2n/curl addons for the *target*. The
+          # usual wrapped clang injects the builder's glibc headers, and
+          # clangNoLibc passes -nostdlibinc (hiding the sysroot's too), so use
+          # the unwrapped clang with the resource dir (builtin headers) spelled
+          # out. lld links cross targets.
+          targetClang = pkgs.symlinkJoin {
+            name = "scalino-target-clang";
+            paths = map
+              (n: pkgs.writeShellScriptBin n ''
+                exec ${pkgs.llvmPackages.clang-unwrapped}/bin/${n} -resource-dir "$(${pkgs.llvmPackages.clangNoLibc}/bin/clang -print-resource-dir)" "$@"
+              '')
+              [ "clang" "clang++" ];
+          };
+          sysrootTools = with pkgs; [ gnutar gzip xz zstd lld targetClang llvm ];
 
           mkScalinoSysrootSources = triple:
             let hash = sysrootHashes.${triple} or (throw "scalino: no sysroot-sources.json entry for ${triple}"); in
@@ -266,8 +276,9 @@
               inherit pname version src buildInputs;
               nativeBuildInputs = [ self.packages.${system}.default ]
                 ++ pkgs.lib.optional (pkgConfig != [ ]) pkgs.pkg-config
-                # cross links with lld; a host build keeps using the system linker
-                ++ pkgs.lib.optional cross pkgs.lld
+                # cross compiles with the unwrapped clang (see targetClang) and
+                # links with lld; a host build keeps using the system toolchain
+                ++ pkgs.lib.optionals cross [ targetClang pkgs.lld ]
                 ++ nativeBuildInputs;
               env = {
                 SCALINO_CACHE = "${mkScalinoCache { inherit lockFile; }}";
