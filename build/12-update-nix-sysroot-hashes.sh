@@ -7,9 +7,11 @@
 #
 # The archive set is fixed by the pins in the scalino release's versions.env,
 # so run this after a release, with that release's scalino (like
-# 10-update-package-metadata.sh). Needs `nix`, curl, tar (xz, zstd) and
-# ld.lld on PATH: with an ld.lld around, scalino doesn't also download one,
-# which is the situation inside the Nix derivation.
+# 10-update-package-metadata.sh). Needs `nix`, curl, tar (xz, zstd), clang
+# and llvm-ar (the s2n/curl addons are compiled) and ld.lld on PATH: with an ld.lld around,
+# scalino doesn't also download one, which is the situation inside the Nix derivation.
+# The clang must not inject its own libc's headers (a plain distro clang is fine; in
+# Nix use llvmPackages.clangNoLibc, not pkgs.clang).
 #
 # Keep the --with list in step with allSysrootAddons in packaging/nix/flake.nix.
 #
@@ -19,7 +21,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 tag="${1:?usage: 12-update-nix-sysroot-hashes.sh vX.Y.Z [scalino]}"
 command -v nix >/dev/null || { echo "nix is required" >&2; exit 1; }
-command -v ld.lld >/dev/null || { echo "ld.lld must be on PATH (see header)" >&2; exit 1; }
+for tool in ld.lld clang llvm-ar; do
+  command -v "$tool" >/dev/null || { echo "$tool must be on PATH (see header)" >&2; exit 1; }
+done
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -37,12 +41,11 @@ if [ -z "$scalino" ]; then
   scalino="$(find "$work" -maxdepth 2 -name scalino -type f | head -n1)"
 fi
 
-triples=(
-  x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+# TRIPLES="a b" limits the run (for testing); the committed file needs all.
+triples=(${TRIPLES:-x86_64-unknown-linux-musl aarch64-unknown-linux-musl
   x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
   x86_64-apple-darwin aarch64-apple-darwin
-  x86_64-pc-windows-gnu aarch64-pc-windows-gnu
-)
+  x86_64-pc-windows-gnu aarch64-pc-windows-gnu})
 
 out=packaging/nix/sysroot-sources.json
 {

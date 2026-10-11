@@ -89,10 +89,12 @@
 
           # clang and llvm-info is a hard runtime dependency (scala-native always links
           # through it, even for a zero-dependency Hello World) -- wrap the
-          # binaries so it's on PATH without polluting the caller's own env.
+          # binaries so it's on PATH without polluting the caller's own env (suffix: a clang
+          # the caller already provides wins, which cross builds rely on, see
+          # mkScalinoSysroot).
           postFixup = ''
-            wrapProgram "$out/bin/scalino" --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev ]}
-            wrapProgram "$out/bin/scalino-lsp" --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev ]}
+            wrapProgram "$out/bin/scalino" --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev ]}
+            wrapProgram "$out/bin/scalino-lsp" --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev ]}
           '';
 
           meta = with pkgs.lib; {
@@ -167,7 +169,10 @@
           # app); mkScalinoSysroot only installs the ones an app asks for.
           allSysrootAddons = [ "openssl" "idn2" "s2n" "curl" ];
 
-          sysrootTools = with pkgs; [ gnutar gzip xz zstd lld clang llvmPackages.llvm.dev ];
+          # clang + llvm-ar compile the s2n/curl addons for the *target*, so the
+          # clang must not be the usual wrapper (which injects the builder's glibc
+          # headers); lld links cross targets.
+          sysrootTools = with pkgs; [ gnutar gzip xz zstd lld llvmPackages.clangNoLibc llvm ];
 
           mkScalinoSysrootSources = triple:
             let hash = sysrootHashes.${triple} or (throw "scalino: no sysroot-sources.json entry for ${triple}"); in

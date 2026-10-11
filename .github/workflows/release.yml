@@ -215,11 +215,25 @@ jobs:
       - name: Update version+sha256 in PKGBUILD/sources.json/homebrew formula
         run: ./build/10-update-package-metadata.sh "${{ inputs.tag || github.ref_name }}"
 
+      # Hashes of the archives `scalino sysroot build` downloads, for the
+      # flake's offline cross-compilation (mkScalinoSysrootSources).
+      # continue-on-error: a failure here must not block the PKGBUILD/sources.json/
+      # homebrew update above; rerun build/12-update-nix-sysroot-hashes.sh locally.
+      - uses: cachix/install-nix-action@v30
+        continue-on-error: true
+
+      - name: Update sysroot source hashes in sysroot-sources.json
+        continue-on-error: true
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y lld clang llvm xz-utils zstd
+          ./build/12-update-nix-sysroot-hashes.sh "${{ inputs.tag || github.ref_name }}"
+
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add packaging/arch/PKGBUILD packaging/nix/sources.json packaging/homebrew/scalino.rb
+          git add packaging/arch/PKGBUILD packaging/nix/sources.json packaging/nix/sysroot-sources.json packaging/homebrew/scalino.rb
           if git diff --cached --quiet; then
             echo "No packaging metadata changes -- skipping commit"
             exit 0
