@@ -254,9 +254,9 @@ jobs:
         run: |
           tests/safepoint-trampoline/run.sh
           ./dist/scalino clean
-          out="$(./dist/scalino run examples/safepoint-trampoline/Main.scala --main-class Main --native-mode release-fast)"
-          echo "$out"
-          [[ "$out" == *"safepoint-trampoline: ok"* ]] || { echo "unexpected output"; exit 1; }
+          # tee: show the program's output even when it fails (a bare $(...) hides it)
+          ./dist/scalino run examples/safepoint-trampoline/Main.scala --main-class Main --native-mode release-fast | tee safepoint-trampoline.out
+          grep -q "safepoint-trampoline: ok" safepoint-trampoline.out || { echo "unexpected output"; exit 1; }
 
       - name: Smoke test -- dist/ is relocatable (flat, like a release tarball)
         shell: bash

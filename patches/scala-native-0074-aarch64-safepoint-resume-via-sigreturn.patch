@@ -1,0 +1,203 @@
+diff --git a/docs/contrib/gc-safepoint-trampoline.md b/docs/contrib/gc-safepoint-trampoline.md
+index 801c833..99fd876 100644
+--- a/docs/contrib/gc-safepoint-trampoline.md
++++ b/docs/contrib/gc-safepoint-trampoline.md
+@@ -30,7 +30,13 @@ The interrupted code can be anywhere a poll sits, including a leaf function that
+ - The trampoline returns with **`ret $128`**: it pops the interrupted `%rip` and drops the red-zone skip in one instruction, so resuming needs **no scratch register** (a `jmp *%reg` exit clobbers whichever register it uses) and leaves `rflags` untouched (they are saved and restored with `pushfq`/`popfq`).
+ - Before calling C, the trampoline aligns `%rsp` to 16 bytes (the poll can interrupt code at any alignment); `%rbp` carries the unaligned value across the call.
+ 
+-`safepointResumePc` is still recorded but only the aarch64 trampoline reads it. AArch64 has no red zone in LLVM's default code generation, and its resume uses `x16`, which compiled code does not keep live across a poll.
++### aarch64: resume through `sigreturn`
++
++The aarch64 trampoline cannot restore registers and then branch to the interrupted PC: there is no register-free indirect branch, and compiled code keeps live values in `x16`, `x17` and `x30` (a `br x16` exit corrupted `x16`), nor does LLVM avoid the 128-byte red zone below `sp` in leaf functions. So:
++
++- `prepare_redirect` copies the whole interrupted machine context (`uc_mcontext`: x0-x30, sp, pc, nzcv, all vector registers) onto the thread's own stack below the red zone and points `sp` at that copy. The copy also keeps the interrupted registers visible to the GC's conservative stack scan.
++- The trampoline only calls `Synchronizer_yield()` and executes `brk`.
++- The `SIGTRAP` handler in `SafepointPollTrampoline.c` (installed by a constructor; a `brk` that is not the trampoline's is passed to the previous handler) copies the saved context over its own signal context and returns, so the kernel's `sigreturn` restores every register exactly. `safepointResumePc` is recorded but unused on aarch64.
+ 
+ Windows uses the **vectored exception** path and still runs `Synchronizer_yield()` from the filter (no `ucontext`); the trampoline header stubs `prepare_redirect` to a no-op there.
+ 
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
+index 2401c1e..9d87856 100644
+--- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
++++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
+@@ -1,7 +1,8 @@
+ /* clang-format off */
+ /*
+  * POSIX aarch64: same role as SafepointPollTrampoline-x86_64.S.
+- * Saves Q0–Q7, X0–X30 and NZCV, calls run_yield + load_resume_pc, br to resume.
++ * Runs Synchronizer_yield, then `brk`s; the SIGTRAP handler in
++ * SafepointPollTrampoline.c restores the full interrupted context via sigreturn.
+  *
+  * The condition flags MUST be preserved: the poll is a plain load placed
+  * between a compare and the branch that consumes it (`cmp ...; ldr xzr,[x];
+@@ -34,66 +35,20 @@ _scalanative_gc_safepoint_poll_trampoline:
+ .type scalanative_gc_safepoint_poll_trampoline, @function
+ scalanative_gc_safepoint_poll_trampoline:
+ #endif
+-    sub sp, sp, #SFPT_FRAME
+-
+-    stp q0, q1, [sp, #0]
+-    stp q2, q3, [sp, #32]
+-    stp q4, q5, [sp, #64]
+-    stp q6, q7, [sp, #96]
+-
+-    stp x0, x1, [sp, #128]
+-    stp x2, x3, [sp, #144]
+-    stp x4, x5, [sp, #160]
+-    stp x6, x7, [sp, #176]
+-    stp x8, x9, [sp, #192]
+-    stp x10, x11, [sp, #208]
+-    stp x12, x13, [sp, #224]
+-    stp x14, x15, [sp, #240]
+-    stp x16, x17, [sp, #256]
+-    stp x18, x19, [sp, #272]
+-    stp x20, x21, [sp, #288]
+-    stp x22, x23, [sp, #304]
+-    stp x24, x25, [sp, #320]
+-    stp x26, x27, [sp, #336]
+-    stp x28, x29, [sp, #352]
+-    str x30, [sp, #368]
+-
+-    /* x0 is saved above, free to use as scratch */
+-    mrs x0, nzcv
+-    str x0, [sp, #384]
+-
++    /* sp points at the machine context copy made by prepare_redirect, below
++     * the red zone, 16-byte aligned. Every register may be clobbered here: the
++     * SIGTRAP handler restores them all from that copy. Keeping the copy on
++     * this stack also makes the interrupted registers visible to the GC's
++     * conservative stack scan while the thread is stopped. */
+     bl RUN_YIELD
+-    bl LOAD_RESUME
+-    str x0, [sp, #376]
+-
+-    ldr x30, [sp, #368]
+-    ldp x28, x29, [sp, #352]
+-    ldp x26, x27, [sp, #336]
+-    ldp x24, x25, [sp, #320]
+-    ldp x22, x23, [sp, #304]
+-    ldp x20, x21, [sp, #288]
+-    ldp x18, x19, [sp, #272]
+-    ldp x16, x17, [sp, #256]
+-    ldp x14, x15, [sp, #240]
+-    ldp x12, x13, [sp, #224]
+-    ldp x10, x11, [sp, #208]
+-    ldp x8, x9, [sp, #192]
+-    ldp x6, x7, [sp, #176]
+-    ldp x4, x5, [sp, #160]
+-    ldp x2, x3, [sp, #144]
+-    ldp x0, x1, [sp, #128]
+-
+-    ldp q6, q7, [sp, #96]
+-    ldp q4, q5, [sp, #64]
+-    ldp q2, q3, [sp, #32]
+-    ldp q0, q1, [sp, #0]
+-
+-    ldr x16, [sp, #384]
+-    msr nzcv, x16
+-
+-    ldr x16, [sp, #376]
+-    add sp, sp, #SFPT_FRAME
+-    br x16
++#if defined(__APPLE__)
++.globl _scalanative_gc_safepoint_poll_resume_brk
++_scalanative_gc_safepoint_poll_resume_brk:
++#else
++.globl scalanative_gc_safepoint_poll_resume_brk
++scalanative_gc_safepoint_poll_resume_brk:
++#endif
++    brk #0xf001
+ 
+ #else
+ .text
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
+index 164cfee..7b88a92 100644
+--- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
++++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
+@@ -93,6 +93,69 @@ void scalanative_gc_safepoint_poll_trampoline(void);
+ #define SN_UC_UNSUPPORTED 1
+ #endif
+ 
++
++#if defined(__aarch64__) && !defined(SN_UC_UNSUPPORTED)
++/* aarch64 resume: the trampoline cannot restore every register and then branch
++ * (there is no register-free indirect branch, and LLVM keeps live values in
++ * x16/x17/x30). Instead prepare_redirect copies the interrupted machine context
++ * onto the thread's own stack, below the red zone, and starts the trampoline
++ * with sp pointing at that copy. After Synchronizer_yield the trampoline executes
++ * `brk`; the SIGTRAP handler below overwrites its own signal context with the copy
++ * and returns, so sigreturn restores x0-x30, sp, pc, nzcv and the whole vector
++ * state exactly as they were at the poll. */
++#include <signal.h>
++#include <string.h>
++
++#if defined(__APPLE__)
++#define SN_MCTX_SIZE sizeof(*((ucontext_t *)0)->uc_mcontext)
++#define SN_UC_MCTX(uc) ((void *)(uc)->uc_mcontext)
++#define SN_UC_GET_SP(uc) ((uintptr_t)(uc)->uc_mcontext->__ss.__sp)
++#define SN_UC_SET_SP(uc, sp)                                                   \
++    ((uc)->uc_mcontext->__ss.__sp = (__uint64_t)(uintptr_t)(sp))
++#else
++#define SN_MCTX_SIZE sizeof(mcontext_t)
++#define SN_UC_MCTX(uc) ((void *)&(uc)->uc_mcontext)
++#define SN_UC_GET_SP(uc) ((uintptr_t)(uc)->uc_mcontext.sp)
++#define SN_UC_SET_SP(uc, sp)                                                   \
++    ((uc)->uc_mcontext.sp = (uint64_t)(uintptr_t)(sp))
++#endif
++#define SN_RED_ZONE 128
++#define SN_ALIGN16(x) (((x) + 15) & ~(uintptr_t)15)
++
++/* Address of the `brk` the trampoline ends with (defined in the .S). */
++extern char scalanative_gc_safepoint_poll_resume_brk[];
++
++static struct sigaction sn_previousSigtrap;
++
++static void sn_resumeTrapHandler(int sig, siginfo_t *info, void *uap) {
++    ucontext_t *uc = (ucontext_t *)uap;
++    if (uc != NULL &&
++        SN_UC_GET_PC(uc) == (uintptr_t)scalanative_gc_safepoint_poll_resume_brk) {
++        memcpy(SN_UC_MCTX(uc), (void *)SN_UC_GET_SP(uc), SN_MCTX_SIZE);
++        return;
++    }
++    /* A brk that is not ours (e.g. a compiler trap): hand it on. */
++    if ((sn_previousSigtrap.sa_flags & SA_SIGINFO) &&
++        sn_previousSigtrap.sa_sigaction != NULL) {
++        sn_previousSigtrap.sa_sigaction(sig, info, uap);
++    } else if (sn_previousSigtrap.sa_handler != SIG_DFL &&
++               sn_previousSigtrap.sa_handler != SIG_IGN) {
++        sn_previousSigtrap.sa_handler(sig);
++    } else {
++        signal(SIGTRAP, SIG_DFL); /* re-executing the brk kills us as usual */
++    }
++}
++
++__attribute__((constructor)) static void sn_installResumeTrapHandler(void) {
++    struct sigaction sa;
++    memset(&sa, 0, sizeof(sa));
++    sigemptyset(&sa.sa_mask);
++    sa.sa_sigaction = &sn_resumeTrapHandler;
++    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
++    sigaction(SIGTRAP, &sa, &sn_previousSigtrap);
++}
++#endif
++
+ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
+ #ifndef SN_UC_UNSUPPORTED
+     MutatorThread *self = (MutatorThread *)mutatorThread;
+@@ -101,7 +164,14 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
+     ucontext_t *uc = (ucontext_t *)uap;
+     uintptr_t pc = SN_UC_GET_PC(uc);
+     self->safepointResumePc = pc;
+-#if defined(__x86_64__)
++#if defined(__aarch64__)
++    /* Save the whole context below the red zone and run the trampoline below
++     * the copy; see sn_resumeTrapHandler. */
++    uintptr_t base = (SN_UC_GET_SP(uc) - SN_RED_ZONE) & ~(uintptr_t)15;
++    uintptr_t copy = base - SN_ALIGN16(SN_MCTX_SIZE);
++    memcpy((void *)copy, SN_UC_MCTX(uc), SN_MCTX_SIZE);
++    SN_UC_SET_SP(uc, copy);
++#elif defined(__x86_64__)
+     /* Emulate a `call` that steps over the 128 B SysV red zone: leaf code
+      * compiled by LLVM keeps live spills below %rsp, and the trampoline's own
+      * frame must not overwrite them. The interrupted PC becomes the return
