@@ -7,8 +7,8 @@
 // Linux targets are musl (linked statically, runs on every distro) or gnu
 // (glibc 2.31 from Debian 11, dynamic, runs on any distro with glibc >= 2.31).
 // macOS targets use a small stand-in for Apple's SDK (libSystem stubs + the
-// open source Darwin libc headers); on a Mac itself none is needed, the
-// installed Xcode SDK serves both architectures. Windows targets use
+// open source Darwin libc headers), on a Mac too, so a build behaves the same on
+// every machine. Windows targets use
 // llvm-mingw's mingw-w64 data.
 
 import java.nio.file.{Files, Path, Paths}
@@ -48,13 +48,12 @@ object Sysroot:
    *  spot. Fails for targets it can't build. */
   def resolve(triples: List[String], explicit: List[String]): List[String] =
     val explicitTriples = explicit.map(_.takeWhile(_ != '=')).toSet
-    val host = Packaging.detectHost()
     val found = triples.filterNot(explicitTriples).flatMap { t =>
-      val target = Packaging.hostFromTriple(t)
-      if target == host then None
-      // clang on a Mac targets both architectures from the installed SDK.
-      else if target.os == "macos" && host.os == "macos" then None
-      else find(t) match
+      // An explicit `--native-target-triple` always links against scalino's
+      // sysroot, the host's own triple and macOS-on-a-Mac included, so a build
+      // gives the same result on every machine (no "works on my Mac, breaks on
+      // Linux CI").
+      find(t) match
         case Some(dir) => Some(s"$t=$dir")
         case None if Supported.contains(t) =>
           println(s"no sysroot for $t -- building it (`scalino sysroot build $t`)")
@@ -70,7 +69,7 @@ object Sysroot:
     val host = Packaging.detectHost()
     val needed = triples.exists { t =>
       val target = Packaging.hostFromTriple(t)
-      target != host && !(target.os == "macos" && host.os == "macos") || target.os == "linux"
+      target != host && !(target.os == "macos" && host.os == "macos") || target.os == "linux" || target.os == "windows"
     }
     val onPath = Option(System.getenv("PATH")).getOrElse("").split(java.io.File.pathSeparator).exists(d =>
       d.nonEmpty && List("ld.lld", "ld.lld.exe").exists(n => Files.isExecutable(Paths.get(d, n))))
@@ -125,15 +124,14 @@ object Sysroot:
       case (lib, triggers) if entries.exists(e => triggers.exists(t => e.contains(if t.contains("/") then t else s"/${t}_native"))) => lib
     }
 
-  /** `--native-lib-addon <triple>=<dir>` entries: for each cross target in
+  /** `--native-lib-addon <triple>=<dir>` entries: for each target in
    *  `triples`, the addons `classpath` needs, installed on the spot when
-   *  missing. A host target links the system's copy. */
+   *  missing. */
   def resolveAddons(triples: List[String], classpath: String): List[String] =
     val libs = neededAddons(classpath)
-    val host = Packaging.detectHost()
     for
       t <- triples.distinct
-      if libs.nonEmpty && Supported.contains(t) && Packaging.hostFromTriple(t) != host
+      if libs.nonEmpty && Supported.contains(t)
       lib <- withDeps(libs, t)
       if addonSupports(lib, t)
     yield

@@ -219,7 +219,7 @@ parsed only once.
 |---|---|---|
 | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot build <triple>` (run for you on first use) |
 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | any host | same; glibc 2.31 from Debian 11, runs on any distro with glibc >= 2.31 |
-| `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | nothing on a Mac (Xcode's SDK serves both); elsewhere `scalino sysroot build <triple>` (run for you on first use) |
+| `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | `scalino sysroot build <triple>` (run for you on first use), on a Mac too |
 | `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot build <triple>`, plus `lld` (**experimental**, see below) |
 
 The musl targets are fully static, so one binary runs on every distro.
@@ -259,6 +259,13 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 
+Passing `--native-target-triple` always links against scalino's sysroot, also
+when the triple is the machine's own (macOS targets on a Mac included, instead
+of the installed SDK): the result doesn't depend on the system's libc, and a
+build that works locally works on any CI. Without it,
+the build is a plain system build, using the machine's own toolchain, SDK, frameworks
+and libraries (`--native-pkg-config` etc.), so on a Mac it can use Apple frameworks.
+
 `run` and `test` always build for the host, because the result has to run on
 this machine.
 
@@ -293,6 +300,25 @@ scalino.lib.${system}.mkScalinoApp {
 
 Outside Nix, the same thing is `//> using nativePkgConfig gtk4` or
 `--native-pkg-config gtk4`.
+
+Cross-compiling from Nix needs no emulation or remote builder: the build-platform
+scalino compiles for the target, using scalino's sysroots, which are fetched
+(hash-pinned) and assembled offline:
+
+```nix
+scalino.lib.${system}.mkScalinoApp {
+  pname = "myapp";
+  src = ./.;
+  nativeTargetTriples = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl" ];
+  # sysrootAddons = [ "openssl" ];   # static C libs the classpath links, see above
+}
+# -> bin/myapp-x86_64-unknown-linux-musl, bin/myapp-aarch64-unknown-linux-musl
+```
+
+With `nativeTargetTriples`, `buildInputs`/`pkgConfig` are rejected: those are the
+builder's libraries, and the target is linked against the sysroot instead.
+`*-linux-musl` binaries are static and run anywhere; `*-linux-gnu` ones are
+dynamic against glibc 2.31 (patchelf them on NixOS).
 
 This fetches every locked jar with `pkgs.fetchurl` and builds offline. Re-run
 `scalino lock` whenever dependencies change. The flake supports x86_64/aarch64

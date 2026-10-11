@@ -2846,8 +2846,8 @@ object ScalinoCli:
               |  scalino sysroot path <triple>  where an installed sysroot lives
               |
               |available: ${Sysroot.Supported.mkString(", ")}
-              |Linux targets are static musl binaries that run on any distro. macOS targets need no
-              |sysroot on a Mac (the Xcode SDK serves both architectures).
+              |Linux targets are static musl binaries that run on any distro. Every
+              |--native-target-triple uses these sysroots, on a Mac too, so builds match across machines.
               |""".stripMargin
       case "version" =>
         head("scalino version", "Print version info.")
