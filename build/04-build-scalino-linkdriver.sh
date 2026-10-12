@@ -204,10 +204,11 @@ if [[ "${#LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-"$JAVA" \
-  -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
-  -cp "$DRIVER_CP" \
-    LinkDriver \
+if [[ -n "${SCALINO_BOOTSTRAP_LINKDRIVER:-}" ]]; then
+  # Link with an existing native scalino-linkdriver (e.g. fetched by
+  # 04b-fetch-scalino-linkdriver.sh) instead of the JVM-hosted LinkDriver.
+  # Direct codegen is the linkdriver default here.
+  env SCALANATIVE_EVAC_ENABLE=1 "$SCALINO_BOOTSTRAP_LINKDRIVER" \
     "$(to_native_path "$NATIVE_DRIVER_CP")" \
     "$(to_native_path "$LINK_WORK")" \
     LinkDriver \
@@ -215,8 +216,25 @@ fi
     "$CLANGPP" \
     info \
     --mode release-fast \
-    --multithreading \
+    --no-incremental-compilation \
     "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}"
+else
+  "$JAVA" \
+    -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
+    -cp "$DRIVER_CP" \
+      LinkDriver \
+      "$(to_native_path "$NATIVE_DRIVER_CP")" \
+      "$(to_native_path "$LINK_WORK")" \
+      LinkDriver \
+      "$CLANG" \
+      "$CLANGPP" \
+      info \
+      --mode release-fast \
+      --multithreading \
+      --no-direct-codegen \
+      --no-incremental-compilation \
+      "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}"
+fi
 
 BUILT="$LINK_WORK/LinkDriver"
 [[ -f "$BUILT" ]] || BUILT="$LINK_WORK/LinkDriver.exe"

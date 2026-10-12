@@ -51,10 +51,8 @@ source ./00-env.sh
 for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt lsp.cp; do
   [[ -f "$WORK/$f" ]] || { echo "missing $WORK/$f -- run build/01-fetch-deps.sh first" >&2; exit 1; }
 done
-[[ -f "$WORK/tools-patched-jvm.cp" ]] || { echo "missing $WORK/tools-patched-jvm.cp -- run build/04a-patch-tools.sh first" >&2; exit 1; }
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
-[[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04-build-scalino-linkdriver.sh first" >&2; exit 1; }
-[[ -d "$WORK/driver-classes" ]] || { echo "missing $WORK/driver-classes -- run build/04-build-scalino-linkdriver.sh first" >&2; exit 1; }
+[[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04b-fetch-scalino-linkdriver.sh first" >&2; exit 1; }
 [[ -e "$JAVAC" ]] || { echo "missing javac at $JAVAC -- need a full JDK (not JRE) for JAVA_HOME" >&2; exit 1; }
 
 SELFHOST_DIR="$WORK/selfhost"
@@ -156,26 +154,23 @@ for artifact in "${LSP_NATIVE_JARS[@]}"; do
   LSP_NATIVE_CP="${LSP_NATIVE_CP:+$LSP_NATIVE_CP$CP_SEP}$jar"
 done
 
-echo "== linking (LinkDriver, run on the JVM -- entry point dotty.tools.languageserver.Main, --mode release-size) =="
+echo "== linking (scalino-linkdriver -- entry point dotty.tools.languageserver.Main, --mode release-size) =="
 rm -rf "$LINK_WORK"
 mkdir -p "$LINK_WORK"
-# Run LinkDriver's own main directly via java, not the compiled native
-# $DIST/scalino-linkdriver binary -- see 03-build-scalino-dotc.sh's identical
-# link step for the full rationale (tools-patched-jvm.cp, not raw tools.cp,
-# for the same NoSuchMethodError-avoidance reason explained there).
-DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
-"$JAVA" \
-  -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
-  -cp "$DRIVER_CP" \
-    LinkDriver \
-    "$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
-    "$(to_native_path "$LINK_WORK")" \
-    dotty.tools.languageserver.Main \
-    "$CLANG" \
-    "$CLANGPP" \
-    info \
-    --mode release-fast \
-    --embed-resources
+# Native scalino-linkdriver (04b-fetch-scalino-linkdriver.sh), not LinkDriver
+# on a JVM -- see 03-build-scalino-dotc.sh's identical link step.
+# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
+# heap badly (interflow's garbage); without it the link runs out of heap.
+env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" \
+  "$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
+  "$(to_native_path "$LINK_WORK")" \
+  dotty.tools.languageserver.Main \
+  "$CLANG" \
+  "$CLANGPP" \
+  info \
+  --mode release-fast \
+  --no-incremental-compilation \
+  --embed-resources
 
 BUILT="$LINK_WORK/dotty.tools.languageserver.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }

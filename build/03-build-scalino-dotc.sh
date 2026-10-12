@@ -26,10 +26,8 @@ source ./00-env.sh
 for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt; do
   [[ -f "$WORK/$f" ]] || { echo "missing $WORK/$f -- run build/01-fetch-deps.sh first" >&2; exit 1; }
 done
-[[ -f "$WORK/tools-patched-jvm.cp" ]] || { echo "missing $WORK/tools-patched-jvm.cp -- run build/04a-patch-tools.sh first" >&2; exit 1; }
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
-[[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04-build-scalino-linkdriver.sh first" >&2; exit 1; }
-[[ -d "$WORK/driver-classes" ]] || { echo "missing $WORK/driver-classes -- run build/04-build-scalino-linkdriver.sh first" >&2; exit 1; }
+[[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04b-fetch-scalino-linkdriver.sh first" >&2; exit 1; }
 [[ -f "$DIST/java.base.jar" ]] || { echo "missing $DIST/java.base.jar -- run build/02-build-java-base.sh first" >&2; exit 1; }
 
 SELFHOST_DIR="$WORK/selfhost"
@@ -87,53 +85,38 @@ NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 # see docs/findings.md "Wiring in the real backend" for the full root cause.
 cp "$ROOT/build/selfhost/compiler.properties" "$NIR_OUT/compiler.properties"
 
-echo "== linking (LinkDriver, run on the JVM -- entry point dotty.tools.dotc.Main) =="
+echo "== linking (scalino-linkdriver, entry point dotty.tools.dotc.Main) =="
 rm -rf "$LINK_WORK"
 mkdir -p "$LINK_WORK"
-# scalino-linkdriver's classpath needs both the just-compiled NIR AND the
+# $DIST/scalino-linkdriver's classpath needs both the just-compiled NIR AND the
 # Scala-Native-cross-compiled stdlib the compiled code links against --
 # NIR_OUT alone has no java.lang.Object etc.
 #
-# Run LinkDriver's own main directly via java, not the compiled native
-# $DIST/scalino-linkdriver binary -- the same class 04-build-scalino-linkdriver.sh's
-# own second step already runs on the JVM to link LinkDriver itself. dotc's
-# real classpath here (NATIVELIBS_CP) is all real .jar files, and Scala
-# Native's javalib implements zero java.nio.file.spi.FileSystemProvider (no
-# "jar:" filesystem), so the native-compiled scalino-linkdriver binary can't
-# open them -- crashes with java.nio.file.ProviderNotFoundException in its
-# own linker.ClassLoader.fromDisk -> VirtualDirectory.jar. Running the exact
-# same LinkDriver code on a real JVM hits the JDK's own jar filesystem
-# provider instead, so it just works (LinkDriver.scala's extractJarIfNeeded
-# now also fixes this for the native binary itself -- see its doc comment --
-# but the JVM path sidesteps the issue entirely).
+# Runs the native scalino-linkdriver (04b-fetch-scalino-linkdriver.sh: the one
+# from the latest release; 04-build-scalino-linkdriver.sh's JVM-built one also
+# works) rather than LinkDriver on a JVM: it reads the classpath jars through
+# the ZipFileSystemProvider (patches/scala-native-0009) and the GC's evacuation
+# keeps its heap small enough for dotc's link.
 #
 # --mode release-size: this was the released scalino-dotc binary's actual
 # shipped build (v0.0.1 shipped scala-native's *default* Mode -- debug --
-# since no --mode flag was passed at all). -Xss64m defensively, same as
-# 08-build-scalino-lsp.sh's identical dotc-based link: release-fast's own
-# null-guard-elimination pass StackOverflowed there against dotc's
-# unusually large, heavily-branching methods (see docs/findings.md); this
-# entry point compiles the exact same dotc, so the same risk applies here.
-## LinkDriver.class here is the exact same compiled artifact 04's own second
-# step runs -- compiled against tools_native0.5_3's patched classpath, so it
-# must run against tools_3's *matching* patch (tools-patched-jvm.cp, not raw
-# tools.cp) or a NativeConfig method it references (e.g.
-# withLLVMDirectCodeGen) throws NoSuchMethodError here. See 04's own DRIVER_CP
-# comment for the full explanation.
-DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
-"$JAVA" \
-  -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
-  -cp "$DRIVER_CP" \
-    LinkDriver \
-    "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
-    "$(to_native_path "$LINK_WORK")" \
-    dotty.tools.dotc.Main \
-    "$CLANG" \
-    "$CLANGPP" \
-    info \
-    --mode release-fast \
-    --multithreading \
-    --embed-resources
+# since no --mode flag was passed at all). The JVM run used -Xss64m because
+# release-fast's null-guard-elimination pass StackOverflowed on dotc's large,
+# heavily-branching methods (docs/findings.md); if the native linkdriver hits
+# the same, raise its stack (ulimit -s) rather than going back to the JVM.
+# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
+# heap badly (interflow's garbage); without it the link runs out of heap.
+env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" \
+  "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
+  "$(to_native_path "$LINK_WORK")" \
+  dotty.tools.dotc.Main \
+  "$CLANG" \
+  "$CLANGPP" \
+  info \
+  --mode release-fast \
+  --multithreading \
+  --no-incremental-compilation \
+  --embed-resources
 
 BUILT="$LINK_WORK/dotty.tools.dotc.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }

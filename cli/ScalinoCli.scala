@@ -2387,9 +2387,9 @@ object ScalinoCli:
       nativeOpts.libAddons.flatMap(v => List("--lib-addon", v)) ++
       nativeOpts.ldPath.toList.flatMap(v => List("--ld-path", v)) ++
       (if nativeOpts.embedResources then List("--embed-resources") else Nil) ++
-      (if nativeOpts.multithreading then List("--multithreading") else Nil) ++
-      (if incremental then List("--incremental-compilation") else Nil) ++
-      (if nativeOpts.directCodegen then List("--direct-codegen") else Nil) ++
+      (if nativeOpts.multithreading then List("--multithreading") else List("--no-multithreading")) ++
+      (if incremental then List("--incremental-compilation") else List("--no-incremental-compilation")) ++
+      (if nativeOpts.directCodegen then List("--direct-codegen") else List("--no-direct-codegen")) ++
       (if nativeOpts.compactHeaders then List("--compact-headers") else List("--no-compact-headers")) ++
       nativeOpts.compactByteArrays.map(v => if v then "--compact-byte-arrays" else "--no-compact-byte-arrays").toList ++
       (if nativeOpts.gcStwSweep then List("--gc-stw-sweep") else Nil) ++

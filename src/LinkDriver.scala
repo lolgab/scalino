@@ -36,15 +36,19 @@ object LinkDriver:
     // ld.lld to link with when the system has none (cli/Sysroot.ensureLld)
     ldPath: Option[String] = None,
     embedResources: Boolean = false,
-    multithreading: Boolean = false,
-    directCodegen: Boolean = false,
-    compactHeaders: Boolean = true,
+    // Defaults here must match cli/ScalinoCli.scala's NativeOpts: a flag the
+    // CLI turns on by default must not need passing to scalino-linkdriver.
+    multithreading: Boolean = true,
+    // None: on, except when targeting Windows (see `windowsTarget`)
+    directCodegen: Option[Boolean] = None,
+    // None: on, except when targeting Windows (see `windowsTarget`)
+    compactHeaders: Option[Boolean] = None,
     // None: on, unless a library depending on the regular array layout is on
     // the classpath, see `LayoutDependentLibraries`
     compactByteArrays: Option[Boolean] = None,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
-    incrementalCompilation: Boolean = false,
+    incrementalCompilation: Boolean = true,
     optimize: Boolean = true,
     linking: List[String] = Nil,
     compile: List[String] = Nil,
@@ -54,43 +58,96 @@ object LinkDriver:
     longRunning: Boolean = false
   )
 
+  /** Windows is gated on the target when cross-compiling, else on the host
+   *  (same rule as cli/ScalinoCli.scala's resolveNativeOpts). Direct codegen
+   *  and compact headers default off there. */
+  def windowsTarget(o: Opts): Boolean =
+    if o.targetTriples.nonEmpty then o.targetTriples.exists(t => t.contains("windows") || t.contains("mingw"))
+    else sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
+
   val LayoutDependentLibraries = List("jsoniter-scala-core_native")
+
+  val Usage: String =
+    """usage: scalino-linkdriver <classpath> <workDir> <mainClass> <clang> <clang++> [quiet|info|verbose] [flags...]
+      |
+      |Links compiled Scala Native NIR into an executable. Internal tool: `scalino`
+      |builds the argv for you.
+      |
+      |arguments:
+      |  classpath    NIR classes dirs and jars, separated by the OS path separator
+      |  workDir      directory for the build output and caches
+      |  mainClass    entry point, also the output binary's name
+      |  clang        path to clang
+      |  clang++      path to clang++
+      |  log level    quiet, info (default) or verbose
+      |
+      |flags (defaults match `scalino`'s):
+      |  --mode <debug|release-fast|release-size|release-full>   --gc <name>   --lto <name>
+      |  --target <app|static|dynamic>
+      |  --target-triple <triple>      (repeatable) cross-compile
+      |  --sysroot <triple>=<dir>      --lib-addon <triple>=<dir>      --ld-path <path>
+      |  --[no-]multithreading         default: on
+      |  --[no-]direct-codegen         default: on (off when targeting Windows)
+      |  --[no-]compact-headers        default: on (off when targeting Windows)
+      |  --[no-]compact-byte-arrays    default: on unless a layout-dependent library is on the classpath
+      |  --[no-]incremental-compilation  default: on
+      |  --no-opt                      disable the optimizer
+      |  --embed-resources   --gc-stw-sweep   --heap-histogram   --long-running
+      |  --linking <opt>  --compile <opt>  --c-compile <opt>  --cpp-compile <opt>  --prune <name>   (repeatable)
+      |  -h, --help                    print this help
+      |""".stripMargin
+
+  /** Prints `msg` plus a pointer to --help, and exits 1. */
+  def fail(msg: String): Nothing =
+    System.err.println(s"scalino-linkdriver: $msg")
+    System.err.println("run `scalino-linkdriver --help` for usage")
+    sys.exit(1)
 
   def parseOpts(rest: Array[String]): Opts =
     var o = Opts()
     var i = 0
+    // The value of the flag at `i`; exits with a message if it is missing.
+    def v: String =
+      if i + 1 < rest.length then rest(i + 1) else fail(s"flag '${rest(i)}' needs a value")
+    // `<key>=<dir>` flag values
+    def kv: (String, String) = v.split("=", 2) match
+      case Array(k, d) if k.nonEmpty && d.nonEmpty => (k, d)
+      case _ => fail(s"flag '${rest(i)}' expects <triple>=<dir>, got '$v'")
     while i < rest.length do
       rest(i) match
-        case "--mode" => o = o.copy(mode = Some(rest(i + 1))); i += 1
-        case "--gc" => o = o.copy(gc = Some(rest(i + 1))); i += 1
-        case "--lto" => o = o.copy(lto = Some(rest(i + 1))); i += 1
-        case "--target" => o = o.copy(target = Some(rest(i + 1))); i += 1
-        case "--target-triple" => o = o.copy(targetTriples = o.targetTriples :+ rest(i + 1)); i += 1
+        case "--mode" => o = o.copy(mode = Some(v)); i += 1
+        case "--gc" => o = o.copy(gc = Some(v)); i += 1
+        case "--lto" => o = o.copy(lto = Some(v)); i += 1
+        case "--target" => o = o.copy(target = Some(v)); i += 1
+        case "--target-triple" => o = o.copy(targetTriples = o.targetTriples :+ v); i += 1
         case "--sysroot" =>
-          val Array(t, d) = rest(i + 1).split("=", 2)
+          val (t, d) = kv
           o = o.copy(sysroots = o.sysroots.updated(t, d)); i += 1
         case "--lib-addon" =>
-          val Array(t, d) = rest(i + 1).split("=", 2)
+          val (t, d) = kv
           o = o.copy(libAddons = o.libAddons.updated(t, o.libAddons.getOrElse(t, Nil) :+ d)); i += 1
-        case "--ld-path" => o = o.copy(ldPath = Some(rest(i + 1))); i += 1
+        case "--ld-path" => o = o.copy(ldPath = Some(v)); i += 1
         case "--embed-resources" => o = o.copy(embedResources = true)
         case "--multithreading" => o = o.copy(multithreading = true)
-        case "--direct-codegen" => o = o.copy(directCodegen = true)
-        case "--compact-headers" => o = o.copy(compactHeaders = true)
-        case "--no-compact-headers" => o = o.copy(compactHeaders = false)
+        case "--no-multithreading" => o = o.copy(multithreading = false)
+        case "--direct-codegen" => o = o.copy(directCodegen = Some(true))
+        case "--no-direct-codegen" => o = o.copy(directCodegen = Some(false))
+        case "--compact-headers" => o = o.copy(compactHeaders = Some(true))
+        case "--no-compact-headers" => o = o.copy(compactHeaders = Some(false))
         case "--compact-byte-arrays" => o = o.copy(compactByteArrays = Some(true))
         case "--no-compact-byte-arrays" => o = o.copy(compactByteArrays = Some(false))
         case "--gc-stw-sweep" => o = o.copy(gcStwSweep = true)
         case "--heap-histogram" => o = o.copy(heapHistogram = true)
         case "--incremental-compilation" => o = o.copy(incrementalCompilation = true)
+        case "--no-incremental-compilation" => o = o.copy(incrementalCompilation = false)
         case "--no-opt" => o = o.copy(optimize = false)
-        case "--linking" => o = o.copy(linking = o.linking :+ rest(i + 1)); i += 1
-        case "--compile" => o = o.copy(compile = o.compile :+ rest(i + 1)); i += 1
-        case "--c-compile" => o = o.copy(cCompile = o.cCompile :+ rest(i + 1)); i += 1
-        case "--cpp-compile" => o = o.copy(cppCompile = o.cppCompile :+ rest(i + 1)); i += 1
-        case "--prune" => o = o.copy(prune = o.prune :+ rest(i + 1)); i += 1
+        case "--linking" => o = o.copy(linking = o.linking :+ v); i += 1
+        case "--compile" => o = o.copy(compile = o.compile :+ v); i += 1
+        case "--c-compile" => o = o.copy(cCompile = o.cCompile :+ v); i += 1
+        case "--cpp-compile" => o = o.copy(cppCompile = o.cppCompile :+ v); i += 1
+        case "--prune" => o = o.copy(prune = o.prune :+ v); i += 1
         case "--long-running" => o = o.copy(longRunning = true)
-        case other => System.err.println(s"scalino-linkdriver: ignoring unknown flag '$other'")
+        case other => fail(s"unknown flag '$other'")
       i += 1
     o
 
@@ -101,6 +158,13 @@ object LinkDriver:
     case other => throw new IllegalArgumentException(s"Unknown native target: '$other' (expected app|static|dynamic)")
 
   def main(args: Array[String]): Unit =
+    if args.exists(a => a == "-h" || a == "--help") then
+      println(Usage)
+      sys.exit(0)
+    if args.length < 5 then
+      if args.nonEmpty then System.err.println(s"scalino-linkdriver: expected at least 5 arguments, got ${args.length}")
+      System.err.println(Usage)
+      sys.exit(2)
     // File.pathSeparator, not a hardcoded ":" -- confirmed via Windows CI:
     // a hardcoded ":" shatters a real Windows path at its own drive-letter
     // colon ("C:\..."), producing garbage entries and "Discovered 0 classes"
@@ -109,6 +173,8 @@ object LinkDriver:
     val workDir = Paths.get(args(1))
     val mainClass = args(2)
     val logLevel = if args.length > 5 then args(5) else "info"
+    if !Set("quiet", "info", "verbose").contains(logLevel) then
+      fail(s"unknown log level '$logLevel' (expected quiet, info or verbose); flags go after it")
     val logger = loggerFor(logLevel)
     val opts = parseOpts(if args.length > 6 then args.drop(6) else Array.empty)
 
@@ -171,8 +237,8 @@ object LinkDriver:
           .withBuildTarget(target)
           .withEmbedResources(opts.embedResources)
           .withMultithreading(if opts.multithreading then Some(true) else None)
-          .withLLVMDirectCodeGen(opts.directCodegen)
-          .withCompactHeaders(opts.compactHeaders)
+          .withLLVMDirectCodeGen(opts.directCodegen.getOrElse(!windowsTarget(opts)))
+          .withCompactHeaders(opts.compactHeaders.getOrElse(!windowsTarget(opts)))
           .withCompactByteArrays(compactByteArrays)
           .withGCStwSweep(opts.gcStwSweep)
           // DirectCodeGen now has its own (scoped) DIBuilder-based debug-info
