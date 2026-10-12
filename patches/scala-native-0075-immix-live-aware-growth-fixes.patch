@@ -1,0 +1,75 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -686,12 +686,22 @@
+ 
+ // Real live bytes from this cycle's mark tally, or 0 if the tally wasn't
+ // collected (evacuation off) -- callers treat 0 as "unknown".
++//
++// The tally is sized when marking starts, but evacuation can grow the heap
++// mid-cycle for its destination blocks, so heap->blockCount may exceed the
++// tally's capacity by the time Heap_shouldGrow asks. Returning 0 ("unknown")
++// then made every evacuating cycle fall back to the free-block-only growth
++// policy, which grew the heap by ~10% per cycle (to the maximum) although
++// live data stayed a few percent of it. Blocks past the capacity were added
++// after marking, so they have no tally entries: sum what was tallied.
+ uint64_t Marker_LiveBytes(Heap *heap) {
+-    if (!Evac_enabled() || blockLiveBytes == NULL ||
+-        blockLiveBytesCapacity < heap->blockCount)
++    if (!Evac_enabled() || blockLiveBytes == NULL)
+         return 0;
++    uint32_t limit = heap->blockCount < blockLiveBytesCapacity
++                         ? heap->blockCount
++                         : blockLiveBytesCapacity;
+     uint64_t total = 0;
+-    for (uint32_t i = 0; i < heap->blockCount; i++)
++    for (uint32_t i = 0; i < limit; i++)
+         total += blockLiveBytes[i];
+     return total;
+ }
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -254,11 +254,19 @@
+     // free-or-recycled blocks so allocation never starves, and grow as
+     // before once live data exceeds 40% of the heap.
+     uint64_t liveBytes = Marker_LiveBytes(heap);
++    GC_LOG_DEBUG("Live bytes from mark tally: %llu (0 = unknown)",
++                 (unsigned long long)liveBytes);
+     if (liveBytes != 0) {
+         uint64_t heapBytes = (uint64_t)blockCount * BLOCK_TOTAL_SIZE;
+         bool plentyLive = liveBytes * 100 > heapBytes * 40;
+         bool starving =
+             10 * (uint64_t)(freeBlockCount + recycledBlockCount) < blockCount;
++        GC_LOG_DEBUG("Live bytes: %llu of %llu heap bytes (%.1f%%), "
++                     "grow: %d (plentyLive: %d, starving: %d)",
++                     (unsigned long long)liveBytes,
++                     (unsigned long long)heapBytes,
++                     100.0 * (double)liveBytes / (double)heapBytes,
++                     plentyLive || starving, plentyLive, starving);
+         return plentyLive || starving;
+     }
+     return freeBlockCount * 2 < blockCount ||
+@@ -377,8 +391,20 @@
+     BlockAllocator_SweepDone(&blockAllocator);
+     MutatorThreads_foreach(mutatorThreads, node) {
+         MutatorThread *thread = node->value;
+-        if (!Allocator_CanInitCursors(&thread->allocator)) {
+-            Heap_exitWithOutOfMemory("growIfNeeded:re-init cursors");
++        // The growth decision above looks at live bytes (with evacuation), so
++        // it can decline to grow while fewer than two completely free blocks
++        // are left (evacuation spends free blocks on its destinations) --
++        // not enough for a thread without recycled blocks to initialize its
++        // cursors. Grow a little instead of aborting; only a heap that cannot
++        // grow at all is out of memory.
++        while (!Allocator_CanInitCursors(&thread->allocator)) {
++            uint32_t blocks = heap->blockCount / 50;
++            if (blocks < 8)
++                blocks = 8;
++            if (!Heap_isGrowingPossible(heap, blocks)) {
++                Heap_exitWithOutOfMemory("growIfNeeded:re-init cursors");
++            }
++            Heap_Grow(heap, blocks);
+         }
+         Allocator_InitCursors(&thread->allocator, false);
+     }

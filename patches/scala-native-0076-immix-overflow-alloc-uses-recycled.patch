@@ -1,0 +1,24 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
+index b84a48c..8c9d073 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
+@@ -89,6 +89,19 @@ word_t *Allocator_overflowAllocation(Allocator *allocator, size_t size) {
+ 
+     if (end > allocator->largeLimit) {
+         if (!Allocator_newOverflowBlock(allocator)) {
++            // No completely free block left. A fragmented heap can still hold
++            // plenty of recycled space (holes of several lines), so look for
++            // a hole that fits in the recycled blocks before giving up and
++            // forcing a collection. Holes skipped on the way stay unused
++            // until the next sweep, like any other discarded hole.
++            while (Allocator_getNextLine(allocator)) {
++                word_t *hole = allocator->cursor;
++                word_t *holeEnd = (word_t *)((uint8_t *)hole + size);
++                if (holeEnd <= allocator->limit) {
++                    allocator->cursor = holeEnd;
++                    return hole;
++                }
++            }
+             return NULL;
+         }
+         return Allocator_overflowAllocation(allocator, size);

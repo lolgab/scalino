@@ -1,0 +1,36 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -708,7 +708,22 @@
+ 
+ // Blocks under this real live-byte occupancy fraction are evacuated.
+ // Matches the threshold already validated via the stage-1 candidate log.
+-#define EVAC_OCCUPANCY_THRESHOLD 0.35
++// Default 70%: self-hosted dotc link measured 971s vs 1092s at 35%, same peak
++// footprint. $SCALANATIVE_EVAC_THRESHOLD (percent, 1-95) overrides it; read
++// once so every phase of a cycle (copy, fixup) agrees on the candidate set.
++static inline double Evac_OccupancyThreshold(void) {
++    static double threshold = -1.0;
++    if (threshold < 0) {
++        threshold = 0.70;
++        const char *env = getenv("SCALANATIVE_EVAC_THRESHOLD");
++        if (env != NULL) {
++            int pct = atoi(env);
++            if (pct >= 1 && pct <= 95)
++                threshold = pct / 100.0;
++        }
++    }
++    return threshold;
++}
+ 
+ static inline bool Evac_IsCandidateBlock(BlockMeta *meta, uint32_t liveBytes,
+                                          uint32_t blockIndex) {
+@@ -721,7 +735,7 @@
+            !EvacPin_isBlockPinned(blockIndex) &&
+            !(heap.hashedBlocks != NULL && heap.hashedBlocks[blockIndex]) &&
+            liveBytes > 0 &&
+-           liveBytes < (uint32_t)(BLOCK_TOTAL_SIZE * EVAC_OCCUPANCY_THRESHOLD);
++           liveBytes < (uint32_t)(BLOCK_TOTAL_SIZE * Evac_OccupancyThreshold());
+ }
+ 
+ // Debug-only targeted tracing for evacuation fixup, gated by two env vars

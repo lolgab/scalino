@@ -1,0 +1,113 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
+@@ -7,6 +7,40 @@
+ #include <memory.h>
+ #include <assert.h>
+ 
++Allocator sharedRecycleAllocator;
++static atomic_flag sharedRecycleLock = ATOMIC_FLAG_INIT;
++#define RECYCLE_BATCH 16
++
++void Allocator_ResetSharedRecycle(Heap *heap) {
++    Allocator *shared = &sharedRecycleAllocator;
++    shared->bytemap = heap->bytemap;
++    shared->blockMetaStart = heap->blockMetaStart;
++    shared->heapStart = heap->heapStart;
++    shared->blockAllocator = &blockAllocator;
++    BlockList_Init(&shared->recycledBlocks, heap->blockMetaStart);
++    shared->recycledBlockCount = 0;
++}
++
++// Moves up to RECYCLE_BATCH blocks from the shared pool to the allocator's own
++// list. Returns false if the pool was empty.
++static bool Allocator_refillFromShared(Allocator *allocator) {
++    if (sharedRecycleAllocator.recycledBlocks.first == NULL)
++        return false;
++    while (atomic_flag_test_and_set_explicit(&sharedRecycleLock,
++                                             memory_order_acquire)) {
++    }
++    int taken = 0;
++    BlockMeta *block;
++    while (taken < RECYCLE_BATCH &&
++           (block = BlockList_Poll(&sharedRecycleAllocator.recycledBlocks)) !=
++               NULL) {
++        BlockList_AddLast(&allocator->recycledBlocks, block);
++        taken++;
++    }
++    atomic_flag_clear_explicit(&sharedRecycleLock, memory_order_release);
++    return taken > 0;
++}
++
+ bool Allocator_getNextLine(Allocator *allocator);
+ bool Allocator_newBlock(Allocator *allocator);
+ bool Allocator_newOverflowBlock(Allocator *allocator);
+@@ -35,7 +69,8 @@
+     uint32_t freeBlockCount =
+         (uint32_t)allocator->blockAllocator->freeBlockCount;
+     return freeBlockCount >= 2 ||
+-           (freeBlockCount == 1 && allocator->recycledBlockCount > 0);
++           (freeBlockCount == 1 && (allocator->recycledBlockCount > 0 ||
++                                    sharedRecycleAllocator.recycledBlockCount > 0));
+ }
+ 
+ void Allocator_InitCursors(Allocator *allocator, bool canCollect) {
+@@ -177,6 +212,8 @@
+ bool Allocator_newBlock(Allocator *allocator) {
+     assert(allocator != NULL);
+     BlockMeta *block = BlockList_Poll(&allocator->recycledBlocks);
++    if (block == NULL && Allocator_refillFromShared(allocator))
++        block = BlockList_Poll(&allocator->recycledBlocks);
+     word_t *blockStart;
+ 
+     if (block != NULL) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h
+@@ -36,6 +36,15 @@
+     atomic_uint_fast32_t recycledBlockCount;
+ } Allocator;
+ 
++// Recycled blocks live in one shared pool instead of being dealt round-robin
++// to every mutator thread: with many (mostly parked) threads, a busy thread
++// would otherwise only ever see 1/N of the recyclable space and force a
++// collection each time that share ran out, however much was free overall.
++// Threads take small batches from the pool (Allocator_newBlock). Only the
++// recycledBlocks list and recycledBlockCount of this one are used.
++extern Allocator sharedRecycleAllocator;
++void Allocator_ResetSharedRecycle(Heap *heap);
++
+ void Allocator_Init(Allocator *allocator, BlockAllocator *blockAllocator,
+                     Bytemap *bytemap, word_t *blockMetaStart,
+                     word_t *heapStart);
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -230,6 +230,7 @@
+     MutatorThreads_foreach(mutatorThreads, node) {
+         recycledBlockCount += node->value->allocator.recycledBlockCount;
+     }
++    recycledBlockCount += sharedRecycleAllocator.recycledBlockCount;
+     uint32_t unavailableBlockCount =
+         blockCount - (freeBlockCount + recycledBlockCount);
+ 
+@@ -317,6 +318,7 @@
+         LargeAllocator_Clear(&thread->largeAllocator);
+     }
+     BlockAllocator_Clear(&blockAllocator);
++    Allocator_ResetSharedRecycle(heap);
+ 
+     BlockMeta *current = (BlockMeta *)heap->blockMetaStart;
+     word_t *currentBlockStart = heap->heapStart;
+@@ -343,9 +345,8 @@
+ 
+         assert(!BlockMeta_IsSuperblockMiddle(current));
+         if (BlockMeta_IsSimpleBlock(current)) {
+-            MutatorThread *recycleBlocksTo = NextMutatorThread();
+-            Block_Recycle(&recycleBlocksTo->allocator, current,
+-                          currentBlockStart, lineMetas);
++            Block_Recycle(&sharedRecycleAllocator, current, currentBlockStart,
++                          lineMetas);
+         } else if (BlockMeta_IsSuperblockStart(current)) {
+             size = BlockMeta_SuperblockSize(current);
+             MutatorThread *recycleBlocksTo = NextMutatorThread();

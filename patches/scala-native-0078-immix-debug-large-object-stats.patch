@@ -1,0 +1,36 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -237,6 +237,32 @@
+     GC_LOG_DEBUG("Block count: %u, Unavailable: %u, Free: %u, Recycled: %u",
+                  blockCount, unavailableBlockCount, freeBlockCount,
+                  recycledBlockCount);
++
++    if (GC_Log_GetLevel() <= GC_LOG_LEVEL_DEBUG) {
++        // Large-object footprint and free-run fragmentation (they never move).
++        uint32_t largeBlocks = 0, largeSuperblocks = 0, runs = 0, longest = 0,
++                 run = 0, freeTotal = 0;
++        for (uint32_t i = 0; i < blockCount; i++) {
++            BlockMeta *m = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
++            if (BlockMeta_IsFree(m)) {
++                freeTotal++;
++                if (run++ == 0)
++                    runs++;
++                if (run > longest)
++                    longest = run;
++            } else {
++                run = 0;
++            }
++            if (BlockMeta_IsSuperblockStart(m) &&
++                BlockMeta_SuperblockSize(m) > 1) {
++                largeSuperblocks++;
++                largeBlocks += BlockMeta_SuperblockSize(m);
++            }
++        }
++        GC_LOG_DEBUG("Large superblocks (>1 block): %u (%u blocks); free "
++                     "blocks %u in %u runs, longest run %u",
++                     largeSuperblocks, largeBlocks, freeTotal, runs, longest);
++    }
+ 
+     // The unavailable ratio alone must not force growth while free blocks
+     // are still abundant (free < 65%), otherwise a workload with a steadily
