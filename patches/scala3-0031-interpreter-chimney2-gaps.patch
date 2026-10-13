@@ -1,0 +1,1358 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index d29752c..00bbf87 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -95,6 +95,14 @@ import dotty.tools.dotc.core.CyclicReference
+  *    signature).
+  */
+ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
++
++  /** State of mutable fields (`var`s) of `object`s: a `ModuleValue` carries no
++   *  field store of its own (it is rebuilt on every access), so writes such as
++   *  `MIO.timeoutDeadlineNanos = Long.MaxValue` are recorded here, keyed by
++   *  module class and field name, and later reads consult it first.
++   */
++  private val moduleVars: mutable.Map[(Symbol, String), Object] = mutable.Map.empty
++
+   import Interpreter.*
+   import tpd.*
+ 
+@@ -152,8 +160,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+   protected def interpretTree(tree: Tree)(using Env): Object = {
+     if debugEnabled then
+       Console.err.println(s"[interp] ${tree.getClass.getSimpleName}: ${tree.show}")
++    recentTrees(recentIdx & 127) = tree
++    recentIdx += 1
++    steps += 1
++    if steps % 1000000L == 0L && System.getenv("SCALINO_OUTER_DIAG") != null then
++      Console.err.println(s"[watchdog] steps=$steps depth=${defStack.size} frames: ${defStack.take(8).map(_.showLocated).mkString(" <- ")}\n   recent: ${(0 until 12).flatMap(i => Option(recentTrees((recentIdx - 1 - i) & 127))).map(t => t.getClass.getSimpleName + ":" + t.show.take(70).replace("\n", " ")).mkString(" | ")}")
+     interpretTree0(tree)
+   }
++
++  /** Ring buffer of the last interpreted trees (diagnostics for stack overflows). */
++  private val recentTrees = new Array[Tree](128)
++  private var recentIdx = 0
++  private var steps = 0L
++  private var newCount = 0L
+   private def interpretTree0(tree: Tree)(using Env): Object = tree match {
+     case Literal(Constant(value)) =>
+       interpretLiteral(value)
+@@ -213,7 +232,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // receiver itself instead of an expression/type value.
+         case None if tree.symbol.name.toString == "reflectModule" =>
+           scala.quoted.runtime.impl.QuotesImpl().asInstanceOf[Object]
+-        case None => unexpectedTree(tree)
++        case None =>
++          throw new StopInterpretation(
++            em"""Unexpected tree could not be interpreted: ${tree.toString}
++                |  (`this` of ${tree.symbol.showLocated} is not bound; bound classes: ${env.keys.filter(_.isClass).map(_.name.toString).toList.sorted.mkString(", ")})""",
++            tree.srcPos)
+ 
+     // `super.foo(...)`: the receiver value is just the same `this` --
+     // `fn.symbol` for a super-qualified select is already resolved
+@@ -301,6 +324,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case Select(qual, name) =>
+           interpretTree(qual) match
+             case inst: InterpretedInstance => inst.fields(name.toString) = interpretTree(rhs); interpretUnit()
++            case ModuleValue(mcls) => moduleVars((mcls, name.toString)) = interpretTree(rhs); interpretUnit()
+             // The write-side counterpart of `reflectiveFieldRead`: a REAL
+             // host object's own uncurated method body mutating its OWN
+             // private state (e.g. `ArrayBuffer#update`'s real
+@@ -313,6 +337,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             // actually has one.
+             case recv if reflectiveFieldWrite(recv, lhs.symbol, interpretTree(rhs)) => interpretUnit()
+             case _ => unexpectedTree(tree)
++        // `fieldOfObject = ...` written unqualified inside the object's own body.
++        case id: Ident if id.symbol.is(Mutable) && id.symbol.owner.is(ModuleClass) =>
++          moduleVars((id.symbol.owner, id.symbol.name.toString)) = interpretTree(rhs)
++          interpretUnit()
+         case _ => unexpectedTree(tree)
+ 
+     case Select(qual, name) if isPrimitiveOp(tree.symbol, qual.tpe) =>
+@@ -343,8 +371,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // constructing a quote), so what gets bound for the callee is
+       // always the fully-concrete type, however many forwarding hops away
+       // from the original call site with real type arguments.
+-      val typeBindings = env.iterator.collect { case (sym, tp: Type) => (sym, tp) }.toList
+-      val typeArgs = callTypeArgs(tree).map(t => if typeBindings.isEmpty then t else t.subst(typeBindings.map(_._1), typeBindings.map(_._2)))
++      // Scanning the whole env for type bindings is O(env size): only do it for
++      // a call that actually has type arguments to resolve.
++      val rawTypeArgs = callTypeArgs(tree)
++      val typeArgs =
++        if rawTypeArgs.isEmpty then Nil
++        else
++          val typeBindings = env.iterator.collect { case (sym, tp: Type) => (sym, tp) }.toList
++          rawTypeArgs.map(t => if typeBindings.isEmpty then t else t.subst(typeBindings.map(_._1), typeBindings.map(_._2))).map(resolveDependentType)
+       if fn.symbol == defn.Predef_classOf then
+         // `classOf[T]`: the real compiler never actually runs `Predef`'s own
+         // body for this (`null.asInstanceOf[Class[T]]`) -- `ConstFold`
+@@ -415,9 +449,18 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           Console.err.println(s"[interpThrow] at ${tree.sourcePos} value=$thrown")
+         throw InterpretedThrow(thrown)
+       else if (fn.symbol.isConstructor)
+-        interpretNew(fn.symbol, rawArgs)
++        interpretNew(fn.symbol, rawArgs, fn.qualifier.tpe)
+       else if (fn.symbol.is(Module))
+-        interpretModuleAccess(fn.symbol)
++        // An `object` nested in a class/trait, reached through an instance
++        // (`mio.unsafe`, `this.CrossQuotes`): its members may reference the
++        // enclosing instance (`MIO.this`), so it has to be that instance's own
++        // module, not a free-standing `ModuleValue`.
++        fn match
++          case Select(qual, _) if !fn.symbol.isStatic && fn.symbol.owner.isClass =>
++            interpretTree(qual) match
++              case inst: InterpretedInstance => nestedModuleInstance(inst, fn.symbol, fn.symbol.name.toString)
++              case _ => interpretModuleAccess(fn.symbol)
++          case _ => interpretModuleAccess(fn.symbol)
+       else if (fn.symbol.is(Method) && fn.symbol.isStatic) {
+         interpretStaticCall(fn.symbol.owner, fn.symbol, rawArgs, typeArgs)
+       }
+@@ -502,7 +545,18 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // part of a super call has to be threaded through separately, via
+         // `staticDispatch`, or it's lost entirely.
+         val receiver = interpretTree(fn.qualifier)
+-        interpretInstanceCall(receiver, fn.symbol, rawArgs, fn.srcPos, typeArgs, staticDispatch = fn.qualifier.isInstanceOf[Super])
++        // A call through a structural refinement (`f.apply[T](x)` on a
++        // `PolyFunction { def apply[...] }` value, whose member has no symbol
++        // of its own): resolve the method by name on the receiver's class.
++        val target =
++          if fn.symbol.exists then fn.symbol
++          else (receiver, fn) match
++            case (inst: InterpretedInstance, sel: Select) =>
++              val argCount = rawArgs.size
++              val cands = inst.cls.info.member(sel.name).alternatives.map(_.symbol).filter(_.is(Method))
++              cands.find(c => c.denot.paramSymss.flatten.count(_.isTerm) == argCount).orElse(cands.headOption).getOrElse(NoSymbol)
++            case _ => NoSymbol
++        interpretInstanceCall(receiver, target, rawArgs, fn.srcPos, typeArgs, staticDispatch = fn.qualifier.isInstanceOf[Super])
+ 
+     case closureDef((ddef @ DefDef(_, ValDefs(arg :: Nil) :: Nil, _, _))) =>
+       (obj: AnyRef) => interpretTree(ddef.rhs)(using env.updated(arg.symbol, obj))
+@@ -757,7 +811,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case (t1: dotty.tools.dotc.core.Types.Type @unchecked, t2: dotty.tools.dotc.core.Types.Type @unchecked) => t1 =:= t2
+         case _ => patValue == scrutinee
+       if matches then Some(env) else None
+-    case UnApply(fun, _, patterns) =>
++    case UnApply(fun, unapplyImplicits, patterns) =>
+       if debugEnabled then
+         Console.err.println(s"[matchPattern UnApply] fun.getClass=${fun.getClass.getSimpleName} fun.symbol=${fun.symbol} fun.symbol.owner=${fun.symbol.owner} fun=${fun.show}")
+       // Not general case-class/quote-pattern deconstruction (still
+@@ -1298,7 +1352,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                 val r = cls.isInstance(v)
+                 if debugEnabled then
+                   Console.err.println(s"[genericTypeTest.check] name=$name cls=$cls v=$v vClass=${if v == null then "null" else v.getClass} result=$r")
+-                if r then Some(List(v)) else None)
++                if r then Some(List(v)) else None).orElse(realTypeTest(name))
+       // `scala.util.matching.Regex#unapplySeq(target)` (e.g. a macro's own
+       // `value match { case SomeRegex(_*) => ... }`, used by ip4s's own
+       // `Hostname.fromString`, needed by its `host"..."` literal macro):
+@@ -1394,10 +1448,21 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         val unapplySym = fun.symbol
+         if !unapplySym.exists then None
+         else qualAndLeadingArgs(t).flatMap { case (qual, leadingArgTrees) =>
+-          resolveExternalDefTree(unapplySym) match
++          // An abstract `unapply` (e.g. `Type.Either.unapply`, declared on a
++          // module trait and implemented by the platform's own module):
++          // dispatch on the evaluated qualifier, like any virtual call.
++          val evaluatedQual = interpretTree(qual)
++          val resolvedUnapply: Tree = resolveExternalDefTree(unapplySym) match
++            case d: DefDef if d.rhs.isEmpty => implementationOf(evaluatedQual, unapplySym).getOrElse(d)
++            case other => other
++          resolvedUnapply match
+             case ddef: DefDef if !ddef.rhs.isEmpty =>
+-              val receiver = interpretTree(qual)
++              val receiver = evaluatedQual
++              // Implicit/using args applied AFTER the scrutinee
++              // (`unapply(tpe)(implicit ctx)`) are not part of `fun`: dotc
++              // keeps them in `UnApply`'s own second field.
+               val leadingArgs = leadingArgTrees.map(interpretTree)
++              val trailingArgs = unapplyImplicits.map(interpretTree)
+               // A plain case class with no user-defined `unapply` gets a
+               // synthesized `def unapply(x: Foo): Foo = x` -- identity,
+               // returning the SAME type as its own parameter, not
+@@ -1422,10 +1487,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                 case None => true
+               Some { (v: Object) =>
+                 if isIdentityUnapply then
+-                  if concreteClassMatches(v) then bindIdentityExtracted(callUserDefDef(Some(receiver), ddef, leadingArgs :+ v))
++                  if concreteClassMatches(v) then bindIdentityExtracted(callUserDefDef(Some(receiver), ddef, leadingArgs ::: (v :: trailingArgs)))
+                   else None
+                 else
+-                  callUserDefDef(Some(receiver), ddef, leadingArgs :+ v) match
++                  callUserDefDef(Some(receiver), ddef, leadingArgs ::: (v :: trailingArgs)) match
+                     case opt: Option[Object @unchecked] @unchecked =>
+                       opt match
+                         case Some(extracted) => bindExtracted(extracted)
+@@ -1776,6 +1841,123 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+   private def constantExtractorTag(name: String): Option[Int] =
+     if name.endsWith("Constant") then constantTag(name.stripSuffix("Constant")) else None
+ 
++  /** Fallback for every `quotes.reflect` `TypeTest` extractor with no
++   *  dedicated case in `matchPattern`: the real `QuotesImpl` implementation
++   *  (generated from the `given XTypeTest: TypeTest[A, B]` list in
++   *  `Quotes.scala`), applied to the scrutinee as-is -- our trees/types are
++   *  the very dotc values `QuotesImpl` itself works on.
++   */
++  private def realTypeTest(name: String)(using Context): Option[Object => Option[List[Object]]] =
++    val q = scala.quoted.runtime.impl.QuotesImpl().asInstanceOf[scala.quoted.runtime.impl.QuotesImpl]
++    name match
++      case "PackageClauseTypeTest" => Some(v => q.reflect.PackageClauseTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ImportTypeTest" => Some(v => q.reflect.ImportTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ExportTypeTest" => Some(v => q.reflect.ExportTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "StatementTypeTest" => Some(v => q.reflect.StatementTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "DefinitionTypeTest" => Some(v => q.reflect.DefinitionTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ClassDefTypeTest" => Some(v => q.reflect.ClassDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ValOrDefDefTypeTest" => Some(v => q.reflect.ValOrDefDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "DefDefTypeTest" => Some(v => q.reflect.DefDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ValDefTypeTest" => Some(v => q.reflect.ValDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeDefTypeTest" => Some(v => q.reflect.TypeDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TermTypeTest" => Some(v => q.reflect.TermTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "RefTypeTest" => Some(v => q.reflect.RefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "IdentTypeTest" => Some(v => q.reflect.IdentTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "WildcardTypeTest" => Some(v => q.reflect.WildcardTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "SelectTypeTest" => Some(v => q.reflect.SelectTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "LiteralTypeTest" => Some(v => q.reflect.LiteralTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ThisTypeTest" => Some(v => q.reflect.ThisTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "NewTypeTest" => Some(v => q.reflect.NewTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "NamedArgTypeTest" => Some(v => q.reflect.NamedArgTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ApplyTypeTest" => Some(v => q.reflect.ApplyTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeApplyTypeTest" => Some(v => q.reflect.TypeApplyTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "SuperTypeTest" => Some(v => q.reflect.SuperTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypedTypeTest" => Some(v => q.reflect.TypedTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "AssignTypeTest" => Some(v => q.reflect.AssignTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "BlockTypeTest" => Some(v => q.reflect.BlockTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ClosureTypeTest" => Some(v => q.reflect.ClosureTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "IfTypeTest" => Some(v => q.reflect.IfTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "MatchTypeTest" => Some(v => q.reflect.MatchTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "SummonFromTypeTest" => Some(v => q.reflect.SummonFromTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TryTypeTest" => Some(v => q.reflect.TryTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ReturnTypeTest" => Some(v => q.reflect.ReturnTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "RepeatedTypeTest" => Some(v => q.reflect.RepeatedTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "InlinedTypeTest" => Some(v => q.reflect.InlinedTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "SelectOuterTypeTest" => Some(v => q.reflect.SelectOuterTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "WhileTypeTest" => Some(v => q.reflect.WhileTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypedOrTestTypeTest" => Some(v => q.reflect.TypedOrTestTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeTreeTypeTest" => Some(v => q.reflect.TypeTreeTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "InferredTypeTest" => Some(v => q.reflect.InferredTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeIdentTypeTest" => Some(v => q.reflect.TypeIdentTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeSelectTypeTest" => Some(v => q.reflect.TypeSelectTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeProjectionTypeTest" => Some(v => q.reflect.TypeProjectionTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "SingletonTypeTest" => Some(v => q.reflect.SingletonTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "RefinedTypeTest" => Some(v => q.reflect.RefinedTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "AppliedTypeTest" => Some(v => q.reflect.AppliedTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "AnnotatedTypeTest" => Some(v => q.reflect.AnnotatedTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "MatchTypeTreeTypeTest" => Some(v => q.reflect.MatchTypeTreeTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "ByNameTypeTest" => Some(v => q.reflect.ByNameTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "LambdaTypeTreeTypeTest" => Some(v => q.reflect.LambdaTypeTreeTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeBindTypeTest" => Some(v => q.reflect.TypeBindTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeBlockTypeTest" => Some(v => q.reflect.TypeBlockTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeBoundsTreeTypeTest" => Some(v => q.reflect.TypeBoundsTreeTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "WildcardTypeTreeTypeTest" => Some(v => q.reflect.WildcardTypeTreeTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "CaseDefTypeTest" => Some(v => q.reflect.CaseDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeCaseDefTypeTest" => Some(v => q.reflect.TypeCaseDefTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "BindTypeTest" => Some(v => q.reflect.BindTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "UnapplyTypeTest" => Some(v => q.reflect.UnapplyTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "AlternativesTypeTest" => Some(v => q.reflect.AlternativesTypeTest.unapply(v.asInstanceOf[q.reflect.Tree]).map(r => List(r.asInstanceOf[Object])))
++      case "TermParamClauseTypeTest" => Some(v => q.reflect.TermParamClauseTypeTest.unapply(v.asInstanceOf[q.reflect.ParamClause]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeParamClauseTypeTest" => Some(v => q.reflect.TypeParamClauseTypeTest.unapply(v.asInstanceOf[q.reflect.ParamClause]).map(r => List(r.asInstanceOf[Object])))
++      case "SimpleSelectorTypeTest" => Some(v => q.reflect.SimpleSelectorTypeTest.unapply(v.asInstanceOf[q.reflect.Selector]).map(r => List(r.asInstanceOf[Object])))
++      case "RenameSelectorTypeTest" => Some(v => q.reflect.RenameSelectorTypeTest.unapply(v.asInstanceOf[q.reflect.Selector]).map(r => List(r.asInstanceOf[Object])))
++      case "OmitSelectorTypeTest" => Some(v => q.reflect.OmitSelectorTypeTest.unapply(v.asInstanceOf[q.reflect.Selector]).map(r => List(r.asInstanceOf[Object])))
++      case "GivenSelectorTypeTest" => Some(v => q.reflect.GivenSelectorTypeTest.unapply(v.asInstanceOf[q.reflect.Selector]).map(r => List(r.asInstanceOf[Object])))
++      case "ConstantTypeTypeTest" => Some(v => q.reflect.ConstantTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "NamedTypeTypeTest" => Some(v => q.reflect.NamedTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "TermRefTypeTest" => Some(v => q.reflect.TermRefTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeRefTypeTest" => Some(v => q.reflect.TypeRefTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "SuperTypeTypeTest" => Some(v => q.reflect.SuperTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "RefinementTypeTest" => Some(v => q.reflect.RefinementTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "AppliedTypeTypeTest" => Some(v => q.reflect.AppliedTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "AnnotatedTypeTypeTest" => Some(v => q.reflect.AnnotatedTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "AndOrTypeTypeTest" => Some(v => q.reflect.AndOrTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "AndTypeTypeTest" => Some(v => q.reflect.AndTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "OrTypeTypeTest" => Some(v => q.reflect.OrTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "MatchTypeTypeTest" => Some(v => q.reflect.MatchTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "ByNameTypeTypeTest" => Some(v => q.reflect.ByNameTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "ParamRefTypeTest" => Some(v => q.reflect.ParamRefTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "ThisTypeTypeTest" => Some(v => q.reflect.ThisTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "RecursiveThisTypeTest" => Some(v => q.reflect.RecursiveThisTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "RecursiveTypeTypeTest" => Some(v => q.reflect.RecursiveTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "LambdaTypeTypeTest" => Some(v => q.reflect.LambdaTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "MethodOrPolyTypeTest" => Some(v => q.reflect.MethodOrPolyTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "MethodTypeTypeTest" => Some(v => q.reflect.MethodTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "PolyTypeTypeTest" => Some(v => q.reflect.PolyTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeLambdaTypeTest" => Some(v => q.reflect.TypeLambdaTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "MatchCaseTypeTest" => Some(v => q.reflect.MatchCaseTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "TypeBoundsTypeTest" => Some(v => q.reflect.TypeBoundsTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "NoPrefixTypeTest" => Some(v => q.reflect.NoPrefixTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "FlexibleTypeTypeTest" => Some(v => q.reflect.FlexibleTypeTypeTest.unapply(v.asInstanceOf[q.reflect.TypeRepr]).map(r => List(r.asInstanceOf[Object])))
++      case "BooleanConstantTypeTest" => Some(v => q.reflect.BooleanConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "ByteConstantTypeTest" => Some(v => q.reflect.ByteConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "ShortConstantTypeTest" => Some(v => q.reflect.ShortConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "IntConstantTypeTest" => Some(v => q.reflect.IntConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "LongConstantTypeTest" => Some(v => q.reflect.LongConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "FloatConstantTypeTest" => Some(v => q.reflect.FloatConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "DoubleConstantTypeTest" => Some(v => q.reflect.DoubleConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "CharConstantTypeTest" => Some(v => q.reflect.CharConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "StringConstantTypeTest" => Some(v => q.reflect.StringConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "UnitConstantTypeTest" => Some(v => q.reflect.UnitConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "NullConstantTypeTest" => Some(v => q.reflect.NullConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "ClassOfConstantTypeTest" => Some(v => q.reflect.ClassOfConstantTypeTest.unapply(v.asInstanceOf[q.reflect.Constant]).map(r => List(r.asInstanceOf[Object])))
++      case "ImplicitSearchSuccessTypeTest" => Some(v => q.reflect.ImplicitSearchSuccessTypeTest.unapply(v.asInstanceOf[q.reflect.ImplicitSearchResult]).map(r => List(r.asInstanceOf[Object])))
++      case "ImplicitSearchFailureTypeTest" => Some(v => q.reflect.ImplicitSearchFailureTypeTest.unapply(v.asInstanceOf[q.reflect.ImplicitSearchResult]).map(r => List(r.asInstanceOf[Object])))
++      case "DivergingImplicitTypeTest" => Some(v => q.reflect.DivergingImplicitTypeTest.unapply(v.asInstanceOf[q.reflect.ImplicitSearchResult]).map(r => List(r.asInstanceOf[Object])))
++      case "NoMatchingImplicitsTypeTest" => Some(v => q.reflect.NoMatchingImplicitsTypeTest.unapply(v.asInstanceOf[q.reflect.ImplicitSearchResult]).map(r => List(r.asInstanceOf[Object])))
++      case "AmbiguousImplicitsTypeTest" => Some(v => q.reflect.AmbiguousImplicitsTypeTest.unapply(v.asInstanceOf[q.reflect.ImplicitSearchResult]).map(r => List(r.asInstanceOf[Object])))
++      case _ => None
++
+   private def typeTestClass(name: String): Option[Class[?]] = name match
+     case "ConstantTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.ConstantType])
+     case "NamedTypeTypeTest" => Some(classOf[dotty.tools.dotc.core.Types.NamedType])
+@@ -1877,8 +2059,31 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     case _: Function0[?] | _: Function1[?, ?] | _: Function2[?, ?, ?] => true
+     case _ => false
+ 
++  /** For a real host object `v` (not one of our own interpreted wrappers) and
++   *  a concrete class `cls` of the standard library: whether `v`'s class is
++   *  `cls` or a subclass, by walking the superclass chain by name. `None` when
++   *  that can't be decided this way (traits, unknown classes, no reflection).
++   */
++  private def hostClassTest(v: Object, cls: Symbol)(using Context): Option[Boolean] =
++    if v == null || !cls.exists || !cls.isClass || cls.is(Trait) || cls.is(JavaDefined) then None
++    else if v.isInstanceOf[InterpretedInstance] || v.isInstanceOf[ModuleValue] then None
++    else
++      val target = flatClassName(cls)
++      if !(target.startsWith("scala.") || target.startsWith("java.")) || target == "java.lang.Object" || target == "scala.Any" then None
++      else
++        try
++          var c: Class[?] = v.getClass
++          var found = false
++          while c != null && !found do
++            if c.getName == target then found = true
++            else c = c.getSuperclass
++          Some(found)
++        catch case _: Throwable => None
++
+   private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
+     val cls = tpe.classSymbol
++    // `null` is an instance of nothing (`x.isInstanceOf[T]`, `case _: T`).
++    if v == null then false else
+     if cls == defn.IntClass then v.isInstanceOf[Integer]
+     else if cls == defn.LongClass then v.isInstanceOf[java.lang.Long]
+     else if cls == defn.BooleanClass then v.isInstanceOf[java.lang.Boolean]
+@@ -1950,6 +2155,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         else if (v.isInstanceOf[dotty.tools.dotc.core.Types.Type] || v.isInstanceOf[dotty.tools.dotc.ast.Trees.Tree[?]])
+           && typeTestClass(cls.name.toString + "TypeTest").isDefined then
+           typeTestClass(cls.name.toString + "TypeTest").get.isInstance(v)
++        // A real stdlib/JDK host object tested against a concrete (non-trait)
++        // class: its own superclass chain decides, by name. The blanket `true`
++        // below made `Iterator#ConcatIterator.merge`'s `current.isInstanceOf[
++        // ConcatIterator]` hold for every host iterator, recursing forever.
++        else if hostClassTest(v, cls).isDefined then hostClassTest(v, cls).get
+         else true
+       if debugEnabled then
+         Console.err.println(s"[matchesRuntimeType] v.getClass=${if v == null then "null" else v.getClass} tpe=${tpe.show} cls=$cls cls.exists=${cls.exists} cls.isClass=${cls.isClass} actual=$actual actual.exists=${actual.exists} baseClasses=${if actual.exists && actual.isClass then actual.asClass.baseClasses else Nil} result=$result")
+@@ -2019,7 +2229,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+ 
+   private def interpretStaticCall(moduleClass: Symbol, fn: Symbol, rawArgs: List[Tree], typeArgs: List[Type] = Nil)(using Env): Object =
+     lazy val args = evalNonErased(rawArgs, fn)
+-    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
++    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
+       resolveExternalDefTree(fn) match
+         // `moduleClass` (not `None`) as the receiver: a top-level object's
+         // own method can still reference `this` internally (e.g. to call a
+@@ -2200,7 +2410,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    *  in this interpreter just wants a fresh generic array of the given
+    *  length, so build a real `Array[Object]` ourselves instead.
+    */
+-  private def interpretJavaReflectionIntrinsic(fn: Symbol, args: => List[Object]): Option[Object] =
++  private def interpretJavaReflectionIntrinsic(fn: Symbol, args: => List[Object])(using Env): Option[Object] =
+     if fn.name.toString == "newInstance" && fn.owner.showFullName == "java.lang.reflect.Array" then
+       args match
+         case _ :: (len: Integer) :: Nil => Some(new Array[Object](len))
+@@ -2219,6 +2429,49 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case (a: Array[Int] @unchecked) :: Nil => java.util.Arrays.sort(a); Some(().asInstanceOf[Object])
+         case (a: Array[Long] @unchecked) :: Nil => java.util.Arrays.sort(a); Some(().asInstanceOf[Object])
+         case (a: Array[Object] @unchecked) :: Nil => java.util.Arrays.sort(a.asInstanceOf[Array[AnyRef]]); Some(().asInstanceOf[Object])
++        case (a: Array[Object] @unchecked) :: cmp :: Nil if !cmp.isInstanceOf[Integer] =>
++          java.util.Arrays.sort(a, asComparator(cmp)); Some(().asInstanceOf[Object])
++        case (a: Array[Object] @unchecked) :: (from: Integer) :: (to: Integer) :: Nil =>
++          java.util.Arrays.sort(a, from, to); Some(().asInstanceOf[Object])
++        case (a: Array[Object] @unchecked) :: (from: Integer) :: (to: Integer) :: cmp :: Nil =>
++          java.util.Arrays.sort(a, from, to, asComparator(cmp)); Some(().asInstanceOf[Object])
++        case _ => None
++    else if fn.name.toString == "copyOfRange" && fn.owner.showFullName == "java.util.Arrays" then
++      args match
++        case (a: Array[Object] @unchecked) :: (from: Integer) :: (to: Integer) :: Nil => Some(java.util.Arrays.copyOfRange(a, from, to))
++        case _ => None
++    else if fn.name.toString == "fill" && fn.owner.showFullName == "java.util.Arrays" then
++      args match
++        case (a: Array[Object] @unchecked) :: v :: Nil => java.util.Arrays.fill(a, v); Some(().asInstanceOf[Object])
++        case _ => None
++    // `java.time.Instant.now()`/`Duration.between` and `System.nanoTime`/
++    // `currentTimeMillis`: real JDK-native clocks (chimney times each
++    // derivation for its diagnostics output).
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "Instant" && fn.name.toString == "now" then
++      Some(FakeInstant(System.nanoTime()))
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "Duration" && fn.name.toString == "between" then
++      args match
++        case (a: FakeInstant) :: (b: FakeInstant) :: Nil => Some(FakeDuration(b.nanos - a.nanos))
++        case _ => None
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "System" && fn.name.toString == "nanoTime" then
++      Some(java.lang.Long.valueOf(System.nanoTime()))
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "System" && fn.name.toString == "currentTimeMillis" then
++      Some(java.lang.Long.valueOf(System.currentTimeMillis()))
++    // `sys.addShutdownHook(...)` (hearth's `TerminationObserver` registers one
++    // to notice Ctrl+C): the interpreted macro never outlives the compiler
++    // process, so a hook can never fire for it -- nothing to register.
++    else if fn.name.toString == "addShutdownHook" && (fn.owner.name.toString.stripSuffix("$").startsWith("sys") || fn.owner.name.toString.stripSuffix("$") == "package" || fn.owner.name.toString.stripSuffix("$") == "ShutdownHookThread") then
++      Some(null)
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "Thread" && fn.name.toString == "interrupted" then
++      Some(java.lang.Boolean.valueOf(Thread.interrupted()))
++    // `java.lang.Boolean.valueOf`/`parseBoolean`/`toString`: real JDK statics
++    // with no retained source (reached through hearth's/chimney's flag
++    // parsing).
++    else if fn.owner.is(JavaDefined) && fn.owner.name.toString.stripSuffix("$") == "Boolean" then
++      (fn.name.toString, args) match
++        case ("valueOf", (b: java.lang.Boolean) :: Nil) => Some(b)
++        case ("valueOf" | "parseBoolean", (s: String) :: Nil) => Some(java.lang.Boolean.valueOf(s))
++        case ("toString", (b: java.lang.Boolean) :: Nil) => Some(java.lang.Boolean.toString(b))
+         case _ => None
+     // `scala.runtime.Statics.releaseFence()`: a real JVM memory-fence
+     // intrinsic (safe publication for concurrent readers) -- meaningless,
+@@ -2289,7 +2542,18 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // e.g. ip4s's own literal-validation macros hand-parsing numbers at
+     // macro-expansion time.
+     else if fn.owner.is(JavaDefined) && Set("Integer", "Long").contains(fn.owner.name.toString.stripSuffix("$")) then
+-      (fn.owner.name.toString.stripSuffix("$"), fn.name.toString, args) match
++      // A `Long` static can receive an `Integer`-boxed argument (a widened
++      // Int literal/expression): widen the numeric operands the Long
++      // overloads take (never a radix, which stays an Int).
++      val numArgs =
++        if fn.owner.name.toString.stripSuffix("$") != "Long" then args
++        else fn.name.toString match
++          case "compare" | "max" | "min" | "sum" => args.map { case i: Integer => java.lang.Long.valueOf(i.longValue); case o => o }
++          case "parseLong" | "valueOf" => args
++          case _ => args match
++            case (i: Integer) :: rest => java.lang.Long.valueOf(i.longValue) :: rest
++            case other => other
++      (fn.owner.name.toString.stripSuffix("$"), fn.name.toString, numArgs) match
+         case ("Integer", "parseInt", (s: String) :: Nil) => Some(Int.box(Integer.parseInt(s)))
+         case ("Integer", "parseInt", (s: String) :: (radix: Integer) :: Nil) => Some(Int.box(Integer.parseInt(s, radix)))
+         case ("Integer", "compare", (x: Integer) :: (y: Integer) :: Nil) => Some(Int.box(Integer.compare(x, y)))
+@@ -2329,7 +2593,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case ("Long", "parseLong", (s: String) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.parseLong(s)))
+         case ("Long", "parseLong", (s: String) :: (radix: Integer) :: Nil) => Some(java.lang.Long.valueOf(java.lang.Long.parseLong(s, radix)))
+         case ("Long", "compare", (x: java.lang.Long) :: (y: java.lang.Long) :: Nil) => Some(Int.box(java.lang.Long.compare(x, y)))
+-        case _ => None
++        case (o, n, as) =>
++          throw new StopInterpretation(em"Interpreter (own implementation): java.lang.$o.$n has no intrinsic for argument classes ${as.map(a => if a == null then "null" else a.getClass.getName).mkString(", ")}", pos)
+     // `java.util.regex.Pattern.compile`/`.quote`: real JDK-native statics
+     // (no Scala source ever) -- `scala.util.matching.Regex`'s own
+     // (real, interpreted) constructor calls `Pattern.compile` directly, and
+@@ -2339,10 +2604,18 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case ("compile", (s: String) :: Nil) => Some(java.util.regex.Pattern.compile(s))
+         case ("compile", (s: String) :: (flags: Integer) :: Nil) => Some(java.util.regex.Pattern.compile(s, flags))
+         case ("quote", (s: String) :: Nil) => Some(java.util.regex.Pattern.quote(s))
++        case ("matches", (re: String) :: (s: CharSequence @unchecked) :: Nil) => Some(Boolean.box(java.util.regex.Pattern.matches(re, s)))
+         case _ => None
+     else None
+ 
+   private def interpretInstanceCall(receiver: Object, fn: Symbol, rawArgs: List[Tree], srcPos: SrcPos, typeArgs: List[Type] = Nil, staticDispatch: Boolean = false)(using Env): Object =
++    if !fn.exists then
++      throw new StopInterpretation(
++        em"""Interpreter (own implementation): call on ${if receiver == null then "null" else receiver.getClass.getName} (${receiver match
++              case i: InterpretedInstance => i.cls.showLocated
++              case ModuleValue(c) => c.showLocated
++              case _ => ""}) resolves to no symbol (arguments: ${rawArgs.map(_.show).mkString(", ")})""",
++        srcPos)
+     lazy val args = evalNonErased(rawArgs, fn)
+     val collectionFactory = receiver match
+       case ModuleValue(cls) => interpretCollectionFactory(cls, fn, args)
+@@ -2376,10 +2649,45 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // crash seen via `List#partition`'s `super.partition(p)` re-resolving
+     // straight back to `List#partition` itself instead of `SeqOps`'s
+     // generic default).
+-    val dispatchFn = if staticDispatch then fn else if concreteCls.exists && concreteCls.isClass then fn.overridingSymbol(concreteCls.asClass).orElse(fn) else fn
+-    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).getOrElse {
++    val dispatchFn0 = if staticDispatch then fn else if concreteCls.exists && concreteCls.isClass then fn.overridingSymbol(concreteCls.asClass).orElse(fn) else fn
++    // An abstract `def` implemented by a `val` of some superclass (`protected
++    // def XMacroSettings` in `trait Definitions`, `protected val
++    // XMacroSettings` in `DefinitionsPlatform`): `overridingSymbol` doesn't
++    // see through the def/val difference, so look the `val` up by name.
++    val dispatchFn =
++      if dispatchFn0 == fn && !staticDispatch && fn.is(Deferred) && fn.isTerm && concreteCls.exists && concreteCls.isClass then
++        concreteCls.asClass.baseClasses.iterator
++          .filter(_ != fn.owner)
++          .flatMap(_.info.decls.lookupAll(fn.name).filter(c => c.isTerm && !c.is(Deferred) && !c.is(Method)))
++          .nextOption().getOrElse(fn)
++      else dispatchFn0
++    // The nested `object` implementing `fn`, when `fn` is a plain (non-method)
++    // member -- either `dispatchFn` itself, or, when `overridingSymbol` didn't
++    // see through the abstract `val Foo: FooModule` declaration `fn` names, an
++    // `object Foo` declared in a more-derived class of the receiver.
++    lazy val moduleImpl: Symbol =
++      if dispatchFn.is(Module) then dispatchFn
++      else if fn.isTerm && !fn.is(Method) && concreteCls.exists && concreteCls.isClass then
++        concreteCls.asClass.baseClasses.iterator
++          .flatMap(_.info.decls.lookupAll(fn.name).filter(_.isTerm))
++          .find(_.is(Module)).getOrElse(NoSymbol)
++      else NoSymbol
++    args // force before recording the call's type arguments (evaluating args may itself make calls)
++    currentTypeArgs = typeArgs
++    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).getOrElse {
+       resolveExternalDefTree(dispatchFn) match
+         case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args, typeArgs)
++        // A nested `object` member, reached through the `val` it compiles to
++        // (typically overriding an abstract `val Foo: FooModule` declared in
++        // a parent trait, e.g. hearth's `object CrossQuotes extends
++        // CrossQuotesModule` inside `EnvironmentsScala3`, read as
++        // `ChimneyExprs.this.CrossQuotes`): the module `val` has no rhs, so
++        // the generic `ValDef` case below would answer `null`. Instantiate
++        // the module class once per receiver (running its own constructor
++        // body, which may set state such as `currentCtx = quotes`) with the
++        // receiver as the enclosing instance, and memoize it as a field.
++        case vdef: ValDef if moduleImpl.exists && receiver.isInstanceOf[InterpretedInstance] =>
++          nestedModuleInstance(receiver.asInstanceOf[InterpretedInstance], moduleImpl, fn.name.toString)
+         case vdef: ValDef =>
+           // A class-body `val`/`var` (private mutable-state fields
+           // derivation macros keep across calls, e.g. a memoization map, or
+@@ -2417,6 +2725,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           })
+           receiver match
+             case inst: InterpretedInstance =>
++              if debugEnabled then
++                Console.err.println(s"[valRead] fn=${fn.showLocated} dispatchFn=${dispatchFn.showLocated} cls=${inst.cls} fieldKeys=${inst.fields.keys.mkString(",")} uninit=$uninitialized hasField=${inst.fields.contains(fn.name.toString)} fieldVal=${inst.fields.get(fn.name.toString).map(v => if v == null then "null" else v.getClass.getName)}")
+               // `inst.outerEnv` (captured when this instance was
+               // constructed, e.g. an anonymous class body's free lexical
+               // references like `flatMap`'s own pattern-bound `c` in `new
+@@ -2439,6 +2749,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             // distinguishes the two cases except this check).
+             case _ if uninitialized && fn.is(ParamAccessor) && fn.owner.derivesFrom(defn.AnyValClass) =>
+               receiver
++            case ModuleValue(mcls) if fn.is(Mutable) || vdef.symbol.is(Mutable) =>
++              moduleVars.getOrElseUpdate((mcls, fn.name.toString),
++                if uninitialized then defaultValueOf(fn.info) else interpretTree(vdef.rhs)(using bindThis(env, fn.owner, receiver)))
+             case _ =>
+               // No `.fields` to memoize into (e.g. a `ModuleValue` receiver)
+               // -- re-runs the initializer per access, which is wasteful but
+@@ -2535,7 +2848,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                         def scan(matchSignature: Boolean) = moreDerived.iterator
+                           .flatMap(_.info.decls.toList)
+                           .filter(s => s.is(Method) && s.name == fn.name && (!matchSignature || s.signature == fn.signature))
+-                          .find(s => !resolveExternalDefTree(s).isEmpty)
++                          // A body-less `DefDef` (an abstract redeclaration, e.g.
++                          // `ReusableBuilder#result` between `ImmutableBuilder`'s
++                          // real one and `Builder`'s) is NOT an implementation:
++                          // picking it dead-ends in `notInterpretable`, while the
++                          // same-name-only second scan would have found the real one.
++                          .find(s => resolveExternalDefTree(s) match
++                            case d: DefDef => !d.rhs.isEmpty
++                            case t => !t.isEmpty)
+                         // Exact signature match first; a same-name-only
+                         // fallback second (last resort) -- an F-bounded
+                         // generic method (e.g. `IterableOps#fromSpecific`,
+@@ -2550,6 +2870,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                         // same-signature scan both correctly handle the
+                         // *simpler* covariant-return case above.
+                         scan(matchSignature = true).orElse(scan(matchSignature = false)).getOrElse(NoSymbol)
++                    if debugEnabled || System.getenv("SCALINO_OUTER_DIAG") != null then
++                      Console.err.println(s"[abstractDispatch] receiver=${receiver.getClass.getSimpleName} fn=${fn.showLocated} concreteCls=$concreteCls overriding=$overriding concrete=$concrete concreteTree=${resolveExternalDefTree(concrete).getClass.getSimpleName} baseClasses=${concreteCls.asClass.baseClasses}")
+                     resolveExternalDefTree(concrete) match
+                       case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args)
+                       case _ => notInterpretable(fn)
+@@ -2563,7 +2885,29 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    *  corrupting any call whose argument has a side effect (e.g. consuming an
+    *  `Iterator`, incrementing a `var`) by running that side effect twice.
+    */
++  /** Names of the interpreted defs currently executing, innermost first
++   *  (only for diagnostics: "Unexpected tree" errors list the top frames).
++   */
++  private var defStack: List[Symbol] = Nil
++  private var reportedStackOverflow = false
++  /** Type arguments of the instance call being dispatched (read by `interpretQuotesApi`). */
++  private var currentTypeArgs: List[Type] = Nil
++
+   private def callUserDefDef(receiver: Option[Object], ddef: DefDef, args: List[Object], typeArgs: List[Type] = Nil)(using Env): Object =
++    val saved = defStack
++    defStack = ddef.symbol :: saved
++    try callUserDefDef0(receiver, ddef, args, typeArgs)
++    catch
++      case so: StackOverflowError =>
++        if !reportedStackOverflow then
++          reportedStackOverflow = true
++          Console.err.println(s"[stackOverflow] interpreted call depth=${defStack.size}; innermost frames: ${defStack.take(30).map(_.showLocated).mkString("\n   ")}")
++          val lastTrees = (0 until 40).flatMap(i => Option(recentTrees((recentIdx - 1 - i) & 127))).map(t => s"${t.getClass.getSimpleName} @${t.srcPos.line + 1}: ${t.show.take(110).replace("\n", " ")}")
++          Console.err.println(s"[stackOverflow] last interpreted trees:\n   ${lastTrees.mkString("\n   ")}")
++        throw so
++    finally defStack = saved
++
++  private def callUserDefDef0(receiver: Option[Object], ddef: DefDef, args: List[Object], typeArgs: List[Type] = Nil)(using Env): Object =
+     val params = ddef.termParamss.flatten.map(_.symbol)
+     // An `InterpretedInstance` receiver's captured `outerEnv` (not
+     // `emptyEnv`) as the base: a non-static inner class's method may still
+@@ -2755,6 +3099,40 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case (n: Integer) :: Nil => Some(new java.lang.StringBuilder(n))
+         case (s: String) :: Nil => Some(new java.lang.StringBuilder(s))
+         case _ => None
++    // `java.util.WeakHashMap`/`java.util.HashMap`: real JDK classes, no
++    // retained Scala source -- same story as `BitSet` above. Seen via
++    // hearth's `loader.scala` (per-classloader `ServiceLoader` caches),
++    // reached through every Scala 3 chimney 2.x derivation.
++    else if fn.owner.is(JavaDefined) && Set("WeakHashMap", "HashMap", "IdentityHashMap", "LinkedHashMap", "ConcurrentHashMap").contains(fn.owner.name.toString) then
++      def mk(n: Option[Int]): java.util.Map[Object, Object] = (fn.owner.name.toString, n) match
++        case ("WeakHashMap", None) => new java.util.WeakHashMap[Object, Object]()
++        case ("WeakHashMap", Some(c)) => new java.util.WeakHashMap[Object, Object](c)
++        case ("HashMap", None) => new java.util.HashMap[Object, Object]()
++        case ("HashMap", Some(c)) => new java.util.HashMap[Object, Object](c)
++        case ("IdentityHashMap", None) => new java.util.IdentityHashMap[Object, Object]()
++        case ("IdentityHashMap", Some(c)) => new java.util.IdentityHashMap[Object, Object](c)
++        case ("LinkedHashMap", None) => new java.util.LinkedHashMap[Object, Object]()
++        case ("LinkedHashMap", Some(c)) => new java.util.LinkedHashMap[Object, Object](c)
++        case (_, None) => new java.util.concurrent.ConcurrentHashMap[Object, Object]()
++        case (_, Some(c)) => new java.util.concurrent.ConcurrentHashMap[Object, Object](c)
++      rawArgs.filterNot(_.isEmpty).map(interpretTree) match
++        case Nil => Some(mk(None))
++        case (n: Integer) :: Nil => Some(mk(Some(n)))
++        case _ => None
++    // `java.util.concurrent.atomic.*`: real JDK classes, used by hearth's
++    // micro-fp (`MIO`, `Log`, `MLocal`, `DirectStyle`) for counters/flags.
++    else if fn.owner.is(JavaDefined) && Set("AtomicLong", "AtomicInteger", "AtomicBoolean", "AtomicReference").contains(fn.owner.name.toString) then
++      val initial = rawArgs.filterNot(_.isEmpty).map(interpretTree)
++      (fn.owner.name.toString, initial) match
++        case ("AtomicLong", Nil) => Some(new java.util.concurrent.atomic.AtomicLong())
++        case ("AtomicLong", (n: java.lang.Number) :: Nil) => Some(new java.util.concurrent.atomic.AtomicLong(n.longValue))
++        case ("AtomicInteger", Nil) => Some(new java.util.concurrent.atomic.AtomicInteger())
++        case ("AtomicInteger", (n: java.lang.Number) :: Nil) => Some(new java.util.concurrent.atomic.AtomicInteger(n.intValue))
++        case ("AtomicBoolean", Nil) => Some(new java.util.concurrent.atomic.AtomicBoolean())
++        case ("AtomicBoolean", (v: java.lang.Boolean) :: Nil) => Some(new java.util.concurrent.atomic.AtomicBoolean(v))
++        case ("AtomicReference", Nil) => Some(new java.util.concurrent.atomic.AtomicReference[Object]())
++        case ("AtomicReference", v :: Nil) => Some(new java.util.concurrent.atomic.AtomicReference[Object](v))
++        case _ => None
+     else fn.owner.showFullName match
+       case "scala.collection.mutable.HashMap" | "scala.collection.mutable.Map" =>
+         Some(mutable.HashMap.empty[Object, Object])
+@@ -2783,7 +3161,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           case _ => None
+       case _ => None
+ 
+-  private def interpretNew(fn: Symbol, rawArgs: List[Tree])(using Env): Object =
++  private def interpretNew(fn: Symbol, rawArgs: List[Tree], newType: Type = NoType)(using Env): Object =
++    newCount += 1
++    if newCount % 50000L == 0L && System.getenv("SCALINO_OUTER_DIAG") != null then
++      Console.err.println(s"[newWatchdog] news=$newCount cls=${fn.owner.showLocated} type=${newType.show.take(80)} depth=${defStack.size} frames=${defStack.take(6).map(_.showLocated).mkString(" <- ")}")
+     if debugEnabled then
+       val dt = fn.owner.primaryConstructor.defTree
+       Console.err.println(s"[interpretNew] cls=${fn.owner} ctorDefTreeEmpty=${dt.isEmpty} ctorDefTreeClass=${dt.getClass.getSimpleName} rawArgs=${rawArgs.map(t => s"${t.getClass.getSimpleName}(isEmpty=${t.isEmpty})")}")
+@@ -2800,11 +3181,76 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // is the right runtime representation regardless of `T`.
+     if fn.owner == defn.ArrayClass then
+       rawArgs.filterNot(_.isEmpty) match
+-        case len :: Nil => new Array[Object](interpretTree(len).asInstanceOf[Integer])
+-        case _ => newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs))
+-    else newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs))
+-
+-  private def interpretNewFromTree(fn: Symbol, rawArgs: List[Tree])(using Env): Object =
++        case len :: Nil =>
++          val arr = new Array[Object](interpretTree(len).asInstanceOf[Integer])
++          // A primitive-element array (`new Array[Long](n)`) starts zeroed, not
++          // null: reading an untouched slot must give `0L`/`false`/..., not a
++          // null that later blows up in an unboxing intrinsic.
++          val elemDefault = newType.dealias.argInfos.headOption.map(defaultValueOf).orNull
++          if elemDefault != null then java.util.Arrays.fill(arr, elemDefault)
++          arr
++        case _ => newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs, newType))
++    else newStdlibCollection(fn, rawArgs).getOrElse(interpretNewFromTree(fn, rawArgs, newType))
++
++  /** Resolves path-dependent type arguments of the form `p.Underlying`, where
++   *  `p` is an interpreted value in `env` (e.g. chimney's `path =>
++   *  f(using path.Underlying)` over an existential): such a type has no
++   *  meaning outside this run, so it is replaced by the real `Type` that
++   *  `p`'s same-named term member (`val Underlying: Type[Underlying]`) holds.
++   */
++  private[dotc] def resolveDependentType(t: Type)(using Env): Type =
++    val map = new dotty.tools.dotc.core.Types.TypeMap:
++      def apply(tp: Type): Type = tp match
++        case tr: TypeRef if tr.prefix.isInstanceOf[TermRef] && env.contains(tr.prefix.asInstanceOf[TermRef].symbol) =>
++          env(tr.prefix.asInstanceOf[TermRef].symbol) match
++            case inst: InterpretedInstance =>
++              val sym = inst.cls.info.member(tr.name.toTermName).symbol
++              if sym.exists then
++                interpretInstanceCall(inst, sym, Nil, pos) match
++                  case ti: scala.quoted.runtime.impl.TypeImpl => ti.typeTree.tpe
++                  case resolved: Type => resolved
++                  case _ => tp
++              else tp
++            case _ => tp
++        case _ => mapOver(tp)
++    map(t)
++
++  /** For `new qual.Inner(...)` of a non-static class, binds `Inner`'s owning
++   *  class to the instance `qual` evaluates to (the outer instance), on top
++   *  of the ambient `env`: the ambient env only covers whoever happens to be
++   *  running the `new`, which isn't the outer instance when `qual` is e.g. a
++   *  nested module (`new Type.Cache[F]` run from elsewhere in the macro).
++   */
++  private def withOuterInstance(env0: Env, cls: Symbol, newType: Type)(using Env): Env =
++    def prefixValue(tp: Type): Option[Object] = tp match
++      case ThisType(tref) => env0.get(tref.symbol)
++      case tr: TermRef if tr.symbol.is(Module) =>
++        if tr.symbol.isStatic then Some(interpretModuleAccess(tr.symbol))
++        else prefixValue(tr.prefix) match
++          case Some(inst: InterpretedInstance) => Some(nestedModuleInstance(inst, tr.symbol, tr.symbol.name.toString))
++          case _ => None
++      // A stable member `val`/`object`/accessor of an instance (e.g. the
++      // abstract `val Type: TypeModule` of `trait Types`, implemented by a
++      // nested object): read it off its qualifier's instance like any member.
++      case tr: TermRef if tr.symbol.exists && !tr.symbol.isStatic =>
++        prefixValue(tr.prefix) match
++          case Some(p: InterpretedInstance) => Some(interpretInstanceCall(p, tr.symbol, Nil, pos))
++          case _ => None
++      case _ => None
++    (newType.dealias match
++      case at: AppliedType => at.tycon.dealias
++      case other => other) match
++      case tr: TypeRef if tr.symbol == cls && cls.owner.isClass =>
++        prefixValue(tr.prefix) match
++          case Some(outer) => bindThis(env0, cls.owner, outer)
++          case None =>
++            if !env0.contains(cls.owner) && System.getenv("SCALINO_OUTER_DIAG") != null then Console.err.println(s"[outerDiag] cls=$cls prefix=${tr.prefix} prefixClass=${tr.prefix.getClass.getSimpleName}")
++            env0
++      case other =>
++        if !env0.contains(cls.owner) && System.getenv("SCALINO_OUTER_DIAG") != null then Console.err.println(s"[outerDiag] cls=$cls newType=$newType other=${other.getClass.getSimpleName}")
++        env0
++
++  private def interpretNewFromTree(fn: Symbol, rawArgs: List[Tree], newType: Type = NoType, existing: InterpretedInstance = null)(using Env): Object =
+     // A secondary/auxiliary constructor (`def this(...) = this(...)`,
+     // e.g. `scala.util.matching.Regex`'s own `def this(regex: String,
+     // groupNames: String*) = this(Pattern.compile(regex), groupNames*)`):
+@@ -2870,8 +3316,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // `ArraySeq.ofRef` inheriting a stale `SeqOps.this` left over from
+         // an unrelated `List` computation. Only genuinely non-static
+         // (lexically instance-nested) classes get the ambient env.
+-        val outerEnv = if fn.owner.isStatic then emptyEnv else env
+-        val instance = InterpretedInstance(fn.owner, outerEnv)
++        val outerEnv = if fn.owner.isStatic then emptyEnv else withOuterInstance(env, fn.owner, newType)
++        val instance = if existing != null then existing else InterpretedInstance(fn.owner, outerEnv)
+         // All clauses, not just the first: `rawArgs` (from `Call`'s
+         // extractor) is already flattened across every parameter clause,
+         // including trailing `(using ...)` ones, so the formal-param list
+@@ -2932,15 +3378,34 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // see the reverted-fix note above) and was reverted; restricting to
+         // `isAnonymousClass` can't touch those, since a named class's
+         // instantiation never reaches this branch at all.
+-        if fn.owner.isAnonymousClass then
+-          val superCall = moduleSuperCtorCall(fn.owner)
++        // Also a NAMED class with a superclass (anywhere up its superclass
++        // chain) exposing constructor-param fields (`class TransformerMacros(q:
++        // Quotes) extends PlatformBridge(q)`, `class PlatformBridge(q) extends
++        // MacroCommonsScala3(using q)`, `MacroCommonsScala3(using val quotes:
++        // Quotes)`): the ancestor's `quotes` accessor would otherwise read
++        // back `null`, as nothing ever runs the parent constructor calls.
++        // Gated on such a field actually existing (a plain parent whose ctor
++        // args are private/local is never read back, and is exactly the broad
++        // case that regressed upickle, see above), and `getOrElseUpdate`
++        // below never overrides a field already bound.
++        val ancestorExposesParamFields =
++          !fn.owner.isAnonymousClass && fn.owner.isClass &&
++            fn.owner.asClass.baseClasses.tail.exists { ps =>
++              ps.isClass && !ps.is(Trait) && !ps.is(JavaDefined) && ps != defn.ObjectClass && ps != defn.AnyClass &&
++                ps.asClass.paramAccessors.exists(a => a.isTerm && a.is(ParamAccessor) && !a.isAllOf(PrivateLocal))
++            }
++        // Runs one class's superclass-constructor call (found in its own
++        // `Template.parents`) and stashes the evaluated args under the
++        // parent's param names, then does the same for the parent itself.
++        def bindSuperCtorFields(cls: Symbol, env0: Env, depth: Int): Unit =
++          val superCall = moduleSuperCtorCall(cls)
+           if debugEnabled then
+-            Console.err.println(s"[anonSuperCtor] cls=${fn.owner} superCall=${superCall.map(_.show)}")
++            Console.err.println(s"[anonSuperCtor] cls=$cls superCall=${superCall.map(_.show)}")
+           superCall.foreach { parent =>
+             val (leadingStats, callTree) = parent match
+               case Block(stats, expr) => (stats, expr)
+               case other => (Nil, other)
+-            leadingStats.foreach(interpretTree(_)(using withParams))
++            leadingStats.foreach(interpretTree(_)(using env0))
+             callTree match
+               case Call(superFn, superArgss) if superFn.symbol.isConstructor =>
+                 // `paramSymss` includes the class's own type-parameter list
+@@ -2950,14 +3415,20 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                 // so keep only the term param symbols to line the two up.
+                 val superParams = superFn.symbol.denot.paramSymss.flatten.filter(_.isTerm)
+                 val superRawArgs = superArgss.flatten
+-                val superBound = bindNonErased(superParams, superRawArgs)(using withParams)
++                val superBound = bindNonErased(superParams, superRawArgs)(using env0)
+                 if debugEnabled then
+                   Console.err.println(s"[anonSuperCtor] superParams=$superParams superRawArgs=$superRawArgs superBound=$superBound")
+                 superBound.foreach((p, v) => instance.fields.getOrElseUpdate(p.name.toString, v))
++                val parentCls = superFn.symbol.owner
++                if depth < 16 && ancestorExposesParamFields then
++                  if parentCls.isClass && !parentCls.is(JavaDefined) && parentCls != defn.ObjectClass then
++                    bindSuperCtorFields(parentCls, superBound.foldLeft(env0)((e, pv) => e.updated(pv._1, pv._2)), depth + 1)
+               case _ =>
+                 if debugEnabled then
+                   Console.err.println(s"[anonSuperCtor] callTree did not match Call-with-constructor: ${callTree.getClass} ${callTree.show}")
+           }
++        if fn.owner.isAnonymousClass || ancestorExposesParamFields then
++          bindSuperCtorFields(fn.owner, withParams, 0)
+         instance
+       case _ if rawArgs.forall(_.isEmpty) =>
+         // No retained constructor body and nothing to bind anyway (typeclass
+@@ -3330,6 +3801,17 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                 .foreach((p, v) => instance.fields.getOrElseUpdate(p.name.toString, v))
+             case _ =>
+           instance
++        // An object extending an ABSTRACT class with no constructor arguments
++        // (`case object BeanAware extends TransformedNamesComparison`): the
++        // parent's instance carries nothing the module needs, and handing it
++        // back as the module's value would lose the object's own members
++        // (every call would then dispatch on the abstract parent).
++        case Some(parentTree)
++            if (parentTree match { case Block(Nil, e) => e; case t => t }) match
++              case Call(superFn, superArgss) =>
++                superFn.symbol.isConstructor && superFn.symbol.owner.is(Abstract) && superArgss.flatten.forall(_.isEmpty)
++              case _ => false =>
++          ModuleValue(fn.moduleClass)
+         case Some(parentTree) => interpretTree(parentTree)
+         case None => ModuleValue(fn.moduleClass)
+     }
+@@ -3377,6 +3859,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case _ => None
+ 
+   private def interpretStaticFieldAccess(sym: Symbol)(using Context): Object =
++    // A `var` of an `object`: its current value lives in `moduleVars` (shared
++    // with `Assign`), seeded from the initializer on first read.
++    if sym.is(Mutable) && sym.owner.is(ModuleClass) then
++      moduleVars.getOrElseUpdate((sym.owner, sym.name.toString),
++        resolveExternalDefTree(sym) match
++          case vdef: ValDef if !vdef.rhs.isEmpty => interpretTree(vdef.rhs)(using emptyEnv)
++          case _ => defaultValueOf(sym.info))
++    else
+     staticFieldCache.getOrElseUpdate(sym,
+       wellKnownSingleton(sym).orElse(javaPrimitiveTypeConstant(sym)).orElse(javaBoxedConstant(sym)).orElse(javaStaticFieldConstant(sym)).getOrElse {
+         resolveExternalDefTree(sym) match
+@@ -3430,6 +3920,18 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             case "HALF_EVEN" => Some(java.math.RoundingMode.HALF_EVEN)
+             case "UNNECESSARY" => Some(java.math.RoundingMode.UNNECESSARY)
+             case _ => None
++        // `java.util.concurrent.TimeUnit.MINUTES` & co: real JDK enum
++        // constants (chimney's per-derivation timeout).
++        case "TimeUnit" if sym.is(JavaDefined) =>
++          sym.name.toString match
++            case "NANOSECONDS" => Some(java.util.concurrent.TimeUnit.NANOSECONDS)
++            case "MICROSECONDS" => Some(java.util.concurrent.TimeUnit.MICROSECONDS)
++            case "MILLISECONDS" => Some(java.util.concurrent.TimeUnit.MILLISECONDS)
++            case "SECONDS" => Some(java.util.concurrent.TimeUnit.SECONDS)
++            case "MINUTES" => Some(java.util.concurrent.TimeUnit.MINUTES)
++            case "HOURS" => Some(java.util.concurrent.TimeUnit.HOURS)
++            case "DAYS" => Some(java.util.concurrent.TimeUnit.DAYS)
++            case _ => None
+         case "File" =>
+           // `java.io.File.separator`/`.separatorChar`/`.pathSeparator`/
+           // `.pathSeparatorChar` -- real JDK-native platform-dependent
+@@ -3525,14 +4027,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         import scala.quoted.runtime.impl.TypeImpl
+         // The `Type[T]` evidence is sometimes the raw dotc `Type` itself
+         // (bound by a call path that never wrapped it) -- same value.
+-        args.collectFirst { case t: TypeImpl => t.typeTree; case t: Type => tpd.TypeTree(t) }
++        args.collectFirst { case t: TypeImpl => t.typeTree; case t: Type => tpd.TypeTree(t) }.orElse(currentTypeArgs.headOption.map(tpd.TypeTree(_)))
+ 
+       case "of" if fn.owner.name.toString == "TypeReprModule" =>
+         // TypeReprModule#of[T](using Type[T]): TypeRepr = tp.typeTree.tpe
+         // (real QuotesImpl source, QuotesImpl.scala:1816-1817) -- same
+         // Type[T]-evidence-as-TypeImpl story as TypeTreeModule#of above.
+         import scala.quoted.runtime.impl.TypeImpl
+-        args.collectFirst { case t: TypeImpl => t.typeTree.tpe; case t: Type => t }
++        args.collectFirst { case t: TypeImpl => t.typeTree.tpe; case t: Type => t }.orElse(currentTypeArgs.headOption)
+ 
+       case "current" if fn.owner.name.toString == "SourceFileModule" =>
+         // SourceFileModule#current = ctx.compilationUnit.source (real source,
+@@ -3563,6 +4065,15 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case "toString" if (receiver.toList ::: args).exists(_.isInstanceOf[java.nio.file.Path]) =>
+         (receiver.toList ::: args).collectFirst { case p: java.nio.file.Path => p.toString }
+ 
++      // `quotes.reflect.Printer.TreeCode`/`TypeReprShortCode`/... (hearth and
++      // other macros pick a specific printer for `show`): the real
++      // `QuotesImpl` printer objects, passed through as opaque values.
++      case n if fn.owner.name.toString == "PrinterModule" && args.isEmpty => reflectPrinter(n)
++
++      // `X.show(using printer)` with an explicit printer: run it for real.
++      case "show" if args.size == 2 && isReflectPrinter(args(1)) && fn.owner.name.toString != "Quotes" =>
++        Some(showWithPrinter(args.head, args(1)))
++
+       case "show" if (receiver.toList ::: args).exists(_.isInstanceOf[Tree]) =>
+         // `TreeMethods#show(self)`: same story, `self` is an explicit arg,
+         // not this call's receiver. dotc's own `Tree#show` (this compiler's
+@@ -3611,7 +4122,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         receiver.collect { case q: QuotesImpl => q }.map { q =>
+           val pickled = args(0).asInstanceOf[String | List[String]]
+           val types = args(1).asInstanceOf[Seq[scala.quoted.Type[?]] | Null]
+-          q.unpickleTypeV2(pickled, types).asInstanceOf[Object]
++          val res = q.unpickleTypeV2(pickled, types)
++          if System.getenv("SCALINO_OUTER_DIAG") != null then
++            Console.err.println(s"[unpickleTypeDiag] types=${if types == null then "null" else types.map(t => t match { case ti: scala.quoted.runtime.impl.TypeImpl => ti.typeTree.tpe.show; case o => String.valueOf(o) }).mkString("[", "; ", "]")} result=${res match { case ti: scala.quoted.runtime.impl.TypeImpl => ti.typeTree.tpe.show; case o => String.valueOf(o) }}")
++          res.asInstanceOf[Object]
+         }
+ 
+       case "apply" if fn.owner == defn.QuotedExprClass.companionModule.moduleClass =>
+@@ -3900,6 +4414,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           case (s: Symbol) :: (annotSym: Symbol) :: Nil => Some(s.denot.getAnnotation(annotSym).map(_.tree))
+           case _ => None
+ 
++      // Every other `SymbolMethods` extension: delegated to the real
++      // `QuotesImpl` (same dotc `Symbol`/`Type` values either way, so no
++      // reimplementation needed -- see `interpretSymbolMethodsExtra`).
++      case n if fn.owner.name.toString == "SymbolMethods" => interpretSymbolMethodsExtra(n, args)
++
+       case "is" if fn.owner.name.toString == "FlagsMethods" =>
+         args match
+           case self :: that :: Nil => Some(Boolean.box(self.asInstanceOf[FlagSet].isAllOf(that.asInstanceOf[FlagSet])))
+@@ -4882,10 +5401,313 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         interpretTree(ddef.rhs)(using withParams)
+       case _ => throw new StopInterpretation(em"Interpreter (own implementation): cannot call $methodName directly on ${inst.toString}", pos)
+ 
++  /** JVM binary name of a class symbol (`a.b.Outer$Inner`), as written in
++   *  `META-INF/services` files and answered by `Class#getName`.
++   */
++  private def flatClassName(sym: Symbol): String =
++    val flat0 = sym.fullNameSeparated(FlatName).toString
++    // Nested classes come out without their package (`Iterator$ConcatIterator`).
++    val flat =
++      if flat0.contains(".") then flat0
++      else
++        val pkg = sym.enclosingPackageClass
++        if pkg.exists && !pkg.isEffectiveRoot then pkg.fullName.toString + "." + flat0 else flat0
++    if sym.is(Module) && !flat.endsWith("$") then flat + "$" else flat
++
++  private def getClassIfExists(name: String)(using Context): Symbol =
++    try staticRef(name.toTypeName).symbol
++    catch case _: Throwable => NoSymbol
++
++  /** Provider class names listed under `META-INF/services/<service>` by any
++   *  entry (directory or jar) of the compile classpath.
++   */
++  private def serviceProviderNames(service: String)(using Context): List[String] =
++    val resource = "META-INF/services/" + service
++    def parse(lines: Iterator[String]): List[String] =
++      lines.map(l => l.takeWhile(_ != '#').trim).filter(_.nonEmpty).toList
++    ctx.settings.classpath.value.split(java.io.File.pathSeparator).toList.filter(_.nonEmpty).flatMap { entry =>
++      val f = java.io.File(entry)
++      try
++        if f.isDirectory then
++          val sf = java.io.File(f, resource)
++          if sf.isFile then
++            val src = scala.io.Source.fromFile(sf, "UTF-8")
++            try parse(src.getLines()) finally src.close()
++          else Nil
++        else if f.isFile then
++          val zf = new java.util.zip.ZipFile(f)
++          try
++            Option(zf.getEntry(resource)).toList.flatMap { e =>
++              val src = scala.io.Source.fromInputStream(zf.getInputStream(e), "UTF-8")
++              try parse(src.getLines()) finally src.close()
++            }
++          finally zf.close()
++        else Nil
++      catch case _: java.io.IOException => Nil
++    }.distinct
++
++  /** Resolves a name obtained through `getMethod` against the Quotes API
++   *  (`Quotes`, `reflectModule` and every `*Module`/`*Methods` trait nested
++   *  in it) and runs it through the usual `interpretQuotesApi` handlers.
++   *  Unknown names raise `NoSuchMethodException`, as the real reflection
++   *  would, so callers wrapping the lookup in `try`/`Try` still work.
++   */
++  private def invokeReflectedApi(name: String, target: Object, args: List[Object])(using Env): Option[Object] =
++    name match
++      case "freshName" if args.size == 1 =>
++        Some(dotty.tools.dotc.core.NameKinds.MacroNames.fresh(termName(String.valueOf(args.head))).toString)
++      case "XmacroSettings" if args.isEmpty =>
++        Some(ctx.settings.XmacroSettings.value)
++      case _ =>
++        val reflectCls = defn.QuotesClass.info.member(typeName("reflectModule")).symbol
++        val owners = defn.QuotesClass :: (if reflectCls.exists then reflectCls :: reflectCls.info.decls.toList.filter(_.isClass) else Nil)
++        val candidates = owners.flatMap(_.info.member(termName(name)).alternatives.map(_.symbol)).filter(_.exists)
++        def arity(sym: Symbol) = sym.denot.paramSymss.flatten.count(_.isTerm)
++        candidates.find(arity(_) == args.size) match
++          case Some(sym) =>
++            interpretQuotesApi(Some(target), sym, args).orElse(interpretSymbolMethodsExtra(name, target :: args)) match
++              case None => notInterpretable(sym)
++              case some => some
++          case None => throw new NoSuchMethodException(name)
++
++  /** `cls`'s companion object, looked up by name in the owner's scope when
++   *  the denotation's own `companionModule` link isn't set up (observed for
++   *  stdlib classes unpickled from TASTy, e.g. `List`).
++   */
++  private def companionModuleOf(cls: Symbol)(using Context): Symbol =
++    val c = cls.denot.companionModule
++    if c.exists then c else cls.owner.info.member(cls.name.toTermName).symbol
++
++  /** The instance of an `object` nested inside the class instance `inst`,
++   *  created once (running the module's own constructor body, with `inst`
++   *  as its enclosing instance) and memoized in `inst.fields` under `key`.
++   */
++  private def nestedModuleInstance(inst: InterpretedInstance, moduleSym: Symbol, key: String)(using Env): Object =
++    inst.fields.get(key) match
++      case Some(existing) => existing
++      case None =>
++        val modCls = moduleSym.moduleClass.asClass
++        val moduleEnv = bindThis(inst.outerEnv, moduleSym.owner, inst)
++        // Registered BEFORE its constructor runs: the module's own body (or
++        // anything it triggers, e.g. `new Type.Cache`) may well read the very
++        // same module again, which must see this instance, not build another.
++        val created = InterpretedInstance(modCls, moduleEnv)
++        inst.fields(key) = created
++        try interpretNewFromTree(modCls.primaryConstructor, Nil, modCls.typeRef, created)(using moduleEnv)
++        catch
++          case t: Throwable =>
++            inst.fields.remove(key)
++            throw t
++        created
++
++  /** The concrete implementation (a `DefDef` with a body) of the abstract
++   *  method `sym` for `receiver`'s class, found by override matching first and
++   *  then by name and arity across the receiver's base classes.
++   */
++  private def implementationOf(receiver: Object, sym: Symbol)(using Context): Option[DefDef] =
++    val cc = receiverConcreteClass(receiver)
++    if !(cc.exists && cc.isClass) then None
++    else
++      def bodyOf(s: Symbol): Option[DefDef] =
++        if !s.exists then None
++        else resolveExternalDefTree(s) match
++          case d: DefDef if !d.rhs.isEmpty => Some(d)
++          case _ => None
++      def arity(x: Symbol) = x.denot.paramSymss.flatten.count(_.isTerm)
++      bodyOf(sym.overridingSymbol(cc.asClass)).orElse(
++        cc.asClass.baseClasses.iterator
++          .filter(_ != sym.owner)
++          .flatMap(_.info.decls.lookupAll(sym.name))
++          .filter(c => c.is(Method) && arity(c) == arity(sym))
++          .flatMap(bodyOf)
++          .nextOption())
++
++  /** A `java.util.Comparator` for `cmp`: a host comparator/`Ordering` as is, an
++   *  interpreted `Ordering` through its (interpreted) `compare`.
++   */
++  private def asComparator(cmp: Object)(using Env): java.util.Comparator[Object] = cmp match
++    case c: java.util.Comparator[Object @unchecked] => c
++    case f: Function2[Object @unchecked, Object @unchecked, Object @unchecked] @unchecked => (x: Object, y: Object) => f(x, y).asInstanceOf[Integer].intValue
++    case other =>
++      val compareSym = requiredClass("scala.math.Ordering").info.member(termName("compare")).symbol
++      if System.getenv("SCALINO_OUTER_DIAG") != null then
++        Console.err.println(s"[cmpDiag] receiver=${other.getClass.getName} concrete=${receiverConcreteClass(other)} ${other match { case i: InterpretedInstance => "fields=" + i.fields.keys.mkString(","); case m: ModuleValue => "module=" + m.moduleClass; case _ => "" }}")
++      (x: Object, y: Object) => callWithValues(other, compareSym, List(x, y)).asInstanceOf[Integer].intValue
++
++  /** Calls `sym` on `receiver` through the ordinary instance-call dispatch with
++   *  already-evaluated arguments (bound to throwaway symbols in `env`).
++   */
++  private def callWithValues(receiver: Object, sym: Symbol, values: List[Object])(using Env): Object =
++    val bound = values.zipWithIndex.map((v, i) => (newSymbol(ctx.owner, termName("arg$" + i), Synthetic, defn.AnyType), v))
++    val env2 = bound.foldLeft(env)((e, sv) => e.updated(sv._1, sv._2))
++    interpretInstanceCall(receiver, sym, bound.map(sv => tpd.ref(sv._1)), pos)(using env2)
++
++  private def isReflectPrinter(o: Object): Boolean =
++    o != null && o.getClass.getName.contains("Printer")
++
++  private def showWithPrinter(x: Object, printer: Object)(using Context): String =
++    val q = scala.quoted.runtime.impl.QuotesImpl().asInstanceOf[scala.quoted.runtime.impl.QuotesImpl]
++    printer.asInstanceOf[q.reflect.Printer[Any]].show(x)
++
++  private def reflectPrinter(name: String)(using Context): Option[Object] =
++    val q = scala.quoted.runtime.impl.QuotesImpl().asInstanceOf[scala.quoted.runtime.impl.QuotesImpl]
++    val pm = q.reflect.Printer
++    def r(x: Any): Option[Object] = Some(x.asInstanceOf[Object])
++    name match
++      case "TreeCode" => r(pm.TreeCode)
++      case "TreeShortCode" => r(pm.TreeShortCode)
++      case "TreeAnsiCode" => r(pm.TreeAnsiCode)
++      case "TreeStructure" => r(pm.TreeStructure)
++      case "TypeReprCode" => r(pm.TypeReprCode)
++      case "TypeReprShortCode" => r(pm.TypeReprShortCode)
++      case "TypeReprAnsiCode" => r(pm.TypeReprAnsiCode)
++      case "TypeReprStructure" => r(pm.TypeReprStructure)
++      case "ConstantCode" => r(pm.ConstantCode)
++      case "ConstantStructure" => r(pm.ConstantStructure)
++      case _ => None
++
++  /** The `quotes.reflect.SymbolMethods` extensions with no dedicated case in
++   *  `interpretQuotesApi`, forwarded to the real `QuotesImpl` implementation
++   *  (our `Symbol` is the raw dotc one, which is exactly what `QuotesImpl`
++   *  itself uses).
++   */
++  private def interpretSymbolMethodsExtra(name: String, args: List[Object])(using Context): Option[Object] =
++    val q = scala.quoted.runtime.impl.QuotesImpl().asInstanceOf[scala.quoted.runtime.impl.QuotesImpl]
++    val sm = q.reflect.SymbolMethods
++    def r(x: Any): Option[Object] = Some(x.asInstanceOf[Object])
++    args match
++      case (s0: Symbol) :: rest =>
++        val s = s0.asInstanceOf[q.reflect.Symbol]
++        (name, rest) match
++          case ("owner", Nil) => r(sm.owner(s))
++          case ("maybeOwner", Nil) => r(sm.maybeOwner(s))
++          case ("privateWithin", Nil) => r(sm.privateWithin(s))
++          case ("protectedWithin", Nil) => r(sm.protectedWithin(s))
++          case ("info", Nil) => r(sm.info(s))
++          case ("docstring", Nil) => r(sm.docstring(s))
++          case ("isDefinedInCurrentRun", Nil) => Some(Boolean.box(sm.isDefinedInCurrentRun(s)))
++          case ("isLocalDummy", Nil) => Some(Boolean.box(sm.isLocalDummy(s)))
++          case ("isRefinementClass", Nil) => Some(Boolean.box(sm.isRefinementClass(s)))
++          case ("isAnonymousClass", Nil) => Some(Boolean.box(sm.isAnonymousClass(s)))
++          case ("isAnonymousFunction", Nil) => Some(Boolean.box(sm.isAnonymousFunction(s)))
++          case ("isAbstractType", Nil) => Some(Boolean.box(sm.isAbstractType(s)))
++          case ("isSuperAccessor", Nil) => Some(Boolean.box(sm.isSuperAccessor(s)))
++          case ("isPackageDef", Nil) => Some(Boolean.box(sm.isPackageDef(s)))
++          case ("isValDef", Nil) => Some(Boolean.box(sm.isValDef(s)))
++          case ("isBind", Nil) => Some(Boolean.box(sm.isBind(s)))
++          case ("declaredField", (n: String) :: Nil) => r(sm.declaredField(s)(n))
++          case ("declaredFields", Nil) => r(sm.declaredFields(s))
++          case ("memberField", (n: String) :: Nil) => r(sm.memberField(s)(n))
++          case ("fieldMember", (n: String) :: Nil) => r(sm.fieldMember(s)(n))
++          case ("declaredMethods", Nil) => r(sm.declaredMethods(s))
++          case ("memberMethod", (n: String) :: Nil) => r(sm.memberMethod(s)(n))
++          case ("declaredType", (n: String) :: Nil) => r(sm.declaredType(s)(n))
++          case ("declaredTypes", Nil) => r(sm.declaredTypes(s))
++          case ("memberType", (n: String) :: Nil) => r(sm.memberType(s)(n))
++          case ("typeMember", (n: String) :: Nil) => r(sm.typeMember(s)(n))
++          case ("memberTypes", Nil) => r(sm.memberTypes(s))
++          case ("typeMembers", Nil) => r(sm.typeMembers(s))
++          case ("allOverriddenSymbols", Nil) => r(sm.allOverriddenSymbols(s))
++          case ("overridingSymbol", (c: Symbol) :: Nil) => r(sm.overridingSymbol(s)(c.asInstanceOf[q.reflect.Symbol]))
++          case _ => None
++      case _ => None
++
++  /** hearth's `platformSpecificServiceLoader.load`/`loadWhen`/
++   *  `loadExcluding` (every chimney 2.x derivation goes through it to
++   *  discover Hearth's own std extensions plus any user-supplied ones):
++   *  the real JDK `ServiceLoader` instantiates providers reflectively,
++   *  which an interpreted macro can't do. Emulated here instead: read the
++   *  `META-INF/services/<service>` entries off the compile classpath and
++   *  instantiate each provider class by interpreting its constructor,
++   *  keeping the `Right(Loaded(services, failures))` shape the callers
++   *  expect.
++   */
++  private def interpretHearthServiceLoader(fn: Symbol, args: List[Object])(using Env): Option[Object] =
++    if fn.owner.name.toString.stripSuffix("$") != "platformSpecificServiceLoader" then None
++    else (fn.name.toString, args) match
++      case (name @ ("load" | "loadWhen" | "loadExcluding"), (service: Type) :: _ :: rest) =>
++        val keep: Symbol => Boolean = name match
++          case "loadWhen" =>
++            val cond = rest.head.asInstanceOf[Object => Object]
++            sym => asBoolean(cond(sym.typeRef))
++          case "loadExcluding" =>
++            val excluded = rest.flatMap(asObjectList).map(String.valueOf).toSet
++            sym => !excluded.contains(flatClassName(sym))
++          case _ => _ => true
++        val providers = serviceProviderNames(flatClassName(service.typeSymbol))
++          .flatMap(n => Option(getClassIfExists(n)).filter(_.exists))
++          .filter(keep)
++          .map { cls =>
++            val newTree = tpd.New(cls.typeRef).select(cls.asClass.primaryConstructor).appliedToNone
++            interpretTree(newTree)(using env)
++          }
++        val loadedCls = fn.owner.info.member(typeName("Loaded")).symbol.asClass
++        val loaded = InterpretedInstance(loadedCls, emptyEnv)
++        loaded.fields("services") = providers.toVector
++        loaded.fields("failures") = Vector.empty[Object]
++        Some(scala.util.Right(loaded))
++      case _ => None
++
+   private def interpretStdlibIntrinsic(receiver: Object, fn: Symbol, args: List[Object])(using Env): Option[Object] =
+     if debugEnabled then
+       Console.err.println(s"[interpretStdlibIntrinsic] receiver.getClass=${if receiver == null then "null" else receiver.getClass} fn.name=${fn.name} args=${args.map(a => if a == null then "null" else a.getClass)}")
+     (receiver, fn.name.toString, args) match
++      // `x.getClass.getMethod(name, ...).invoke(target, args*)`: hearth's way
++      // of calling `@experimental` `quotes.reflect` members (`freshName`,
++      // `SymbolMethods#tree`, `CompilationInfo#XmacroSettings`, ...) without
++      // marking its whole codebase experimental. The "method" is just its
++      // name; `invoke` resolves it against the real Quotes API.
++      case (_, "getMethod" | "getDeclaredMethod", (name: String) :: _) if fn.owner.name.toString == "Class" && fn.owner.is(JavaDefined) =>
++        Some(ReflectedApiMethod(name))
++      case (m: ReflectedApiMethod, "invoke", target :: rest) =>
++        val invokeArgs = rest match
++          case (a: Array[Object @unchecked]) :: Nil => a.toList
++          case (s: scala.collection.Seq[Object @unchecked]) :: Nil => s.toList
++          case other => other
++        invokeReflectedApi(m.name, target, invokeArgs)
++      case (d: FakeDuration, "toMillis", Nil) => Some(java.lang.Long.valueOf(d.nanos / 1000000L))
++      case (d: FakeDuration, "toNanos", Nil) => Some(java.lang.Long.valueOf(d.nanos))
++      case (d: FakeDuration, "getSeconds", Nil) => Some(java.lang.Long.valueOf(d.nanos / 1000000000L))
++      case (i: FakeInstant, "toEpochMilli", Nil) => Some(java.lang.Long.valueOf(i.nanos / 1000000L))
++      // `IterableOps#iterableFactory`/`mapFactory` on a real host collection:
++      // abstract on the trait, answered by the concrete class's companion.
++      case (r: scala.collection.Iterable[?], "iterableFactory", Nil) =>
++        Some(ModuleValue(requiredModule(r.iterableFactory.getClass.getName.stripSuffix("$")).moduleClass))
++      case (r: scala.collection.Map[?, ?], "mapFactory", Nil) =>
++        Some(ModuleValue(requiredModule(r.mapFactory.getClass.getName.stripSuffix("$")).moduleClass))
++      case (u: java.util.concurrent.TimeUnit, "toNanos", (d: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(u.toNanos(d)))
++      case (u: java.util.concurrent.TimeUnit, "toMillis", (d: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(u.toMillis(d)))
++      case (u: java.util.concurrent.TimeUnit, "toSeconds", (d: java.lang.Long) :: Nil) => Some(java.lang.Long.valueOf(u.toSeconds(d)))
++      case (u: java.util.concurrent.TimeUnit, "convert", (d: java.lang.Long) :: (v: java.util.concurrent.TimeUnit) :: Nil) => Some(java.lang.Long.valueOf(u.convert(d, v)))
++      case (a: java.util.concurrent.atomic.AtomicLong, "get", Nil) => Some(java.lang.Long.valueOf(a.get()))
++      case (a: java.util.concurrent.atomic.AtomicLong, "set", (n: java.lang.Number) :: Nil) => a.set(n.longValue); Some(().asInstanceOf[Object])
++      case (a: java.util.concurrent.atomic.AtomicLong, "incrementAndGet", Nil) => Some(java.lang.Long.valueOf(a.incrementAndGet()))
++      case (a: java.util.concurrent.atomic.AtomicLong, "getAndIncrement", Nil) => Some(java.lang.Long.valueOf(a.getAndIncrement()))
++      case (a: java.util.concurrent.atomic.AtomicLong, "addAndGet", (n: java.lang.Number) :: Nil) => Some(java.lang.Long.valueOf(a.addAndGet(n.longValue)))
++      case (a: java.util.concurrent.atomic.AtomicInteger, "get", Nil) => Some(java.lang.Integer.valueOf(a.get()))
++      case (a: java.util.concurrent.atomic.AtomicInteger, "set", (n: java.lang.Number) :: Nil) => a.set(n.intValue); Some(().asInstanceOf[Object])
++      case (a: java.util.concurrent.atomic.AtomicInteger, "incrementAndGet", Nil) => Some(java.lang.Integer.valueOf(a.incrementAndGet()))
++      case (a: java.util.concurrent.atomic.AtomicInteger, "getAndIncrement", Nil) => Some(java.lang.Integer.valueOf(a.getAndIncrement()))
++      case (a: java.util.concurrent.atomic.AtomicInteger, "addAndGet", (n: java.lang.Number) :: Nil) => Some(java.lang.Integer.valueOf(a.addAndGet(n.intValue)))
++      case (a: java.util.concurrent.atomic.AtomicBoolean, "get", Nil) => Some(java.lang.Boolean.valueOf(a.get()))
++      case (a: java.util.concurrent.atomic.AtomicBoolean, "set", (v: java.lang.Boolean) :: Nil) => a.set(v); Some(().asInstanceOf[Object])
++      case (a: java.util.concurrent.atomic.AtomicBoolean, "getAndSet", (v: java.lang.Boolean) :: Nil) => Some(java.lang.Boolean.valueOf(a.getAndSet(v)))
++      case (a: java.util.concurrent.atomic.AtomicBoolean, "compareAndSet", (e: java.lang.Boolean) :: (v: java.lang.Boolean) :: Nil) => Some(java.lang.Boolean.valueOf(a.compareAndSet(e, v)))
++      case (a: java.util.concurrent.atomic.AtomicReference[Object @unchecked], "get", Nil) => Some(a.get())
++      case (a: java.util.concurrent.atomic.AtomicReference[Object @unchecked], "set", v :: Nil) => a.set(v); Some(().asInstanceOf[Object])
++      // A lambda SAM-converted to `Ordering`/`Comparator` is a bare closure here.
++      case (f: Function2[Object @unchecked, Object @unchecked, Object @unchecked] @unchecked, "compare", x :: y :: Nil) => Some(f(x, y))
++      // `java.lang.Boolean#booleanValue` & co: unboxing of host boxed values
++      // (e.g. from a `java.util.Map` or a reflective `invoke` result).
++      case (v: java.lang.Boolean, "booleanValue", Nil) => Some(v)
++      case (v: java.lang.Integer, "intValue", Nil) => Some(v)
++      case (v: java.lang.Long, "longValue", Nil) => Some(v)
++      case (v: java.lang.Double, "doubleValue", Nil) => Some(v)
++      case (v: java.lang.Character, "charValue", Nil) => Some(v)
++      // `Class#getName` on a `classOf`-style value (our representation of a
++      // `Class` is the dotc `Type` itself, see `classOf` above).
++      case (t: Type, "getName", Nil) if fn.owner.name.toString == "Class" && fn.owner.is(JavaDefined) =>
++        Some(flatClassName(t.typeSymbol))
+       // `RichInt`/`RichChar`/`RichLong`/etc (e.g. `65.toChar.to(90.toChar)`,
+       // from `Rfc3986`'s hand-rolled char-range parsers, reached via
+       // http4s's `uri"..."` literal macro): all `extends AnyVal with
+@@ -4910,6 +5732,20 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (b: java.util.BitSet, "flip", (from: Integer) :: (to: Integer) :: Nil) => b.flip(from, to); Some(().asInstanceOf[Object])
+       case (b: java.util.BitSet, "cardinality", Nil) => Some(Int.box(b.cardinality()))
+       case (b: java.util.BitSet, "nextSetBit", (from: Integer) :: Nil) => Some(Int.box(b.nextSetBit(from)))
++      // `java.util.WeakHashMap`/`java.util.HashMap`: real JDK-native methods
++      // (see the matching `newStdlibCollection` case) -- hearth's
++      // `loader.scala` per-classloader caches, reached through chimney 2.x.
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "get", k :: Nil) if fn.owner.is(JavaDefined) => Some(m.get(k))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "put", k :: v :: Nil) if fn.owner.is(JavaDefined) => Some(m.put(k, v))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "containsKey", k :: Nil) if fn.owner.is(JavaDefined) => Some(Boolean.box(m.containsKey(k)))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "remove", k :: Nil) if fn.owner.is(JavaDefined) => Some(m.remove(k))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "getOrDefault", k :: d :: Nil) if fn.owner.is(JavaDefined) => Some(m.getOrDefault(k, d))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "putIfAbsent", k :: v :: Nil) if fn.owner.is(JavaDefined) => Some(m.putIfAbsent(k, v))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "computeIfAbsent", k :: (f: Function1[Object, Object] @unchecked) :: Nil) if fn.owner.is(JavaDefined) =>
++        Some(m.computeIfAbsent(k, kk => f(kk)))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "clear", Nil) if fn.owner.is(JavaDefined) => m.clear(); Some(().asInstanceOf[Object])
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "size", Nil) if fn.owner.is(JavaDefined) => Some(Int.box(m.size()))
++      case (m: java.util.Map[Object @unchecked, Object @unchecked], "isEmpty", Nil) if fn.owner.is(JavaDefined) => Some(Boolean.box(m.isEmpty()))
+       // `java.util.regex.Pattern`/`Matcher`: real JDK classes, no retained
+       // Scala source ever -- needed by `scala.util.matching.Regex`'s own
+       // `replaceAllIn`/`findFirstIn`/etc (interpreted, since `Regex` itself
+@@ -4921,6 +5757,17 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // see the matching `newStdlibCollection` case.
+       case (p: java.util.regex.Pattern, "matcher", List(s: CharSequence @unchecked)) => Some(p.matcher(s))
+       case (m: java.util.regex.Matcher, "find", Nil) => Some(Boolean.box(m.find()))
++      case (m: java.util.regex.Matcher, "find", List(i: Integer)) => Some(Boolean.box(m.find(i)))
++      case (m: java.util.regex.Matcher, "matches", Nil) => Some(Boolean.box(m.matches()))
++      case (m: java.util.regex.Matcher, "lookingAt", Nil) => Some(Boolean.box(m.lookingAt()))
++      case (m: java.util.regex.Matcher, "hitEnd", Nil) => Some(Boolean.box(m.hitEnd()))
++      case (m: java.util.regex.Matcher, "reset", Nil) => Some(m.reset())
++      case (m: java.util.regex.Matcher, "reset", List(s: CharSequence @unchecked)) => Some(m.reset(s))
++      case (m: java.util.regex.Matcher, "replaceAll", List(r: String)) => Some(m.replaceAll(r))
++      case (m: java.util.regex.Matcher, "replaceFirst", List(r: String)) => Some(m.replaceFirst(r))
++      case (p: java.util.regex.Pattern, "pattern" | "toString", Nil) => Some(p.pattern())
++      case (p: java.util.regex.Pattern, "flags", Nil) => Some(Int.box(p.flags()))
++      case (p: java.util.regex.Pattern, "split", List(s: CharSequence @unchecked)) => Some(p.split(s))
+       case (m: java.util.regex.Matcher, "group", Nil) => Some(m.group())
+       case (m: java.util.regex.Matcher, "group", List(i: Integer)) => Some(m.group(i))
+       case (m: java.util.regex.Matcher, "group", List(s: String)) => Some(m.group(s))
+@@ -5614,7 +6461,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case _ => throw new StopInterpretation(em"Interpreter (own implementation): unsupported primitive op $op", pos)
+ 
+   private def unexpectedTree(tree: Tree): Object =
+-    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}", tree.srcPos)
++    throw new StopInterpretation(em"Unexpected tree could not be interpreted: ${tree.toString}${if tree.isEmpty then "\n  (interpreting: " + defStack.take(6).map(_.showLocated).mkString(" <- ") + ")" else ""}", tree.srcPos)
+ 
+ end Interpreter
+ 
+@@ -5622,6 +6469,19 @@ end Interpreter
+  *  resolved purely from the callee's symbol/tree, so no backing JVM object is
+  *  needed.
+  */
++/** What `getMethod`/`getDeclaredMethod` answer inside an interpreted macro:
++ *  just the method's name. `invoke` later resolves it against the real
++ *  `quotes.reflect` API (see `Interpreter#invokeReflectedApi`).
++ */
++final case class ReflectedApiMethod(name: String)
++
++/** Stand-ins for `java.time.Instant`/`Duration` (absent from the Scala Native
++ *  javalib this compiler is linked against), enough for macros that time
++ *  their own expansion.
++ */
++final case class FakeInstant(nanos: Long)
++final case class FakeDuration(nanos: Long)
++
+ case class ModuleValue(moduleClass: Symbol)
+ 
+ /** A same-run object built by interpreting its constructor, instead of by
+diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+index d0ef2b2..507c181 100644
+--- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+@@ -42,12 +42,33 @@ object Splicer {
+    *
+    *  See: `Staging`
+    */
++  /** Runs `body` on a fresh thread with a very large stack and waits for it.
++   *
++   *  The tree-walking macro interpreter recurses natively (every interpreted
++   *  call costs several large native frames), and a real derivation such as
++   *  chimney's nests hundreds of interpreted calls: the compiler's own
++   *  (default, 8MB) main-thread stack overflows long before the macro
++   *  finishes. The stack is only reserved, not committed, so this costs
++   *  nothing for small macros.
++   */
++  private def onBigStack[T](body: => T): T =
++    if Thread.currentThread().getName == "scalino-macro" then body
++    else
++      var result: Either[Throwable, T] | Null = null
++      val thread = new Thread(null, () => { result = try Right(body) catch { case e: Throwable => Left(e) } }, "scalino-macro", 512L * 1024 * 1024)
++      thread.start()
++      thread.join()
++      result match
++        case Right(v) => v
++        case Left(e) => throw e
++        case null => throw new IllegalStateException("macro expansion thread produced no result")
++
+   def splice(tree: Tree, splicePos: SrcPos, spliceExpansionPos: SrcPos, classLoader: ClassLoader)(using Context): Tree = tree match {
+     case Quote(quotedTree, Nil) => quotedTree
+     case _ =>
+       val owner = ctx.owner
+       val macroOwner = newSymbol(owner, nme.MACROkw, Macro | Synthetic, defn.AnyType, coord = tree.span)
+-      try
++      try onBigStack {
+         val sliceContext = SpliceScope.contextWithNewSpliceScope(splicePos.sourcePos).withOwner(macroOwner)
+         inContext(sliceContext) {
+           val oldContextClassLoader = Thread.currentThread().getContextClassLoader
+@@ -86,6 +107,7 @@ object Splicer {
+             Thread.currentThread().setContextClassLoader(oldContextClassLoader)
+           }
+         }.changeOwner(macroOwner, ctx.owner)
++      }
+       catch {
+         case ex: CompilationUnit.SuspendException =>
+           throw ex
+@@ -387,7 +409,7 @@ object Splicer {
+           Console.err.println(s"[quoteTypeBindings] body2=${body2.show} typeBindings=${typeBindings.map((s, t) => s"$s(${System.identityHashCode(s)})->${t.show}")} fullEnvKeys=${env.keys.map(k => s"$k(${System.identityHashCode(k)})").mkString(",")}")
+         val body3 =
+           if typeBindings.isEmpty then body2
+-          else new TreeTypeMap(typeMap = _.subst(typeBindings.map(_._1), typeBindings.map(_._2))).transform(body2)
++          else new TreeTypeMap(typeMap = tp => resolveDependentType(tp.subst(typeBindings.map(_._1), typeBindings.map(_._2)))).transform(body2)
+         if Interpreter.debugEnabled then
+           Console.err.println(s"[quoteBody3] body2.show=${body2.show} body3.show=${body3.show} body3.tpe=${body3.tpe.show}")
+         new ExprImpl(Inlined(EmptyTree, Nil, body3.changeNonLocalOwners(ctx.owner)).withSpan(body3.span), SpliceScope.getCurrent)
+@@ -402,9 +424,9 @@ object Splicer {
+         // as the term-quote case above does, so the resulting `Type[T]`
+         // carries the real type (it's what `case '[List[t]]` then matches).
+         val typeBindings = env.iterator.collect { case (sym, tp: Type) => (sym, tp) }.toList
+-        val quoted1 =
+-          if typeBindings.isEmpty then quoted
+-          else new TreeTypeMap(typeMap = _.subst(typeBindings.map(_._1), typeBindings.map(_._2))).transform(quoted)
++        // Also path-dependent types (`init.Underlying`, with `init` an
++        // interpreted value): see `Interpreter#resolveDependentType`.
++        val quoted1 = new TreeTypeMap(typeMap = tp => resolveDependentType(tp.subst(typeBindings.map(_._1), typeBindings.map(_._2)))).transform(quoted)
+         new TypeImpl(quoted1.changeNonLocalOwners(ctx.owner), SpliceScope.getCurrent)
+ 
+       case _ =>

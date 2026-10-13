@@ -215,7 +215,7 @@ if [[ -n "${SCALINO_BOOTSTRAP_LINKDRIVER:-}" ]]; then
     "$CLANG" \
     "$CLANGPP" \
     info \
-    --mode release-fast \
+    --mode "$SCALINO_LINK_MODE" \
     --no-incremental-compilation \
     "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}"
 else
@@ -229,7 +229,7 @@ else
       "$CLANG" \
       "$CLANGPP" \
       info \
-      --mode release-fast \
+      --mode "$SCALINO_LINK_MODE" \
       --multithreading \
       --no-direct-codegen \
       --no-incremental-compilation \

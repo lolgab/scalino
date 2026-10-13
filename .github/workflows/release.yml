@@ -27,6 +27,8 @@ jobs:
       # Single link/codegen/clang worker: parallel clang on the 2-core runners
       # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
       SCALANATIVE_LINK_THREADS: '1'
+      # Tag builds ship optimized binaries; everything else links in debug mode.
+      SCALINO_LINK_MODE: release-fast
     strategy:
       fail-fast: false
       matrix:

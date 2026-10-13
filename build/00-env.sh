@@ -134,3 +134,9 @@ require cs
 require "$JAVA"
 require "$JAVAC"
 require "$CLANG"
+
+# Scala Native link mode for the scalino-dotc / linkdriver / lsp self-links:
+# `debug` (fast to link) for local builds and CI; the release workflow (tags)
+# sets `release-fast`. The scalino CLI link (07) uses release-size when this is
+# anything but `debug`.
+export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-debug}"

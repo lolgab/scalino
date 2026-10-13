@@ -115,7 +115,7 @@ LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$N
 # itself is much smaller, but this is cheap insurance either way).
 # SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
 # heap badly (interflow's garbage); without it the link runs out of heap.
-env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP" info --mode release-size --multithreading --no-incremental-compilation
+env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP" info --mode "$([[ "$SCALINO_LINK_MODE" == debug ]] && echo debug || echo release-size)" --multithreading --no-incremental-compilation
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"
 chmod +x "$DIST/scalino"

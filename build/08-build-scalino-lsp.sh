@@ -168,7 +168,7 @@ env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" \
   "$CLANG" \
   "$CLANGPP" \
   info \
-  --mode release-fast \
+  --mode "$SCALINO_LINK_MODE" \
   --no-incremental-compilation \
   --embed-resources
 
