@@ -111,7 +111,11 @@ code) simply do not match and are optimized as before.
   `SCALANATIVE_LINK_STACK_MB`), like the JVM driver's `-Xss64m`; with the OS
   default (512KB on macOS) the escape analysis recursion overflowed on dotc-sized
   inputs.
-* Linking dotc/lsp needs `SCALANATIVE_EVAC_ENABLE=1`, and the instrumented links
-  `SCALANATIVE_GC_SYNC_TIMEOUT_MS=0` (LLVM can sit in one instrumented function
-  longer than the GC's safepoint timeout).
+* Linking dotc/lsp needs `SCALANATIVE_EVAC_ENABLE=1`. The long LLVM-C calls
+  (`LLVMRunPasses`, `LLVMTargetMachineEmitToFile`, `LLVMVerifyModule`,
+  `LLVMDIBuilderFinalize`, module/context disposal) are `@blocking` externs
+  (patch `scala-native-0080`), so the GC can collect while a codegen thread is
+  inside LLVM; unannotated they looked like a stuck thread, and one huge function
+  exceeded the GC's 60s safepoint timeout and aborted the link. The instrumented
+  pipeline links still set `SCALANATIVE_GC_SYNC_TIMEOUT_MS=0` as a precaution.
 * Don't run several dotc links at once on a 16GB machine.

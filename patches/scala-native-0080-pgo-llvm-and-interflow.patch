@@ -112,10 +112,75 @@ index b51308c..23cfc2b 100644
      case build.Mode.ReleaseFast => "default<O2>"
      // Not `default<Oz>`: LLVM 23 removed that pipeline spelling ("Use O2 in
 diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
-index ff4848c..5cec52b 100644
+index ff4848c..dfcb68b 100644
 --- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
-@@ -566,4 +566,16 @@ private[direct] object LLVMCApi {
+@@ -128,12 +128,12 @@ private[direct] object LLVMCApi {
+   @extern
+   private[direct] object Core {
+     def LLVMContextCreate(): LLVMContextRef = extern
+-    def LLVMContextDispose(ctx: LLVMContextRef): Unit = extern
++    @blocking def LLVMContextDispose(ctx: LLVMContextRef): Unit = extern
+     def LLVMModuleCreateWithNameInContext(
+         moduleId: CString,
+         ctx: LLVMContextRef
+     ): LLVMModuleRef = extern
+-    def LLVMDisposeModule(m: LLVMModuleRef): Unit = extern
++    @blocking def LLVMDisposeModule(m: LLVMModuleRef): Unit = extern
+     def LLVMSetTarget(m: LLVMModuleRef, triple: CString): Unit = extern
+     def LLVMAddModuleFlag(
+         m: LLVMModuleRef,
+@@ -412,7 +412,7 @@ private[direct] object LLVMCApi {
+ 
+   @extern
+   private[direct] object Analysis {
+-    def LLVMVerifyModule(
++    @blocking def LLVMVerifyModule(
+         m: LLVMModuleRef,
+         action: CInt,
+         outMessage: Ptr[CString]
+@@ -429,7 +429,7 @@ private[direct] object LLVMCApi {
+   private[direct] object DebugInfo {
+     def LLVMCreateDIBuilder(m: LLVMModuleRef): LLVMDIBuilderRef = extern
+     def LLVMDisposeDIBuilder(builder: LLVMDIBuilderRef): Unit = extern
+-    def LLVMDIBuilderFinalize(builder: LLVMDIBuilderRef): Unit = extern
++    @blocking def LLVMDIBuilderFinalize(builder: LLVMDIBuilderRef): Unit = extern
+     def LLVMDIBuilderCreateFile(
+         builder: LLVMDIBuilderRef,
+         filename: CString,
+@@ -535,7 +535,7 @@ private[direct] object LLVMCApi {
+     def LLVMDisposeTargetMachine(t: LLVMTargetMachineRef): Unit = extern
+     def LLVMCreateTargetDataLayout(t: LLVMTargetMachineRef): LLVMTargetDataRef = extern
+     def LLVMCopyStringRepOfTargetData(td: LLVMTargetDataRef): CString = extern
+-    def LLVMTargetMachineEmitToFile(
++    @blocking def LLVMTargetMachineEmitToFile(
+         t: LLVMTargetMachineRef,
+         m: LLVMModuleRef,
+         filename: CString,
+@@ -544,6 +544,13 @@ private[direct] object LLVMCApi {
+     ): LLVMBool = extern
+   }
+ 
++  // `@blocking` (here and on LLVMVerifyModule, LLVMDIBuilderFinalize,
++  // LLVMDisposeModule/LLVMContextDispose): these run for as long as LLVM takes
++  // on a whole module, with no safepoint polls. Unannotated, the GC waits for
++  // the calling thread to come back before it can collect (a huge function made
++  // that exceed SCALANATIVE_GC_SYNC_TIMEOUT_MS and abort the link); `@blocking`
++  // lets it collect meanwhile. All arguments are C memory (Zone/malloc), never
++  // GC-managed objects, and LLVM never calls back into Scala.
+   // llvm-c/Transforms/PassBuilder.h + llvm-c/Error.h. `LLVMRunPasses` is the
+   // new-PM equivalent of what `clang -O2` does to a module before handing it
+   // to the codegen backend -- mem2reg, SROA, GVN (incl. redundant
+@@ -557,7 +564,7 @@ private[direct] object LLVMCApi {
+   private[direct] object Passes {
+     def LLVMCreatePassBuilderOptions(): LLVMPassBuilderOptionsRef = extern
+     def LLVMDisposePassBuilderOptions(options: LLVMPassBuilderOptionsRef): Unit = extern
+-    def LLVMRunPasses(
++    @blocking def LLVMRunPasses(
+         m: LLVMModuleRef,
+         passes: CString,
+         tm: LLVMTargetMachineRef,
+@@ -566,4 +573,16 @@ private[direct] object LLVMCApi {
      def LLVMGetErrorMessage(err: LLVMErrorRef): CString = extern
      def LLVMDisposeErrorMessage(errMsg: CString): Unit = extern
    }

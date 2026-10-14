@@ -39,10 +39,6 @@ pgo_prepare() {
     PGO_ENV+=("SCALANATIVE_PGO_PROFILE=$d/$name.interflow.txt")
   fi
   if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
-    # LLVM can spend longer than the GC's 60s safepoint timeout inside one huge
-    # function (a codegen thread in native code can't reach a safepoint), which
-    # would abort the link; PGO makes that more likely.
-    PGO_ENV+=("SCALANATIVE_GC_SYNC_TIMEOUT_MS=0")
     echo "  PGO: using $PGO_DIR/$name.* (${#PGO_ENV[@]} setting(s))"
   else
     echo "  PGO: no usable profile for $name in $PGO_DIR, linking without"
