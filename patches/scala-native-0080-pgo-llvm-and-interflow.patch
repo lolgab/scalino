@@ -1,0 +1,446 @@
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+index b51308c..23cfc2b 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+@@ -35,7 +35,7 @@ import scala.scalanative.unsafe._
+ import scala.scalanative.unsigned._
+ 
+ import LLVMCApi._
+-import LLVMCApi.{Core => C, Analysis => A, Target => T, TargetMachine => TM, DebugInfo => DI, Passes => P}
++import LLVMCApi.{Core => C, Analysis => A, Target => T, TargetMachine => TM, DebugInfo => DI, Passes => P, Support}
+ 
+ private[codegen] object DirectCodeGen {
+ 
+@@ -65,6 +65,62 @@ private[codegen] object DirectCodeGen {
+       }
+     }
+ 
++  // ---- IR-level profile guided optimization (LLVM's own PGO passes) ------
++  // `SCALANATIVE_PGO_GEN=1`: instrument every function (entry-first, plus
++  // indirect-call value profiling) before the optimization pipeline; the
++  // linked program needs the compiler-rt profile runtime (see build/pgo) and
++  // writes `.profraw` files at exit (`LLVM_PROFILE_FILE`).
++  // `SCALANATIVE_PGO_USE=<merged.profdata>`: annotate the IR with it before
++  // the pipeline, which then inlines/lays out/devirtualizes accordingly.
++  // Both passes run on the unoptimized IR so the CFG they hash is the same in
++  // both builds.
++  private[direct] def envFlag(name: String): Boolean =
++    sys.env.get(name).exists(v => v.nonEmpty && v != "0" && v != "false")
++  private[direct] val pgoGen: Boolean = envFlag("SCALANATIVE_PGO_GEN")
++  private[direct] val pgoUse: Option[String] =
++    sys.env.get("SCALANATIVE_PGO_USE").filter(_.nonEmpty).filter { path =>
++      // pgo-instr-use only reads indexed profiles ("\xfflprofi\x81"); given
++      // anything else (a text profile, a .profraw) it fails *silently* inside
++      // the pass pipeline and the build just comes out unprofiled.
++      val magic = Array(0xff, 0x6c, 0x70, 0x72, 0x6f, 0x66, 0x69, 0x81).map(_.toByte)
++      val ok =
++        try {
++          val in = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(path))
++          try { val buf = new Array[Byte](8); in.read(buf) == 8 && java.util.Arrays.equals(buf, magic) }
++          finally in.close()
++        } catch { case _: java.io.IOException => false }
++      if (!ok)
++        System.err.println(
++          s"[pgo] SCALANATIVE_PGO_USE=$path is not an indexed LLVM profile " +
++            "(llvm-profdata merge <text|raw> -o x.profdata): ignoring it"
++        )
++      ok
++    }
++
++  private val pgoOptionsLock = new Object
++  private var pgoOptionsSet = false
++
++  /** `cl::opt`s are process global and not thread safe to set: do it once,
++   *  from `emit`, before any codegen worker thread calls into LLVM.
++   */
++  private[direct] def ensurePgoOptions(): Unit =
++    if (pgoGen || pgoUse.isDefined)
++      pgoOptionsLock.synchronized {
++        if (!pgoOptionsSet) {
++          pgoOptionsSet = true
++          val args =
++            List("scalino") ++
++              (if (pgoGen) List("-pgo-instrument-entry=true") else Nil) ++
++              pgoUse.toList.map(p => s"-pgo-test-profile-file=$p")
++          Zone.acquire { implicit z =>
++            val argv = alloc[CString](args.length.toUSize)
++            args.zipWithIndex.foreach { case (a, i) => argv(i) = toCString(a) }
++            Support.LLVMParseCommandLineOptions(args.length, argv, null)
++          }
++        }
++      }
++
++
+   /** Pure, cheap classification of one partition -- no LLVM API calls, just
+    *  a walk over already-in-memory NIR. Called synchronously (not inside a
+    *  `Future`) by CodeGen.scala so it can decide *before* scheduling any
+@@ -93,7 +149,12 @@ private[codegen] object DirectCodeGen {
+       env: Map[nir.Global, nir.Defn],
+       capableDefns: Seq[nir.Defn],
+       objPath: Path
+-  )(implicit platform: PlatformInfo): Boolean =
++  )(implicit platform: PlatformInfo): Boolean = {
++    // Before this worker (or any other one, they all wait on its lock) calls
++    // into LLVM at all: parsing cl::opts while another worker is already
++    // building IR or running passes races ("Option 'h' registered more than
++    // once", LLVM ERROR: inconsistency in registered CommandLine options).
++    ensurePgoOptions()
+     try {
+       new DirectCodeGen(config, env, capableDefns).emitTo(objPath)
+       true
+@@ -110,6 +171,7 @@ private[codegen] object DirectCodeGen {
+         )
+         false
+     }
++  }
+ 
+   private object Capability {
+ 
+@@ -1244,7 +1306,13 @@ private[direct] final class DirectCodeGen(
+   // `LLVMCreateTargetMachine` below (that one only tunes the codegen
+   // backend's instruction selection/scheduling, and runs no IR-level
+   // passes on its own -- see LLVMCApi.Passes's doc comment).
+-  private def passPipelineFor(mode: build.Mode): String = mode match {
++  private def passPipelineFor(mode: build.Mode): String =
++    (if (mode == build.Mode.Debug) ""
++     else if (DirectCodeGen.pgoGen) "pgo-instr-gen,instrprof,"
++     else if (DirectCodeGen.pgoUse.isDefined) "pgo-instr-use,pgo-icall-prom,"
++     else "") + basePassPipelineFor(mode)
++
++  private def basePassPipelineFor(mode: build.Mode): String = mode match {
+     case build.Mode.Debug       => "default<O0>"
+     case build.Mode.ReleaseFast => "default<O2>"
+     // Not `default<Oz>`: LLVM 23 removed that pipeline spelling ("Use O2 in
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
+index ff4848c..5cec52b 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
+@@ -566,4 +566,16 @@ private[direct] object LLVMCApi {
+     def LLVMGetErrorMessage(err: LLVMErrorRef): CString = extern
+     def LLVMDisposeErrorMessage(errMsg: CString): Unit = extern
+   }
++
++  // llvm-c/Support.h. Process-global `cl::opt` setter; used to hand LLVM's
++  // IR-PGO passes their (hidden) options, which `LLVMRunPasses` has no
++  // parameter for.
++  @extern
++  private[direct] object Support {
++    def LLVMParseCommandLineOptions(
++        argc: CInt,
++        argv: Ptr[CString],
++        overview: CString
++    ): Unit = extern
++  }
+ }
+diff --git a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+index e6dfeb4..a44318d 100644
+--- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
++++ b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+@@ -69,7 +69,7 @@ private[scalanative] object ScalaNative {
+                 config.logger.time("Escape analysis report") {
+                   interflow.EscapeAnalysis.report(config, analysis, defns)
+                 }
+-              if (interflow.Inline.stats) interflow.Inline.dumpStats(m => config.logger.info(m))
++              if (interflow.Inline.pgoStats) interflow.Inline.dumpStats(m => config.logger.info(m))
+               if (sys.env.contains("SCALANATIVE_ESCAPE_EXIT")) sys.exit(0)
+               val finalDefns =
+                 if (stackObjectsEnabled(config))
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Inline.scala b/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
+index 8661e9c..2d42eb3 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Inline.scala
+@@ -34,6 +34,23 @@ private[interflow] trait Inline { self: Interflow =>
+         def hintInline = defn.attrs.inlineHint == nir.Attr.InlineHint
+         def isRecursive = inliningBacktrace.contains(name)
+         def isDenylisted = this.isDenylisted(name)
++        // Profile guided (SCALANATIVE_PGO_PROFILE): a call is hot when both
++        // caller and callee are hot in the profile (unknown counts never
++        // count as hot), cold when either one never ran.
++        val pgo = PgoProfile.current
++        val calleeCount = if (pgo != null) pgo.count(name) else -1L
++        val callerCount =
++          if (pgo != null && currentAsker != null) pgo.count(currentAsker)
++          else -1L
++        def pgoHot =
++          pgo != null && pgo.isHot(calleeCount) &&
++            (callerCount < 0 || pgo.isHot(callerCount))
++        def pgoCold =
++          pgo != null && (pgo.isCold(calleeCount) || pgo.isCold(callerCount))
++        // a hot callee is worth inlining up to this size, instead of just
++        // `smallFunctionSize` (never beyond the usual callee limit)
++        def hotCalleeLimit =
++          math.min(maxCalleeSize, smallFunctionSize * Inline.HotSizeFactor)
+         def calleeTooBig = defn.insts.size > maxCalleeSize
+         def callerTooBig = mergeProcessor.currentSize() > maxCallerSize
+         def inlineDepthLimitExceeded = inliningBacktrace.size > maxInlineDepth
+@@ -43,14 +60,23 @@ private[interflow] trait Inline { self: Interflow =>
+         // worth inlining so allocations can be scalar replaced / stack
+         // allocated in the caller.
+         def allocInline =
+-          Inline.allocInlineEnabled(mode) && defn.insts.size <= Inline.MaxAllocInlineSize && (
++          Inline.allocInlineEnabled(mode) && defn.insts.size <= (if (pgoHot) Inline.MaxAllocInlineSize * 2 else Inline.MaxAllocInlineSize) && (
+             hasVirtualArgs || defn.insts.exists {
+               case nir.Inst.Let(_, _: nir.Op.Classalloc | _: nir.Op.Box | _: nir.Op.Arrayalloc, _) => true
+               case _ => false
+             }
+           )
+ 
+-        val shall = mode match {
++        val shall = if (mode != build.Mode.Debug && pgoCold && !alwaysInline) {
++          // never ran in the profile: only inline what is free anyway
++          val s = isSmall
++          if (Inline.pgoStats) Inline.count(if (s) "pgo-cold-small" else "pgo-cold-skipped")
++          s
++        } else if (mode != build.Mode.Debug && pgoHot && !isRecursive && !noInline && !isExtern &&
++            defn.insts.size <= hotCalleeLimit) {
++          if (Inline.pgoStats) Inline.count("pgo-hot")
++          true
++        } else mode match {
+           case build.Mode.Debug =>
+             alwaysInline || isCtor || allocInline
+           case build.Mode.ReleaseFast =>
+@@ -286,6 +312,12 @@ private[scalanative] object Inline {
+ 
+   // profiling aid: outcome of allocation-oriented inlining decisions
+   val stats: Boolean = sys.env.contains("SCALANATIVE_INLINE_STATS")
++  /** Cheap PGO decision counters (no per-callee strings, unlike `stats`,
++   *  which is far too slow on a program the size of dotc).
++   */
++  val pgoStats: Boolean = stats || sys.env.contains("SCALANATIVE_PGO_STATS")
++  def count(outcome: String): Unit =
++    outcomes.computeIfAbsent(outcome, _ => new java.util.concurrent.atomic.AtomicLong()).incrementAndGet()
+   private val outcomes = new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicLong]()
+   def record(outcome: String, callee: String): Unit = {
+     outcomes.computeIfAbsent(outcome, _ => new java.util.concurrent.atomic.AtomicLong()).incrementAndGet()
+@@ -300,6 +332,10 @@ private[scalanative] object Inline {
+     all.filter(_._1.contains(" ")).sortBy(-_._2).take(60).foreach { case (k, v) => log(s"[inline-stats]   $k $v".take(260)) }
+   }
+ 
++  /** A callee at a hot call site is inlined up to `smallFunctionSize` times this. */
++  val HotSizeFactor: Int =
++    sys.env.get("SCALANATIVE_PGO_HOT_FACTOR").flatMap(s => scala.util.Try(s.toInt).toOption).filter(_ >= 1).getOrElse(4)
++
+   val MaxAllocInlineSize: Int =
+     sys.env.get("SCALANATIVE_INLINE_ALLOC").flatMap(s => scala.util.Try(s.toInt).toOption).filter(_ > 1).getOrElse(64) // not toIntOption: sbt compiles this on Scala 2.12
+ }
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+index 0302303..0ce020b 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+@@ -26,6 +26,23 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+     with Log {
+   implicit val platform: PlatformInfo = PlatformInfo(config)
+ 
++  /** True when the PGO profile (`SCALANATIVE_PGO_PROFILE`) says the method
++   *  being optimized right now is *very* hot (the tier of the few functions
++   *  covering 90% of all entry counts) and the call is in its own body, not
++   *  in a callee inlined into it (`currentAsker` stays the same while nested
++   *  bodies are evaluated, so without that the wide polymorphic inlining and
++   *  specialization would multiply at every nesting level), and, if `callee`
++   *  is given, that callee is too. This is what lets the release-full only machinery (wider
++   *  polymorphic inlining, call-site specialization) run in hot code of the
++   *  cheaper release modes: unknown counts are never hot.
++   */
++  private[interflow] def pgoHotSite(callee: nir.Global.Member = null): Boolean = {
++    val pgo = PgoProfile.current
++    pgo != null && currentAsker != null && inliningBacktrace.size == 0 &&
++    pgo.isVeryHot(pgo.count(currentAsker)) &&
++    (callee == null || pgo.isVeryHot(pgo.count(callee)))
++  }
++
+   private val originals = {
+     val out = mutable.Map.empty[nir.Global, nir.Defn]
+     analysis.defns.foreach { defn => out(defn.name) = defn }
+@@ -132,7 +149,9 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+       newConfig: build.Config,
+       newAnalysis: ReachabilityAnalysis.Result
+   )(implicit ec: ExecutionContext): Option[Future[Seq[nir.Defn]]] = {
+-    if (mode == build.Mode.ReleaseFull) None
++    // PGO builds may specialize (`Sig.Duplicate`) in hot code in any release
++    // mode, which the reuse argument above does not cover.
++    if (mode == build.Mode.ReleaseFull || PgoProfile.current != null) None
+     else if (newConfig != config) None
+     else {
+       val oldInfos = analysis.infos
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/PgoProfile.scala b/tools/src/main/scala/scala/scalanative/interflow/PgoProfile.scala
+new file mode 100644
+index 0000000..e5e3a0e
+--- /dev/null
++++ b/tools/src/main/scala/scala/scalanative/interflow/PgoProfile.scala
+@@ -0,0 +1,141 @@
++package scala.scalanative
++package interflow
++
++import java.io.{BufferedReader, FileReader}
++import java.util.concurrent.ConcurrentHashMap
++
++/** Function-level execution profile consumed by the Interflow inliner.
++ *
++ *  The profile is the LLVM IR-PGO data of an earlier, instrumented link of
++ *  the same program (`SCALANATIVE_PGO_GEN`), rendered with
++ *
++ *  {{{
++ *  llvm-profdata show --all-functions --counts merged.profdata > profile.txt
++ *  }}}
++ *
++ *  (or the compact `<entry count>\t<symbol>` lines build/pgo/ keeps in the
++ *  repo) and pointed to by `SCALANATIVE_PGO_PROFILE`. The instrumented build uses
++ *  entry-first instrumentation, so the first block count of every function
++ *  is its entry count. LLVM function names are the mangled NIR names, so a
++ *  count is looked up as `"_S" + name.mangle` (the symbol codegen emits).
++ *
++ *  A function that is missing from the profile is *unknown*, not cold: it
++ *  may have been inlined away by the instrumented build, or may not have
++ *  existed there. Only a function that is present with an entry count of 0
++ *  is cold.
++ */
++private[scalanative] final class PgoProfile private (
++    counts: java.util.HashMap[String, java.lang.Long],
++    val hotCut: Long,
++    val veryHotCut: Long
++) {
++  private val cache = new ConcurrentHashMap[nir.Global, java.lang.Long]()
++
++  /** Entry count of `name`, or -1 when the profile has no data for it. */
++  def count(name: nir.Global): Long = {
++    var c = cache.get(name)
++    if (c == null) {
++      val found = counts.get("_S" + name.mangle)
++      c = if (found == null) java.lang.Long.valueOf(-1L) else found
++      cache.put(name, c)
++    }
++    c.longValue
++  }
++
++  /** Covers the functions that account for 99% of all entry counts
++   *  (cheap boosts: larger inlining size limits).
++   */
++  def isHot(count: Long): Boolean = count >= 0 && count >= hotCut
++
++  /** Only the few functions covering 90% of the entry counts (expensive
++   *  ReleaseFull-only features: wide polymorphic inlining, specialization).
++   */
++  def isVeryHot(count: Long): Boolean = count >= 0 && count >= veryHotCut
++  def isCold(count: Long): Boolean = count == 0
++
++  def size: Int = counts.size
++}
++
++private[scalanative] object PgoProfile {
++  val EnvVar = "SCALANATIVE_PGO_PROFILE"
++
++  /** Fraction of all recorded entry counts that the hot functions have to
++   *  cover (LLVM's `ProfileSummary` uses 0.99 for its hot cutoff too), and
++   *  the same for the very hot tier. `SCALANATIVE_PGO_HOT_COVERAGE` and
++   *  `SCALANATIVE_PGO_VERY_HOT_COVERAGE` override them.
++   */
++  private def coverage(env: String, default: Double): Double =
++    sys.env.get(env).flatMap(s => scala.util.Try(s.toDouble).toOption).filter(d => d > 0 && d <= 1).getOrElse(default)
++  private val HotCoverage = coverage("SCALANATIVE_PGO_HOT_COVERAGE", 0.99)
++  private val VeryHotCoverage = coverage("SCALANATIVE_PGO_VERY_HOT_COVERAGE", 0.90)
++
++  private def log(msg: String): Unit = System.err.println(s"[pgo] $msg")
++
++  lazy val current: PgoProfile = sys.env.get(EnvVar).filter(_.nonEmpty) match {
++    case None => null
++    case Some(path) =>
++      try {
++        val p = load(path)
++        log(s"loaded ${p.size} functions from $path, hot entry count >= ${p.hotCut}, very hot >= ${p.veryHotCut}")
++        p
++      } catch {
++        case e: Exception =>
++          log(s"cannot read $path: $e -- continuing without a profile")
++          null
++      }
++  }
++
++  def load(path: String): PgoProfile = {
++    val counts = new java.util.HashMap[String, java.lang.Long]()
++    val reader = new BufferedReader(new FileReader(path))
++    try {
++      var name: String = null
++      var line = reader.readLine()
++      while (line != null) {
++        val tab = line.indexOf('\t')
++        if (tab > 0) {
++          // compact form: `<entry count>\t<symbol>`
++          counts.put(line.substring(tab + 1), java.lang.Long.valueOf(line.substring(0, tab).toLong))
++        } else if (line.startsWith("  ") && !line.startsWith("   ") && line.endsWith(":")) {
++          name = line.substring(2, line.length - 1)
++        } else if (name != null) {
++          val i = line.indexOf("Block counts: [")
++          if (i >= 0) {
++            val start = i + "Block counts: [".length
++            var end = start
++            while (end < line.length && Character.isDigit(line.charAt(end))) end += 1
++            if (end > start)
++              counts.put(name, java.lang.Long.valueOf(line.substring(start, end).toLong))
++            name = null
++          }
++        }
++        line = reader.readLine()
++      }
++    } finally reader.close()
++
++    val nonZero = {
++      val buf = new java.util.ArrayList[java.lang.Long]()
++      val it = counts.values().iterator()
++      while (it.hasNext) { val v = it.next(); if (v.longValue > 0) buf.add(v) }
++      val arr = new Array[Long](buf.size)
++      var i = 0
++      while (i < arr.length) { arr(i) = buf.get(i).longValue; i += 1 }
++      java.util.Arrays.sort(arr)
++      arr
++    }
++    val total = nonZero.foldLeft(0.0)(_ + _)
++    // smallest count such that the functions at or above it cover `fraction`
++    def cutFor(fraction: Double): Long = {
++      var cut = Long.MaxValue
++      var acc = 0.0
++      var i = nonZero.length - 1
++      while (i >= 0 && acc < total * fraction) {
++        acc += nonZero(i)
++        cut = nonZero(i)
++        i -= 1
++      }
++      cut
++    }
++    new PgoProfile(counts, cutFor(HotCoverage), cutFor(VeryHotCoverage))
++  }
++}
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala b/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala
+index dbed633..ee1738d 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala
+@@ -28,7 +28,7 @@ private[interflow] trait PolyInline { self: Interflow =>
+               val implsCount = impls.size
+ 
+               val shallPolyInline =
+-                if (mode == build.Mode.ReleaseFast || mode == build.Mode.ReleaseSize) {
++                if ((mode == build.Mode.ReleaseFast || mode == build.Mode.ReleaseSize) && !pgoHotSite()) {
+                   classesCount <= 8 && implsCount == 2
+                 } else {
+                   classesCount <= 16 && implsCount >= 2 && implsCount <= 4
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Visit.scala b/tools/src/main/scala/scala/scalanative/interflow/Visit.scala
+index 69dc5e7..b2d13b4 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Visit.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Visit.scala
+@@ -24,10 +24,15 @@ private[interflow] trait Visit { self: Interflow =>
+ 
+   def shallDuplicate(name: nir.Global.Member, argtys: Seq[nir.Type]): Boolean =
+     mode match {
+-      case build.Mode.Debug | build.Mode.ReleaseFast | build.Mode.ReleaseSize =>
++      case build.Mode.Debug =>
++        false
++
++      case build.Mode.ReleaseFast | build.Mode.ReleaseSize
++          if !pgoHotSite(name) =>
+         false
+ 
+-      case build.Mode.ReleaseFull =>
++      // ReleaseFull, or a hot call site (PGO) of the other release modes
++      case _ =>
+         if (!shallVisit(name)) {
+           false
+         } else {

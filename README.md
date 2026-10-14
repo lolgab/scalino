@@ -8,7 +8,9 @@ straight to a native executable via Scala Native — no bytecode, no JIT, no
 
 Everything you run day to day is native: the compiler, the linker, the
 `scalino` build tool, and the `scalino-lsp` language server are all compiled
-by dotc from their own patched source, targeting Scala Native directly. See
+by dotc from their own patched source, targeting Scala Native directly. The
+compiler, linker and language server are profile-guided builds (about 11–14%
+faster than without, see [`docs/pgo.md`](docs/pgo.md)). See
 [`docs/findings.md`](docs/findings.md) for the full story.
 
 ## Quick start

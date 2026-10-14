@@ -154,23 +154,37 @@ for artifact in "${LSP_NATIVE_JARS[@]}"; do
   LSP_NATIVE_CP="${LSP_NATIVE_CP:+$LSP_NATIVE_CP$CP_SEP}$jar"
 done
 
-echo "== linking (scalino-linkdriver -- entry point dotty.tools.languageserver.Main, --mode release-size) =="
-rm -rf "$LINK_WORK"
-mkdir -p "$LINK_WORK"
+echo "== linking (scalino-linkdriver -- entry point dotty.tools.languageserver.Main, --mode $SCALINO_LINK_MODE) =="
+source ./pgo/pgo-lib.sh
+# The link classpath is kept for build/pgo/pgo-lsp.sh, which relinks it.
+LSP_LINK_CP="$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP"
+printf '%s' "$LSP_LINK_CP" > "$SELFHOST_DIR/lsp-link.cp"
 # Native scalino-linkdriver (04b-fetch-scalino-linkdriver.sh), not LinkDriver
 # on a JVM -- see 03-build-scalino-dotc.sh's identical link step.
 # SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
 # heap badly (interflow's garbage); without it the link runs out of heap.
-env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" \
-  "$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP" \
-  "$(to_native_path "$LINK_WORK")" \
-  dotty.tools.languageserver.Main \
-  "$CLANG" \
-  "$CLANGPP" \
-  info \
-  --mode "$SCALINO_LINK_MODE" \
-  --no-incremental-compilation \
-  --embed-resources
+lsp_link() {
+  rm -rf "$LINK_WORK"
+  mkdir -p "$LINK_WORK"
+  env SCALANATIVE_EVAC_ENABLE=1 "$@" "$DIST/scalino-linkdriver" \
+    "$LSP_LINK_CP" \
+    "$(to_native_path "$LINK_WORK")" \
+    dotty.tools.languageserver.Main \
+    "$CLANG" \
+    "$CLANGPP" \
+    info \
+    --mode "$SCALINO_LINK_MODE" \
+    --no-incremental-compilation \
+    --embed-resources
+}
+# Release builds use the committed PGO profiles (pgo/, see docs/pgo.md); a
+# failing PGO link falls back to the plain one rather than failing the build.
+pgo_prepare lsp
+if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
+  lsp_link "${PGO_ENV[@]}" || { echo "WARNING: PGO link failed, relinking without PGO" >&2; lsp_link; }
+else
+  lsp_link
+fi
 
 BUILT="$LINK_WORK/dotty.tools.languageserver.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }

@@ -74,6 +74,7 @@ SHARED_SOURCES=(
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/State.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/Inline.scala"
+  "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/PgoProfile.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/Visit.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala"

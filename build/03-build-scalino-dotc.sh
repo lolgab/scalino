@@ -86,8 +86,7 @@ NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 cp "$ROOT/build/selfhost/compiler.properties" "$NIR_OUT/compiler.properties"
 
 echo "== linking (scalino-linkdriver, entry point dotty.tools.dotc.Main) =="
-rm -rf "$LINK_WORK"
-mkdir -p "$LINK_WORK"
+source ./pgo/pgo-lib.sh
 # $DIST/scalino-linkdriver's classpath needs both the just-compiled NIR AND the
 # Scala-Native-cross-compiled stdlib the compiled code links against --
 # NIR_OUT alone has no java.lang.Object etc.
@@ -106,17 +105,29 @@ mkdir -p "$LINK_WORK"
 # the same, raise its stack (ulimit -s) rather than going back to the JVM.
 # SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
 # heap badly (interflow's garbage); without it the link runs out of heap.
-env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" \
-  "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
-  "$(to_native_path "$LINK_WORK")" \
-  dotty.tools.dotc.Main \
-  "$CLANG" \
-  "$CLANGPP" \
-  info \
-  --mode "$SCALINO_LINK_MODE" \
-  --multithreading \
-  --no-incremental-compilation \
-  --embed-resources
+dotc_link() {
+  rm -rf "$LINK_WORK"
+  mkdir -p "$LINK_WORK"
+  env SCALANATIVE_EVAC_ENABLE=1 "$@" "$DIST/scalino-linkdriver" \
+    "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
+    "$(to_native_path "$LINK_WORK")" \
+    dotty.tools.dotc.Main \
+    "$CLANG" \
+    "$CLANGPP" \
+    info \
+    --mode "$SCALINO_LINK_MODE" \
+    --multithreading \
+    --no-incremental-compilation \
+    --embed-resources
+}
+# Release builds use the committed PGO profiles (pgo/, see docs/pgo.md); a
+# failing PGO link falls back to the plain one rather than failing the build.
+pgo_prepare dotc
+if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
+  dotc_link "${PGO_ENV[@]}" || { echo "WARNING: PGO link failed, relinking without PGO" >&2; dotc_link; }
+else
+  dotc_link
+fi
 
 BUILT="$LINK_WORK/dotty.tools.dotc.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }

@@ -76,7 +76,7 @@ mkdir -p "$WORK/driver-classes"
   -d "$WORK/driver-classes" \
   "$ROOT/src/LinkDriver.scala"
 
-LINK_WORK="$WORK/driver-link"
+LINK_WORK="${SCALINO_LINK_WORK:-$WORK/driver-link}"
 rm -rf "$LINK_WORK"
 mkdir -p "$LINK_WORK"
 
@@ -204,20 +204,34 @@ if [[ "${#LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-if [[ -n "${SCALINO_BOOTSTRAP_LINKDRIVER:-}" ]]; then
-  # Link with an existing native scalino-linkdriver (e.g. fetched by
-  # 04b-fetch-scalino-linkdriver.sh) instead of the JVM-hosted LinkDriver.
-  # Direct codegen is the linkdriver default here.
-  env SCALANATIVE_EVAC_ENABLE=1 "$SCALINO_BOOTSTRAP_LINKDRIVER" \
+# Extra static libs for the final link (e.g. the compiler-rt profile runtime
+# of a build/pgo instrumented link), space separated.
+EXTRA_LINKING_OPTS=()
+for f in ${SCALINO_EXTRA_LINKING:-}; do EXTRA_LINKING_OPTS+=(--linking "$f"); done
+
+# Links LinkDriver with an existing native scalino-linkdriver $1 (direct codegen
+# is its default) into $2; further args are env settings for that run.
+native_link() {
+  local linker="$1" dir="$2"; shift 2
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  env SCALANATIVE_EVAC_ENABLE="${SCALINO_BOOTSTRAP_EVAC:-1}" "$@" "$linker" \
     "$(to_native_path "$NATIVE_DRIVER_CP")" \
-    "$(to_native_path "$LINK_WORK")" \
+    "$(to_native_path "$dir")" \
     LinkDriver \
     "$CLANG" \
     "$CLANGPP" \
     info \
     --mode "$SCALINO_LINK_MODE" \
     --no-incremental-compilation \
-    "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}"
+    "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}" \
+    "${EXTRA_LINKING_OPTS[@]+"${EXTRA_LINKING_OPTS[@]}"}"
+}
+
+if [[ -n "${SCALINO_BOOTSTRAP_LINKDRIVER:-}" ]]; then
+  # Link with an existing native scalino-linkdriver (e.g. fetched by
+  # 04b-fetch-scalino-linkdriver.sh) instead of the JVM-hosted LinkDriver.
+  native_link "$SCALINO_BOOTSTRAP_LINKDRIVER" "$LINK_WORK"
 else
   "$JAVA" \
     -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
@@ -233,12 +247,32 @@ else
       --multithreading \
       --no-direct-codegen \
       --no-incremental-compilation \
-      "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}"
+      "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}" \
+      "${EXTRA_LINKING_OPTS[@]+"${EXTRA_LINKING_OPTS[@]}"}"
 fi
 
 BUILT="$LINK_WORK/LinkDriver"
 [[ -f "$BUILT" ]] || BUILT="$LINK_WORK/LinkDriver.exe"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
+# Release builds relink once more, with the plain build as the linker, using the
+# committed PGO profiles (pgo/, see docs/pgo.md). The profiles were taken on
+# exactly this link (direct codegen, same flags), so it has to be the native
+# command above, not the JVM one. A failing PGO link keeps the plain build.
+source ./pgo/pgo-lib.sh
+pgo_prepare linkdriver
+if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
+  echo "== relinking scalino-linkdriver with PGO"
+  PGO_WORK="${LINK_WORK}-pgo"
+  if native_link "$BUILT" "$PGO_WORK" "${PGO_ENV[@]}" && [[ -f "$PGO_WORK/LinkDriver" ]]; then
+    BUILT="$PGO_WORK/LinkDriver"
+  else
+    echo "WARNING: PGO link failed, shipping the plain scalino-linkdriver" >&2
+  fi
+fi
+if [[ -n "${SCALINO_LINK_NO_DIST:-}" ]]; then
+  echo "built $BUILT (SCALINO_LINK_NO_DIST: dist/ untouched)"
+  exit 0
+fi
 # rm first: overwriting a running/mapped signed binary in place leaves a stale code-signature
 # cache on macOS and the new file is killed at launch (CODE SIGNING: rejecting invalid page)
 rm -f "$DIST/scalino-linkdriver"
