@@ -237,7 +237,7 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
 |---|---|
 | musl | Debian's `musl-dev` (unmodified musl) and `libclang-rt-14-dev` (compiler-rt) |
 | gnu | Debian 11's glibc 2.31 and kernel headers, plus the same compiler-rt |
-| macOS | the open source Darwin libc headers from the Zig project's source tarball, and a `libSystem` stub generated from them (a stand-in for Apple's SDK, enough for anything that needs no frameworks) |
+| macOS | the open source Darwin libc headers from the Zig project's source tarball, and `libSystem` and `libobjc` stubs generated from them (a stand-in for Apple's SDK: enough for anything that needs no frameworks, including programs that `dlopen` them and drive them through the Objective-C runtime) |
 | Windows | mingw-w64 with libc++ from the [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) project (GitHub) |
 
 - The Windows sysroot's libc++ needs **clang 21 or newer** (older clangs fail on its
@@ -258,6 +258,9 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
   on your `PATH` (about a minute per target, once); both need the OpenSSL addon, installed with them,
   and set `SSL_CERT_FILE` to the system's CA bundle at startup unless you have. libcurl is built with
   HTTP(S) over OpenSSL and zlib only (Windows: MSYS2's full build).
+- Programs that call the Objective-C runtime (`objc_msgSend`, ...) and `dlopen` the frameworks link against the
+  macOS sysroot's `libobjc` stub. `ld64.lld` ignores `#pragma comment(lib, "objc")`, so pass `-lobjc` yourself
+  (`//> using nativeLinking -lobjc`). Frameworks themselves are not in the sysroot.
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 

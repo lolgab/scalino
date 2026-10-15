@@ -141,9 +141,14 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--clang", default="clang")
     ap.add_argument("--nm", default="llvm-nm")  # unused, kept for compatibility
+    ap.add_argument("--only", help="restrict to the headers under usr/include/<dir>/ (libobjc: --only objc)")
+    ap.add_argument("--subtract", help="prefix of symbol lists (<prefix>-<arch>.txt) to leave out: what --only's headers include from libc")
+    ap.add_argument("--lib", default="libSystem", help="library name for the comment in the output files")
     a = ap.parse_args()
     inc = os.path.join(a.sysroot, "usr", "include")
     allh = headers(inc)
+    if a.only:
+        allh = [h for h in allh if h.startswith(a.only.rstrip("/") + "/")]
     for target in TARGETS:
         with cf.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
             ok = [r for r in ex.map(lambda h: compiles(a.clang, target, a.sysroot, h), allh) if r]
@@ -152,9 +157,12 @@ def main():
             syms = symbols(a.clang, a.nm, target, a.sysroot, ok, work)
         print("%s: %d of %d headers, %d symbols" % (target, len(ok), len(allh), len(syms)), file=sys.stderr)
         arch = target.split("-")[0]
+        if a.subtract:
+            with open("%s-%s.txt" % (a.subtract, arch)) as f:
+                syms -= {l.strip() for l in f if l.startswith("_")}
         with open("%s-%s.txt" % (a.out, arch), "w") as f:
-            f.write("# Symbols libSystem exports on %s, derived from Apple's open source Darwin headers by\n" % arch)
-            f.write("# build/gen-libsystem-symbols.py and pruned by build/check-libsystem-symbols.py.\n")
+            f.write("# Symbols %s exports on %s, derived from Apple's open source Darwin headers by\n" % (a.lib, arch))
+            f.write("# build/gen-libsystem-symbols.py%s and pruned by build/check-libsystem-symbols.py.\n" % (" --only " + a.only if a.only else ""))
             f.write("# Only symbol names: no SDK content.\n")
             for sym in sorted(syms):
                 f.write(sym + "\n")
