@@ -56,6 +56,10 @@ jobs:
         if: matrix.name == 'lsp'
         run: ./build/all.sh lsp
 
+      # the compiler-rt profile runtime the instrumented binaries link
+      - name: Install libclang-rt
+        run: sudo apt-get install -y libclang-rt-20-dev
+
       - name: Profile ${{ matrix.name }}
         env:
           SCALINO_PGO: '1'

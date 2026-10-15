@@ -84,8 +84,8 @@ pgo_profile_runtime() {
   local res
   res="$("$CLANG" --print-resource-dir)"
   case "$(uname -s)" in
-    Darwin) ls "$res"/lib/darwin/libclang_rt.profile_osx.a ;;
-    *) ls "$res"/lib/*/libclang_rt.profile*"$(uname -m)"*.a "$res"/lib/"$(uname -m)"-*/libclang_rt.profile.a 2>/dev/null | head -1 ;;
+    Darwin) ls "$res"/lib/darwin/libclang_rt.profile_osx.a || true ;;
+    *) ls "$res"/lib/*/libclang_rt.profile*"$(uname -m)"*.a "$res"/lib/"$(uname -m)"-*/libclang_rt.profile.a 2>/dev/null | head -1 || true ;;
   esac
 }
 
