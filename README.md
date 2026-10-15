@@ -259,8 +259,9 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
   and set `SSL_CERT_FILE` to the system's CA bundle at startup unless you have. libcurl is built with
   HTTP(S) over OpenSSL and zlib only (Windows: MSYS2's full build).
 - Programs that call the Objective-C runtime (`objc_msgSend`, ...) and `dlopen` the frameworks link against the
-  macOS sysroot's `libobjc` stub. `ld64.lld` ignores `#pragma comment(lib, "objc")`, so pass `-lobjc` yourself
-  (`//> using nativeLinking -lobjc`). Frameworks themselves are not in the sysroot.
+  macOS sysroot's `libobjc` stub (`@link("objc")` adds `-lobjc`; C code can autolink it with
+  `__asm__(".linker_option \"-lobjc\"")`, which `ld64.lld` honours; `#pragma comment(lib)` is not implemented for
+  Mach-O). Frameworks themselves are not in the sysroot.
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 
