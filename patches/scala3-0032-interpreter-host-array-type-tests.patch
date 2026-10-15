@@ -1,0 +1,63 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -2079,6 +2079,51 @@
+             else c = c.getSuperclass
+           Some(found)
+         catch case _: Throwable => None
++
++  /** `v` against `Array[T]` (`case xs: Array[AnyRef] =>`, `isInstanceOf[Array[Int]]`):
++   *  a real host array, which is a JVM array here but a
++   *  `scala.scalanative.runtime.XyzArray` when the interpreter itself runs as a
++   *  native binary (never a `scala.Array` by name, so `hostClassTest`'s
++   *  superclass walk always said no -- e.g. `ArrayOps#iterator`'s own
++   *  `case xs: Array[AnyRef] => ...` threw a `MatchError` on a `String[]`).
++   *  Decided by element kind: a primitive element type needs that primitive
++   *  array, any reference element type needs an object array, anything else
++   *  (`Any`, an abstract type) any array.
++   */
++  private def hostArrayTest(v: Object, tpe: Type)(using Context): Boolean =
++    val cn = v.getClass.getName
++    val vKind: Option[Char] =
++      if v.getClass.isArray then
++        if cn.length == 2 then Some(cn.charAt(1)) else Some('L') // "[I", "[Ljava.lang.String;"
++      else if cn.startsWith("scala.scalanative.runtime.") && cn.endsWith("Array") then
++        cn.stripPrefix("scala.scalanative.runtime.").stripSuffix("Array") match
++          case "Boolean" => Some('Z')
++          case "Char" => Some('C')
++          case "Byte" => Some('B')
++          case "Short" => Some('S')
++          case "Int" => Some('I')
++          case "Long" => Some('J')
++          case "Float" => Some('F')
++          case "Double" => Some('D')
++          case "Object" => Some('L')
++          case _ => None
++      else None
++    vKind match
++      case None => false // not an array at all
++      case Some(k) =>
++        val elemCls = tpe.dealias.argInfos.headOption.map(_.classSymbol).getOrElse(NoSymbol)
++        val elemKind: Option[Char] =
++          if elemCls == defn.BooleanClass then Some('Z')
++          else if elemCls == defn.CharClass then Some('C')
++          else if elemCls == defn.ByteClass then Some('B')
++          else if elemCls == defn.ShortClass then Some('S')
++          else if elemCls == defn.IntClass then Some('I')
++          else if elemCls == defn.LongClass then Some('J')
++          else if elemCls == defn.FloatClass then Some('F')
++          else if elemCls == defn.DoubleClass then Some('D')
++          else if elemCls == defn.AnyClass || !elemCls.exists then None // any array
++          else Some('L')
++        elemKind.forall(_ == k)
+ 
+   private def matchesRuntimeType(v: Object, tpe: Type): Boolean =
+     val cls = tpe.classSymbol
+@@ -2088,6 +2133,7 @@
+     else if cls == defn.LongClass then v.isInstanceOf[java.lang.Long]
+     else if cls == defn.BooleanClass then v.isInstanceOf[java.lang.Boolean]
+     else if cls == defn.StringClass then v.isInstanceOf[String]
++    else if cls == defn.ArrayClass then hostArrayTest(v, tpe)
+     else
+       // For anything else, check real ancestry whenever `v`'s own concrete
+       // class is one we can actually name (an `InterpretedInstance`/etc,
