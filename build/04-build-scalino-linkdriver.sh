@@ -53,7 +53,7 @@ fi
 # classes) -- scalino-linkdriver's own bootstrap build links a full program
 # against javalib+nativelib together, so both need to agree on the same
 # patched pair, not just javalib.
-LOCAL_NATIVELIB_JAR="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/nativelib_native0.5_3.jar"
+LOCAL_NATIVELIB_JAR="${SCALINO_NATIVELIB_JAR:-$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/nativelib_native0.5_3.jar}"
 if [[ -f "$LOCAL_NATIVELIB_JAR" ]]; then
   TMP_NATIVELIB_SWAP="$(mktemp)"
   { tr "$CP_SEP" '\n' < "$TOOLS_PATCHED_JAVALIB_CP" | grep -v '/nativelib_native0\.5_3-'; echo "$LOCAL_NATIVELIB_JAR"; } | paste -sd"$CP_SEP" - > "$TMP_NATIVELIB_SWAP"
@@ -225,7 +225,8 @@ native_link() {
     --mode "$SCALINO_LINK_MODE" \
     --no-incremental-compilation \
     "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}" \
-    "${EXTRA_LINKING_OPTS[@]+"${EXTRA_LINKING_OPTS[@]}"}"
+    "${EXTRA_LINKING_OPTS[@]+"${EXTRA_LINKING_OPTS[@]}"}" \
+    ${SCALINO_LINK_EXTRA_ARGS:-}
 }
 
 if [[ -n "${SCALINO_BOOTSTRAP_LINKDRIVER:-}" ]]; then
