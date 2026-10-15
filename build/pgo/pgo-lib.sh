@@ -7,12 +7,21 @@
 # the multi-stage pipeline below (pgo_pipeline).
 
 PGO_DIR="$ROOT/pgo"
+source "$ROOT/build/link-lib.sh" # jvm_link_enabled
+
+# pgo_key <name>: the profile set <name> stands for in the current link mode. The
+# JVM link (build/link-lib.sh: no direct codegen, the IR is textual and clang
+# runs the PGO passes, patch scala-native-0082) sees different IR than the direct
+# one, so it has its own profiles, pgo/<name>.jvm.*. scalino-linkdriver itself is
+# always linked natively (build/04).
+pgo_key() { if [[ "$1" != linkdriver ]] && jvm_link_enabled; then echo "$1.jvm"; else echo "$1"; fi; }
 
 # pgo_prepare <name>: sets PGO_ENV (array) to the env settings that make the
 # linker use pgo/<name>.* -- empty when PGO is off (SCALINO_PGO=0), the mode is
 # not a release mode, or there is no profile for <name>.
 pgo_prepare() {
-  local name="$1"
+  local name
+  name="$(pgo_key "$1")"
   PGO_ENV=()
   [[ "${SCALINO_PGO:-1}" != 0 ]] || return 0
   case "${SCALINO_LINK_MODE:-debug}" in release-*) ;; *) return 0 ;; esac
@@ -115,7 +124,7 @@ pgo_pipeline() {
   if stage train1; then
     echo "== $NAME train1"; rm -rf "${OUT:?}/raw1"; mkdir -p "$OUT/raw1"
     pgo_train "$OUT/gen1/$BIN" "$OUT/raw1"; pgo_merge "$OUT/raw1" prof1
-    [[ "${PGO_STAGES:-2}" != 1 ]] || pgo_pack "$NAME" "" "$OUT/prof1.profdata"
+    [[ "${PGO_STAGES:-2}" != 1 ]] || pgo_pack "$(pgo_key "$NAME")" "" "$OUT/prof1.profdata"
   fi
   if [[ "${PGO_STAGES:-2}" != 1 ]] && stage gen2; then
     echo "== $NAME gen2"
@@ -124,7 +133,7 @@ pgo_pipeline() {
   if [[ "${PGO_STAGES:-2}" != 1 ]] && stage train2; then
     echo "== $NAME train2"; rm -rf "${OUT:?}/raw2"; mkdir -p "$OUT/raw2"
     pgo_train "$OUT/gen2/$BIN" "$OUT/raw2"; pgo_merge "$OUT/raw2" prof2
-    pgo_pack "$NAME" "$OUT/prof1.txt" "$OUT/prof2.profdata"
+    pgo_pack "$(pgo_key "$NAME")" "$OUT/prof1.txt" "$OUT/prof2.profdata"
   fi
   if [[ "${PGO_STAGES:-2}" == 1 ]]; then on=1; fi
   # SKIP_FINAL=1: stop after packing (the real build/03|08 link is the final one)

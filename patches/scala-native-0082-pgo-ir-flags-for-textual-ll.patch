@@ -1,0 +1,44 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+--- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
++++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+@@ -167,6 +167,7 @@
+         langOptions ++ platformFlags ++ debugFlags ++
+         configFlags ++ Seq("-fvisibility=hidden", opt) ++
+         Seq("-fomit-frame-pointer") ++
++        (if (isLl) pgoIrFlags else Nil) ++
+         config.compileOptions
+     val compilec: Seq[String] =
+       Seq(compiler, "-c", inpath, "-o", outpath) ++ flags
+@@ -498,6 +499,32 @@
+       case None     => Seq("-Wno-override-module")
+     }
+ 
++  /** IR-level profile guided optimization of the textual `.ll` files, for
++   *  links without direct codegen (the direct path runs the same passes itself,
++   *  see DirectCodeGen). `SCALANATIVE_PGO_GEN=1` instruments every function
++   *  (entry-first, like the direct path) -- the program must link the
++   *  compiler-rt profile runtime; `SCALANATIVE_PGO_USE=<indexed .profdata>`
++   *  annotates the IR with it. Only `.ll` files: the C/C++ runtime has no
++   *  profile and is not instrumented.
++   */
++  private lazy val pgoIrFlags: Seq[String] = {
++    def env(name: String) = sys.env.get(name).filter(_.nonEmpty)
++    val gen =
++      if (env("SCALANATIVE_PGO_GEN").exists(_ != "0"))
++        Seq("-fprofile-generate", "-mllvm", "-pgo-instrument-entry=true")
++      else Nil
++    val use = env("SCALANATIVE_PGO_USE").toSeq.flatMap { path =>
++      Seq(
++        s"-fprofile-use=$path",
++        // a profile of a slightly different build is expected, not an error
++        "-Wno-profile-instr-unprofiled",
++        "-Wno-profile-instr-out-of-date",
++        "-Wno-profile-instr-missing"
++      )
++    }
++    gen ++ use
++  }
++
+   private def opt(implicit config: Config): String =
+     config.mode match {
+       case Mode.Debug       => "-O0"

@@ -2,9 +2,9 @@
 # Installs cross-built binaries (build/cross-lib.sh) into dist/ on the target
 # machine: build/13-install-prebuilt.sh <dir with scalino-dotc, scalino-lsp...>
 set -euo pipefail
+SRC="$(cd "${1:?usage: 13-install-prebuilt.sh <dir>}" && pwd)" # before the cd below
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
-SRC="${1:?usage: 13-install-prebuilt.sh <dir>}"
 for f in "$SRC"/*; do
   name="$(basename "$f")"
   rm -f "$DIST/$name" # new inode, see 04-build-scalino-linkdriver.sh

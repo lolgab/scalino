@@ -27,7 +27,8 @@ for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt; do
   [[ -f "$WORK/$f" ]] || { echo "missing $WORK/$f -- run build/01-fetch-deps.sh first" >&2; exit 1; }
 done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
-[[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04b-fetch-scalino-linkdriver.sh first" >&2; exit 1; }
+source ./link-lib.sh
+link_require
 [[ -f "$DIST/java.base.jar" ]] || { echo "missing $DIST/java.base.jar -- run build/02-build-java-base.sh first" >&2; exit 1; }
 
 SELFHOST_DIR="$WORK/selfhost"
@@ -109,13 +110,11 @@ LINK_EXTRA=()
 dotc_link() {
   rm -rf "$LINK_WORK"
   mkdir -p "$LINK_WORK"
-  env SCALANATIVE_EVAC_ENABLE=1 "$@" "$DIST/scalino-linkdriver" \
+  LINK_ENV=("$@")
+  linkdriver_run \
     "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
     "$(to_native_path "$LINK_WORK")" \
     dotty.tools.dotc.Main \
-    "$CLANG" \
-    "$CLANGPP" \
-    info \
     --mode "$SCALINO_LINK_MODE" \
     --multithreading \
     --no-incremental-compilation \

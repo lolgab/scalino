@@ -17,6 +17,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-release-fast}"
 source ./00-env.sh
 source ./pgo/pgo-lib.sh
+source ./link-lib.sh
 NAME=lsp; BIN=dotty.tools.languageserver.Main
 BOOT="${BOOT:-$DIST/scalino-linkdriver}"
 OUT="${OUT:-$WORK/pgo-lsp}"
@@ -32,9 +33,10 @@ pgo_link() { # linker, dir, env...  -> dir/$BIN (same command as build/08)
   rm -rf "${dir:?}"; mkdir -p "$dir"
   local t0=$SECONDS extra=()
   [[ " $* " == *" SCALANATIVE_PGO_GEN=1 "* ]] && extra=(--linking "$PROFILE_RT")
-  env "$@" SCALANATIVE_EVAC_ENABLE="${EVAC:-1}" SCALANATIVE_GC_SYNC_TIMEOUT_MS=0 "$linker" \
+  LINK_ENV=("$@" SCALANATIVE_EVAC_ENABLE="${EVAC:-1}" SCALANATIVE_GC_SYNC_TIMEOUT_MS=0)
+  LINKDRIVER="$linker" linkdriver_run \
     "$(cat "$LINK_CP_FILE")" "$(to_native_path "$dir")" \
-    "$BIN" "$CLANG" "$CLANGPP" info --mode "$SCALINO_LINK_MODE" \
+    "$BIN" --mode "$SCALINO_LINK_MODE" \
     --no-incremental-compilation --embed-resources \
     "${extra[@]+"${extra[@]}"}" > "$dir.log" 2>&1 \
     || { tail -30 "$dir.log" >&2; echo "link into $dir failed" >&2; return 1; }

@@ -52,7 +52,8 @@ for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt lsp.c
   [[ -f "$WORK/$f" ]] || { echo "missing $WORK/$f -- run build/01-fetch-deps.sh first" >&2; exit 1; }
 done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
-[[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04b-fetch-scalino-linkdriver.sh first" >&2; exit 1; }
+source ./link-lib.sh
+link_require
 [[ -e "$JAVAC" ]] || { echo "missing javac at $JAVAC -- need a full JDK (not JRE) for JAVA_HOME" >&2; exit 1; }
 
 SELFHOST_DIR="$WORK/selfhost"
@@ -167,13 +168,11 @@ LINK_EXTRA=()
 lsp_link() {
   rm -rf "$LINK_WORK"
   mkdir -p "$LINK_WORK"
-  env SCALANATIVE_EVAC_ENABLE=1 "$@" "$DIST/scalino-linkdriver" \
+  LINK_ENV=("$@")
+  linkdriver_run \
     "$LSP_LINK_CP" \
     "$(to_native_path "$LINK_WORK")" \
     dotty.tools.languageserver.Main \
-    "$CLANG" \
-    "$CLANGPP" \
-    info \
     --mode "$SCALINO_LINK_MODE" \
     --no-incremental-compilation \
     --embed-resources \

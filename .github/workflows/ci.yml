@@ -107,6 +107,9 @@ jobs:
       # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
       SCALANATIVE_LINK_THREADS: '1'
       SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
+      # Link with LinkDriver on a JVM (build/link-lib.sh): the native linkdriver
+      # needs ~25 min and several GB more per link.
+      SCALINO_JVM_LINK: '1'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -160,6 +163,9 @@ jobs:
       # (plus the JVM heap) OOM-killed the runner. patch scala-native-0070.
       SCALANATIVE_LINK_THREADS: '1'
       SCALINO_LINK_RAM_PERCENT: ${{ startsWith(matrix.target, 'linux') && '55' || '80' }}
+      # Link with LinkDriver on a JVM (build/link-lib.sh): the native linkdriver
+      # needs ~25 min and several GB more per link.
+      SCALINO_JVM_LINK: '1'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}

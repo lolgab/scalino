@@ -6,8 +6,10 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
+source ./link-lib.sh
+link_require
 
-for f in "$DIST/scalino-dotc" "$DIST/scalino-linkdriver" "$DIST/java.base.jar"; do
+for f in "$DIST/scalino-dotc" "$DIST/java.base.jar"; do
   [[ -e "$f" ]] || { echo "missing $f -- run build/all.sh first" >&2; exit 1; }
 done
 for f in "$WORK/compiler.cp" "$WORK/nativelibs.cp" "$WORK/nscplugin.jar.txt"; do
@@ -115,7 +117,8 @@ LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$N
 # itself is much smaller, but this is cheap insurance either way).
 # SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
 # heap badly (interflow's garbage); without it the link runs out of heap.
-env SCALANATIVE_EVAC_ENABLE=1 "$DIST/scalino-linkdriver" "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli "$CLANG" "$CLANGPP" info --mode "$([[ "$SCALINO_LINK_MODE" == debug ]] && echo debug || echo release-size)" --multithreading --no-incremental-compilation
+LINK_ENV=()
+linkdriver_run "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli --mode "$([[ "$SCALINO_LINK_MODE" == debug ]] && echo debug || echo release-size)" --multithreading --no-incremental-compilation
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"
 chmod +x "$DIST/scalino"

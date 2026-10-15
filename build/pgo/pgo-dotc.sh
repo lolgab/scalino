@@ -14,6 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-release-fast}"
 source ./00-env.sh
 source ./pgo/pgo-lib.sh
+source ./link-lib.sh
 NAME=dotc; BIN=dotty.tools.dotc.Main
 BOOT="${BOOT:-$DIST/scalino-linkdriver}"
 OUT="${OUT:-$WORK/pgo-dotc}"
@@ -31,9 +32,10 @@ pgo_link() { # linker, dir, env...  -> dir/$BIN (same command as build/03)
   [[ " $* " == *" SCALANATIVE_PGO_GEN=1 "* ]] && extra=(--linking "$PROFILE_RT")
   # GC_SYNC_TIMEOUT_MS=0: LLVM can sit in one huge instrumented function for
   # longer than the GC's 60s safepoint timeout
-  env "$@" SCALANATIVE_EVAC_ENABLE="${EVAC:-1}" SCALANATIVE_GC_SYNC_TIMEOUT_MS=0 "$linker" \
+  LINK_ENV=("$@" SCALANATIVE_EVAC_ENABLE="${EVAC:-1}" SCALANATIVE_GC_SYNC_TIMEOUT_MS=0)
+  LINKDRIVER="$linker" linkdriver_run \
     "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" "$(to_native_path "$dir")" \
-    "$BIN" "$CLANG" "$CLANGPP" info --mode "$SCALINO_LINK_MODE" \
+    "$BIN" --mode "$SCALINO_LINK_MODE" \
     --multithreading --no-incremental-compilation --embed-resources \
     "${extra[@]+"${extra[@]}"}" > "$dir.log" 2>&1 \
     || { tail -30 "$dir.log" >&2; echo "link into $dir failed" >&2; return 1; }

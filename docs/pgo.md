@@ -61,6 +61,25 @@ runs in two rounds:
    will actually ship;
 3. **final** link with both profiles, exactly like a release build does.
 
+## JVM links (`SCALINO_JVM_LINK=1`)
+
+CI links scalino-dotc, scalino-lsp and the CLI with `LinkDriver` on a JVM
+(`build/link-lib.sh`) instead of the native linkdriver: no direct codegen, so the
+IR is textual `.ll` and clang compiles it. PGO works there too, with clang doing
+what the direct codegen does itself (patch `scala-native-0082`):
+`SCALANATIVE_PGO_GEN=1` adds `-fprofile-generate -mllvm -pgo-instrument-entry=true`
+to the clang call of every `.ll` file, `SCALANATIVE_PGO_USE=<.profdata>` adds
+`-fprofile-use=`. The Interflow profile (`SCALANATIVE_PGO_PROFILE`) is the same.
+
+The IR differs from the direct codegen's, so the JVM link has its own profiles,
+`pgo/<name>.jvm.{llvm,interflow}.gz` (`pgo_key` in `build/pgo/pgo-lib.sh`), taken
+by the same `build/pgo/pgo-<name>.sh` scripts with `SCALINO_JVM_LINK=1`.
+The `Refresh PGO profiles` workflow (`workflow_dispatch`) does that on a CI runner
+-- with the toolchain, clang and `SCALANATIVE_LINK_THREADS` of the release build,
+so the CFG hashes match -- and opens a PR with the new files. Until they are
+committed a JVM release link simply has no PGO. scalino-linkdriver is always
+linked natively and keeps its direct-codegen profile.
+
 ## Refreshing the profiles
 
 ```
