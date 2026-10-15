@@ -29,6 +29,9 @@ jobs:
       SCALANATIVE_LINK_THREADS: '1'
       # Tag builds ship optimized binaries; everything else links in debug mode.
       SCALINO_LINK_MODE: release-fast
+      # build/cross-lib.sh: also link scalino-dotc/scalino-lsp for this target
+      # (empty = no cross linking)
+      SCALINO_CROSS_TRIPLE: ${{ matrix.cross }}
     strategy:
       fail-fast: false
       matrix:
@@ -37,10 +40,14 @@ jobs:
             os: ubuntu-24.04
           - target: linux-arm64
             os: ubuntu-24.04-arm
+          # macos-arm64 is not a leg of its own here: the 7GB arm64 runner
+          # cannot link scalino-dotc/scalino-lsp (the GC runs out of heap, see
+          # the v0.0.22 run), the 14GB Intel one can. This leg cross-links both
+          # for aarch64-apple-darwin (clang, no emulation) and the
+          # `build-macos-arm64` job below assembles and tests the arm64 release.
           - target: macos-x86_64
             os: macos-15-intel
-          - target: macos-arm64
-            os: macos-14
+            cross: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -87,6 +94,13 @@ jobs:
             assets/*.tar.gz.sha256
           if-no-files-found: error
 
+      - uses: actions/upload-artifact@v4
+        if: matrix.cross != ''
+        with:
+          name: cross-macos-arm64
+          path: dist-cross/${{ matrix.cross }}/*
+          if-no-files-found: error
+
       # .deb/.rpm are an alternative to the tarball for apt/dnf users --
       # native package manager install (clang pulled in as a real dependency)
       # instead of tarball+install.sh. Linux only: fpm's rpm backend shells
@@ -116,6 +130,80 @@ jobs:
             assets/*.deb.sha256
             assets/*.rpm
             assets/*.rpm.sha256
+          if-no-files-found: error
+
+  # The arm64 macOS release: scalino-linkdriver is built here (it embeds the host's
+  # static LLVM, so it cannot be cross-linked), scalino-dotc/scalino-lsp come
+  # from the Intel leg above (cross-linked, see build/cross-lib.sh), and the
+  # scalino CLI is built last, with those. Everything is smoke tested natively
+  # before the tarball is published.
+  build-macos-arm64:
+    name: build (macos-arm64)
+    needs: build
+    # run even when an unrelated leg of `build` failed: only the cross-built
+    # binaries are needed, and the download below fails if they are missing
+    if: ${{ !cancelled() }}
+    runs-on: macos-14
+    env:
+      SCALANATIVE_LINK_THREADS: '1'
+      SCALINO_LINK_MODE: release-fast
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cross-macos-arm64
+          path: cross-macos-arm64
+
+      - name: Build toolchain (scalino-linkdriver, packaging)
+        shell: bash
+        run: ./build/all.sh core
+
+      - name: Install the cross-built scalino-dotc and scalino-lsp
+        shell: bash
+        run: ./build/13-install-prebuilt.sh cross-macos-arm64
+
+      - name: Build the scalino CLI
+        shell: bash
+        run: |
+          ./build/03b-build-scalalib-retained.sh
+          ./build/07-build-scalino.sh
+          rm -f dist/tools-patched-jvm.jar
+
+      - name: Smoke test -- scalino-lsp
+        shell: bash
+        run: ./build/08b-smoke-lsp.sh
+
+      - name: Smoke test -- plain program
+        shell: bash
+        run: ./dist/scalino run examples/Hello.scala
+
+      - name: Smoke test -- real macro
+        # Known-failing, see the identical step in the build job
+        continue-on-error: true
+        shell: bash
+        run: ./dist/scalino run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
+
+      - name: Package
+        shell: bash
+        run: |
+          version="${{ inputs.tag || github.ref_name }}"
+          pkg="scalino-${version}-macos-arm64"
+          mkdir -p "out/$pkg"
+          cp -a dist/. "out/$pkg/"
+          cp README.md LICENSE NOTICE "out/$pkg/"
+          mkdir -p assets
+          tar czf "assets/$pkg.tar.gz" -C out "$pkg"
+          ( cd assets && shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-arm64
+          path: |
+            assets/*.tar.gz
+            assets/*.tar.gz.sha256
           if-no-files-found: error
 
   # Windows x86_64 release build disabled -- see docs/findings.md.
@@ -173,7 +261,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: [build]
+    needs: [build, build-macos-arm64]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

@@ -163,6 +163,7 @@ printf '%s' "$LSP_LINK_CP" > "$SELFHOST_DIR/lsp-link.cp"
 # on a JVM -- see 03-build-scalino-dotc.sh's identical link step.
 # SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
 # heap badly (interflow's garbage); without it the link runs out of heap.
+LINK_EXTRA=()
 lsp_link() {
   rm -rf "$LINK_WORK"
   mkdir -p "$LINK_WORK"
@@ -175,7 +176,8 @@ lsp_link() {
     info \
     --mode "$SCALINO_LINK_MODE" \
     --no-incremental-compilation \
-    --embed-resources
+    --embed-resources \
+    ${LINK_EXTRA[@]+"${LINK_EXTRA[@]}"}
 }
 # Release builds use the committed PGO profiles (pgo/, see docs/pgo.md); a
 # failing PGO link falls back to the plain one rather than failing the build.
@@ -188,6 +190,23 @@ fi
 
 BUILT="$LINK_WORK/dotty.tools.languageserver.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
+source ./cross-lib.sh
+if cross_enabled; then
+  echo "== cross-linking scalino-lsp for $SCALINO_CROSS_TRIPLE =="
+  HOST_LINK_WORK="$LINK_WORK"
+  LINK_WORK="$SELFHOST_DIR/lsp-link-work-cross"
+  LINK_EXTRA=(--target-triple "$SCALINO_CROSS_TRIPLE")
+  if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
+    lsp_link "${PGO_ENV[@]}" || { echo "WARNING: PGO cross link failed, relinking without PGO" >&2; lsp_link; }
+  else
+    lsp_link
+  fi
+  CROSS_BUILT="$LINK_WORK/$SCALINO_CROSS_TRIPLE/dotty.tools.languageserver.Main"
+  [[ -f "$CROSS_BUILT" ]] || { echo "cross link did not produce $CROSS_BUILT" >&2; exit 1; }
+  cross_install "$CROSS_BUILT" scalino-lsp
+  LINK_WORK="$HOST_LINK_WORK"
+  LINK_EXTRA=()
+fi
 rm -f "$DIST/scalino-lsp" # new inode, see 04-build-scalino-linkdriver.sh
 cp "$BUILT" "$DIST/scalino-lsp"
 # On macOS/arm64, the linker's own ad-hoc signature on this particular
