@@ -29,7 +29,13 @@ pgo_link() { # linker, dir, env...  -> dir/$BIN (same command as build/03)
   local linker="$1" dir="$2"; shift 2
   rm -rf "${dir:?}"; mkdir -p "$dir"
   local t0=$SECONDS extra=()
-  [[ " $* " == *" SCALANATIVE_PGO_GEN=1 "* ]] && extra=(--linking "$PROFILE_RT")
+  # Linux: clang's driver adds this itself for -fprofile-generate; without it the
+  # archive's initializer (which registers the atexit writer) is never linked in
+  # and the binary runs but writes no .profraw. Darwin pulls it in by itself.
+  if [[ " $* " == *" SCALANATIVE_PGO_GEN=1 "* ]]; then
+    extra=(--linking "$PROFILE_RT")
+    [[ "$(uname -s)" == Darwin ]] || extra+=(--linking -Wl,-u,__llvm_profile_runtime)
+  fi
   # GC_SYNC_TIMEOUT_MS=0: LLVM can sit in one huge instrumented function for
   # longer than the GC's 60s safepoint timeout
   LINK_ENV=("$@" SCALANATIVE_EVAC_ENABLE="${EVAC:-1}" SCALANATIVE_GC_SYNC_TIMEOUT_MS=0)
