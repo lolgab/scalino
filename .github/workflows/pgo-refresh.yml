@@ -89,7 +89,12 @@ jobs:
     if: ${{ !cancelled() && needs.profile.result != 'failure' }}
     runs-on: ubuntu-24.04
     steps:
+      # Full history: from a depth-1 checkout the push of the new branch sends the
+      # tip commit as a root, and GitHub then rejects it for "creating"
+      # .github/workflows/* without the `workflows` permission the token lacks.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
