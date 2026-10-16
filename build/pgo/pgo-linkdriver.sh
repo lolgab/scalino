@@ -25,7 +25,11 @@ PROFILE_RT="$(pgo_profile_runtime)"
 pgo_link() {
   local linker="$1" dir="$2"; shift 2
   local t0=$SECONDS extra=""
-  [[ " $* " == *" SCALANATIVE_PGO_GEN=1 "* ]] && extra="$PROFILE_RT"
+  if [[ " $* " == *" SCALANATIVE_PGO_GEN=1 "* ]]; then
+    extra="$PROFILE_RT"
+    # Linux: see pgo-dotc.sh -- without it no .profraw is written
+    [[ "$(uname -s)" == Darwin ]] || extra="$extra -Wl,-u,__llvm_profile_runtime"
+  fi
   rm -rf "${dir:?}"
   env "$@" SCALINO_PGO=0 SCALINO_EXTRA_LINKING="$extra" \
     SCALINO_BOOTSTRAP_LINKDRIVER="$linker" SCALINO_BOOTSTRAP_EVAC=0 \

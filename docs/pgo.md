@@ -76,7 +76,8 @@ The IR differs from the direct codegen's, so the JVM link has its own profiles,
 by the same `build/pgo/pgo-<name>.sh` scripts with `SCALINO_JVM_LINK=1`.
 The `Refresh PGO profiles` workflow (`workflow_dispatch`) does that on a CI runner
 -- with the toolchain, clang and `SCALANATIVE_LINK_THREADS` of the release build,
-so the CFG hashes match -- and opens a PR with the new files. Until they are
+so the CFG hashes match -- and opens a PR with the new files. It refreshes
+`pgo/linkdriver.*.gz` too (natively linked, direct codegen; `names` input selects). Until they are
 committed a JVM release link simply has no PGO. scalino-linkdriver is always
 linked natively and keeps its direct-codegen profile.
 
