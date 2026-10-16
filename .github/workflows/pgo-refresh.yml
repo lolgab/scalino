@@ -60,10 +60,10 @@ jobs:
       - name: Install libclang-rt
         run: sudo apt-get install -y libclang-rt-20-dev
 
-      # 06-package.sh drops dist/tools-patched.jar, which the dotc workload
-      # (the Scala Native tools sources) compiles against
+      # 06-package.sh drops dist/tools-patched.jar, which the dotc workload (the
+      # Scala Native tools sources) and build/04 (LinkDriver.scala, relinked by
+      # the linkdriver profile) compile against
       - name: Restore tools-patched.jar
-        if: matrix.name == 'dotc'
         run: ./build/04a-patch-tools.sh
 
       - name: Profile ${{ matrix.name }}
