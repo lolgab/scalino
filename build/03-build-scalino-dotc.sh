@@ -132,23 +132,6 @@ fi
 
 BUILT="$LINK_WORK/dotty.tools.dotc.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
-source ./cross-lib.sh
-if cross_enabled; then
-  echo "== cross-linking scalino-dotc for $SCALINO_CROSS_TRIPLE =="
-  HOST_LINK_WORK="$LINK_WORK"
-  LINK_WORK="$SELFHOST_DIR/link-work-cross"
-  LINK_EXTRA=(--target-triple "$SCALINO_CROSS_TRIPLE")
-  if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
-    dotc_link "${PGO_ENV[@]}" || { echo "WARNING: PGO cross link failed, relinking without PGO" >&2; dotc_link; }
-  else
-    dotc_link
-  fi
-  CROSS_BUILT="$LINK_WORK/$SCALINO_CROSS_TRIPLE/dotty.tools.dotc.Main"
-  [[ -f "$CROSS_BUILT" ]] || { echo "cross link did not produce $CROSS_BUILT" >&2; exit 1; }
-  cross_install "$CROSS_BUILT" scalino-dotc
-  LINK_WORK="$HOST_LINK_WORK"
-  LINK_EXTRA=()
-fi
 rm -f "$DIST/scalino-dotc" # new inode, see 04-build-scalino-linkdriver.sh
 cp "$BUILT" "$DIST/scalino-dotc"
 echo "OK: $DIST/scalino-dotc"

@@ -189,23 +189,6 @@ fi
 
 BUILT="$LINK_WORK/dotty.tools.languageserver.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
-source ./cross-lib.sh
-if cross_enabled; then
-  echo "== cross-linking scalino-lsp for $SCALINO_CROSS_TRIPLE =="
-  HOST_LINK_WORK="$LINK_WORK"
-  LINK_WORK="$SELFHOST_DIR/lsp-link-work-cross"
-  LINK_EXTRA=(--target-triple "$SCALINO_CROSS_TRIPLE")
-  if [[ ${#PGO_ENV[@]} -gt 0 ]]; then
-    lsp_link "${PGO_ENV[@]}" || { echo "WARNING: PGO cross link failed, relinking without PGO" >&2; lsp_link; }
-  else
-    lsp_link
-  fi
-  CROSS_BUILT="$LINK_WORK/$SCALINO_CROSS_TRIPLE/dotty.tools.languageserver.Main"
-  [[ -f "$CROSS_BUILT" ]] || { echo "cross link did not produce $CROSS_BUILT" >&2; exit 1; }
-  cross_install "$CROSS_BUILT" scalino-lsp
-  LINK_WORK="$HOST_LINK_WORK"
-  LINK_EXTRA=()
-fi
 rm -f "$DIST/scalino-lsp" # new inode, see 04-build-scalino-linkdriver.sh
 cp "$BUILT" "$DIST/scalino-lsp"
 # On macOS/arm64, the linker's own ad-hoc signature on this particular
