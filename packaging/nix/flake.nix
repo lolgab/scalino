@@ -263,7 +263,8 @@
               crossArgs = [ "--native-target-triple" (pkgs.lib.concatStringsSep "," nativeTargetTriples) ]
                 ++ pkgs.lib.concatMap (t: [ "--native-sysroot" "${t}=${sysroots}/${t}" ]) nativeTargetTriples;
               hostArgs = pkgs.lib.concatMap (m: [ "--native-pkg-config" m ]) pkgConfig;
-              binaries = if builtins.length nativeTargetTriples == 1
+              # a host build (no triples) and a single-triple cross build both produce `app`
+              binaries = if !cross || builtins.length nativeTargetTriples == 1
                 then [ { from = "app"; to = pname; } ]
                 else map (t: { from = "app-${t}"; to = "${pname}-${t}"; }) nativeTargetTriples;
             in
