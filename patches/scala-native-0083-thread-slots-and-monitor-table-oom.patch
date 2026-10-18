@@ -1,0 +1,178 @@
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
+index 7ebbe7e..a0e77e8 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
+@@ -9,7 +9,11 @@ import scala.concurrent.duration._
+ 
+ import scala.scalanative.annotation.alwaysinline
+ import scala.scalanative.concurrent.NativeExecutionContext
+-import scala.scalanative.meta.LinktimeInfo.{isMultithreadingEnabled, isWindows}
++import scala.scalanative.meta.LinktimeInfo.{
++  isCompactHeaders,
++  isMultithreadingEnabled,
++  isWindows
++}
+ import scala.scalanative.runtime.GC.{ThreadRoutineArg, ThreadStartRoutine}
+ import scala.scalanative.runtime.Intrinsics._
+ import scala.scalanative.runtime.ffi.stdatomic.atomic_thread_fence
+@@ -243,6 +247,8 @@ object NativeThread {
+         nativeThread.state = NativeThread.State.Terminated
+         thread.notifyAll()
+       }
++      // After the last lock of the thread, gives back its thin lock owner id
++      if (isCompactHeaders) monitor.ThreadSlots.releaseCurrent()
+       StackOverflowGuards.close()
+     }
+   }
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
+index d5a4cbf..c056bfc 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
+@@ -159,11 +159,11 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+ 
+   @alwaysinline private def getThreadId(thread: Thread): ThreadId = {
+     if (isCompactHeaders) {
+-      // Thread ids are never reused, the first ones get the unique owner ids
+-      val slot = thread.getId() + 1
+-      return castLongToRawPtr(
+-        if (slot < LockWord.ThreadIdMax) slot else LockWord.ThreadIdMax
+-      )
++      // Owner ids are leased to live threads, see thread_slots.c. Virtual
++      // threads share their carrier's native thread, they never get one.
++      if (thread.isInstanceOf[VirtualThread])
++        return castLongToRawPtr(LockWord.ThreadIdMax)
++      return castLongToRawPtr(ThreadSlots.current().toLong)
+     }
+     val addr = castObjectToRawPtr(thread)
+     if (is32bit) castIntToRawPtr(castRawPtrToInt(addr) & LockWord32.ThreadIdMax)
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
+index 87c2da3..1a11d5e 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
+@@ -41,6 +41,9 @@ private[runtime] object MonitorTable {
+         storeInt(lockCell, 0)
+         owners = new scala.Array[WeakReference[AnyRef]](Capacity)
+         monitors = new scala.Array[ObjectMonitor](Capacity)
++        exhausted = new OutOfMemoryError(
++          "Too many inflated monitors, limit with compact object headers is " + Capacity
++        )
+       }
+     }
+ 
+@@ -59,10 +62,32 @@ private[runtime] object MonitorTable {
+   private def unlock(): Unit =
+     atomic_store_int(lockCell, 0, memory_order_release)
+ 
++  /** Thrown when the table is full. Preallocated: building a new throwable
++   *  synchronizes on it, which can inflate its lock and register in this very
++   *  table, failing again until the stack overflows.
++   */
++  private var exhausted: OutOfMemoryError = _
++
+   /** Registers the monitor of `owner` and returns its index */
+   private[monitor] def register(owner: AnyRef, monitor: ObjectMonitor): Int = {
+     // Allocate outside of the lock, GC can't suspend threads waiting for it
+     val ref = new WeakReference[AnyRef](owner)
++    var idx = tryRegister(ref, monitor)
++    if (idx < 0) {
++      // Slots of collected objects are only reusable once their references are
++      // cleared
++      System.gc()
++      idx = tryRegister(ref, monitor)
++    }
++    if (idx < 0) throw exhausted
++    idx
++  }
++
++  /** Index of the claimed slot, -1 if all of them belong to live objects */
++  private def tryRegister(
++      ref: WeakReference[AnyRef],
++      monitor: ObjectMonitor
++  ): Int = {
+     lock()
+     try {
+       var tries = 0
+@@ -77,9 +102,7 @@ private[runtime] object MonitorTable {
+         idx = (idx + 1) & (Capacity - 1)
+         tries += 1
+       }
++      -1
+     } finally unlock()
+-    throw new OutOfMemoryError(
+-      "Too many inflated monitors, limit with compact object headers is " + Capacity
+-    )
+   }
+ }
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
+new file mode 100644
+index 0000000..836d051
+--- /dev/null
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
+@@ -0,0 +1,16 @@
++package scala.scalanative.runtime
++package monitor
++
++import scala.scalanative.unsafe._
++
++/** Leases of the owner ids of thin locks, see thread_slots.c. Extern, so the
++ *  lock path never needs a module to be loaded.
++ */
++@extern
++private[runtime] object ThreadSlots {
++  @name("scalanative_monitor_thread_slot")
++  def current(): CInt = extern
++
++  @name("scalanative_monitor_release_thread_slot")
++  def releaseCurrent(): Unit = extern
++}
+diff --git a/nativelib/src/main/resources/scala-native/thread_slots.c b/nativelib/src/main/resources/scala-native/thread_slots.c
+new file mode 100644
+index 0000000..a7334b4
+--- /dev/null
++++ b/nativelib/src/main/resources/scala-native/thread_slots.c
+@@ -0,0 +1,45 @@
++// Owner ids of the thin locks with compact object headers, see
++// scala.scalanative.runtime.monitor.BasicMonitor.getThreadId.
++//
++// Kept in C on purpose: the lock path can run while a Scala module is being
++// initialized (waiting for it takes the lock of its class), so it can't depend
++// on loading any Scala module, nor on state kept in a Scala object.
++#include <stdatomic.h>
++
++// The owner field of the compact lock word has 10 bits. The last id is never
++// leased, it marks the threads without a slot (see LockWord.ThreadIdMax).
++#define SLOTLESS 1023
++
++// Index 0 is unused
++static atomic_int slots[SLOTLESS];
++
++// Slot of the current thread, 0 until its first lock
++static _Thread_local int threadSlot = 0;
++
++static int acquire(void) {
++    for (int i = 1; i < SLOTLESS; i++) {
++        int expected = 0;
++        if (atomic_compare_exchange_strong(&slots[i], &expected, 1))
++            return i;
++    }
++    return SLOTLESS;
++}
++
++// Slot of the current thread, leased on first use
++int scalanative_monitor_thread_slot(void) {
++    int slot = threadSlot;
++    if (slot == 0) {
++        slot = acquire();
++        threadSlot = slot;
++    }
++    return slot;
++}
++
++// Gives back the slot of the current thread when it terminates, if it still
++// takes locks afterwards it does as a slotless thread
++void scalanative_monitor_release_thread_slot(void) {
++    int slot = threadSlot;
++    threadSlot = SLOTLESS;
++    if (slot > 0 && slot < SLOTLESS)
++        atomic_store_explicit(&slots[slot], 0, memory_order_release);
++}
