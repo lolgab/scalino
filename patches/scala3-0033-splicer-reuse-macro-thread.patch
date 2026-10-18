@@ -1,0 +1,52 @@
+diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+index 507c1811..057bf108 100644
+--- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
+@@ -3,6 +3,7 @@ package transform
+ 
+ 
+ import java.io.{PrintWriter, StringWriter}
++import java.util.concurrent.{Callable, ExecutionException, ExecutorService, Executors}
+ import java.lang.reflect.{InvocationTargetException, Method => JLRMethod}
+ 
+ import dotty.tools.dotc.ast.tpd
+@@ -42,7 +43,7 @@ object Splicer {
+    *
+    *  See: `Staging`
+    */
+-  /** Runs `body` on a fresh thread with a very large stack and waits for it.
++  /** Runs `body` on a dedicated thread with a very large stack and waits for it.
+    *
+    *  The tree-walking macro interpreter recurses natively (every interpreted
+    *  call costs several large native frames), and a real derivation such as
+@@ -50,18 +51,22 @@ object Splicer {
+    *  (default, 8MB) main-thread stack overflows long before the macro
+    *  finishes. The stack is only reserved, not committed, so this costs
+    *  nothing for small macros.
++   *
++   *  A single thread serves every expansion: a thread per expansion exhausts
++   *  the runtime's thread resources on macro heavy code (upickle, http4s).
+    */
++  private lazy val macroThread: ExecutorService =
++    Executors.newSingleThreadExecutor { task =>
++      val thread = new Thread(null, task, "scalino-macro", 512L * 1024 * 1024)
++      thread.setDaemon(true)
++      thread
++    }
++
+   private def onBigStack[T](body: => T): T =
+     if Thread.currentThread().getName == "scalino-macro" then body
+     else
+-      var result: Either[Throwable, T] | Null = null
+-      val thread = new Thread(null, () => { result = try Right(body) catch { case e: Throwable => Left(e) } }, "scalino-macro", 512L * 1024 * 1024)
+-      thread.start()
+-      thread.join()
+-      result match
+-        case Right(v) => v
+-        case Left(e) => throw e
+-        case null => throw new IllegalStateException("macro expansion thread produced no result")
++      try macroThread.submit(new Callable[T] { def call(): T = body }).get()
++      catch case e: ExecutionException => throw e.getCause
+ 
+   def splice(tree: Tree, splicePos: SrcPos, spliceExpansionPos: SrcPos, classLoader: ClassLoader)(using Context): Tree = tree match {
+     case Quote(quotedTree, Nil) => quotedTree
