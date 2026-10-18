@@ -1,0 +1,45 @@
+name: Publish apt/dnf repo
+
+# Manual backfill: rebuilds and deploys the apt/dnf repo (plus the docs site)
+# from the latest published releases, without building or cutting a release.
+# Keep the steps in sync with the publish-repo job in release.yml.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish-repo:
+    name: Publish apt/dnf repo
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install repo-building tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gnupg dpkg-dev apt-utils createrepo-c rpm
+
+      - name: Build apt/dnf repo tree
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: ./build/11-build-apt-dnf-repo.sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deployment
