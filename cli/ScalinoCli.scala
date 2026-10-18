@@ -639,8 +639,16 @@ object ScalinoCli:
         s"$org:${name}_native${BuildInfo.nativeBinaryVersion}_3:$version"
       case _ => dep
 
+  /** Filesystem-safe cache key. Short inputs are kept readable (and keep their
+   *  existing cache file names); long ones -- a project with many dependencies
+   *  -- are truncated and suffixed with a digest, since the full name would
+   *  exceed the filesystem's filename limit ("File name too long"). */
   def sanitizeKey(s: String): String =
-    s.map(c => if c.isLetterOrDigit then c else '_')
+    val sanitized = s.map(c => if c.isLetterOrDigit then c else '_')
+    if sanitized.length <= MaxKeyLength then sanitized
+    else sanitized.take(MaxKeyLength - 17) + "-" + hashKey(s)
+
+  private val MaxKeyLength = 100
 
   /** FNV-1a 64-bit, hex-encoded -- for cache keys derived from a *resolved
    *  classpath* (many absolute paths) rather than a short dep-coordinate
@@ -1852,8 +1860,13 @@ object ScalinoCli:
   // together instead, since test sources depend on main scope.
   // ---------------------------------------------------------------------
 
+  // Anything under an sbt-style `src/main/` is main scope even when a package
+  // directory further down is called `test` (`src/main/scala/app/test/Foo.scala`
+  // is `package app.test`, not a test source).
   def isTestSource(p: Path): Boolean =
-    p.iterator().asScala.exists(_.toString == "test")
+    val segments = p.iterator().asScala.map(_.toString).toList
+    val underSrcMain = segments.zip(segments.drop(1)).contains(("src", "main"))
+    !underSrcMain && segments.contains("test")
 
   def partitionSources(sources: List[Path]): (List[Path], List[Path]) =
     sources.partition(s => !isTestSource(s))
