@@ -1,0 +1,26 @@
+diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala
+index bd99a6d..0b78884 100644
+--- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala
++++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala
+@@ -4,6 +4,7 @@ import dotty.tools._
+ import dotty.tools.dotc._
+ import dotty.tools.dotc.ast.tpd._
+ import dotty.tools.dotc.config.*
++import dotty.tools.dotc.core.NullOpsDecorator.*
+ import dotty.tools.dotc.plugins.PluginPhase
+ 
+ import scala.scalanative.nscplugin.CompilerCompat.SymUtilsCompat.*
+@@ -160,7 +161,12 @@ class PrepNativeInterop extends PluginPhase with NativeInteropUtil {
+         val res = owner.denot.info
+           .member(methodName)
+           .filterWithPredicate(
+-            _.info.paramInfoss.flatten.corresponds(argTypes)(_ =:= _)
++            // Under `-Yexplicit-nulls` the stdlib's `Enumeration#Value(name: String)`
++            // overloads are seen with a different nullability than the one assumed
++            // by `ValueNameType` below, so also accept a match ignoring `| Null`.
++            _.info.paramInfoss.flatten.corresponds(argTypes) { (param, arg) =>
++              param =:= arg || param.stripNull() =:= arg.stripNull()
++            }
+           )
+           .symbol
+         assert(res.exists, "tried to resolve NoSymbol")
