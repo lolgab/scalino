@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Builds a static apt repo (dists/+pool/) and dnf repo (per-arch repodata/)
-# from every .deb/.rpm ever published to this repo's GitHub Releases, signed
+# from the .deb/.rpm of the latest 2 GitHub Releases (Pages caps site size), signed
 # with the GPG key in $APT_GPG_PRIVATE_KEY. Output goes to $1 (default:
 # ./site), ready to hand to actions/upload-pages-artifact.
 #
 # Rebuilds the whole tree from scratch every run (via `gh release download`
-# across ALL tags) rather than keeping incremental state, since a GitHub
+# across the latest $keep_releases tags) rather than keeping incremental state, since a GitHub
 # Pages deploy is itself a full-tree replace each time -- there's nowhere
 # durable to keep a partial apt/dnf repo between runs anyway.
 #
@@ -16,6 +16,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 repo="lolgab/scalino"
 site="${1:-site}"
+keep_releases=2
 : "${APT_GPG_PRIVATE_KEY:?APT_GPG_PRIVATE_KEY env var (armored private key) must be set}"
 
 work="$(mktemp -d)"
@@ -41,8 +42,8 @@ EOF
 rm -rf "$site"
 mkdir -p "$site/apt/pool/main/s/scalino" "$site/dnf/x86_64" "$site/dnf/aarch64" "$work/raw"
 
-echo "Fetching .deb/.rpm assets from every published release of $repo..."
-tags="$(gh release list --repo "$repo" --json tagName -q '.[].tagName' || true)"
+echo "Fetching .deb/.rpm assets from the latest $keep_releases published releases of $repo..."
+tags="$(gh release list --repo "$repo" --exclude-drafts --limit "$keep_releases" --json tagName -q '.[].tagName' || true)"
 if [ -z "$tags" ]; then
   echo "No published releases yet -- publishing an EMPTY apt/dnf repo (valid, just has nothing installable)."
 fi
