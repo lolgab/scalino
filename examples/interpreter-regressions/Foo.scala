@@ -133,6 +133,15 @@ object Regressions:
   def staticFieldIdentityStable: Boolean =
     Sentinel.unit eq Sentinel.unit
 
+  // `Set#map` on a real host `HashSet` (5+ elements; smaller sets are
+  // `Set1`..`Set4`) rebuilds through `HashSet.newBuilder`. That used to yield
+  // a hybrid interpreted `HashSet` with the right `size` but an empty
+  // iterator, so e.g. `blocks.map(_.toList).toList` came back empty.
+  def hashSetMapIterates: Boolean =
+    val mapped = (1 to 40).toSet.map(_ + 1)
+    mapped.size == 40 && mapped.toList.size == 40 && mapped.contains(41) &&
+      Set(Seq("a"), Seq("b"), Seq("c", "d"), Seq("e"), Seq("f")).map(_.toList).toList.size == 5
+
   def summary: String =
     val labels = allLabelsValid("host-1.example.com")
     val thunk = runThunk(21 + 21)
@@ -144,7 +153,8 @@ object Regressions:
     val region = regionMatchesWorks
     val ioobe = indexOutOfBoundsConstructible
     val identity = staticFieldIdentityStable
-    s"labels=$labels thunk=$thunk tag=$tag ident=$ident uninit=$uninit hostMut=$hostMut wrap=$wrap region=$region ioobe=$ioobe identity=$identity"
+    val hashSetMap = hashSetMapIterates
+    s"labels=$labels thunk=$thunk tag=$tag ident=$ident uninit=$uninit hostMut=$hostMut wrap=$wrap region=$region ioobe=$ioobe identity=$identity hashSetMap=$hashSetMap"
 
 object Foo:
   inline def myMacro(): String = ${ aMacroImplementation }

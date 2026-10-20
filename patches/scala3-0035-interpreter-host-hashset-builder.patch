@@ -1,0 +1,19 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -5109,6 +5109,15 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         Some(scala.StringContext(parts.map(_.toString).toSeq*))
+       case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "Set" =>
+         Some(scala.collection.immutable.Set.newBuilder[Object])
++      // `Set#map`/`filter`/... on a real host `HashSet` rebuild through its OWN
++      // companion's `newBuilder` (`iterableFactory`); left to the generic path
++      // that walks `HashSet.newBuilder`/`HashSetBuilder#result`, the result is a
++      // hybrid interpreted `HashSet` whose `iterator`/`toList`/`contains` run
++      // against a half-built trie (reports the right `size`, iterates as empty).
++      // A 5+-element `Set` takes this path (`Set1`..`Set4` rebuild via
++      // `Set.newBuilder` above) -- e.g. `blocks.map(_.toList).toList` in a macro.
++      case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "HashSet" && fn.owner.fullName.toString.startsWith("scala.collection.immutable.") =>
++        Some(scala.collection.immutable.HashSet.newBuilder[Object])
+       case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "List" =>
+         Some(List.newBuilder[Object])
+       // `newBuilder` dispatched via the genuinely ABSTRACT `IterableFactory`
