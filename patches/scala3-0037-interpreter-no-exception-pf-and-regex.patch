@@ -1,0 +1,1120 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 2946bc0..5cb9300 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -605,7 +605,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         interpretInstanceCall(receiver, target, rawArgs, fn.srcPos, typeArgs, staticDispatch = fn.qualifier.isInstanceOf[Super])
+ 
+     case closureDef((ddef @ DefDef(_, ValDefs(arg :: Nil) :: Nil, _, _))) =>
+-      (obj: AnyRef) => interpretTree(ddef.rhs)(using env.updated(arg.symbol, obj))
++      new InterpretedFn1(ddef, arg.symbol, env)
+ 
+     // General N-ary closures (e.g. the 3-arg `termHole` callback PickleQuotes
+     // generates for a quote's nested splices: `(idx, holeArgs, quotes) => ...`).
+@@ -769,6 +769,47 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     interpretTree(expr)(using newEnv)
+   }
+ 
++  /** `Tuple\d+`, without `String#matches` compiling a regex on every call. */
++  private def isTupleName(n: String): Boolean =
++    n.length > 5 && n.startsWith("Tuple") && allDigits(n, 5)
++
++  /** `_\d+`. */
++  private def isProductAccessorName(n: String): Boolean =
++    n.length > 1 && n.charAt(0) == '_' && allDigits(n, 1)
++
++  private def allDigits(n: String, from: Int): Boolean =
++    var i = from
++    while i < n.length && n.charAt(i) >= '0' && n.charAt(i) <= '9' do i += 1
++    i == n.length
++
++  /** Marker returned by `InterpretedFn1#applyIfMatched` for an unmatched input. */
++  private val NoMatch: Object = new Object
++
++  /** A 1-arg interpreted closure. When it is a `{ case ... }` partial-function
++   *  literal (body is a top-level `Match`) `applyIfMatched` reports "no case
++   *  matched" by returning `NoMatch` instead of throwing a `MatchError` --
++   *  capturing a stack trace and unwinding per probed element made
++   *  `lift`/`isDefinedAt`/`collect`/`applyOrElse` over interpreted partial
++   *  functions a hot spot.
++   */
++  private final class InterpretedFn1(ddef: DefDef, arg: Symbol, env: Env) extends Function1[Object, Object]:
++    def apply(x: Object): Object = interpretTree(ddef.rhs)(using env.updated(arg, x))
++    def applyIfMatched(x: Object): Object =
++      ddef.rhs match
++        case Match(selector, cases) =>
++          given Env = env.updated(arg, x)
++          try
++            interpretCases(cases, interpretTree(selector)) match
++              case Some(v) => v
++              case None => NoMatch
++          catch case _: MatchError => NoMatch
++        case _ =>
++          try apply(x) catch case _: MatchError => NoMatch
++
++  private def applyIfMatched(f: Function1[Object, Object], x: Object): Object = f match
++    case f: InterpretedFn1 => f.applyIfMatched(x)
++    case _ => try f(x) catch case _: MatchError => NoMatch
++
+   private def interpretCases(cases: List[CaseDef], scrutinee: Object)(using Env): Option[Object] =
+     cases.iterator.map(c => matchCase(c, scrutinee)).find(_.isDefined).flatten
+ 
+@@ -983,7 +1024,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+               case t: dotty.tools.dotc.core.Types.AnnotatedType => Some(List(t.underlying.stripTypeVar, t.annot.tree))
+               case _ => None
+             }
+-            case name2 if name2.matches("Tuple\\d+") =>
++            case name2 if isTupleName(name2) =>
+               // `case (a, b, ...) =>`/`case TupleN(a, b, ...) =>` -- the
+               // compiler-generated `TupleN.unapply`. A real `TupleN` (e.g.
+               // from `Tuple.fromArray` in the `apply` case below, or
+@@ -3265,7 +3306,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // (reached through http4s's `uri"..."` literal macro) is later read
+     // back via a real `.asInstanceOf[(Object, Object)]`, which an
+     // `InterpretedInstance` can't satisfy.
+-    else if fn.owner.name.toString.matches("Tuple\\d+") && fn.owner.derivesFrom(defn.ProductClass) then
++    else if isTupleName(fn.owner.name.toString) && fn.owner.derivesFrom(defn.ProductClass) then
+       Some(scala.Tuple.fromArray(rawArgs.filterNot(_.isEmpty).map(interpretTree).toArray))
+     // NOT `::` (deliberately not special-cased): `ListBuffer`'s own real
+     // source mutates a `::` cell's `next` field directly after construction
+@@ -4312,6 +4353,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     def findQuotes(candidates: List[Object]): Option[QuotesImpl] =
+       (receiver.toList ::: candidates).collectFirst { case q: QuotesImpl => q }
+ 
++    lazy val ownerName = fn.owner.name.toString
+     fn.name.toString match
+       case "reflect" if fn.owner == defn.QuotesClass =>
+         // `Quotes#reflect` is implemented by returning the Quotes instance
+@@ -4328,7 +4370,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // enough (a real per-argument position isn't threaded through this
+       // deep) -- and, for the two abort variants, actually stops
+       // expansion the same way an uncaught interpretation error would.
+-      case ("error" | "errorAndAbort" | "warning" | "info") if fn.owner.name.toString == "reportModule" =>
++      case ("error" | "errorAndAbort" | "warning" | "info") if ownerName == "reportModule" =>
+         val msg = args.collectFirst { case s: String => s }.getOrElse("")
+         fn.name.toString match
+           case "info" => report.echo(msg, pos)
+@@ -4339,7 +4381,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             throw new StopInterpretation(em"$msg", pos)
+         Some(().asInstanceOf[Object])
+ 
+-      case "of" if fn.owner.name.toString == "TypeTreeModule" =>
++      case "of" if ownerName == "TypeTreeModule" =>
+         // TypeTreeModule#of[T](using Type[T]): TypeTree = tp.typeTree (real
+         // QuotesImpl source, QuotesImpl.scala:1157) -- the Type[T] evidence
+         // is a real TypeImpl we already hold.
+@@ -4350,7 +4392,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+ 
+       // `TypeRepr.typeConstructorOf(classOf[X])`: the interpreter's `classOf[X]` is
+       // the dotc `Type` itself, whose constructor is its class's `typeRef`.
+-      case "typeConstructorOf" if fn.owner.name.toString == "TypeReprModule" =>
++      case "typeConstructorOf" if ownerName == "TypeReprModule" =>
+         args match
+           case (t: Type) :: Nil =>
+             val cs = t.dealias.classSymbol
+@@ -4359,14 +4401,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             val sym = requiredClass(c.getName)
+             if sym.exists then Some(sym.typeRef) else None
+           case _ => None
+-      case "of" if fn.owner.name.toString == "TypeReprModule" =>
++      case "of" if ownerName == "TypeReprModule" =>
+         // TypeReprModule#of[T](using Type[T]): TypeRepr = tp.typeTree.tpe
+         // (real QuotesImpl source, QuotesImpl.scala:1816-1817) -- same
+         // Type[T]-evidence-as-TypeImpl story as TypeTreeModule#of above.
+         import scala.quoted.runtime.impl.TypeImpl
+         args.collectFirst { case t: TypeImpl => t.typeTree.tpe; case t: Type => t }.orElse(currentTypeArgs.headOption)
+ 
+-      case "current" if fn.owner.name.toString == "SourceFileModule" =>
++      case "current" if ownerName == "SourceFileModule" =>
+         // SourceFileModule#current = ctx.compilationUnit.source (real source,
+         // QuotesImpl.scala:3274-3279).
+         Some(ctx.compilationUnit.source)
+@@ -4398,7 +4440,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `quotes.reflect.Printer.TreeCode`/`TypeReprShortCode`/... (hearth and
+       // other macros pick a specific printer for `show`): the real
+       // `QuotesImpl` printer objects, passed through as opaque values.
+-      case n if fn.owner.name.toString == "PrinterModule" && args.isEmpty => reflectPrinter(n)
++      case n if ownerName == "PrinterModule" && args.isEmpty => reflectPrinter(n)
+ 
+       // `X.show(using printer)` with an explicit printer: run it for real.
+       case "show" if args.size == 2 && isReflectPrinter(args(1)) && fn.owner.name.toString != "Quotes" =>
+@@ -4424,7 +4466,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // just above.
+         (receiver.toList ::: args).collectFirst { case e: scala.quoted.runtime.impl.ExprImpl => e.tree.show.asInstanceOf[Object] }
+ 
+-      case name if fn.owner.name.toString == "reflectModule" && args.isEmpty =>
++      case name if ownerName == "reflectModule" && args.isEmpty =>
+         // Any zero-arg accessor directly under `quotes.reflect` (the
+         // `XMethods` extension-bag givens, and the `TypeTree`/`SourceFile`/...
+         // companion-module accessors): treated as an opaque marker carrying
+@@ -4494,7 +4536,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // passed as an explicit argument, same "desugars to a call ON the
+       // `Quotes` instance" story as `valueOrAbort` below -- the receiver
+       // here is the `QuotesImpl`, not the tree.
+-      case "asExprOf" if fn.owner.name.toString == "TreeMethods" =>
++      case "asExprOf" if ownerName == "TreeMethods" =>
+         (receiver.toList ::: args).collectFirst { case t: Tree => new ExprImpl(t, SpliceScope.getCurrent) }
+       case "valueOrAbort" | "value" if fn.owner.derivesFrom(defn.QuotedExprClass) || fn.owner == defn.QuotesClass =>
+         // Desugars to a call ON the Quotes instance, with the actual Expr[T]
+@@ -4519,29 +4561,29 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // object Symbol ~L2665, object Flags ~L3160) one case at a time.
+       // -----------------------------------------------------------------
+ 
+-      case "show" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "show" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.show }
+-      case "dealias" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "dealias" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.dealias }
+-      case "widen" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "widen" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.widen }
+-      case "isSingleton" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "isSingleton" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => Boolean.box(t.isSingleton) }
+-      case "simplified" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "simplified" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.simplified }
+-      case "classSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "classSymbol" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type =>
+           if debugEnabled then
+             Console.err.println(s"[classSymbol] t=${t.show} tId=${System.identityHashCode(t)} tClass=${t.getClass} classSymbol=${t.classSymbol} exists=${t.classSymbol.exists}")
+           if t.classSymbol.exists then Some(t.classSymbol) else None
+         }
+-      case "typeSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "typeSymbol" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.typeSymbol }
+-      case "termSymbol" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "termSymbol" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.termSymbol }
+-      case "baseClasses" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "baseClasses" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.baseClasses }
+-      case "typeArgs" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "typeArgs" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type =>
+           def targsOf(t: Type): List[Type] = t match
+             case AppliedType(_, targs) => targs
+@@ -4550,46 +4592,46 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             case _ => Nil
+           targsOf(t)
+         }
+-      case "appliedTo" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "appliedTo" if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (targ: Type) :: Nil => Some(t.appliedTo(targ))
+           case (t: Type) :: (targs: List[Type] @unchecked) :: Nil => Some(t.appliedTo(targs))
+           case _ => None
+-      case "substituteTypes" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "substituteTypes" if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (from: List[Symbol] @unchecked) :: (to: List[Type] @unchecked) :: Nil => Some(t.subst(from, to))
+           case _ => None
+-      case ("=:=" | "<:<") if fn.owner.name.toString == "TypeReprMethods" =>
++      case ("=:=" | "<:<") if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (that: Type) :: Nil =>
+             Some(Boolean.box(if fn.name.toString == "=:=" then t =:= that else t <:< that))
+           case _ => None
+-      case "memberType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "memberType" if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (member: Symbol) :: Nil =>
+             val memberInfo = if t.typeSymbol.isClass then member.info.substThis(t.classSymbol.asClass, t) else member.info
+             Some(memberInfo.asSeenFrom(t, member.owner))
+           case _ => None
+       // Remaining `TypeReprMethods` members, same definitions as `QuotesImpl`.
+-      case "baseType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "baseType" if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (cls: Symbol) :: Nil => Some(t.baseType(cls))
+           case _ => None
+-      case "widenByName" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "widenByName" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.widenExpr }
+-      case "widenTermRefByName" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "widenTermRefByName" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type =>
+           t.widenTermRefExpr match
+             case dotty.tools.dotc.core.Types.ClassInfo(prefix, sym, _, _, _) => prefix.select(sym)
+             case other => other
+         }
+-      case "dealiasKeepOpaques" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "dealiasKeepOpaques" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => t.dealiasKeepOpaques }
+-      case "isFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "isFunctionType" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => Boolean.box(defn.isFunctionNType(t)) }
+-      case "isContextFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "isContextFunctionType" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => Boolean.box(defn.isContextFunctionType(t)) }
+-      case "isErasedFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "isErasedFunctionType" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type =>
+           Boolean.box(t match
+             case defn.PolyFunctionOf(mt) =>
+@@ -4601,34 +4643,34 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                 case _ => false
+             case _ => false)
+         }
+-      case "isDependentFunctionType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "isDependentFunctionType" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type =>
+           val noRefinement = t.dropDependentRefinement
+           Boolean.box(noRefinement != t && defn.isNonRefinedFunction(noRefinement))
+         }
+-      case "isTupleN" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "isTupleN" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => Boolean.box(defn.isTupleNType(t)) }
+-      case "select" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "select" if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (sym: Symbol) :: Nil => Some(t.select(sym))
+           case _ => None
+-      case "seal" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "seal" if ownerName == "TypeReprMethods" =>
+         args.headOption.collect { case t: Type => new scala.quoted.runtime.impl.TypeImpl(tpd.TypeTree(t), SpliceScope.getCurrent) }
+-      case "derivesFrom" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "derivesFrom" if ownerName == "TypeReprMethods" =>
+         args match
+           case (t: Type) :: (cls: Symbol) :: Nil => Some(Boolean.box(t.derivesFrom(cls)))
+           case _ => None
+-      case "asType" if fn.owner.name.toString == "TypeReprMethods" =>
++      case "asType" if ownerName == "TypeReprMethods" =>
+         import scala.quoted.runtime.impl.TypeImpl
+         args.headOption.collect { case t: Type => new TypeImpl(tpd.TypeTree(t), SpliceScope.getCurrent) }
+ 
+-      case "name" if fn.owner.name.toString == "SymbolMethods" =>
++      case "name" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.name.toString }
+-      case "fullName" if fn.owner.name.toString == "SymbolMethods" =>
++      case "fullName" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.fullName.toString }
+-      case "flags" if fn.owner.name.toString == "SymbolMethods" =>
++      case "flags" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.flags.asInstanceOf[Object] }
+-      case "pos" if fn.owner.name.toString == "SymbolMethods" =>
++      case "pos" if ownerName == "SymbolMethods" =>
+         // Real QuotesImpl (QuotesImpl.scala:2964-2972): `None` for a
+         // nonexistent symbol or one truly outside any source, else its own
+         // `sourcePos` or (as with `TreeMethods#pos` above) a zero-span
+@@ -4641,35 +4683,35 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             else if s.source.exists then Some(s.source.atSpan(dotty.tools.dotc.util.Spans.Span(0)))
+             else None
+         }
+-      case "exists" if fn.owner.name.toString == "SymbolMethods" =>
++      case "exists" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s != NoSymbol) }
+-      case "isNoSymbol" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isNoSymbol" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s == NoSymbol) }
+-      case "companionModule" if fn.owner.name.toString == "SymbolMethods" =>
++      case "companionModule" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+           val cm = s.denot.companionModule
+           if debugEnabled then
+             Console.err.println(s"[companionModule] s=$s id=${System.identityHashCode(s)} cm=$cm cmId=${System.identityHashCode(cm)}")
+           cm
+         }
+-      case "companionClass" if fn.owner.name.toString == "SymbolMethods" =>
++      case "companionClass" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.companionClass }
+-      case "children" if fn.owner.name.toString == "SymbolMethods" =>
++      case "children" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.children }
+-      case "caseFields" if fn.owner.name.toString == "SymbolMethods" =>
++      case "caseFields" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+           if !s.isClass then Nil else s.asClass.classDenot.paramAccessors.filter(_.is(CaseAccessor))
+         }
+-      case "paramSymss" if fn.owner.name.toString == "SymbolMethods" =>
++      case "paramSymss" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.paramSymss }
+-      case "primaryConstructor" if fn.owner.name.toString == "SymbolMethods" =>
++      case "primaryConstructor" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.primaryConstructor }
+-      case ("fieldMembers" | "memberFields") if fn.owner.name.toString == "SymbolMethods" =>
++      case ("fieldMembers" | "memberFields") if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+           val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+           prefix.allMembers.iterator.map(_.symbol).filter(sym => sym.isTerm && !sym.is(Method)).toList
+         }
+-      case "methodMember" if fn.owner.name.toString == "SymbolMethods" =>
++      case "methodMember" if ownerName == "SymbolMethods" =>
+         // "Get named non-private methods declared or inherited" -- unlike
+         // `declaredMethod` (declared directly on this symbol only, via
+         // `.decls`), this also finds methods inherited from a superclass
+@@ -4681,65 +4723,65 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             Some(prefix.allMembers.iterator.map(_.symbol).filter(sym =>
+               sym.isTerm && sym.is(Method) && !sym.isConstructor && !sym.isPrivate && sym.name.toString == name).toList)
+           case _ => None
+-      case ("methodMembers" | "memberMethods") if fn.owner.name.toString == "SymbolMethods" =>
++      case ("methodMembers" | "memberMethods") if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+           val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+           prefix.allMembers.iterator.map(_.symbol).filter(sym =>
+             sym.isTerm && sym.is(Method) && !sym.isConstructor && !sym.isPrivate).toList
+         }
+-      case "declaredMethod" if fn.owner.name.toString == "SymbolMethods" =>
++      case "declaredMethod" if ownerName == "SymbolMethods" =>
+         args match
+           case (s: Symbol) :: (name: String) :: Nil =>
+             Some(s.denot.typeRef.decls.iterator.filter(sym =>
+               sym.isTerm && sym.is(Method) && !sym.isConstructor && sym.name.toString == name).toList)
+           case _ => None
+-      case "isDefDef" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isDefDef" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.is(Method)) }
+-      case "isClassConstructor" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isClassConstructor" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.denot.isClassConstructor) }
+-      case "isTypeDef" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isTypeDef" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.isType && !s.isClass && !s.is(Case)) }
+-      case "isClassDef" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isClassDef" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.isClass) }
+-      case "isAliasType" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isAliasType" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.denot.isAliasType) }
+-      case "typeRef" if fn.owner.name.toString == "SymbolMethods" =>
++      case "typeRef" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.typeRef }
+-      case "termRef" if fn.owner.name.toString == "SymbolMethods" =>
++      case "termRef" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.termRef }
+-      case "isTypeParam" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isTypeParam" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.isTypeParam) }
+-      case "isType" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isType" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.isType) }
+-      case "isTerm" if fn.owner.name.toString == "SymbolMethods" =>
++      case "isTerm" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => Boolean.box(s.isTerm) }
+-      case "paramVariance" if fn.owner.name.toString == "SymbolMethods" =>
++      case "paramVariance" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.paramVariance.asInstanceOf[Object] }
+-      case "signature" if fn.owner.name.toString == "SymbolMethods" =>
++      case "signature" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.signature }
+-      case "moduleClass" if fn.owner.name.toString == "SymbolMethods" =>
++      case "moduleClass" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.moduleClass }
+-      case "declarations" if fn.owner.name.toString == "SymbolMethods" =>
++      case "declarations" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.denot.typeRef.info.decls.toList }
+       // `Symbol#tree`: real quotes reflection (`FromSymbol.definitionFromSym`)
+       // also synthesizes a placeholder tree when `defTree` is empty (a
+       // symbol with no retained source, e.g. a purely-signature-only cross-
+       // module one) -- not reimplemented here, only the common case a
+       // retained tree already covers everything the rest of this file needs.
+-      case "tree" if fn.owner.name.toString == "SymbolMethods" =>
++      case "tree" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol => s.defTree }
+-      case "annotations" if fn.owner.name.toString == "SymbolMethods" =>
++      case "annotations" if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+           s.denot.annotations.flatMap {
+             case _: dotty.tools.dotc.core.Annotations.BodyAnnotation => Nil
+             case annot => annot.tree :: Nil
+           }
+         }
+-      case "hasAnnotation" if fn.owner.name.toString == "SymbolMethods" =>
++      case "hasAnnotation" if ownerName == "SymbolMethods" =>
+         args match
+           case (s: Symbol) :: (annotSym: Symbol) :: Nil => Some(Boolean.box(s.denot.hasAnnotation(annotSym)))
+           case _ => None
+-      case "getAnnotation" if fn.owner.name.toString == "SymbolMethods" =>
++      case "getAnnotation" if ownerName == "SymbolMethods" =>
+         args match
+           case (s: Symbol) :: (annotSym: Symbol) :: Nil => Some(s.denot.getAnnotation(annotSym).map(_.tree))
+           case _ => None
+@@ -4747,36 +4789,36 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // Every other `SymbolMethods` extension: delegated to the real
+       // `QuotesImpl` (same dotc `Symbol`/`Type` values either way, so no
+       // reimplementation needed -- see `interpretSymbolMethodsExtra`).
+-      case n if fn.owner.name.toString == "SymbolMethods" => interpretSymbolMethodsExtra(n, args)
++      case n if ownerName == "SymbolMethods" => interpretSymbolMethodsExtra(n, args)
+ 
+-      case "is" if fn.owner.name.toString == "FlagsMethods" =>
++      case "is" if ownerName == "FlagsMethods" =>
+         args match
+           case self :: that :: Nil => Some(Boolean.box(self.asInstanceOf[FlagSet].isAllOf(that.asInstanceOf[FlagSet])))
+           case _ => None
+-      case "|" if fn.owner.name.toString == "FlagsMethods" =>
++      case "|" if ownerName == "FlagsMethods" =>
+         args match
+           case self :: that :: Nil => Some((self.asInstanceOf[FlagSet] | that.asInstanceOf[FlagSet]).asInstanceOf[Object])
+           case _ => None
+-      case "&" if fn.owner.name.toString == "FlagsMethods" =>
++      case "&" if ownerName == "FlagsMethods" =>
+         args match
+           case self :: that :: Nil => Some((self.asInstanceOf[FlagSet] & that.asInstanceOf[FlagSet]).asInstanceOf[Object])
+           case _ => None
+-      case name if fn.owner.name.toString == "FlagsModule" =>
++      case name if ownerName == "FlagsModule" =>
+         Some(flagConstant(name).asInstanceOf[Object])
+ 
+-      case "requiredClass" if fn.owner.name.toString == "SymbolModule" =>
++      case "requiredClass" if ownerName == "SymbolModule" =>
+         args match { case (path: String) :: Nil => Some(requiredClass(path)); case _ => None }
+-      case "requiredModule" if fn.owner.name.toString == "SymbolModule" =>
++      case "requiredModule" if ownerName == "SymbolModule" =>
+         args match { case (path: String) :: Nil => Some(requiredModule(path)); case _ => None }
+-      case "requiredMethod" if fn.owner.name.toString == "SymbolModule" =>
++      case "requiredMethod" if ownerName == "SymbolModule" =>
+         args match { case (path: String) :: Nil => Some(requiredMethod(path)); case _ => None }
+-      case "spliceOwner" if fn.owner.name.toString == "SymbolModule" =>
++      case "spliceOwner" if ownerName == "SymbolModule" =>
+         if debugEnabled then
+           Console.err.println(s"[spliceOwner] ctx.owner=${ctx.owner} id=${System.identityHashCode(ctx.owner)}")
+         Some(ctx.owner)
+-      case "noSymbol" if fn.owner.name.toString == "SymbolModule" =>
++      case "noSymbol" if ownerName == "SymbolModule" =>
+         Some(NoSymbol)
+-      case "newVal" if fn.owner.name.toString == "SymbolModule" =>
++      case "newVal" if ownerName == "SymbolModule" =>
+         args match
+           case (owner: Symbol) :: (name: String) :: (tpe: Type) :: flags :: (privateWithin: Symbol) :: Nil =>
+             val pw = if privateWithin.isTerm then NoSymbol else privateWithin
+@@ -4785,7 +4827,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+               Console.err.println(s"[newVal] owner=$owner ownerId=${System.identityHashCode(owner)} name=$name tpe=${tpe.show} newSym=$newSym newSymId=${System.identityHashCode(newSym)} newSym.owner=${newSym.owner} newSym.owner.id=${System.identityHashCode(newSym.owner)}")
+             Some(newSym)
+           case _ => None
+-      case "newMethod" if fn.owner.name.toString == "SymbolModule" =>
++      case "newMethod" if ownerName == "SymbolModule" =>
+         args match
+           case (owner: Symbol) :: (name: String) :: (tpe: Type) :: Nil =>
+             Some(newSymbol(owner, name.toTermName, Method, tpe, NoSymbol))
+@@ -4793,7 +4835,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             val pw = if privateWithin.isTerm then NoSymbol else privateWithin
+             Some(newSymbol(owner, name.toTermName, flags.asInstanceOf[FlagSet] | Method, tpe, pw))
+           case _ => None
+-      case "newBind" if fn.owner.name.toString == "SymbolModule" =>
++      case "newBind" if ownerName == "SymbolModule" =>
+         args match
+           case (owner: Symbol) :: (name: String) :: flags :: (tpe: Type) :: Nil =>
+             Some(newSymbol(owner, name.toTermName, flags.asInstanceOf[FlagSet] | Case, tpe))
+@@ -4809,17 +4851,17 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // precise one, which doesn't affect what they compile to.
+       // -----------------------------------------------------------------
+ 
+-      case "apply" if fn.owner.name.toString == "ValDefModule" =>
++      case "apply" if ownerName == "ValDefModule" =>
+         args match
+           case (sym: Symbol) :: rhs :: Nil =>
+             val rhsTree = rhs match { case Some(t: Tree) => t; case _ => tpd.EmptyTree }
+             Some(tpd.ValDef(sym.asTerm, rhsTree))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "SelectModule" =>
++      case "apply" if ownerName == "SelectModule" =>
+         args match
+           case (qual: Tree) :: (sym: Symbol) :: Nil => Some(tpd.Select(qual, TermRef(qual.tpe, sym)))
+           case _ => None
+-      case "unique" if fn.owner.name.toString == "SelectModule" =>
++      case "unique" if ownerName == "SelectModule" =>
+         args match
+           case (qual: Tree) :: (name: String) :: Nil => Some(tpd.Select(qual, name.toTermName))
+           case _ => None
+@@ -4827,14 +4869,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // real `QuotesImpl` just forwards to dotc's own `tpd.applyOverloaded`
+       // (real overload resolution), so do the same here instead of
+       // reimplementing it.
+-      case "overloaded" if fn.owner.name.toString == "SelectModule" =>
++      case "overloaded" if ownerName == "SelectModule" =>
+         args match
+           case (qual: Tree) :: (name: String) :: (targs: List[Type @unchecked]) :: (as: List[Tree @unchecked]) :: Nil =>
+             Some(tpd.applyOverloaded(qual, name.toTermName, as, targs, WildcardType))
+           case (qual: Tree) :: (name: String) :: (targs: List[Type @unchecked]) :: (as: List[Tree @unchecked]) :: (retTpe: Type @unchecked) :: Nil =>
+             Some(tpd.applyOverloaded(qual, name.toTermName, as, targs, retTpe))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "BlockModule" =>
++      case "apply" if ownerName == "BlockModule" =>
+         args match
+           // `stats` (e.g. jsoniter-scala's own `Block(defs.toList, codecDef)`,
+           // `defs` a real interpreted `ListBuffer[Statement]`) can arrive as
+@@ -4845,46 +4887,46 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           case _ => None
+       // `Repeated.apply(elems, elemtpt)`: real `QuotesImpl` just constructs
+       // a `tpd.SeqLiteral` directly (`type Repeated = tpd.SeqLiteral`).
+-      case "apply" if fn.owner.name.toString == "RepeatedModule" =>
++      case "apply" if ownerName == "RepeatedModule" =>
+         args match
+           case (elems: List[Tree @unchecked]) :: (elemtpt: Tree) :: Nil => Some(tpd.SeqLiteral(elems, elemtpt))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "NewModule" =>
++      case "apply" if ownerName == "NewModule" =>
+         args match
+           case (tpt: Tree) :: Nil => Some(tpd.New(tpt))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "RefModule" =>
++      case "apply" if ownerName == "RefModule" =>
+         args.headOption.collect { case s: Symbol => tpd.ref(s) }
+-      case "apply" if fn.owner.name.toString == "IdentModule" =>
++      case "apply" if ownerName == "IdentModule" =>
+         // `quotes.reflect.Ident.apply(tmref: TermRef): Term` -- takes the
+         // already-built `TermRef`, not a bare `Symbol` (that's `Ref.apply`,
+         // which also picks Ident-or-package-qualified-Select automatically;
+         // this always builds a bare `Ident`).
+         args.headOption.collect { case t: NamedType => tpd.Ident(t) }
+-      case "term" if fn.owner.name.toString == "RefModule" =>
++      case "term" if ownerName == "RefModule" =>
+         args.headOption.collect { case t: NamedType => tpd.ref(t) }
+       // `TupleN.apply(...)` (real scala-library case classes, e.g. built by
+       // macros pairing up a symbol with computed metadata) -- no retained
+       // body, but a `TupleN` is just its N fields, constructible directly.
+-      case "apply" if fn.owner.name.toString.stripSuffix("$").matches("Tuple\\d+") =>
++      case "apply" if isTupleName(fn.owner.name.toString.stripSuffix("$")) =>
+         Some(Tuple.fromArray(args.toArray))
+       // NOT `Some.apply(x)` (deliberately not special-cased): with
+       // dist/lib/scalalib-retained.jar on the classpath, `Option.scala`'s
+       // own compiler-generated `Some.apply` has a real retained body
+       // `resolveExternalDefTree` can run directly.
+-      case "apply" if fn.owner.name.toString == "ApplyModule" =>
++      case "apply" if ownerName == "ApplyModule" =>
+         args match
+           case (fun: Tree) :: as :: Nil => Some(tpd.Apply(fun, asObjectList(as).asInstanceOf[List[Tree]]))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "TypeApplyModule" =>
++      case "apply" if ownerName == "TypeApplyModule" =>
+         args match
+           case (fun: Tree) :: as :: Nil => Some(tpd.TypeApply(fun, asObjectList(as).asInstanceOf[List[Tree]]))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "TypedModule" =>
++      case "apply" if ownerName == "TypedModule" =>
+         args match
+           case (expr: Tree) :: (tpt: Tree) :: Nil => Some(tpd.Typed(expr, tpt))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "LiteralModule" =>
++      case "apply" if ownerName == "LiteralModule" =>
+         args match
+           // A bare `tpd.Literal` has no children to derive a span from
+           // (unlike `Apply`/`If`/etc, whose smart constructors union their
+@@ -4894,60 +4936,60 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           // expansion's call site, is the best span available here).
+           case (const: Constant) :: Nil => Some(tpd.Literal(const).withSpan(pos.span))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "IfModule" =>
++      case "apply" if ownerName == "IfModule" =>
+         args match
+           case (cond: Tree) :: (thenp: Tree) :: (elsep: Tree) :: Nil => Some(tpd.If(cond, thenp, elsep))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "MatchModule" =>
++      case "apply" if ownerName == "MatchModule" =>
+         args match
+           case (selector: Tree) :: (cases: List[CaseDef @unchecked]) :: Nil => Some(tpd.Match(selector, cases))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "CaseDefModule" =>
++      case "apply" if ownerName == "CaseDefModule" =>
+         args match
+           case (pattern: Tree) :: guard :: (rhs: Tree) :: Nil =>
+             val g = guard match { case Some(t: Tree) => t; case _ => tpd.EmptyTree }
+             Some(tpd.CaseDef(pattern, g, rhs))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "BindModule" =>
++      case "apply" if ownerName == "BindModule" =>
+         args match
+           case (sym: Symbol) :: (pattern: Tree) :: Nil => Some(tpd.Bind(sym, pattern))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "AssignModule" =>
++      case "apply" if ownerName == "AssignModule" =>
+         args match
+           case (lhs: Tree) :: (rhs: Tree) :: Nil => Some(tpd.Assign(lhs, rhs))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "InferredModule" =>
++      case "apply" if ownerName == "InferredModule" =>
+         // Another childless leaf (see `LiteralModule` above).
+         args match
+           case (tpe: Type) :: Nil => Some(tpd.TypeTree(tpe).withSpan(pos.span))
+           case _ => None
+-      case "apply" if fn.owner.name.toString == "WildcardModule" =>
++      case "apply" if ownerName == "WildcardModule" =>
+         Some(dotty.tools.dotc.ast.untpd.Ident(nme.WILDCARD).withType(defn.AnyType).withSpan(pos.span))
+-      case "apply" if fn.owner.name.toString == "IntConstantModule" =>
++      case "apply" if ownerName == "IntConstantModule" =>
+         args match { case (v: Integer) :: Nil => Some(Constant(v.intValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "BooleanConstantModule" =>
++      case "apply" if ownerName == "BooleanConstantModule" =>
+         args match { case (v: java.lang.Boolean) :: Nil => Some(Constant(v.booleanValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "StringConstantModule" =>
++      case "apply" if ownerName == "StringConstantModule" =>
+         args match { case (v: String) :: Nil => Some(Constant(v)); case other => None }
+-      case "apply" if fn.owner.name.toString == "ByteConstantModule" =>
++      case "apply" if ownerName == "ByteConstantModule" =>
+         args match { case (v: java.lang.Byte) :: Nil => Some(Constant(v.byteValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "ShortConstantModule" =>
++      case "apply" if ownerName == "ShortConstantModule" =>
+         args match { case (v: java.lang.Short) :: Nil => Some(Constant(v.shortValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "LongConstantModule" =>
++      case "apply" if ownerName == "LongConstantModule" =>
+         args match { case (v: java.lang.Long) :: Nil => Some(Constant(v.longValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "FloatConstantModule" =>
++      case "apply" if ownerName == "FloatConstantModule" =>
+         args match { case (v: java.lang.Float) :: Nil => Some(Constant(v.floatValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "DoubleConstantModule" =>
++      case "apply" if ownerName == "DoubleConstantModule" =>
+         args match { case (v: java.lang.Double) :: Nil => Some(Constant(v.doubleValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "CharConstantModule" =>
++      case "apply" if ownerName == "CharConstantModule" =>
+         args match { case (v: java.lang.Character) :: Nil => Some(Constant(v.charValue)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "UnitConstantModule" =>
++      case "apply" if ownerName == "UnitConstantModule" =>
+         Some(Constant(()))
+-      case "apply" if fn.owner.name.toString == "ClassOfConstantModule" =>
++      case "apply" if ownerName == "ClassOfConstantModule" =>
+         args match { case (v: Type) :: Nil => Some(Constant(v)); case _ => None }
+-      case "apply" if fn.owner.name.toString == "NullConstantModule" =>
++      case "apply" if ownerName == "NullConstantModule" =>
+         Some(Constant(null))
+-      case "apply" if fn.owner.name.toString == "DefDefModule" =>
++      case "apply" if ownerName == "DefDefModule" =>
+         args match
+           case (sym: Symbol) :: rhsFn :: Nil =>
+             val f = rhsFn.asInstanceOf[Object => Object]
+@@ -4963,9 +5005,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // back or further building on trees the macro just constructed.
+       // -----------------------------------------------------------------
+ 
+-      case "symbol" if fn.owner.name.toString == "TreeMethods" =>
++      case "symbol" if ownerName == "TreeMethods" =>
+         args.headOption.collect { case t: Tree => t.symbol }
+-      case "pos" if fn.owner.name.toString == "TreeMethods" =>
++      case "pos" if ownerName == "TreeMethods" =>
+         // Real QuotesImpl (QuotesImpl.scala:103-108): the tree's own
+         // `sourcePos` when it has one, else a synthetic zero-span position
+         // in its source file (macros never see a tree with no source at all).
+@@ -4973,121 +5015,121 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           val treePos = t.sourcePos
+           if treePos.exists then treePos else t.source.atSpan(dotty.tools.dotc.util.Spans.Span(0))
+         }
+-      case "asExpr" if fn.owner.name.toString == "TreeMethods" =>
++      case "asExpr" if ownerName == "TreeMethods" =>
+         args.headOption.collect { case t: Tree => new ExprImpl(t, SpliceScope.getCurrent) }
+-      case "asExprOf" if fn.owner.name.toString == "TreeMethods" =>
++      case "asExprOf" if ownerName == "TreeMethods" =>
+         args.headOption.collect { case t: Tree => new ExprImpl(t, SpliceScope.getCurrent) }
+-      case "changeOwner" if fn.owner.name.toString == "TreeMethods" =>
++      case "changeOwner" if ownerName == "TreeMethods" =>
+         args match
+           case (t: Tree) :: (newOwner: Symbol) :: Nil => Some(tpd.TreeOps(t).changeNonLocalOwners(newOwner))
+           case _ => None
+       // `ClassDefMethods`: a `ClassDef` is a `TypeDef` whose `rhs` is its
+       // `Template` (see `FromSymbol.classDef`/real `QuotesImpl`) -- reading
+       // straight off that `Template`, same as the real implementation does.
+-      case "body" if fn.owner.name.toString == "ClassDefMethods" =>
++      case "body" if ownerName == "ClassDefMethods" =>
+         args.headOption.collect { case t: TypeDef => t.rhs.asInstanceOf[Template].body }
+-      case "constructor" if fn.owner.name.toString == "ClassDefMethods" =>
++      case "constructor" if ownerName == "ClassDefMethods" =>
+         args.headOption.collect { case t: TypeDef => t.rhs.asInstanceOf[Template].constr }
+-      case "parents" if fn.owner.name.toString == "ClassDefMethods" =>
++      case "parents" if ownerName == "ClassDefMethods" =>
+         args.headOption.collect { case t: TypeDef => t.rhs.asInstanceOf[Template].parents }
+-      case "name" if fn.owner.name.toString == "DefinitionMethods" =>
++      case "name" if ownerName == "DefinitionMethods" =>
+         args.headOption.collect { case m: dotty.tools.dotc.ast.tpd.MemberDef => m.name.toString }
+-      case "tpt" if fn.owner.name.toString == "ValDefMethods" =>
++      case "tpt" if ownerName == "ValDefMethods" =>
+         args.headOption.collect { case v: ValDef => v.tpt }
+-      case "rhs" if fn.owner.name.toString == "ValDefMethods" =>
++      case "rhs" if ownerName == "ValDefMethods" =>
+         args.headOption.collect { case v: ValDef => if v.rhs.isEmpty then None else Some(v.rhs) }
+-      case "returnTpt" if fn.owner.name.toString == "DefDefMethods" =>
++      case "returnTpt" if ownerName == "DefDefMethods" =>
+         args.headOption.collect { case d: DefDef => d.tpt }
+-      case "rhs" if fn.owner.name.toString == "DefDefMethods" =>
++      case "rhs" if ownerName == "DefDefMethods" =>
+         args.headOption.collect { case d: DefDef => if d.rhs.isEmpty then None else Some(d.rhs) }
+-      case "paramss" if fn.owner.name.toString == "DefDefMethods" =>
++      case "paramss" if ownerName == "DefDefMethods" =>
+         args.headOption.collect { case d: DefDef => d.paramss }
+-      case "termParamss" if fn.owner.name.toString == "DefDefMethods" =>
++      case "termParamss" if ownerName == "DefDefMethods" =>
+         args.headOption.collect { case d: DefDef => d.termParamss }
+-      case "leadingTypeParams" if fn.owner.name.toString == "DefDefMethods" =>
++      case "leadingTypeParams" if ownerName == "DefDefMethods" =>
+         args.headOption.collect { case d: DefDef => d.leadingTypeParams }
+-      case "trailingParamss" if fn.owner.name.toString == "DefDefMethods" =>
++      case "trailingParamss" if ownerName == "DefDefMethods" =>
+         args.headOption.collect { case d: DefDef => d.trailingParamss }
+       // `ParamClauseMethods#params`: a `ParamClause` already IS its
+       // `List[ValDef] | List[TypeDef]` (see real `QuotesImpl`).
+-      case "params" if fn.owner.name.toString == "ParamClauseMethods" =>
++      case "params" if ownerName == "ParamClauseMethods" =>
+         args.headOption.collect { case l: List[?] => l }
+       // `TermParamClauseMethods`: flag queries on the clause's first param,
+       // mirroring real `QuotesImpl` (an empty clause has none of them set).
+-      case "isGiven" if fn.owner.name.toString == "TermParamClauseMethods" =>
++      case "isGiven" if ownerName == "TermParamClauseMethods" =>
+         args.headOption.collect { case l: List[?] => l.headOption.exists { case v: ValDef => v.symbol.is(Given); case _ => false }.asInstanceOf[Object] }
+-      case "isImplicit" if fn.owner.name.toString == "TermParamClauseMethods" =>
++      case "isImplicit" if ownerName == "TermParamClauseMethods" =>
+         args.headOption.collect { case l: List[?] => l.headOption.exists { case v: ValDef => v.symbol.is(Implicit); case _ => false }.asInstanceOf[Object] }
+-      case "hasErasedArgs" if fn.owner.name.toString == "TermParamClauseMethods" =>
++      case "hasErasedArgs" if ownerName == "TermParamClauseMethods" =>
+         args.headOption.collect { case l: List[?] => l.exists { case v: ValDef => v.symbol.is(Erased); case _ => false }.asInstanceOf[Object] }
+-      case "erasedArgs" if fn.owner.name.toString == "TermParamClauseMethods" =>
++      case "erasedArgs" if ownerName == "TermParamClauseMethods" =>
+         args.headOption.collect { case l: List[?] => l.map { case v: ValDef => v.symbol.is(Erased); case _ => false } }
+-      case "select" if fn.owner.name.toString == "TermMethods" =>
++      case "select" if ownerName == "TermMethods" =>
+         args match
+           case (self: Tree) :: (sym: Symbol) :: Nil => Some(tpd.Select(self, TermRef(self.tpe, sym)))
+           case _ => None
+-      case "appliedTo" if fn.owner.name.toString == "TermMethods" =>
++      case "appliedTo" if ownerName == "TermMethods" =>
+         args match
+           case (self: Tree) :: (arg: Tree) :: Nil => Some(tpd.Apply(self, List(arg)))
+           case _ => None
+-      case "appliedToArgs" if fn.owner.name.toString == "TermMethods" =>
++      case "appliedToArgs" if ownerName == "TermMethods" =>
+         args match
+           case (self: Tree) :: as :: Nil => Some(tpd.Apply(self, asObjectList(as).asInstanceOf[List[Tree]]))
+           case _ => None
+-      case "appliedToArgss" if fn.owner.name.toString == "TermMethods" =>
++      case "appliedToArgss" if ownerName == "TermMethods" =>
+         args match
+           case (self: Tree) :: argss :: Nil =>
+             Some(asObjectList(argss).foldLeft(self)((fn0, as) => tpd.Apply(fn0, asObjectList(as).asInstanceOf[List[Tree]])))
+           case _ => None
+-      case "appliedToNone" if fn.owner.name.toString == "TermMethods" =>
++      case "appliedToNone" if ownerName == "TermMethods" =>
+         args.headOption.collect { case self: Tree => tpd.Apply(self, Nil) }
+-      case "appliedToType" if fn.owner.name.toString == "TermMethods" =>
++      case "appliedToType" if ownerName == "TermMethods" =>
+         args match
+           case (self: Tree) :: (targ: Type) :: Nil => Some(tpd.TypeApply(self, List(tpd.TypeTree(targ))))
+           case _ => None
+-      case "appliedToTypes" if fn.owner.name.toString == "TermMethods" =>
++      case "appliedToTypes" if ownerName == "TermMethods" =>
+         args match
+           case (self: Tree) :: (targs: List[Type @unchecked]) :: Nil =>
+             if targs.isEmpty then Some(self) else Some(tpd.TypeApply(self, targs.map(tpd.TypeTree(_))))
+           case _ => None
+-      case "tpe" if fn.owner.name.toString == "TermMethods" =>
++      case "tpe" if ownerName == "TermMethods" =>
+         args.headOption.collect { case t: Tree => t.tpe.widenSkolem }
+       // `LambdaTypeMethods` (`MethodType`/`PolyType`/`TypeLambda`), as real `QuotesImpl`.
+-      case "paramNames" if fn.owner.name.toString == "LambdaTypeMethods" =>
++      case "paramNames" if ownerName == "LambdaTypeMethods" =>
+         args.headOption.collect { case l: LambdaType => l.paramNames.map(_.toString) }
+-      case "paramTypes" if fn.owner.name.toString == "LambdaTypeMethods" =>
++      case "paramTypes" if ownerName == "LambdaTypeMethods" =>
+         args.headOption.collect { case l: LambdaType => l.paramInfos }
+-      case "resType" if fn.owner.name.toString == "LambdaTypeMethods" =>
++      case "resType" if ownerName == "LambdaTypeMethods" =>
+         args.headOption.collect { case l: LambdaType => l.resType }
+       case "param" if Set("MethodTypeMethods", "PolyTypeMethods", "TypeLambdaMethods").contains(fn.owner.name.toString) =>
+         args match
+           case (l: LambdaType) :: (i: Integer) :: Nil => Some(l.paramRefs(i))
+           case _ => None
+-      case "isImplicit" if fn.owner.name.toString == "MethodTypeMethods" =>
++      case "isImplicit" if ownerName == "MethodTypeMethods" =>
+         args.headOption.collect { case m: MethodType => Boolean.box(m.isImplicitMethod) }
+-      case "isErased" if fn.owner.name.toString == "MethodTypeMethods" =>
++      case "isErased" if ownerName == "MethodTypeMethods" =>
+         args.headOption.collect { case m: MethodType => Boolean.box(m.hasErasedParams) }
+-      case "value" if fn.owner.name.toString == "ConstantMethods" =>
++      case "value" if ownerName == "ConstantMethods" =>
+         args.headOption.collect { case c: Constant => c.value.asInstanceOf[Object] }
+-      case "translucentSuperType" if fn.owner.name.toString == "TypeRefMethods" =>
++      case "translucentSuperType" if ownerName == "TypeRefMethods" =>
+         args.headOption.collect { case t: TypeRef => t.translucentSuperType }
+-      case "tpe" if fn.owner.name.toString == "TypeTreeMethods" =>
++      case "tpe" if ownerName == "TypeTreeMethods" =>
+         args.headOption.collect { case t: Tree => t.tpe }
+-      case "underlyingArgument" if fn.owner.name.toString == "TermMethods" =>
++      case "underlyingArgument" if ownerName == "TermMethods" =>
+         // Real QuotesImpl (QuotesImpl.scala:463): `new tpd.TreeOps(self).underlyingArgument`,
+         // a plain real dotc method -- called directly like `changeOwner` above.
+         args.headOption.collect { case t: Tree => tpd.TreeOps(t).underlyingArgument }
+-      case "underlying" if fn.owner.name.toString == "TermMethods" =>
++      case "underlying" if ownerName == "TermMethods" =>
+         args.headOption.collect { case t: Tree => tpd.TreeOps(t).underlying }
+ 
+-      case "asTerm" if fn.owner.name.toString == "reflectModule" =>
++      case "asTerm" if ownerName == "reflectModule" =>
+         args.headOption.collect { case e: ExprImpl => e.tree }
+ 
+-      case "search" if fn.owner.name.toString == "ImplicitsModule" =>
++      case "search" if ownerName == "ImplicitsModule" =>
+         args match
+           case (t: Type) :: Nil => Some(ctx.typer.inferImplicitArg(t, pos.span))
+           case _ => None
+-      case "searchIgnoring" if fn.owner.name.toString == "ImplicitsModule" =>
++      case "searchIgnoring" if ownerName == "ImplicitsModule" =>
+         args match
+           case (t: Type) :: ignored :: Nil =>
+             val tree = ctx.typer.inferImplicitArg(t, pos.span, asObjectList(ignored).collect { case s: Symbol => s }.toSet)
+@@ -5101,15 +5143,15 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `QuotesImpl` itself returns).
+       case name if fn.owner.name.toString.endsWith("Methods") && treeAccessor(fn.owner.name.toString, name, args).isDefined =>
+         treeAccessor(fn.owner.name.toString, name, args)
+-      case "tree" if fn.owner.name.toString == "ImplicitSearchSuccessMethods" =>
++      case "tree" if ownerName == "ImplicitSearchSuccessMethods" =>
+         args.headOption.collect { case t: Tree => t }
+-      case "explanation" if fn.owner.name.toString == "ImplicitSearchFailureMethods" =>
++      case "explanation" if ownerName == "ImplicitSearchFailureMethods" =>
+         args.headOption.collect { case t: Tree => t.tpe.asInstanceOf[dotty.tools.dotc.typer.Implicits.SearchFailureType].explanation }
+ 
+-      case name if fn.owner.name.toString == "defnModule" =>
++      case name if ownerName == "defnModule" =>
+         defnConstant(name).orElse(defnMethod(name, args))
+ 
+-      case "ofMacroExpansion" if fn.owner.name.toString == "PositionModule" =>
++      case "ofMacroExpansion" if ownerName == "PositionModule" =>
+         Some(pos.sourcePos)
+ 
+       // `PositionMethods`: `Position` (`quotes.reflect.Position`) is a real
+@@ -5118,21 +5160,21 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // directly the same way `TreeMethods#pos` above is. Needed by
+       // munit/utest's own `Location`/`Clue`/source-echoing macros, which is
+       // where this real-world gap was found (see docs/findings.md).
+-      case "start" if fn.owner.name.toString == "PositionMethods" =>
++      case "start" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.start) }
+-      case "end" if fn.owner.name.toString == "PositionMethods" =>
++      case "end" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.end) }
+-      case "sourceFile" if fn.owner.name.toString == "PositionMethods" =>
++      case "sourceFile" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => p.source }
+-      case "startLine" if fn.owner.name.toString == "PositionMethods" =>
++      case "startLine" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.startLine) }
+-      case "endLine" if fn.owner.name.toString == "PositionMethods" =>
++      case "endLine" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.endLine) }
+-      case "startColumn" if fn.owner.name.toString == "PositionMethods" =>
++      case "startColumn" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.startColumn) }
+-      case "endColumn" if fn.owner.name.toString == "PositionMethods" =>
++      case "endColumn" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition => Int.box(p.endColumn) }
+-      case "sourceCode" if fn.owner.name.toString == "PositionMethods" =>
++      case "sourceCode" if ownerName == "PositionMethods" =>
+         args.headOption.collect { case p: dotty.tools.dotc.util.SourcePosition =>
+           val contents = p.source.content()
+           if contents.length < p.end then None
+@@ -5170,7 +5212,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // like this produces, only that it collects elements in order -- a
+       // plain `List` builder is a safe, general default (same choice the
+       // concrete `List`/`Set` cases just above already hardcode).
+-      case "newBuilder" if fn.owner.name.toString == "IterableFactory" =>
++      case "newBuilder" if ownerName == "IterableFactory" =>
+         Some(List.newBuilder[Object])
+       case "apply" if fn.owner.name.toString.stripSuffix("$") == "List" =>
+         val elems = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
+@@ -5230,19 +5272,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case ("intWrapper" | "longWrapper" | "byteWrapper" | "shortWrapper" | "charWrapper" | "doubleWrapper" | "floatWrapper") =>
+         args.headOption
+ 
+-      case "apply" if fn.owner.name.toString == "TypeBoundsModule" =>
++      case "apply" if ownerName == "TypeBoundsModule" =>
+         args match
+           case (lo: Type) :: (hi: Type) :: Nil => Some(TypeBounds(lo, hi))
+           case _ => None
+-      case "empty" if fn.owner.name.toString == "TypeBoundsModule" =>
++      case "empty" if ownerName == "TypeBoundsModule" =>
+         Some(TypeBounds.empty)
+-      case "upper" if fn.owner.name.toString == "TypeBoundsModule" =>
++      case "upper" if ownerName == "TypeBoundsModule" =>
+         args.headOption.collect { case hi: Type => TypeBounds.upper(hi) }
+-      case "lower" if fn.owner.name.toString == "TypeBoundsModule" =>
++      case "lower" if ownerName == "TypeBoundsModule" =>
+         args.headOption.collect { case lo: Type => TypeBounds.lower(lo) }
+-      case "low" if fn.owner.name.toString == "TypeBoundsMethods" =>
++      case "low" if ownerName == "TypeBoundsMethods" =>
+         args.headOption.collect { case b: TypeBounds => b.lo.stripLazyRef }
+-      case "hi" if fn.owner.name.toString == "TypeBoundsMethods" =>
++      case "hi" if ownerName == "TypeBoundsMethods" =>
+         args.headOption.collect { case b: TypeBounds => b.hi.stripLazyRef }
+ 
+       // `TermModule#betaReduce(term)`: real QuotesImpl (QuotesImpl.scala:
+@@ -5256,7 +5298,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // relying on the backend to inline it later (e.g. utest's own
+       // `Tracer.traceOneWithCode`/`Tracer.apply`, `scli test`, see
+       // docs/findings.md).
+-      case "betaReduce" if fn.owner.name.toString == "TermModule" =>
++      case "betaReduce" if ownerName == "TermModule" =>
+         args.headOption.collect { case t: Tree =>
+           val reduced = new tpd.TreeMap {
+             override def transform(tree: Tree)(using Context): Tree = tree match
+@@ -5272,7 +5314,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           if reduced == t then None else Some(reduced)
+         }
+ 
+-      case "apply" if fn.owner.name.toString == "MethodTypeModule" =>
++      case "apply" if ownerName == "MethodTypeModule" =>
+         args match
+           case (paramNames: List[String @unchecked]) :: (paramInfosExp: Function1[Object, Object] @unchecked) :: (resultTypeExp: Function1[Object, Object] @unchecked) :: Nil =>
+             Some(MethodType(paramNames.map(_.toTermName))(
+@@ -5293,96 +5335,96 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // (`scli test`, see docs/findings.md). Curated over the common TERM
+       // shapes as exercised; `TypeTree`-shape copies
+       // (`TypeSelect`/`Annotated`/etc) aren't covered yet.
+-      case "copy" if fn.owner.name.toString == "SelectModule" =>
++      case "copy" if ownerName == "SelectModule" =>
+         args match
+           case (original: Tree) :: (qual: Tree) :: (name: String) :: Nil => Some(tpd.cpy.Select(original)(qual, name.toTermName))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "IdentModule" =>
++      case "copy" if ownerName == "IdentModule" =>
+         args match
+           case (original: Tree) :: (name: String) :: Nil => Some(tpd.cpy.Ident(original)(name.toTermName))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "SuperModule" =>
++      case "copy" if ownerName == "SuperModule" =>
+         args match
+           case (original: Tree) :: (qual: Tree) :: (mixOpt: Option[String @unchecked]) :: Nil =>
+             Some(tpd.cpy.Super(original)(qual, mixOpt.map(x => dotty.tools.dotc.ast.untpd.Ident(x.toTypeName)).getOrElse(dotty.tools.dotc.ast.untpd.EmptyTypeIdent)))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "ApplyModule" =>
++      case "copy" if ownerName == "ApplyModule" =>
+         args match
+           case (original: Tree) :: (fn2: Tree) :: (as: List[Tree @unchecked]) :: Nil => Some(tpd.cpy.Apply(original)(fn2, as))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "TypeApplyModule" =>
++      case "copy" if ownerName == "TypeApplyModule" =>
+         args match
+           case (original: Tree) :: (fn2: Tree) :: (as: List[Tree @unchecked]) :: Nil => Some(tpd.cpy.TypeApply(original)(fn2, as))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "LiteralModule" =>
++      case "copy" if ownerName == "LiteralModule" =>
+         args match
+           case (original: Tree) :: (c: dotty.tools.dotc.core.Constants.Constant) :: Nil => Some(tpd.cpy.Literal(original)(c))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "NewModule" =>
++      case "copy" if ownerName == "NewModule" =>
+         args match
+           case (original: Tree) :: (tpt: Tree) :: Nil => Some(tpd.cpy.New(original)(tpt))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "TypedModule" || fn.owner.name.toString == "TypedOrTestModule" =>
++      case "copy" if ownerName == "TypedModule" || ownerName == "TypedOrTestModule" =>
+         args match
+           case (original: Tree) :: (expr: Tree) :: (tpt: Tree) :: Nil => Some(tpd.cpy.Typed(original)(expr, tpt))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "NamedArgModule" =>
++      case "copy" if ownerName == "NamedArgModule" =>
+         args match
+           case (original: Tree) :: (name: String) :: (arg: Tree) :: Nil => Some(tpd.cpy.NamedArg(original)(name.toTermName, arg))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "AssignModule" =>
++      case "copy" if ownerName == "AssignModule" =>
+         args match
+           case (original: Tree) :: (lhs: Tree) :: (rhs: Tree) :: Nil => Some(tpd.cpy.Assign(original)(lhs, rhs))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "BlockModule" =>
++      case "copy" if ownerName == "BlockModule" =>
+         args match
+           case (original: Tree) :: (stats: List[Tree @unchecked]) :: (expr: Tree) :: Nil => Some(tpd.cpy.Block(original)(stats, expr))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "IfModule" =>
++      case "copy" if ownerName == "IfModule" =>
+         args match
+           case (original: Tree) :: (cond: Tree) :: (thenp: Tree) :: (elsep: Tree) :: Nil => Some(tpd.cpy.If(original)(cond, thenp, elsep))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "MatchModule" =>
++      case "copy" if ownerName == "MatchModule" =>
+         args match
+           case (original: Tree) :: (sel: Tree) :: (cases: List[CaseDef @unchecked]) :: Nil => Some(tpd.cpy.Match(original)(sel, cases))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "ClosureModule" =>
++      case "copy" if ownerName == "ClosureModule" =>
+         args match
+           case (original: Tree) :: (meth: Tree) :: (tpeOpt: Option[Type @unchecked]) :: Nil =>
+             Some(tpd.cpy.Closure(original)(Nil, meth, tpeOpt.map(tpd.TypeTree(_)).getOrElse(tpd.EmptyTree)))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "SummonFromModule" =>
++      case "copy" if ownerName == "SummonFromModule" =>
+         args match
+           case (original: Tree) :: (cases: List[CaseDef @unchecked]) :: Nil => Some(tpd.cpy.Match(original)(tpd.EmptyTree, cases))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "ReturnModule" =>
++      case "copy" if ownerName == "ReturnModule" =>
+         args match
+           case (original: Tree) :: (expr: Tree) :: (from: Symbol) :: Nil => Some(tpd.cpy.Return(original)(expr, tpd.ref(from)))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "TryModule" =>
++      case "copy" if ownerName == "TryModule" =>
+         args match
+           case (original: Tree) :: (expr: Tree) :: (cases: List[CaseDef @unchecked]) :: (finalizerOpt: Option[Tree @unchecked]) :: Nil =>
+             Some(tpd.cpy.Try(original)(expr, cases, finalizerOpt.getOrElse(tpd.EmptyTree)))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "WhileModule" =>
++      case "copy" if ownerName == "WhileModule" =>
+         args match
+           case (original: Tree) :: (cond: Tree) :: (body: Tree) :: Nil => Some(tpd.cpy.WhileDo(original)(cond, body))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "RepeatedModule" =>
++      case "copy" if ownerName == "RepeatedModule" =>
+         args match
+           case (original: Tree) :: (elems: List[Tree @unchecked]) :: (elemtpt: Tree) :: Nil => Some(tpd.cpy.SeqLiteral(original)(elems, elemtpt))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "CaseDefModule" =>
++      case "copy" if ownerName == "CaseDefModule" =>
+         args match
+           case (original: Tree) :: (pat: Tree) :: (guardOpt: Option[Tree @unchecked]) :: (rhs: Tree) :: Nil =>
+             Some(tpd.cpy.CaseDef(original)(pat, guardOpt.getOrElse(tpd.EmptyTree), rhs))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "ValDefModule" =>
++      case "copy" if ownerName == "ValDefModule" =>
+         args match
+           case (original: Tree) :: (name: String) :: (tpt: Tree) :: (rhsOpt: Option[Tree @unchecked]) :: Nil =>
+             Some(tpd.cpy.ValDef(original)(name.toTermName, tpt, rhsOpt.getOrElse(tpd.EmptyTree)))
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "ClassDefModule" =>
++      case "copy" if ownerName == "ClassDefModule" =>
+         // As real `QuotesImpl`: keep the original `TypeDef`, swap the `Template`'s parts.
+         args match
+           case (original: Tree) :: (name: String) :: (constr: Tree) :: (parents: List[Tree @unchecked]) :: (selfOpt: Option[Tree @unchecked]) :: (body: List[Tree @unchecked]) :: Nil =>
+@@ -5391,7 +5433,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                 Some(tpd.cpy.TypeDef(original)(name.toTypeName, tpd.cpy.Template(originalImpl)(constr.asInstanceOf[tpd.DefDef], parents, Nil, selfOpt.getOrElse(tpd.EmptyValDef).asInstanceOf[tpd.ValDef], body)))
+               case _ => None
+           case _ => None
+-      case "copy" if fn.owner.name.toString == "DefDefModule" =>
++      case "copy" if ownerName == "DefDefModule" =>
+         args match
+           case (original: Tree) :: (name: String) :: (paramss: List[Tree @unchecked]) :: (tpt: Tree) :: (rhsOpt: Option[Tree @unchecked]) :: Nil =>
+             Some(tpd.cpy.DefDef(original)(name.toTermName, paramss.asInstanceOf[List[tpd.ParamClause]], tpt, rhsOpt.getOrElse(tpd.EmptyTree)))
+@@ -6391,7 +6433,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (s: scala.collection.Seq[Object] @unchecked, "groupBy", (f: Function1[Object, Object] @unchecked) :: Nil) =>
+         Some(s.groupBy(f))
+       case (s: scala.collection.Seq[Object] @unchecked, "collect", (f: Function1[Object, Object] @unchecked) :: Nil) =>
+-        Some(s.iterator.flatMap(x => try Some(f(x)) catch case _: MatchError => None).toSeq match
++        Some(s.iterator.flatMap(x => applyIfMatched(f, x) match { case NoMatch => None; case r => Some(r) }).toSeq match
+           case r if s.isInstanceOf[List[?]] => r.toList
+           case r if s.isInstanceOf[Vector[?]] => r.toVector
+           case r => r)
+@@ -6819,9 +6861,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // match would, so that's the (standard Scala) signal to use instead
+       // of a real `isDefinedAt`.
+       case (f: Function1[Object, Object] @unchecked, "lift", Nil) =>
+-        Some((x: Object) => try Some(f(x)) catch case _: MatchError => None)
++        Some((x: Object) => applyIfMatched(f, x) match { case NoMatch => None; case r => Some(r) })
+       case (f: Function1[Object, Object] @unchecked, "isDefinedAt", (v: Object) :: Nil) =>
+-        Some(Boolean.box(try { f(v); true } catch case _: MatchError => false))
++        Some(Boolean.box(applyIfMatched(f, v) ne NoMatch))
+       // `default` (the "if unmatched, use this instead" callback e.g.
+       // `strictOptimizedCollect`'s own `((x: A) => marker)`) isn't always a
+       // real host closure -- a closure hoisted out of a loop as a reusable
+@@ -6829,7 +6871,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `InterpretedInstance` rather than a `closureDef` match, so this
+       // has to accept either shape (see `applyFn1`).
+       case (f: Function1[Object, Object] @unchecked, "applyOrElse", (v: Object) :: (default: Object) :: Nil) =>
+-        Some(try f(v) catch case _: MatchError => applyFn1(default, v))
++        Some(applyIfMatched(f, v) match { case NoMatch => applyFn1(default, v); case r => r })
+       // Real host closures our own interpreter already produced (from a
+       // `closureDef`/`lift`/etc match) called via `.apply` -- plain
+       // application, not `notInterpretable`'s abstract `FunctionN#apply`.
+@@ -6859,7 +6901,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // case-class-shaped host value) -- no retained body for these on the
+       // stdlib `TupleN` classes, but `Product#productElement` gets the same
+       // field generically without one case per arity.
+-      case (r: Product, name, Nil) if name.matches("_\\d+") =>
++      case (r: Product, name, Nil) if isProductAccessorName(name) =>
+         Some(r.productElement(name.tail.toInt - 1).asInstanceOf[Object])
+       case (i: Integer, "until", (end: Integer) :: Nil) => Some(scala.Range(i, end))
+       case (i: Integer, "to", (end: Integer) :: Nil) => Some(scala.Range.inclusive(i, end))

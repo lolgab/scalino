@@ -144,12 +144,11 @@ new file mode 100644
 index 0000000..8eb32a5
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,135 @@
 +package dotty.tools.dotc
 +package quoted
 +
 +import java.nio.charset.Charset
-+import java.util.Locale
 +
 +/** Calls on values the interpreter represents by their real host object:
 + *  `String` and the boxed primitives. These classes have no body to interpret
@@ -218,9 +217,9 @@ index 0000000..8eb32a5
 +      case ("split", (re: String) :: Nil) => Some(s.split(re))
 +      case ("split", (re: String) :: limit :: Nil) => Some(s.split(re, int(limit)))
 +      case ("toLowerCase", Nil) => Some(s.toLowerCase)
-+      case ("toLowerCase", (l: Locale) :: Nil) => Some(s.toLowerCase(l))
++      case ("toLowerCase", (l: Object) :: Nil) if l.getClass.getName == "java.util.Locale" => Some(s.toLowerCase)
 +      case ("toUpperCase", Nil) => Some(s.toUpperCase)
-+      case ("toUpperCase", (l: Locale) :: Nil) => Some(s.toUpperCase(l))
++      case ("toUpperCase", (l: Object) :: Nil) if l.getClass.getName == "java.util.Locale" => Some(s.toUpperCase)
 +      case ("trim", Nil) => Some(s.trim)
 +      case ("strip", Nil) => Some(s.strip)
 +      case ("stripLeading", Nil) => Some(s.stripLeading)
