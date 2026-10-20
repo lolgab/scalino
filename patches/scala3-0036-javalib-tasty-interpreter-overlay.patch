@@ -1,0 +1,618 @@
+diff --git a/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala b/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala
+index 3fd466c..36f0a7f 100644
+--- a/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala
++++ b/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala
+@@ -7,7 +7,8 @@ import Contexts.*, SymDenotations.*,  Decorators.*
+ import dotty.tools.dotc.ast.tpd
+ import TastyUnpickler.*
+ import classfile.ClassfileParser
+-import Names.SimpleName
++import Names.{Name, SimpleName}
++import Symbols.Symbol
+ import TreeUnpickler.UnpickleMode
+ 
+ import dotty.tools.tasty.TastyReader
+@@ -83,6 +84,10 @@ class DottyUnpickler(
+   def enter(roots: Set[SymDenotation])(using Context): Unit =
+     treeUnpickler.enter(roots)
+ 
++  /** See `TreeUnpickler#enterDetached`. */
++  def enterDetached(tops: scala.collection.mutable.Map[(Symbol, Name), Symbol], load: (Symbol, Name, Context) => Unit)(using Context): Unit =
++    treeUnpickler.enterDetached(tops, load)
++
+   protected def treeSectionUnpickler(
+     posUnpicklerOpt: Option[PositionUnpickler],
+     commentUnpicklerOpt: Option[CommentUnpickler],
+diff --git a/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala b/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
+index 514a87a..bfcfa78 100644
+--- a/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
++++ b/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
+@@ -96,6 +96,33 @@ class TreeUnpickler(reader: TastyReader,
+    */
+   private var roots: Set[SymDenotation] = uninitialized
+ 
++  /** True when this file is unpickled "detached" (see `enterDetached`):
++   *  its top-level definitions are fresh symbols that are never entered in
++   *  their package's scope and never registered as companions of the
++   *  same-named symbols already there.
++   */
++  private var detached: Boolean = false
++
++  /** The top-level definitions of all detached files, by (package class,
++   *  name), shared between the files of one overlay. Qualified references
++   *  to them (`TYPEREF`/`TERMREF` with a package prefix) must see these
++   *  symbols, not whatever the package scope has under that name.
++   */
++  private var detachedTops: mutable.Map[(Symbol, Name), Symbol] = mutable.Map.empty
++
++  /** Called for a qualified reference to a top-level name that is not (yet)
++   *  in `detachedTops`, so that the file defining it can be loaded on demand.
++   */
++  private var detachedLoad: (Symbol, Name, Context) => Unit = (_, _, _) => ()
++
++  private def detachedTop(pre: Type, name: Name)(using Context): Symbol =
++    if !detached then NoSymbol
++    else pre match
++      case pre: TermRef if pre.symbol.is(Package) =>
++        val key = (pre.symbol.moduleClass, name)
++        detachedTops.getOrElse(key, { detachedLoad(key._1, name, ctx); detachedTops.getOrElse(key, NoSymbol) })
++      case _ => NoSymbol
++
+   /** The root symbols that are defined in this Tasty file. This
+    *  is a subset of `roots.map(_.symbol)`.
+    */
+@@ -134,6 +161,20 @@ class TreeUnpickler(reader: TastyReader,
+       rdr.indexStats(reader.endAddr)
+   }
+ 
++  /** Like `enter(Set.empty)`, but for a TASTy file whose top-level classes
++   *  have *another*, already-loaded definition under the same name -- e.g.
++   *  scala-native's javalib TASTy for `java.util.StringJoiner`, while the
++   *  compiler's own `java.util.StringJoiner` is the (Java-defined) JDK
++   *  class. Nothing is entered into the package scope (that would replace
++   *  the existing symbol) and companions are not linked; the resulting
++   *  symbols and trees are only reachable through `unpickle`'s result.
++   */
++  def enterDetached(tops: mutable.Map[(Symbol, Name), Symbol], load: (Symbol, Name, Context) => Unit)(using Context): Unit =
++    detached = true
++    detachedTops = tops
++    detachedLoad = load
++    enter(Set.empty)
++
+   /** The unpickled trees */
+   def unpickle(mode: UnpickleMode)(using Context): List[Tree] = {
+     if mode != UnpickleMode.TopLevel then rootOwner = ctx.owner
+@@ -478,7 +519,8 @@ class TreeUnpickler(reader: TastyReader,
+           if unpicklingJava && name == tpnme.Object && (pre.termSymbol eq defn.JavaLangPackageVal) then
+             defn.FromJavaObjectType
+           else
+-            TypeRef(pre, name)
++            val top = detachedTop(pre, name)
++            if top.exists then NamedType(pre, top) else TypeRef(pre, name)
+         case TERMREF =>
+           val sname = readName()
+           val prefix = readType()
+@@ -486,7 +528,8 @@ class TreeUnpickler(reader: TastyReader,
+             case SignedName(name, sig, target) =>
+               TermRef(prefix, name, prefix.member(name).atSignature(sig, target))
+             case name =>
+-              TermRef(prefix, name)
++              val top = detachedTop(prefix, name)
++              if top.exists then NamedType(prefix, top) else TermRef(prefix, name)
+           }
+         case THIS =>
+           ThisType.raw(readType().asInstanceOf[TypeRef])
+@@ -696,13 +739,14 @@ class TreeUnpickler(reader: TastyReader,
+               newSymbol(ctx.owner, name, flags, completer, privateWithin, coord)
+         }
+       registerSym(start, sym)
++      if detached && ctx.owner.is(Package) then detachedTops((ctx.owner, sym.name)) = sym
+       val annotOwner =
+         if sym.owner.isClass then newLocalDummy(sym.owner) else sym.owner
+       sym.annotations = annotFns.map(_(annotOwner))
+       if sym.isOpaqueAlias then sym.setFlag(Deferred)
+       val isScala2MacroDefinedInScala3 = flags.is(Macro, butNot = Inline) && flags.is(Erased)
+       ctx.owner match {
+-        case cls: ClassSymbol if !isScala2MacroDefinedInScala3 || cls == defn.StringContextClass =>
++        case cls: ClassSymbol if !(detached && cls.is(Package)) && (!isScala2MacroDefinedInScala3 || cls == defn.StringContextClass) =>
+           // Enter all members of classes that are not Scala 2 macros.
+           //
+           // For `StringContext`, enter `s`, `f` and `raw`
+@@ -998,7 +1042,7 @@ class TreeUnpickler(reader: TastyReader,
+             // be missing from the Tasty file. So we check explicitly for that.
+             def isCodefined = roots.contains(companion.denot) == seenRoots.contains(companion)
+ 
+-            if (companion.exists && isCodefined) sym.registerCompanion(companion)
++            if (companion.exists && isCodefined && !detached) sym.registerCompanion(companion)
+             TypeDef(readTemplate(using localCtx))
+           }
+           else {
+@@ -1335,8 +1379,10 @@ class TreeUnpickler(reader: TastyReader,
+ 
+       def completeSelect(name: Name, sig: Signature, target: Name): Select =
+         val qual = readTree()
++        val top = if detached then detachedTop(qual.tpe, name) else NoSymbol
+         val denot =
+-          if unpicklingJava && name == tpnme.Object && qual.symbol == defn.JavaLangPackageVal then
++          if top.exists then top.denot
++          else if unpicklingJava && name == tpnme.Object && qual.symbol == defn.JavaLangPackageVal then
+             defn.FromJavaObjectSymbol.denot
+           else
+             val qualType = qual.tpe.widenIfUnstable
+diff --git a/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
+new file mode 100644
+index 0000000..8eb32a5
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
+@@ -0,0 +1,136 @@
++package dotty.tools.dotc
++package quoted
++
++import java.nio.charset.Charset
++import java.util.Locale
++
++/** Calls on values the interpreter represents by their real host object:
++ *  `String` and the boxed primitives. These classes have no body to interpret
++ *  (they are `java.lang` natives; even in javalib, `String` is a thin wrapper
++ *  over a char array), so every public method is reachable here by name and
++ *  runtime argument types, rather than one hand-picked overload at a time.
++ *
++ *  Arguments arrive as boxed values; an `int`/`char` parameter may be given
++ *  either a `Character` or an `Integer` (a `Char` argument widened at the call
++ *  site), which `int`/`str` normalise.
++ */
++object HostValueCalls:
++  private def int(o: Object): Int = o match
++    case i: Integer => i.intValue
++    case c: Character => c.charValue.toInt
++    case b: java.lang.Byte => b.intValue
++    case s: java.lang.Short => s.intValue
++  private def bool(o: Object): Boolean = o.asInstanceOf[java.lang.Boolean].booleanValue
++  private def isInt(o: Object): Boolean = o.isInstanceOf[Integer] || o.isInstanceOf[Character] || o.isInstanceOf[java.lang.Byte] || o.isInstanceOf[java.lang.Short]
++  private def cs(o: Object): CharSequence = o.asInstanceOf[CharSequence]
++  private def box(b: Boolean): Object = java.lang.Boolean.valueOf(b)
++  private def box(i: Int): Object = Integer.valueOf(i)
++
++  def string(s: String, name: String, args: List[Object]): Option[Object] =
++    (name, args) match
++      case ("length", Nil) => Some(box(s.length))
++      case ("isEmpty", Nil) => Some(box(s.isEmpty))
++      case ("isBlank", Nil) => Some(box(s.isBlank))
++      case ("charAt", i :: Nil) => Some(Character.valueOf(s.charAt(int(i))))
++      case ("codePointAt", i :: Nil) => Some(box(s.codePointAt(int(i))))
++      case ("codePointBefore", i :: Nil) => Some(box(s.codePointBefore(int(i))))
++      case ("codePointCount", a :: b :: Nil) => Some(box(s.codePointCount(int(a), int(b))))
++      case ("offsetByCodePoints", a :: b :: Nil) => Some(box(s.offsetByCodePoints(int(a), int(b))))
++      case ("hashCode", Nil) => Some(box(s.hashCode))
++      case ("equals", o :: Nil) => Some(box(s == o))
++      case ("toString", Nil) => Some(s)
++      case ("intern", Nil) => Some(s.intern)
++      case ("compareTo", (o: String) :: Nil) => Some(box(s.compareTo(o)))
++      case ("compareToIgnoreCase", (o: String) :: Nil) => Some(box(s.compareToIgnoreCase(o)))
++      case ("equalsIgnoreCase", o :: Nil) => Some(box(o match { case o: String => s.equalsIgnoreCase(o); case _ => false }))
++      case ("contentEquals", o :: Nil) => Some(box(s.contentEquals(cs(o))))
++      case ("contains", o :: Nil) => Some(box(s.contains(cs(o))))
++      case ("startsWith", (p: String) :: Nil) => Some(box(s.startsWith(p)))
++      case ("startsWith", (p: String) :: i :: Nil) => Some(box(s.startsWith(p, int(i))))
++      case ("endsWith", (p: String) :: Nil) => Some(box(s.endsWith(p)))
++      case ("matches", (re: String) :: Nil) => Some(box(s.matches(re)))
++      case ("regionMatches", a :: (o: String) :: b :: c :: Nil) if isInt(a) => Some(box(s.regionMatches(int(a), o, int(b), int(c))))
++      case ("regionMatches", ic :: a :: (o: String) :: b :: c :: Nil) => Some(box(s.regionMatches(bool(ic), int(a), o, int(b), int(c))))
++      case ("indexOf", (x: String) :: Nil) => Some(box(s.indexOf(x)))
++      case ("indexOf", (x: String) :: from :: Nil) => Some(box(s.indexOf(x, int(from))))
++      case ("indexOf", x :: Nil) if isInt(x) => Some(box(s.indexOf(int(x))))
++      case ("indexOf", x :: from :: Nil) if isInt(x) => Some(box(s.indexOf(int(x), int(from))))
++      case ("lastIndexOf", (x: String) :: Nil) => Some(box(s.lastIndexOf(x)))
++      case ("lastIndexOf", (x: String) :: from :: Nil) => Some(box(s.lastIndexOf(x, int(from))))
++      case ("lastIndexOf", x :: Nil) if isInt(x) => Some(box(s.lastIndexOf(int(x))))
++      case ("lastIndexOf", x :: from :: Nil) if isInt(x) => Some(box(s.lastIndexOf(int(x), int(from))))
++      case ("substring", a :: Nil) => Some(s.substring(int(a)))
++      case ("substring", a :: b :: Nil) => Some(s.substring(int(a), int(b)))
++      case ("subSequence", a :: b :: Nil) => Some(s.subSequence(int(a), int(b)))
++      case ("concat", (o: String) :: Nil) => Some(s.concat(o))
++      case ("replace", a :: b :: Nil) if isInt(a) && isInt(b) => Some(s.replace(int(a).toChar, int(b).toChar))
++      case ("replace", a :: b :: Nil) => Some(s.replace(cs(a), cs(b)))
++      case ("replaceAll", (a: String) :: (b: String) :: Nil) => Some(s.replaceAll(a, b))
++      case ("replaceFirst", (a: String) :: (b: String) :: Nil) => Some(s.replaceFirst(a, b))
++      // `split` yields a real `Array[String]` (see the note in `Interpreter`'s `String` rows).
++      case ("split", (re: String) :: Nil) => Some(s.split(re))
++      case ("split", (re: String) :: limit :: Nil) => Some(s.split(re, int(limit)))
++      case ("toLowerCase", Nil) => Some(s.toLowerCase)
++      case ("toLowerCase", (l: Locale) :: Nil) => Some(s.toLowerCase(l))
++      case ("toUpperCase", Nil) => Some(s.toUpperCase)
++      case ("toUpperCase", (l: Locale) :: Nil) => Some(s.toUpperCase(l))
++      case ("trim", Nil) => Some(s.trim)
++      case ("strip", Nil) => Some(s.strip)
++      case ("stripLeading", Nil) => Some(s.stripLeading)
++      case ("stripTrailing", Nil) => Some(s.stripTrailing)
++      case ("stripIndent", Nil) => Some(s.stripIndent)
++      case ("translateEscapes", Nil) => Some(s.translateEscapes)
++      case ("indent", n :: Nil) => Some(s.indent(int(n)))
++      case ("repeat", n :: Nil) => Some(s.repeat(int(n)))
++      case ("toCharArray", Nil) => Some(s.toCharArray)
++      case ("getBytes", Nil) => Some(s.getBytes)
++      case ("getBytes", (c: Charset) :: Nil) => Some(s.getBytes(c))
++      case ("getBytes", (c: String) :: Nil) => Some(s.getBytes(c))
++      case ("chars", Nil) => Some(s.chars)
++      case ("codePoints", Nil) => Some(s.codePoints)
++      case ("lines", Nil) => Some(s.lines)
++      case _ => None
++
++  /** The interpreter represents every `Array[T]` as an `Array[Object]` of boxes
++   *  (see `interpretNew`); a real host `byte[]`/`char[]` is rebuilt from it.
++   *  `elem` is the declared element type of the parameter (`"Byte"`/`"Char"`).
++   */
++  private def realArray(a: Object, elem: String): Object = a match
++    case arr: Array[Object] if elem == "Byte" => Array.tabulate(arr.length)(i => arr(i).asInstanceOf[Number].byteValue)
++    case arr: Array[Object] if elem == "Char" => Array.tabulate(arr.length)(i => arr(i).asInstanceOf[Character].charValue)
++    case other => other
++
++  /** `new String(...)`; `elem` is the element type name of the constructor's array parameter, if any. */
++  def newString(args0: List[Object], elem: String): Option[Object] =
++    val args = args0.map(realArray(_, elem))
++    args match
++      case Nil => Some("")
++      case (s: String) :: Nil => Some(new String(s))
++      case (b: Array[Byte]) :: Nil => Some(new String(b))
++      case (b: Array[Byte]) :: (c: Charset) :: Nil => Some(new String(b, c))
++      case (b: Array[Byte]) :: (c: String) :: Nil => Some(new String(b, c))
++      case (b: Array[Byte]) :: off :: len :: Nil => Some(new String(b, int(off), int(len)))
++      case (b: Array[Byte]) :: off :: len :: (c: Charset) :: Nil => Some(new String(b, int(off), int(len), c))
++      case (b: Array[Byte]) :: off :: len :: (c: String) :: Nil => Some(new String(b, int(off), int(len), c))
++      case (c: Array[Char]) :: Nil => Some(new String(c))
++      case (c: Array[Char]) :: off :: len :: Nil => Some(new String(c, int(off), int(len)))
++      case (sb: java.lang.StringBuilder) :: Nil => Some(new String(sb))
++      case (sb: java.lang.StringBuffer) :: Nil => Some(new String(sb))
++      case _ => None
++
++  /** `x.toByte`/`toShort`/`toChar`/`toInt`/`toLong`/`toFloat`/`toDouble` on any boxed numeric or `Char`. */
++  def numericConversion(x: Object, name: String): Option[Object] =
++    val n: Number | Null = x match
++      case n: Number => n
++      case c: Character => Integer.valueOf(c.charValue.toInt)
++      case _ => null
++    if n == null then None
++    else name match
++      case "toByte" => Some(java.lang.Byte.valueOf(n.byteValue))
++      case "toShort" => Some(java.lang.Short.valueOf(n.shortValue))
++      case "toChar" => Some(Character.valueOf(n.intValue.toChar))
++      case "toInt" => Some(Integer.valueOf(n.intValue))
++      case "toLong" => Some(java.lang.Long.valueOf(n.longValue))
++      case "toFloat" => Some(java.lang.Float.valueOf(n.floatValue))
++      case "toDouble" => Some(java.lang.Double.valueOf(n.doubleValue))
++      case _ => None
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 216cfe4..2946bc0 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -222,7 +222,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // value (e.g. `Iterator.slice`'s local `def adjustedBound = ...`
+         // used bare as `adjustedBound min (until - lo)`).
+         case v: LocalDef if v.ddef.termParamss.isEmpty =>
+-          interpretTree(v.ddef.rhs)(using v.closureEnv)
++          // A `return` in a local def exits that def (not the enclosing method).
++          try interpretTree(v.ddef.rhs)(using v.closureEnv)
++          catch case LabeledReturn(label, value) if label == v.ddef.symbol => value
+         case v => v
+ 
+     // `this` inside a method/constructor body we're interpreting: `env`
+@@ -373,6 +375,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           val rv = interpretTree(rhs)
+           moduleVars((id.symbol.owner, id.symbol.name.toString)) = rv
+           interpretUnit()
++        // `field = ...` written unqualified inside an interpreted class's own body.
++        case id: Ident if id.symbol.is(Mutable) && id.symbol.owner.isClass && env.get(id.symbol.owner).exists(_.isInstanceOf[InterpretedInstance]) =>
++          val rv = interpretTree(rhs)
++          env(id.symbol.owner).asInstanceOf[InterpretedInstance].fields(id.symbol.name.toString) = rv
++          interpretUnit()
+         case _ => unexpectedTree(tree)
+ 
+     case Select(qual, name) if isPrimitiveOp(tree.symbol, qual.tpe) =>
+@@ -528,7 +535,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // symbol and the spliced code fails to typecheck against it.
+         val withTypeParams = ddef.leadingTypeParams.map(_.symbol).zip(typeArgs).foldLeft(closureEnv)((e, pv) => e.updated(pv._1, pv._2))
+         val callEnv = bindNonErased(params, rawArgs).foldLeft(withTypeParams)((e, pv) => e.updated(pv._1, pv._2))
+-        interpretTree(ddef.rhs)(using callEnv)
++        // A `return` in a local def exits that def (not the enclosing method).
++        try interpretTree(ddef.rhs)(using callEnv)
++        catch case LabeledReturn(label, value) if label == ddef.symbol => value
+       else if (env.contains(fn.symbol))
+         // `fn.symbol` is a local `val`/parameter bound to an already-
+         // interpreted function VALUE (not a real method symbol, so none of
+@@ -2870,7 +2879,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       else NoSymbol
+     args // force before recording the call's type arguments (evaluating args may itself make calls)
+     currentTypeArgs = typeArgs
+-    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).getOrElse {
++    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).orElse(hostValueCall(receiver, fn, args)).getOrElse {
+       resolveExternalDefTree(dispatchFn) match
+         case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args, typeArgs)
+         // A nested `object` member, reached through the `val` it compiles to
+@@ -3244,6 +3253,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       rawArgs.filterNot(_.isEmpty) match
+         case v :: Nil => Some(Some(interpretTree(v)))
+         case _ => None
++    else if fn.owner == defn.StringClass then
++      val elem = fn.info.firstParamTypes.headOption.flatMap(_.dealias.argInfos.headOption).map(_.typeSymbol.name.toString).getOrElse("")
++      HostValueCalls.newString(rawArgs.filterNot(_.isEmpty).map(interpretTree), elem)
+     // `Tuple2`/`Tuple3`/etc (a tuple literal like `(a, b)`, or `Predef`'s
+     // `ArrowAssoc#->` -- itself just `(self, y)`): built as a REAL host
+     // tuple via `scala.Tuple.fromArray` (genuinely general over any arity,
+@@ -3501,7 +3513,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         if !env0.contains(cls.owner) && System.getenv("SCALINO_OUTER_DIAG") != null then Console.err.println(s"[outerDiag] cls=$cls newType=$newType other=${other.getClass.getSimpleName}")
+         env0
+ 
+-  private def interpretNewFromTree(fn: Symbol, rawArgs: List[Tree], newType: Type = NoType, existing: InterpretedInstance = null)(using Env): Object =
++  private def interpretNewFromTree(fn0: Symbol, rawArgs: List[Tree], newType: Type = NoType, existing: InterpretedInstance = null)(using Env): Object =
++    // A JDK constructor stands for the same-signature constructor of the
++    // javalib class implementing it (which may be that class's primary one).
++    val fn = if fn0.is(JavaDefined) then javalibOverlay.map(_.treeFor(fn0)).filter(!_.isEmpty).fold(fn0)(_.symbol) else fn0
+     // A secondary/auxiliary constructor (`def this(...) = this(...)`,
+     // e.g. `scala.util.matching.Regex`'s own `def this(regex: String,
+     // groupNames: String*) = this(Pattern.compile(regex), groupNames*)`):
+@@ -3997,8 +4012,28 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+   /** Local classes met while interpreting blocks, by (possibly re-owned) class symbol. */
+   private val localClassTrees = mutable.Map.empty[Symbol, TypeDef]
+ 
++  /** Bodies of JDK classes from scala-native's javalib TASTy, see `JavalibOverlay`. */
++  private lazy val javalibOverlay: Option[JavalibOverlay] = JavalibOverlay.fromSettings()
++
++  /** `String` and boxed-primitive receivers: see `HostValueCalls`. */
++  private def hostValueCall(receiver: Object, fn: Symbol, args: List[Object]): Option[Object] =
++    receiver match
++      case s: String => HostValueCalls.string(s, fn.name.toString, args)
++      case _ if args.isEmpty => HostValueCalls.numericConversion(receiver, fn.name.toString)
++      case _ => None
++
++  /** An interpreted instance of a javalib class whose `toString` has a real body. */
++  private def hasJavalibToString(receiver: Object)(using Context): Boolean = receiver match
++    case inst: InterpretedInstance if javalibOverlay.exists(_.isShadow(inst.cls)) =>
++      val m = inst.cls.info.member(nme.toString_).suchThat(_.is(Method)).symbol
++      m.exists && m.owner != defn.ObjectClass && !resolveExternalDefTree(m).isEmpty
++    case _ => false
++
+   private def resolveExternalDefTree(sym: Symbol)(using Context): Tree =
+     if !sym.defTree.isEmpty then sym.defTree
++    else if javalibOverlay.exists(o => o.isShadow(sym) || (sym.is(JavaDefined) && !o.treeFor(sym).isEmpty)) then
++      val t = javalibOverlay.get.treeFor(sym)
++      t
+     else if sym.maybeOwner.exists && localClassTrees.contains(sym.owner) && findDefTree(localClassTrees(sym.owner), sym).isDefined then
+       findDefTree(localClassTrees(sym.owner), sym).get
+     else
+@@ -4252,6 +4287,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+   private def notInterpretable(sym: Symbol): Nothing =
+     val hint =
+       if sym.isDefinedInCurrentRun || !sym.defTree.isEmpty then ""
++      else if sym.is(JavaDefined) then
++        // JDK classes have no TASTy of their own: their bodies come from
++        // javalib's (`JavalibOverlay`), except the host-native `java.lang` core.
++        if javalibOverlay.isEmpty then " (a JDK method: its body is only available through javalib-tasty.jar, which is not on the classpath)"
++        else " (a JDK method that javalib's TASTy does not define, or a host-native `java.lang` class such as String/boxes/Math whose methods are handled by `HostValueCalls`)"
+       else " (its definition tree is not retained -- likely defined in a separately-compiled dependency; " +
+            "this own-implementation interpreter does not yet unpickle cross-module TASTy bodies, see docs/findings.md)"
+     throw new StopInterpretation(
+@@ -6842,7 +6882,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         Some((c.charValue to end.charValue))
+       case (str: String, "repeat", (n: Integer) :: Nil) => Some(str.repeat(n))
+       case (r, "getClass", Nil) if r != null => Some(r.getClass)
+-      case (r, "toString", Nil) => Some(r.toString)
++      case (r, "toString", Nil) if !hasJavalibToString(r) => Some(r.toString)
+       // `Throwable#getMessage`/`#getCause`: real JDK methods with no
+       // retained Scala source, needed by any interpreted `catch` handler
+       // that inspects the exception it caught (e.g. a curated real
+diff --git a/compiler/src/dotty/tools/dotc/quoted/JavalibOverlay.scala b/compiler/src/dotty/tools/dotc/quoted/JavalibOverlay.scala
+new file mode 100644
+index 0000000..cf22cfb
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/quoted/JavalibOverlay.scala
+@@ -0,0 +1,210 @@
++package dotty.tools.dotc
++package quoted
++
++import scala.collection.mutable
++
++import dotty.tools.dotc.ast.tpd.*
++import dotty.tools.dotc.core.Contexts.*
++import dotty.tools.dotc.core.Decorators.*
++import dotty.tools.dotc.core.Flags.*
++import dotty.tools.dotc.core.NameOps.*
++import dotty.tools.dotc.core.Names.*
++import dotty.tools.dotc.core.StdNames.*
++import dotty.tools.dotc.core.Symbols.*
++import dotty.tools.dotc.core.tasty.DottyUnpickler
++import dotty.tools.dotc.util.NoSource
++import dotty.tools.io.AbstractFile
++
++/** Method bodies for JDK classes, read from scala-native's javalib TASTy.
++ *
++ *  The compiler sees `java.util.StringJoiner` as a Java-defined class (from
++ *  the JDK stub), which has no tree to interpret. scala-native's javalib,
++ *  however, implements it in Scala, and its `.tasty` files (`javalib-tasty.jar`,
++ *  `build/01b-build-patched-javalib.sh`) carry every method body.
++ *
++ *  Those files define classes under the *same names* as the JDK ones, so
++ *  they cannot be loaded the usual way (the new symbols would replace the
++ *  JDK ones in their package scope, changing how the rest of the
++ *  compilation sees them). Instead each file is unpickled "detached"
++ *  (`DottyUnpickler#enterDetached`): fresh "shadow" symbols that are never
++ *  entered anywhere, and that refer to each other (and to javalib-only
++ *  helper classes) rather than to the JDK versions. A Java-defined member is
++ *  mapped to its shadow definition by (owning class, name, erased parameter
++ *  types).
++ *
++ *  Loading is two-staged. *Entering* a file (creating its shadow symbols)
++ *  happens as soon as another javalib file refers to it. *Indexing* it
++ *  (reading its trees) only happens when a body from it is needed, so a
++ *  class that is merely mentioned costs one name-table read.
++ *
++ *  The `java.lang` core classes (`String`, boxes, `Throwable`, ...) are never
++ *  shadowed: the interpreter represents them by real host objects.
++ */
++final class JavalibOverlay(root: AbstractFile):
++  import JavalibOverlay.*
++
++  /** Entered files by top-level class full name. */
++  private val units = mutable.Map.empty[String, DottyUnpickler]
++  private val noFile = mutable.Set.empty[String]
++  private val indexed = mutable.Set.empty[String]
++  /** Top-level shadow class/module symbols -> the file (full name) defining them. */
++  private val unitOfTop = java.util.IdentityHashMap[Symbol, String]()
++  /** Definition tree of every indexed shadow member/class symbol. */
++  private val treeOf = java.util.IdentityHashMap[Symbol, Tree]()
++  private val byKey = mutable.Map.empty[Key, List[Symbol]]
++  /** Top-level shadow definitions of every entered file, by (package class, name). */
++  private val tops = mutable.Map.empty[(Symbol, Name), Symbol]
++
++  private def topLevelOf(sym: Symbol)(using Context): Symbol =
++    var c = sym
++    while c.exists && c.maybeOwner.exists && !c.owner.is(PackageClass) do c = c.owner
++    c
++
++  def isShadow(sym: Symbol)(using Context): Boolean =
++    sym.exists && (treeOf.containsKey(sym) || unitOfTop.containsKey(topLevelOf(sym)))
++
++  /** The shadow definition tree for `sym`: `sym` itself when it already is a
++   *  shadow symbol, otherwise the same-named member of the javalib class
++   *  standing in for `sym`'s Java-defined owner. `EmptyTree` if there is none.
++   */
++  def treeFor(sym: Symbol)(using Context): Tree =
++    if !sym.exists then EmptyTree
++    else
++      val direct = treeOf.get(sym)
++      if direct != null then direct
++      else
++        val fileOfShadow = unitOfTop.get(topLevelOf(sym))
++        if fileOfShadow != null then
++          index(fileOfShadow)
++          Option(treeOf.get(sym)).getOrElse(EmptyTree)
++        else if sym.is(JavaDefined) && !sym.isClass && sym.maybeOwner.exists then
++          topLevelName(sym.owner).foreach(name => if enter(name) then index(name))
++          byKey.getOrElse(keyOf(sym), Nil) match
++            case shadow :: _ => treeOf.get(shadow)
++            case Nil => EmptyTree
++        else EmptyTree
++
++  private def topLevelName(cls: Symbol)(using Context): Option[String] =
++    val c = topLevelOf(cls)
++    if c.exists && c.maybeOwner.exists then
++      Some((c.owner.fullName.toString + "." + c.name.stripModuleClassSuffix.toString).stripPrefix("<empty>."))
++    else None
++
++  /** Creates the shadow symbols of top-level class `name`'s file, if javalib has one. */
++  private def enter(name: String)(using Context): Boolean =
++    if units.contains(name) then true
++    else if noFile.contains(name) || !name.startsWith("java.") || isHostNative(name) then false
++    else
++      val file = find(name.replace('.', '/') + ".tasty")
++      if file == null then
++        noFile += name
++        false
++      else
++        try
++          val unpickler = new DottyUnpickler(file, file.toByteArray, isBestEffortTasty = false)
++          units(name) = unpickler
++          val sctx = ctx.withSource(NoSource)
++          unpickler.enterDetached(tops, loadByRef)(using sctx)
++          // remember which symbols belong to this file
++          val dot = name.lastIndexOf('.')
++          val pkg = requiredPackage(name.substring(0, dot)).moduleClass
++          val simple = name.substring(dot + 1)
++          for n <- List(typeName(simple), typeName(simple + "$")) do
++            tops.get((pkg, n)).foreach(s => unitOfTop.put(s, name))
++          true
++        catch case e: Exception if !e.isInstanceOf[java.nio.file.NoSuchFileException] =>
++          units -= name
++          noFile += name
++          if System.getenv("SCALINO_INTERP_DEBUG") != null then
++            Console.err.println(s"[javalib-overlay] failed to read $name: $e")
++          false
++
++  /** Reads and indexes the trees of an entered file. */
++  private def index(name: String)(using Context): Unit =
++    if !indexed.contains(name) then
++      indexed += name
++      units.get(name).foreach { unpickler =>
++        try
++          val sctx = ctx.withSource(NoSource)
++          unpickler.rootTrees(using sctx).foreach(indexTree(_)(using sctx))
++        catch case e: Exception =>
++          if System.getenv("SCALINO_INTERP_DEBUG") != null then
++            Console.err.println(s"[javalib-overlay] failed to index $name: $e")
++      }
++
++  /** A qualified reference, inside javalib TASTy, to top-level `name` of
++   *  package class `pkg`: enter the file defining it, if javalib has one.
++   */
++  private def loadByRef(pkg: Symbol, name: Name, ctx0: Context): Unit =
++    given Context = ctx0
++    // javalib names its `java.lang` classes that are special to the compiler
++    // `_String`, `_Enum`, ... (scala-native's nscplugin maps them back): those
++    // stand for the JDK classes.
++    if pkg == defn.JavaLangPackageVal.moduleClass && name.toString.startsWith("_") && !name.toString.startsWith("__") then
++      val real = name.toString.drop(1)
++      val jdk = pkg.info.decl(if name.isTypeName then typeName(real) else termName(real)).symbol
++      if jdk.exists then tops((pkg, name)) = jdk
++    else
++      val base = name.stripModuleClassSuffix.toString
++      val full = if pkg.isEmptyPackage then base else pkg.fullName.toString + "." + base
++      enter(full)
++
++  /** `lookupPathUnchecked` is unsupported on the root of a zip archive; walk it by iteration. */
++  private def find(path: String): AbstractFile | Null =
++    var cur: AbstractFile | Null = root
++    val parts = path.split('/')
++    var i = 0
++    while cur != null && i < parts.length do
++      cur = cur.iterator.find(_.name == parts(i)).orNull
++      i += 1
++    cur
++
++  private def indexTree(tree: Tree)(using Context): Unit = tree match
++    case PackageDef(_, stats) => stats.foreach(indexTree)
++    case td: TypeDef if td.rhs.isInstanceOf[Template] =>
++      val tmpl = td.rhs.asInstanceOf[Template]
++      treeOf.put(td.symbol, td)
++      (tmpl.constr :: tmpl.body).foreach(indexTree)
++    case m @ (_: DefDef | _: ValDef) =>
++      treeOf.put(m.symbol, m)
++      val key = keyOf(m.symbol)
++      byKey(key) = byKey.getOrElse(key, Nil) :+ m.symbol
++    case _ =>
++
++object JavalibOverlay:
++  /** Classes the interpreter represents by real host objects (or throws as
++   *  real host exceptions), so javalib's own implementation of them must not
++   *  replace the JDK symbols: everything in `java.lang` itself (`String`,
++   *  boxes, `StringBuilder`, `Math`, `Throwable` and its subclasses, ...).
++   */
++  private def isHostNative(topLevelName: String): Boolean =
++    topLevelName.startsWith("java.lang.") && topLevelName.indexOf('.', "java.lang.".length) < 0
++
++  /** (owner full name without module `$`, owner is module class, member name, erased parameter types) */
++  private type Key = (String, Boolean, String, String)
++
++  private def keyOf(sym: Symbol)(using Context): Key =
++    val owner = sym.owner
++    val sig = if sym.is(Method) then sym.signature.paramsSig.mkString(",") else ""
++    (owner.fullName.toString.replace("$", ""), owner.is(ModuleClass), sym.name.toString, sig)
++
++  /** The overlay over javalib's TASTy, as given by `-Xmacro-settings:javalibTasty=<jar or dir>`
++   *  (`cli/ScalinoCli.scala`'s `javalibTastyOptions`). Not a classpath entry:
++   *  dotc would then load javalib's classes in place of the JDK ones.
++   */
++  def fromSettings()(using Context): Option[JavalibOverlay] =
++    cache match
++      case (base, overlay) if base eq ctx.base => overlay
++      case _ =>
++        val overlay = create()
++        cache = (ctx.base, overlay)
++        overlay
++
++  // Symbols belong to one `ContextBase` (one compiler run / LSP session).
++  private var cache: (ContextBase, Option[JavalibOverlay]) | Null = null
++
++  private def create()(using Context): Option[JavalibOverlay] =
++    ctx.settings.XmacroSettings.value.collectFirst { case s if s.startsWith("javalibTasty=") => s.stripPrefix("javalibTasty=") }.flatMap { path =>
++      // a jar (zip) or a directory
++      Option(AbstractFile.getDirectory(dotty.tools.io.File(path))).map(new JavalibOverlay(_))
++    }

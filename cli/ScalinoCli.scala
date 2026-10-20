@@ -1903,6 +1903,16 @@ object ScalinoCli:
    *  `buildBinary` also needs it, unmodified, for linking. */
   case class CompileClasspath(javaBase: String, pluginJar: String, compileCp: String, nativelibsCp: String)
 
+  /** `-Xmacro-settings:javalibTasty=dist/lib/javalib-tasty.jar` (build/01b-build-patched-javalib.sh):
+   *  the `.tasty` of scala-native's javalib, which its published jar omits.
+   *  The macro interpreter reads JDK method bodies (`java.util.StringJoiner`,
+   *  `java.net.URI`, ...) from it (`JavalibOverlay`). A setting, not a
+   *  classpath entry: on the classpath, dotc would load javalib's classes
+   *  in place of the JDK ones (`java.lang.Throwable`, ...). */
+  def javalibTastyOptions: List[String] =
+    val jar = s"$dist/lib/javalib-tasty.jar"
+    if new java.io.File(jar).isFile then List(s"-Xmacro-settings:javalibTasty=$jar") else Nil
+
   def computeCompileClasspath(extraClasspath: String, extraCompileOnlyClasspath: String = ""): CompileClasspath =
     val javaBase = s"$dist/java.base.jar"
     val compilerCp = resolveCp(readListFile("compiler.cp"))
@@ -2159,6 +2169,7 @@ object ScalinoCli:
         "-classpath", compileCp,
         "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
         "-Yretain-trees",
+      ) ++ javalibTastyOptions ++ List(
         // The reduced dotc has no JVM backend, so this early (pipelined)
         // output is the only way a .tasty gets written next to the .nir.
         "-Xearly-tasty-output", classesDir.toString
@@ -3311,7 +3322,7 @@ object ScalinoCli:
         id: String, dependsOn: List[String], sources: List[Path], classpathParts: List[String], options: List[String]
     ): String =
       val cc = computeCompileClasspath(classpathParts.filter(_.nonEmpty).mkString(CP_SEP), extraCompileOnlyClasspath)
-      val compilerArguments = List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ options
+      val compilerArguments = List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ javalibTastyOptions ++ options
       val sourceDirectories = sources.map(_.toAbsolutePath.getParent.toString).distinct.sorted
       val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
       s"""  {

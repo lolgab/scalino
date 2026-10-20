@@ -68,10 +68,25 @@ trap restore EXIT
 # org.scala-native, keyed on everything that determines these jars) skips the
 # ~8 min sbt build when the jars are already there.
 _IVY_JAVALIB="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT"
-if [[ "${SCALINO_REUSE_PUBLISHED:-}" == 1 && -f "$_IVY_JAVALIB/jars/javalib_native0.5_3.jar" && -f "$_IVY_JAVALIB/srcs/javalib_native0.5_3-sources.jar" ]]; then
+if [[ "${SCALINO_REUSE_PUBLISHED:-}" == 1 && -f "$_IVY_JAVALIB/jars/javalib_native0.5_3.jar" && -f "$_IVY_JAVALIB/srcs/javalib_native0.5_3-sources.jar" && -f "$_IVY_JAVALIB/jars/javalib-tasty.jar" ]]; then
   echo "reusing cached patched javalib from $_IVY_JAVALIB"
 else
   env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF -u CI sbt javalib3/publishLocal
+
+  # javalib's published jar is NIR-only (project/Settings.scala's
+  # NIROnlySettings drops .class and .tasty), but the .tasty files are
+  # produced by the compile above and carry every method body in javalib.
+  # The macro interpreter reads JDK method bodies from them (Interpreter's
+  # JavalibOverlay), so keep them as a sibling jar -- next to the published
+  # one, so SCALINO_REUSE_PUBLISHED's cache keeps them too.
+  _TASTY_CLASSES="$(ls -d javalib/.3/target/scala-*/classes 2>/dev/null | head -1)"
+  [[ -n "$_TASTY_CLASSES" ]] || { echo "no javalib classes dir under vendor/scala-native/javalib/.3/target" >&2; exit 1; }
+  _TASTY_LIST="$(mktemp)"
+  (cd "$_TASTY_CLASSES" && find . -name '*.tasty' | sed 's|^\./||' | sort) > "$_TASTY_LIST"
+  [[ -s "$_TASTY_LIST" ]] || { echo "no .tasty files in $_TASTY_CLASSES" >&2; exit 1; }
+  mkdir -p "$_IVY_JAVALIB/jars"
+  (cd "$_TASTY_CLASSES" && "$JAR" cf "$_IVY_JAVALIB/jars/javalib-tasty.jar" @"$_TASTY_LIST")
+  rm -f "$_TASTY_LIST"
 fi
 cd - > /dev/null
 

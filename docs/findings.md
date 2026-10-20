@@ -164,6 +164,48 @@ pass `-Yretain-trees` (`bin/scalino-bootstrap` always does). Verified against
 real upstream tests, originally `Macro_1.scala`/`Test_2.scala`-style separate
 compilations.
 
+**JDK classes: bodies from scala-native's javalib TASTy (2026-10-20,
+`patches/scala3-0036`).** `java.*` classes are Java-defined as far as dotc is
+concerned (the `java.base.jar` stub), so there is no TASTy to unpickle and the
+old answer was one hand-written intrinsic per method. scala-native's javalib
+*is* Scala, and its sbt build produces a `.tasty` per class -- it just drops
+them from the published jar (`NIROnlySettings`). `build/01b-build-patched-
+javalib.sh` now packs them into `dist/lib/javalib-tasty.jar` (3 MB, ~790 files),
+and `cli/ScalinoCli.scala` passes `-Xmacro-settings:javalibTasty=<jar>`.
+`JavalibOverlay` (new, `quoted/`) maps a Java-defined symbol to the same
+(class, name, erased params) member of the javalib class and the interpreter
+runs that body. Design points that cost real debugging time:
+- **The jar must NOT go on the classpath.** dotc then loads javalib's
+  `Throwable.tasty` etc. in place of the JDK classes. Hence the setting.
+- javalib classes have the *same names* as the JDK ones, so unpickling them
+  normally would replace the JDK symbols in their package scope. Files are
+  unpickled **detached** (`TreeUnpickler#enterDetached`, same patch): shadow
+  symbols, never entered in a package, no companion linking. Qualified
+  references inside javalib TASTy resolve to *other shadow classes* (loaded on
+  demand) -- needed because javalib classes call javalib-only helpers
+  (`AbstractList#checkIndexOnBounds`, `URIEncoderDecoder`) that the JDK stub
+  lacks. `java.lang._Enum`/`_String`/... (javalib's names for compiler-special
+  classes) resolve to the JDK class.
+- Two-stage loading: *entering* a file (symbols) on reference, *indexing* it
+  (trees) only when a body is needed -- eagerly reading every referenced file
+  broke on unrelated ones (`Collector`, via `Optional`).
+- `java.lang.*` stays host-native (String, boxes, Math, Throwable, ...): the
+  interpreter represents them by real host objects, javalib's `_String` wraps
+  a char array. Those are covered by `HostValueCalls` (whole `String` API by
+  name + runtime arg types, numeric conversions, `new String(...)`), not one
+  overload at a time.
+- Also fixed on the way: `return` inside a *local* def escaped as
+  `LabeledReturn`, and `field = ...` written unqualified inside an interpreted
+  class was "unexpected tree".
+Verified on the JVM fast loop only (`examples/interpreter-regressions`
+`javalib=true`; upstream fixtures unchanged): StringJoiner, Optional, UUID,
+java.net.URI. **Not yet verified: a native `scalino-dotc` rebuild, `01b` end to
+end, the real `scalino` CLI.** Known open: `java.util.Base64` (a different
+stdlib gap, and its failure mode differs with `SCALINO_INTERP_DEBUG`), and the
+host-vs-interpreted object rule -- an interpreted javalib `ArrayList` passed to
+code expecting a host one (or the reverse) is the same hybrid hazard as
+patch 0035's HashSet.
+
 **Test fixtures**: `interpreter/test-fixtures/` holds real macro tests
 harvested from `vendor/scala3/tests/{run-macros,pos-macros}`. Of the curated
 set: 9 pass correctly end-to-end (including through the actual `scalino-dotc`

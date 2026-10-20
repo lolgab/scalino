@@ -69,6 +69,15 @@ vendor_sources() {
 }
 vendor_sources "$WORK/nativelibs-sources.cp"
 
+# javalib's .tasty (01b-build-patched-javalib.sh): bodies of JDK classes for the
+# macro interpreter, see cli/ScalinoCli.scala's computeCompileClasspath.
+JAVALIB_TASTY_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib-tasty.jar"
+if [[ -f "$JAVALIB_TASTY_JAR" ]]; then
+  cp -p "$JAVALIB_TASTY_JAR" "$DIST/lib/javalib-tasty.jar"
+else
+  echo "warning: $JAVALIB_TASTY_JAR missing -- the macro interpreter will have no JDK method bodies (run build/01b-build-patched-javalib.sh)" >&2
+fi
+
 PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 PLUGIN_BASE="$(basename "$PLUGIN_JAR")"
 cp -p "$PLUGIN_JAR" "$DIST/lib/$PLUGIN_BASE"

@@ -142,6 +142,21 @@ object Regressions:
     mapped.size == 40 && mapped.toList.size == 40 && mapped.contains(41) &&
       Set(Seq("a"), Seq("b"), Seq("c", "d"), Seq("e"), Seq("f")).map(_.toList).toList.size == 5
 
+  // JDK classes with no TASTy of their own (`java.util.StringJoiner`,
+  // `Optional`, `UUID`, `java.net.URI`) run from scala-native's javalib TASTy
+  // (`dist/lib/javalib-tasty.jar`, Interpreter's `JavalibOverlay`) instead of
+  // needing a hand-written intrinsic per method: constructors, instance and
+  // static methods, javalib-private helper classes (`URIEncoderDecoder`) and
+  // a local-def `return` (`URI`'s parser) all go through the real bodies.
+  def javalibBodies: Boolean =
+    val joiner = new java.util.StringJoiner(", ", "[", "]")
+    joiner.add("a").add("b")
+    val uri = java.net.URI.create("http://a.b/c?d=1#e")
+    joiner.toString == "[a, b]" && joiner.length == 6 &&
+      java.util.Optional.of("x").map(_.toUpperCase).orElse("n") == "X" &&
+      java.util.UUID.fromString("123e4567-e89b-12d3-a456-426614174000").toString == "123e4567-e89b-12d3-a456-426614174000" &&
+      uri.getHost == "a.b" && uri.getPath == "/c" && uri.getQuery == "d=1" && uri.getFragment == "e"
+
   def summary: String =
     val labels = allLabelsValid("host-1.example.com")
     val thunk = runThunk(21 + 21)
@@ -154,7 +169,8 @@ object Regressions:
     val ioobe = indexOutOfBoundsConstructible
     val identity = staticFieldIdentityStable
     val hashSetMap = hashSetMapIterates
-    s"labels=$labels thunk=$thunk tag=$tag ident=$ident uninit=$uninit hostMut=$hostMut wrap=$wrap region=$region ioobe=$ioobe identity=$identity hashSetMap=$hashSetMap"
+    val javalib = javalibBodies
+    s"labels=$labels thunk=$thunk tag=$tag ident=$ident uninit=$uninit hostMut=$hostMut wrap=$wrap region=$region ioobe=$ioobe identity=$identity hashSetMap=$hashSetMap javalib=$javalib"
 
 object Foo:
   inline def myMacro(): String = ${ aMacroImplementation }
