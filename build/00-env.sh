@@ -140,3 +140,8 @@ require "$CLANG"
 # sets `release-fast`. The scalino CLI link (07) uses release-size when this is
 # anything but `debug`.
 export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-debug}"
+
+# LTO for the scalino-dotc / linkdriver / lsp self-links (--lto <none|thin|full>).
+# thin only affects the clang-compiled C/C++ runtime and .ll fallback partitions:
+# direct-codegen objects are native, and PGO is applied there, so PGO is unaffected.
+export SCALINO_LINK_LTO="${SCALINO_LINK_LTO:-thin}"

@@ -223,6 +223,7 @@ native_link() {
     "$CLANGPP" \
     info \
     --mode "$SCALINO_LINK_MODE" \
+    --lto "$SCALINO_LINK_LTO" \
     --no-incremental-compilation \
     "${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]+"${LLVM_DIRECT_CODEGEN_LINKING_OPTS[@]}"}" \
     "${EXTRA_LINKING_OPTS[@]+"${EXTRA_LINKING_OPTS[@]}"}" \
@@ -245,6 +246,7 @@ else
       "$CLANGPP" \
       info \
       --mode "$SCALINO_LINK_MODE" \
+      --lto "$SCALINO_LINK_LTO" \
       --multithreading \
       --no-direct-codegen \
       --no-incremental-compilation \

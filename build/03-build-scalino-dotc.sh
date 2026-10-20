@@ -116,6 +116,7 @@ dotc_link() {
     "$(to_native_path "$LINK_WORK")" \
     dotty.tools.dotc.Main \
     --mode "$SCALINO_LINK_MODE" \
+    --lto "$SCALINO_LINK_LTO" \
     --multithreading \
     --no-incremental-compilation \
     --embed-resources \

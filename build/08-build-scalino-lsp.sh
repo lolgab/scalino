@@ -174,6 +174,7 @@ lsp_link() {
     "$(to_native_path "$LINK_WORK")" \
     dotty.tools.languageserver.Main \
     --mode "$SCALINO_LINK_MODE" \
+    --lto "$SCALINO_LINK_LTO" \
     --no-incremental-compilation \
     --embed-resources \
     ${LINK_EXTRA[@]+"${LINK_EXTRA[@]}"}
