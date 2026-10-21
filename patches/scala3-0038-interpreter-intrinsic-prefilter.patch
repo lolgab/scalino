@@ -1,0 +1,177 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 5cb9300..f90e363 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -4353,7 +4353,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     def findQuotes(candidates: List[Object]): Option[QuotesImpl] =
+       (receiver.toList ::: candidates).collectFirst { case q: QuotesImpl => q }
+ 
+-    lazy val ownerName = fn.owner.name.toString
++    lazy val ownerName = ownerNames(fn.owner)._1
++    lazy val ownerStripped = ownerNames(fn.owner)._2
++    // A call can only reach a case below if its name is one of the literals the cases test, or its
++    // owner is one of those the name-binding cases (`case n if ownerName == ...`) are limited to;
++    // every other call (most calls of user and library code) goes straight to the fallthrough
++    // instead of failing ~230 string tests first.
++    if !quotesApiNames.contains(fn.name.toString) && !quotesApiOwnerMayBind(ownerName) then
++      return quotesApiFallthrough(fn, args)
+     fn.name.toString match
+       case "reflect" if fn.owner == defn.QuotesClass =>
+         // `Quotes#reflect` is implemented by returning the Quotes instance
+@@ -4443,7 +4450,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case n if ownerName == "PrinterModule" && args.isEmpty => reflectPrinter(n)
+ 
+       // `X.show(using printer)` with an explicit printer: run it for real.
+-      case "show" if args.size == 2 && isReflectPrinter(args(1)) && fn.owner.name.toString != "Quotes" =>
++      case "show" if args.size == 2 && isReflectPrinter(args(1)) && ownerName != "Quotes" =>
+         Some(showWithPrinter(args.head, args(1)))
+ 
+       case "show" if (receiver.toList ::: args).exists(_.isInstanceOf[Tree]) =>
+@@ -4908,7 +4915,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `TupleN.apply(...)` (real scala-library case classes, e.g. built by
+       // macros pairing up a symbol with computed metadata) -- no retained
+       // body, but a `TupleN` is just its N fields, constructible directly.
+-      case "apply" if isTupleName(fn.owner.name.toString.stripSuffix("$")) =>
++      case "apply" if isTupleName(ownerStripped) =>
+         Some(Tuple.fromArray(args.toArray))
+       // NOT `Some.apply(x)` (deliberately not special-cased): with
+       // dist/lib/scalalib-retained.jar on the classpath, `Option.scala`'s
+@@ -5101,7 +5108,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         args.headOption.collect { case l: LambdaType => l.paramInfos }
+       case "resType" if ownerName == "LambdaTypeMethods" =>
+         args.headOption.collect { case l: LambdaType => l.resType }
+-      case "param" if Set("MethodTypeMethods", "PolyTypeMethods", "TypeLambdaMethods").contains(fn.owner.name.toString) =>
++      case "param" if Set("MethodTypeMethods", "PolyTypeMethods", "TypeLambdaMethods").contains(ownerName) =>
+         args match
+           case (l: LambdaType) :: (i: Integer) :: Nil => Some(l.paramRefs(i))
+           case _ => None
+@@ -5141,8 +5148,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `self` tree is the first (and only receiver) argument, the answer is
+       // the matching field of the underlying dotc `tpd` node (what
+       // `QuotesImpl` itself returns).
+-      case name if fn.owner.name.toString.endsWith("Methods") && treeAccessor(fn.owner.name.toString, name, args).isDefined =>
+-        treeAccessor(fn.owner.name.toString, name, args)
++      case name if ownerName.endsWith("Methods") && treeAccessor(ownerName, name, args).isDefined =>
++        treeAccessor(ownerName, name, args)
+       case "tree" if ownerName == "ImplicitSearchSuccessMethods" =>
+         args.headOption.collect { case t: Tree => t }
+       case "explanation" if ownerName == "ImplicitSearchFailureMethods" =>
+@@ -5186,10 +5193,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `report.info(s"...")`) via its ordinary, cross-module (no retained
+       // body) `apply` method (`.s(...)` is an instance call, handled in
+       // `interpretStdlibIntrinsic` instead).
+-      case "apply" if fn.owner.name.toString.stripSuffix("$") == "StringContext" =>
++      case "apply" if ownerStripped == "StringContext" =>
+         val parts = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
+         Some(scala.StringContext(parts.map(_.toString).toSeq*))
+-      case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "Set" =>
++      case "newBuilder" if ownerStripped == "Set" =>
+         Some(scala.collection.immutable.Set.newBuilder[Object])
+       // `Set#map`/`filter`/... on a real host `HashSet` rebuild through its OWN
+       // companion's `newBuilder` (`iterableFactory`); left to the generic path
+@@ -5198,9 +5205,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // against a half-built trie (reports the right `size`, iterates as empty).
+       // A 5+-element `Set` takes this path (`Set1`..`Set4` rebuild via
+       // `Set.newBuilder` above) -- e.g. `blocks.map(_.toList).toList` in a macro.
+-      case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "HashSet" && fn.owner.fullName.toString.startsWith("scala.collection.immutable.") =>
++      case "newBuilder" if ownerStripped == "HashSet" && fn.owner.fullName.toString.startsWith("scala.collection.immutable.") =>
+         Some(scala.collection.immutable.HashSet.newBuilder[Object])
+-      case "newBuilder" if fn.owner.name.toString.stripSuffix("$") == "List" =>
++      case "newBuilder" if ownerStripped == "List" =>
+         Some(List.newBuilder[Object])
+       // `newBuilder` dispatched via the genuinely ABSTRACT `IterableFactory`
+       // trait itself, not a concrete companion -- e.g. `Map#collect`'s real
+@@ -5214,10 +5221,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // concrete `List`/`Set` cases just above already hardcode).
+       case "newBuilder" if ownerName == "IterableFactory" =>
+         Some(List.newBuilder[Object])
+-      case "apply" if fn.owner.name.toString.stripSuffix("$") == "List" =>
++      case "apply" if ownerStripped == "List" =>
+         val elems = args match { case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s; case other => other }
+         Some(elems.toList)
+-      case "empty" if fn.owner.name.toString.stripSuffix("$") == "List" =>
++      case "empty" if ownerStripped == "List" =>
+         Some(Nil)
+       // `java.lang.Boolean.getBoolean`/etc: real JDK-native methods with no
+       // Scala/dotc-compiled source at all (unlike everything else this
+@@ -5238,7 +5245,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `catch case _: ClassNotFoundException`), where "not found" is
+       // always a sound, if pessimistic, answer -- it just selects that
+       // class's own plain `WeakHashMap`-backed fallback implementation.
+-      case "forName" if fn.owner.name.toString.stripSuffix("$") == "Class" && fn.owner.is(JavaDefined) =>
++      case "forName" if ownerStripped == "Class" && fn.owner.is(JavaDefined) =>
+         val name = args.headOption.collect { case s: String => s }.getOrElse("")
+         // Exception: a Scala standard-library module class (`scala.Some$`,
+         // ...), which jsoniter-scala's compile-time config evaluator
+@@ -5249,7 +5256,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           try Some(Class.forName(name))
+           catch case _: ClassNotFoundException | _: LinkageError => throw new ClassNotFoundException(name)
+         else throw new ClassNotFoundException(name)
+-      case name if fn.owner.name.toString.stripSuffix("$") == "Math" =>
++      case name if ownerStripped == "Math" =>
+         args.map {
+           case i: Integer => i.intValue
+           case l: java.lang.Long => l.longValue
+@@ -5439,9 +5446,61 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             Some(tpd.cpy.DefDef(original)(name.toTermName, paramss.asInstanceOf[List[tpd.ParamClause]], tpt, rhsOpt.getOrElse(tpd.EmptyTree)))
+           case _ => None
+ 
+-      case _ => moduleConstructor(fn.owner.name.toString, fn.name.toString, args)
++      case _ => quotesApiFallthrough(fn, args)
+   end interpretQuotesApi
+ 
++  /** An owner's name and its name without the module `$`, computed once per symbol: the guards of
++   *  `interpretQuotesApi` read them on every call, and `Name.toString` allocates.
++   */
++  private val ownerNameCache = mutable.HashMap.empty[Symbol, (String, String)]
++  private def ownerNames(owner: Symbol): (String, String) =
++    ownerNameCache.getOrElseUpdate(owner, { val n = owner.name.toString; (n, n.stripSuffix("$")) })
++
++  /** Every case of `moduleConstructor` is keyed by a `*Module` owner; the other calls have no
++   *  tuple tests to go through.
++   */
++  private def quotesApiFallthrough(fn: Symbol, args: List[Object]): Option[Object] =
++    val owner = fn.owner.name.toString
++    if owner.endsWith("Module") then moduleConstructor(owner, fn.name.toString, args) else None
++
++  /** The owners `interpretQuotesApi`'s cases that bind the method name (`case n if ...`) accept. */
++  private def quotesApiOwnerMayBind(ownerName: String): Boolean =
++    ownerName.endsWith("Methods") || ownerName.stripSuffix("$") == "Math" || ownerName == "PrinterModule" ||
++    ownerName == "reflectModule" || ownerName == "FlagsModule" || ownerName == "defnModule"
++
++  /** The method names `interpretQuotesApi`'s cases test as literals (generated from its source;
++   *  keep in step when adding a case).
++   */
++  private val quotesApiNames: Set[String] = Set(
++    "&", "<:<", "=:=", "annotations", "appliedTo", "appliedToArgs",
++    "appliedToArgss", "appliedToNone", "appliedToType", "appliedToTypes", "apply", "asExpr",
++    "asExprOf", "asTerm", "asType", "baseClasses", "baseType", "betaReduce",
++    "body", "byteWrapper", "caseFields", "changeOwner", "charWrapper", "children",
++    "classSymbol", "companionClass", "companionModule", "constructor", "copy", "current",
++    "dealias", "dealiasKeepOpaques", "declarations", "declaredMethod", "derivesFrom", "doubleWrapper",
++    "empty", "end", "endColumn", "endLine", "erasedArgs", "error",
++    "errorAndAbort", "exists", "explanation", "fieldMembers", "flags", "floatWrapper",
++    "forName", "fullName", "getAnnotation", "getBoolean", "getFileName", "getJPath",
++    "hasAnnotation", "hasErasedArgs", "hi", "info", "intWrapper", "is",
++    "isAliasType", "isClassConstructor", "isClassDef", "isContextFunctionType", "isDefDef", "isDependentFunctionType",
++    "isErased", "isErasedFunctionType", "isExprOf", "isFunctionType", "isGiven", "isImplicit",
++    "isNoSymbol", "isSingleton", "isTerm", "isTupleN", "isType", "isTypeDef",
++    "isTypeParam", "jpath", "leadingTypeParams", "longWrapper", "low", "lower",
++    "memberFields", "memberMethods", "memberType", "methodMember", "methodMembers", "moduleClass",
++    "name", "newBind", "newBuilder", "newMethod", "newVal", "noSymbol",
++    "of", "ofMacroExpansion", "overloaded", "param", "paramNames", "paramSymss",
++    "paramTypes", "paramVariance", "params", "paramss", "parents", "path",
++    "pos", "primaryConstructor", "reflect", "requiredClass", "requiredMethod", "requiredModule",
++    "resType", "returnTpt", "rhs", "seal", "search", "searchIgnoring",
++    "select", "shortWrapper", "show", "signature", "simplified", "sourceCode",
++    "sourceFile", "spliceOwner", "start", "startColumn", "startLine", "substituteTypes",
++    "symbol", "term", "termParamss", "termRef", "termSymbol", "toString",
++    "tpe", "tpt", "trailingParamss", "translucentSuperType", "tree", "typeArgs",
++    "typeConstructorOf", "typeRef", "typeSymbol", "underlying", "underlyingArgument", "unique",
++    "unpickleExprV2", "unpickleTypeV2", "upper", "value", "valueOrAbort", "warning",
++    "widen", "widenByName", "widenTermRefByName", "|"
++  )
++
+   /** `quotes.reflect.*Module#apply`/`#copy` for the tree and TypeRepr
+    *  constructors not covered by a dedicated case in `interpretQuotesApi`;
+    *  each mirrors the matching definition in `QuotesImpl` (positions
