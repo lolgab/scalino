@@ -144,4 +144,12 @@ export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-debug}"
 # LTO for the scalino-dotc / linkdriver / lsp self-links (--lto <none|thin|full>).
 # thin only affects the clang-compiled C/C++ runtime and .ll fallback partitions:
 # direct-codegen objects are native, and PGO is applied there, so PGO is unaffected.
-export SCALINO_LINK_LTO="${SCALINO_LINK_LTO:-thin}"
+# ld64 asserts on thin-LTO'd libunwind.cpp (alias and target land in different
+# sections), so macOS defaults to full LTO.
+if [[ -z "${SCALINO_LINK_LTO:-}" ]]; then
+  case "$(uname -s)" in
+    Darwin) SCALINO_LINK_LTO=full ;;
+    *) SCALINO_LINK_LTO=thin ;;
+  esac
+fi
+export SCALINO_LINK_LTO

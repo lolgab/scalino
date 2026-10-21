@@ -1,0 +1,13 @@
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/StringConstants.scala b/nativelib/src/main/scala/scala/scalanative/runtime/StringConstants.scala
+index 220b0e3..deab9ac 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/StringConstants.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/StringConstants.scala
+@@ -5,6 +5,6 @@ import scalanative.unsafe._
+ 
+ @extern
+ object StringConstants {
+-  def snErrorPrefix: CString = extern
+-  def snFatalErrorPrefix: CString = extern
++  var snErrorPrefix: CString = extern
++  var snFatalErrorPrefix: CString = extern
+ }
