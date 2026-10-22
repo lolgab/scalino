@@ -2433,8 +2433,15 @@ object ScalinoCli:
       val candidates = List(mainClass, mainClass.toLowerCase).flatMap(n => List(n, n + ".exe")).map(dir.resolve)
       val actual = candidates.find(Files.exists(_)).getOrElse(fail(s"expected linked binary at ${candidates.head}, not found"))
       Files.createDirectories(Option(out.getParent).getOrElse(Paths.get(".")))
-      Files.copy(actual, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-      out.toFile.setExecutable(true)
+      // Write a new file and rename it over `out` instead of overwriting in
+      // place: a running instance keeps its old inode, and on macOS a rewritten
+      // vnode keeps its cached code signature, so later launches get SIGKILLed.
+      val tmp = out.resolveSibling(out.getFileName.toString + ".tmp")
+      try
+        Files.copy(actual, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        tmp.toFile.setExecutable(true)
+        Files.move(tmp, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+      finally Files.deleteIfExists(tmp)
     if nativeOpts.targetTriples.isEmpty then collect(linkDir, outFor(mainClass))
     else nativeOpts.targetTriples.foreach(t => collect(linkDir.resolve(t), outForTriple(mainClass, t)))
     mainClass
