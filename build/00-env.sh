@@ -144,12 +144,19 @@ export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-debug}"
 # LTO for the scalino-dotc / linkdriver / lsp self-links (--lto <none|thin|full>).
 # thin only affects the clang-compiled C/C++ runtime and .ll fallback partitions:
 # direct-codegen objects are native, and PGO is applied there, so PGO is unaffected.
-# ld64 asserts on thin-LTO'd libunwind.cpp (alias and target land in different
-# sections), so macOS defaults to full LTO.
+# Only linux-x86_64 defaults to thin; everywhere else it is off until the
+# failures below are fixed (override with SCALINO_LINK_LTO=thin|full|none):
+#  - macOS: ld64 asserts on thin-LTO'd libunwind.cpp (alias/target in different
+#    sections), and full LTO takes 1.5-3h for dotc/lsp in CI.
+#  - arm64: the LTO'd binaries are broken at runtime (linux-arm64 scalino-dotc
+#    dies with "terminate called after throwing ExceptionWrapper"; macOS arm64
+#    linkdriver reads .nir files as empty: BufferUnderflowException in
+#    Prelude.readNIRVersion).
 if [[ -z "${SCALINO_LINK_LTO:-}" ]]; then
-  case "$(uname -s)" in
-    Darwin) SCALINO_LINK_LTO=full ;;
-    *) SCALINO_LINK_LTO=thin ;;
-  esac
+  if [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]; then
+    SCALINO_LINK_LTO=thin
+  else
+    SCALINO_LINK_LTO=none
+  fi
 fi
 export SCALINO_LINK_LTO
