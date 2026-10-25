@@ -124,6 +124,9 @@ scalino package examples/Hello.scala -o hello && ./hello
   //> using options -Wunused:all -deprecation
   //> using nativeMode release-fast
   ```
+- **Debug info:** binaries are built without source-level debug info (DWARF).
+  Opt in with `--native-debug-info` or `//> using nativeDebugInfo true` when
+  you want lldb/gdb or profilers to show Scala sources and lines.
 - **Tests:** the test framework is auto-detected from the classpath, so any
   framework with a Scala Native port works. `--test-only <glob>` drops the
   other suites from the link, and `-- <pattern>` is passed through to the

@@ -48,6 +48,7 @@ object LinkDriver:
     compactByteArrays: Option[Boolean] = None,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
+    debugInfo: Boolean = false,
     incrementalCompilation: Boolean = true,
     optimize: Boolean = true,
     linking: List[String] = Nil,
@@ -92,7 +93,7 @@ object LinkDriver:
       |  --[no-]compact-byte-arrays    default: on unless a layout-dependent library is on the classpath
       |  --[no-]incremental-compilation  default: on
       |  --no-opt                      disable the optimizer
-      |  --embed-resources   --gc-stw-sweep   --heap-histogram   --long-running
+      |  --embed-resources   --gc-stw-sweep   --heap-histogram   --debug-info   --long-running
       |  --linking <opt>  --compile <opt>  --c-compile <opt>  --cpp-compile <opt>  --prune <name>   (repeatable)
       |  -h, --help                    print this help
       |""".stripMargin
@@ -138,6 +139,7 @@ object LinkDriver:
         case "--no-compact-byte-arrays" => o = o.copy(compactByteArrays = Some(false))
         case "--gc-stw-sweep" => o = o.copy(gcStwSweep = true)
         case "--heap-histogram" => o = o.copy(heapHistogram = true)
+        case "--debug-info" => o = o.copy(debugInfo = true)
         case "--incremental-compilation" => o = o.copy(incrementalCompilation = true)
         case "--no-incremental-compilation" => o = o.copy(incrementalCompilation = false)
         case "--no-opt" => o = o.copy(optimize = false)
@@ -241,11 +243,12 @@ object LinkDriver:
           .withCompactHeaders(opts.compactHeaders.getOrElse(!windowsTarget(opts)))
           .withCompactByteArrays(compactByteArrays)
           .withGCStwSweep(opts.gcStwSweep)
-          // DirectCodeGen now has its own (scoped) DIBuilder-based debug-info
-          // support (Phase 3), so debug info no longer needs forcing off for
-          // the flag to have an effect -- always on, same as every other
-          // path, regardless of the direct-codegen flag.
-          .withSourceLevelDebuggingConfig(SourceLevelDebuggingConfig.enabled)
+          // DirectCodeGen has its own (scoped) DIBuilder-based debug-info
+          // support (Phase 3), so the flag has the same effect regardless of
+          // the direct-codegen setting. Opt-in (`--debug-info`): off by default.
+          .withSourceLevelDebuggingConfig(
+            if opts.debugInfo then SourceLevelDebuggingConfig.enabled else SourceLevelDebuggingConfig.disabled
+          )
           .withIncrementalCompilation(opts.incrementalCompilation)
           .withOptimize(opts.optimize)
           // `//> using nativePrune`: patterns travel to the linker's Reach

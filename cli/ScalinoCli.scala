@@ -440,6 +440,7 @@ object ScalinoCli:
     nativeCompactByteArrays: Option[Boolean],
     nativeGcStwSweep: Option[Boolean],
     nativeHeapHistogram: Option[Boolean],
+    nativeDebugInfo: Option[Boolean],
     nativeOptimize: Option[Boolean],
     jars: List[String],
     testOptions: List[String],
@@ -469,7 +470,7 @@ object ScalinoCli:
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativePrune", "nativeTarget",
     "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot", "nativePkgConfig",
-    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeOptimize",
+    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
     "packageHomepage", "packageDep", "packageDeps", "packageFile", "packageFiles",
@@ -537,6 +538,7 @@ object ScalinoCli:
     var nativeCompactByteArrays = Option.empty[Boolean]
     var nativeGcStwSweep = Option.empty[Boolean]
     var nativeHeapHistogram = Option.empty[Boolean]
+    var nativeDebugInfo = Option.empty[Boolean]
     var nativeOptimize = Option.empty[Boolean]
     var jars = List.empty[String]
     var testOptions = List.empty[String]
@@ -599,6 +601,7 @@ object ScalinoCli:
         directiveBool(line, "nativeCompactByteArrays").foreach(v => nativeCompactByteArrays = Some(v))
         directiveBool(line, "nativeGcStwSweep").foreach(v => nativeGcStwSweep = Some(v))
         directiveBool(line, "nativeHeapHistogram").foreach(v => nativeHeapHistogram = Some(v))
+        directiveBool(line, "nativeDebugInfo").foreach(v => nativeDebugInfo = Some(v))
         directiveBool(line, "nativeOptimize").foreach(v => nativeOptimize = Some(v))
         for (spelling, canonical) <- Packaging.DirectiveAliases do
           directiveValues(line, spelling).foreach(vs => pkg = pkg.updated(canonical, pkg.getOrElse(canonical, Nil) ++ vs))
@@ -606,7 +609,7 @@ object ScalinoCli:
       deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile, nativePrune,
-      nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeOptimize,
+      nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeDebugInfo, nativeOptimize,
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
       nativeTargetTriples, nativeSysroots, nativePkgConfig
     )
@@ -2231,6 +2234,7 @@ object ScalinoCli:
     compactByteArrays: Option[Boolean] = None,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
+    debugInfo: Boolean = false,
     optimize: Boolean = true,
     linking: List[String] = Nil,
     compile: List[String] = Nil,
@@ -2306,6 +2310,9 @@ object ScalinoCli:
       // always-linked static table otherwise bloats every binary by ~7.5MB
       // regardless of whether it's ever used at runtime.
       heapHistogram = directives.nativeHeapHistogram.getOrElse(false) || o.cliNativeHeapHistogram,
+      // Opt-in: source-level debug info (DWARF line/variable info) makes every
+      // binary noticeably bigger and slower to link, so it is only emitted on request.
+      debugInfo = directives.nativeDebugInfo.orElse(o.cliNativeDebugInfo).getOrElse(false),
       // Default-on, same opt-out shape as multithreading/directCodegen above.
       optimize = directives.nativeOptimize.orElse(o.cliNativeOptimize).getOrElse(true),
       linking = directives.nativeLinking ++ o.cliNativeLinking ++ pkgConfig("--libs", pkgModules),
@@ -2418,6 +2425,7 @@ object ScalinoCli:
       nativeOpts.compactByteArrays.map(v => if v then "--compact-byte-arrays" else "--no-compact-byte-arrays").toList ++
       (if nativeOpts.gcStwSweep then List("--gc-stw-sweep") else Nil) ++
       (if nativeOpts.heapHistogram then List("--heap-histogram") else Nil) ++
+      (if nativeOpts.debugInfo then List("--debug-info") else Nil) ++
       (if !nativeOpts.optimize then List("--no-opt") else Nil) ++
       nativeOpts.linking.flatMap(v => List("--linking", v)) ++
       nativeOpts.compile.flatMap(v => List("--compile", v)) ++
@@ -2622,6 +2630,9 @@ object ScalinoCli:
        |                             marking finishes (off by default; throughput over
        |                             concurrency -- trades commix's concurrent/lazy sweep
        |                             bookkeeping for a longer, fully parallel STW pause)
+       |  --native-debug-info[=true|false]  emit source-level debug info (DWARF) so debuggers
+       |                                  and profilers see Scala sources/lines (off by default;
+       |                                  makes binaries bigger and links slower)
        |  --native-optimize[=true|false]  Scala Native's Interflow NIR optimizer pass
        |                                  (on by default; pass =false to skip it, e.g. for
        |                                  faster iterative builds or clearer debug binaries)
@@ -2666,6 +2677,7 @@ object ScalinoCli:
        |  //> using nativeCompactByteArrays true   (on by default, see --native-compact-byte-arrays)
        |  //> using nativeGcStwSweep true   (commix GC only; off by default)
        |  //> using nativeHeapHistogram true   (live-heap histogram GC debug dump; off by default, adds ~7.5MB to binary)
+       |  //> using nativeDebugInfo true   (source-level debug info; off by default)
        |  //> using nativeOptimize false   (Interflow NIR optimizer; on by default)
        |""".stripMargin
 
@@ -2923,6 +2935,7 @@ object ScalinoCli:
     cliNativeCompactByteArrays: Option[Boolean] = None,
     cliNativeGcStwSweep: Boolean = false,
     cliNativeHeapHistogram: Boolean = false,
+    cliNativeDebugInfo: Option[Boolean] = None,
     cliNativeOptimize: Option[Boolean] = None,
     formats: List[String] = Nil,
     pkgName: Option[String] = None,
@@ -3015,6 +3028,12 @@ object ScalinoCli:
           o = o.copy(cliNativeCompactByteArrays = Some(v == "true"))
         case "--native-gc-stw-sweep" => o = o.copy(cliNativeGcStwSweep = true)
         case "--native-heap-histogram" => o = o.copy(cliNativeHeapHistogram = true)
+        case "--native-debug-info" => o = o.copy(cliNativeDebugInfo = Some(true))
+        case f if f.startsWith("--native-debug-info=") =>
+          val v = f.drop("--native-debug-info=".length)
+          if (v != "true" && v != "false")
+            die(s"--native-debug-info=$v: expected true or false")
+          o = o.copy(cliNativeDebugInfo = Some(v == "true"))
         case "--native-optimize" => o = o.copy(cliNativeOptimize = Some(true))
         case f if f.startsWith("--native-optimize=") =>
           val v = f.drop("--native-optimize=".length)
@@ -3406,7 +3425,7 @@ object ScalinoCli:
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
-    "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-optimize " +
+    "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
     "--formats --package-name --package-version -h --help"
 
   private def bashCompletion: String =
