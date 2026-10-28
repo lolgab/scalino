@@ -78,6 +78,8 @@ SHARED_SOURCES=(
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/Visit.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala"
+  "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/Opt.scala"
+  "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/package.scala"
   "$VENDOR/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala"
 )
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
@@ -156,6 +158,7 @@ NIR_SOURCES=(
   "$VENDOR/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala"
   "$VENDOR/nir/src/main/scala/scala/scalanative/nir/SourcePosition.scala"
   "$VENDOR/nir/src/main/scala/scala/scalanative/nir/Show.scala"
+  "$VENDOR/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala"
 )
 ORIG_NIR_JAR="$(tr "$CP_SEP" '\n' < "$WORK/util-native-patched.cp" | grep "nir_native0.5_3-$SCALA_NATIVE_VERSION.jar$")"
 [[ -n "$ORIG_NIR_JAR" ]] || { echo "could not find nir_native0.5_3-$SCALA_NATIVE_VERSION.jar on util-native-patched.cp" >&2; exit 1; }

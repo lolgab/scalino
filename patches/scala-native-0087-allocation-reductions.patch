@@ -1,0 +1,487 @@
+--- a/tools/src/main/scala/scala/scalanative/interflow/State.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/State.scala	2026-10-26 13:31:44
+@@ -32,11 +32,14 @@
+   var getClassCache = mutable.AnyRefMap.empty[nir.Val, nir.Val]
+ 
+   // Delayed init
+-  var localNames: mutable.OpenHashMap[nir.Local, String] = _
++  // Keyed by the raw Long id of the nir.Local, like `locals`: LongMap clones
++  // its two arrays, OpenHashMap.clone re-inserted every entry (an entry, a
++  // Some and a Tuple2 each).
++  var localNames: mutable.LongMap[String] = _
+   var virtualNames: mutable.LongMap[String] = _
+ 
+   if (preserveDebugInfo) {
+-    localNames = mutable.OpenHashMap.empty[nir.Local, String]
++    localNames = mutable.LongMap.empty[String]
+     virtualNames = mutable.LongMap.empty[String]
+   }
+ 
+@@ -133,7 +136,7 @@
+     // Don't emit local names for ops returning unit value
+     if (preserveDebugInfo && op.resty != nir.Type.Unit) {
+       virtualNames.get(addr).foreach { name =>
+-        this.localNames += value.id -> name
++        this.localNames.update(value.id.id, name)
+       }
+     }
+     value
+@@ -300,7 +303,7 @@
+     newstate.getClassCache = getClassCache.clone()
+ 
+     if (preserveDebugInfo) {
+-      newstate.virtualNames = virtualNames.mapValuesNow(identity)
++      newstate.virtualNames = virtualNames.clone()
+       newstate.localNames = localNames.clone()
+     }
+     newstate
+--- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala	2026-10-26 13:31:44
+@@ -98,8 +98,7 @@
+         // Long-keyed (see State.locals's comment): mirrors the state-side
+         // fix, since this map gets assigned directly to `mergeState.locals`.
+         val mergeLocals = mutable.LongMap.empty[nir.Val]
+-        val mergeLocalNames =
+-          mutable.OpenHashMap.empty[nir.Local, nir.LocalName]
++        val mergeLocalNames = mutable.LongMap.empty[nir.LocalName]
+         val mergeHeap = mutable.LongMap.empty[Instance]
+         val mergePhis = mutable.UnrolledBuffer.empty[MergePhi]
+         val mergeDelayed = mutable.AnyRefMap.empty[nir.Op, nir.Val]
+@@ -158,7 +157,7 @@
+         def rootTuples: Seq[Seq[nir.Val]] = {
+           if (rootTuplesCache == null) {
+             val b = Seq.newBuilder[Seq[nir.Val]]
+-            headState.locals.keysIterator.foreach { id =>
++            headState.locals.foreachKey { id =>
+               val vs = states.flatMap(_.locals.get(id))
+               if (vs.size == states.size) b += vs
+             }
+@@ -276,7 +275,7 @@
+             val paramty = Sub.lub(materialized.map(_.ty), bound)
+             val param = nir.Val.Local(id, paramty)
+             if (eval.preserveDebugInfo) {
+-              localName.foreach(mergeLocalNames.getOrElseUpdate(id, _))
++              localName.foreach(mergeLocalNames.getOrElseUpdate(id.id, _))
+             }
+             mergePhis += MergePhi(param, localIds.zip(materialized))
+             param
+@@ -286,9 +285,9 @@
+         def localNameOf(local: nir.Local) = if (eval.preserveDebugInfo) {
+           debugInfo.localNames
+             .get(local)
+-            .orElse(mergeLocalNames.get(local))
++            .orElse(mergeLocalNames.get(local.id))
+             .orElse(
+-              MergeProcessor.findNameOf(_.localNames.get(local))(states)
++              MergeProcessor.findNameOf(_.localNames.get(local.id))(states)
+             )
+         } else None
+ 
+@@ -300,8 +299,11 @@
+         def computeMerge(): Unit = {
+           // 1. Merge locals
+           def mergeLocal(local: nir.Local, value: nir.Val): Unit = {
+-            val values = mutable.UnrolledBuffer.empty[nir.Val]
+-            states.foreach(_.locals.get(local.id).foreach(values += _))
++            val values = new mutable.ArrayBuffer[nir.Val](states.size)
++            states.foreach { s =>
++              val v = s.locals.getOrNull(local.id)
++              if (v != null) values += v
++            }
+             if (states.size == values.size) {
+               mergeLocals(local.id) = mergePhi(
+                 values.toSeq,
+@@ -310,8 +312,8 @@
+               )
+             }
+           }
+-          headState.locals.foreach {
+-            case (localId, value) => mergeLocal(nir.Local(localId), value)
++          headState.locals.foreachEntry { (localId, value) =>
++            mergeLocal(nir.Local(localId), value)
+           }
+ 
+           // 2. Merge heap
+--- a/tools/src/main/scala/scala/scalanative/interflow/Eval.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/Eval.scala	2026-10-26 13:31:44
+@@ -30,7 +30,7 @@
+         param <- params
+         name <- debugInfo.localNames.get(param.id)
+       } {
+-        state.localNames.getOrElseUpdate(param.id, name)
++        state.localNames.getOrElseUpdate(param.id.id, name)
+       }
+     }
+ 
+@@ -56,7 +56,7 @@
+             val localName = debugInfo.localNames.get(local)
+             value match {
+               case nir.Val.Local(id, _) =>
+-                localName.foreach(state.localNames.getOrElseUpdate(id, _))
++                localName.foreach(state.localNames.getOrElseUpdate(id.id, _))
+               case nir.Val.Virtual(addr) =>
+                 localName.foreach(state.virtualNames.getOrElseUpdate(addr, _))
+               case _ => ()
+--- a/tools/src/main/scala/scala/scalanative/interflow/Opt.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/Opt.scala	2026-10-26 13:31:44
+@@ -71,7 +71,7 @@
+           if (preserveDebugInfo) {
+             origdefn.debugInfo.localNames
+               .get(origarg.id)
+-              .foreach(state.localNames.update(id, _))
++              .foreach(state.localNames.update(id.id, _))
+           }
+           nir.Val.Local(id, ty)
+       }
+@@ -122,7 +122,7 @@
+             block.toInsts()
+           }
+           val debugInfo: DebugInfo = if (preserveDebugInfo) {
+-            val localNames = mutable.OpenHashMap.empty[nir.Local, nir.LocalName]
++            val localNames = mutable.LongMap.empty[nir.LocalName]
+             for {
+               block <- blocks
+               state = block.end
+@@ -130,7 +130,11 @@
+               localNames.addMissing(block.end.localNames)
+             }
+             DebugInfo(
+-              localNames = localNames.toMap,
++              localNames = {
++                val b = Map.newBuilder[nir.Local, nir.LocalName]
++                localNames.foreachEntry((id, n) => b += nir.Local(id) -> n)
++                b.result()
++              },
+               lexicalScopes = currentLexicalScopes.get.toSeq
+             )
+           } else DebugInfo.empty
+--- a/tools/src/main/scala/scala/scalanative/interflow/package.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/package.scala	2026-10-26 13:31:44
+@@ -6,11 +6,14 @@
+ 
+   private[interflow] type Addr = Long
+ 
+-  private[interflow] implicit class MutMapOps[K, V](val map: mutable.Map[K, V])
++  // No Tuple2 per entry and no by-name closure per entry (profiled: tens of
++  // millions of each while linking dotc).
++  private[interflow] implicit class LongMapOps[V](val map: mutable.LongMap[V])
+       extends AnyVal {
+-    def addMissing(other: Iterable[(K, V)]): Unit = other.foreach {
+-      case (key, value) => map.getOrElseUpdate(key, value)
+-    }
++    def addMissing(other: mutable.LongMap[V]): Unit =
++      other.foreachEntry { (key, value) =>
++        if (!map.contains(key)) map.update(key, value)
++      }
+   }
+ 
+ }
+--- a/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala	2026-10-26 13:31:44
+@@ -8,33 +8,48 @@
+ 
+ object UseDef {
+ 
+-  private sealed abstract class Def {
+-    def id: nir.Local
+-    def deps: mutable.UnrolledBuffer[Def]
+-    def uses: mutable.UnrolledBuffer[Def]
++  // One object per definition, and its dependencies in a plain array: this
++  // ran an UnrolledBuffer (buffer + node + array) for `deps` and another for
++  // `uses` (which nothing ever read) per instruction of every optimized
++  // function. Profiled while linking dotc: ~200M UnrolledBuffer allocations.
++  private final class Def(val id: nir.Local) {
+     var alive: Boolean = false
++    var deps: Array[Def] = Def.NoDeps
++    var depCount: Int = 0
++    def addDep(dep: Def): Unit = {
++      if (depCount == deps.length)
++        deps = java.util.Arrays.copyOf(deps, math.max(2, depCount * 2))
++      deps(depCount) = dep
++      depCount += 1
++    }
+   }
++  private object Def {
++    val NoDeps = new Array[Def](0)
++  }
+ 
+-  private final case class InstDef(
+-      id: nir.Local,
+-      deps: mutable.UnrolledBuffer[Def],
+-      uses: mutable.UnrolledBuffer[Def]
+-  ) extends Def
++  /** Distinct local ids a single instruction depends on, in order of first
++   *  occurrence. One instance is reused for every instruction. */
++  private final class CollectLocalValDeps extends nir.Transform {
++    var ids = new Array[Long](8)
++    var count = 0
+ 
+-  private final case class BlockDef(
+-      id: nir.Local,
+-      deps: mutable.UnrolledBuffer[Def],
+-      uses: mutable.UnrolledBuffer[Def],
+-      params: Seq[Def]
+-  ) extends Def
++    def reset(): Unit = count = 0
+ 
+-  private class CollectLocalValDeps extends nir.Transform {
+-    val deps = mutable.UnrolledBuffer.empty[nir.Local]
++    private def add(id: Long): Unit = {
++      var i = 0
++      while (i < count) {
++        if (ids(i) == id) return
++        i += 1
++      }
++      if (count == ids.length) ids = java.util.Arrays.copyOf(ids, count * 2)
++      ids(count) = id
++      count += 1
++    }
+ 
+     override def onVal(value: nir.Val) = {
+       value match {
+-        case v @ nir.Val.Local(n, _) =>
+-          deps += n
++        case nir.Val.Local(n, _) =>
++          add(n.id)
+         case _ =>
+           ()
+       }
+@@ -44,7 +59,7 @@
+     override def onNext(next: nir.Next) = {
+       next match {
+         case next if next ne nir.Next.None =>
+-          deps += next.id
++          add(next.id.id)
+         case _ =>
+           ()
+       }
+@@ -55,12 +70,6 @@
+ 
+   }
+ 
+-  private def collect(inst: nir.Inst): Seq[nir.Local] = {
+-    val collector = new CollectLocalValDeps
+-    collector.onInst(inst)
+-    collector.deps.distinct.toSeq
+-  }
+-
+   private def isPure(inst: nir.Inst) = inst match {
+     case nir.Inst.Let(_, nir.Op.Call(_, nir.Val.Global(name, _), _), _) =>
+       Allowlist.pure.contains(name)
+@@ -81,27 +90,25 @@
+   private def apply(cfg: nir.ControlFlow.Graph): mutable.LongMap[Def] = {
+     val defs = mutable.LongMap.empty[Def]
+     val blocks = cfg.all
++    val collector = new CollectLocalValDeps
+ 
++    def enterInst(n: nir.Local) = {
++      assert(!defs.contains(n.id), s"duplicate local ids: $n")
++      defs(n.id) = new Def(n)
++    }
+     def enterBlock(n: nir.Local, params: Seq[nir.Local]) = {
+       params.foreach(enterInst)
+-      val deps = mutable.UnrolledBuffer.empty[Def]
+-      val uses = mutable.UnrolledBuffer.empty[Def]
+-      val paramDefs = params.map(p => defs(p.id))
+       assert(!defs.contains(n.id))
+-      defs(n.id) = BlockDef(n, deps, uses, paramDefs)
++      defs(n.id) = new Def(n)
+     }
+-    def enterInst(n: nir.Local) = {
+-      val deps = mutable.UnrolledBuffer.empty[Def]
+-      val uses = mutable.UnrolledBuffer.empty[Def]
+-      assert(!defs.contains(n.id), s"duplicate local ids: $n")
+-      defs(n.id) = InstDef(n, deps, uses)
+-    }
+-    def deps(n: nir.Local, deps: Seq[nir.Local]) = {
++    def addDep(n: nir.Local, dep: nir.Local) =
++      defs(n.id).addDep(defs(dep.id))
++    def addCollectedDeps(n: nir.Local) = {
+       val ndef = defs(n.id)
+-      deps.foreach { dep =>
+-        val ddef = defs(dep.id)
+-        ddef.uses += ndef
+-        ndef.deps += ddef
++      var i = 0
++      while (i < collector.count) {
++        ndef.addDep(defs(collector.ids(i)))
++        i += 1
+       }
+     }
+     def traceAlive(ndef: Def): Unit = {
+@@ -110,7 +117,11 @@
+         val ndef = todo.dequeue()
+         if (!ndef.alive) {
+           ndef.alive = true
+-          todo ++= ndef.deps
++          var i = 0
++          while (i < ndef.depCount) {
++            todo.enqueue(ndef.deps(i))
++            i += 1
++          }
+         }
+       }
+     }
+@@ -137,14 +148,18 @@
+       }
+     }
+ 
+-    // enter deps & uses
++    // enter deps
+     blocks.foreach { block =>
+       block.insts.foreach {
+         case inst: nir.Inst.Let =>
+-          deps(inst.id, collect(inst))
+-          if (!isPure(inst)) deps(block.id, Seq(inst.id))
++          collector.reset()
++          collector.onInst(inst)
++          addCollectedDeps(inst.id)
++          if (!isPure(inst)) addDep(block.id, inst.id)
+         case inst: nir.Inst.Cf =>
+-          deps(block.id, collect(inst))
++          collector.reset()
++          collector.onInst(inst)
++          addCollectedDeps(block.id)
+         case inst =>
+           unreachable
+       }
+--- a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala	2026-10-26 13:31:44
++++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala	2026-10-26 13:31:44
+@@ -701,10 +701,29 @@
+       r
+     }
+ 
++    // Pending (x, y) pairs of union(): two int arrays reused across calls
++    // instead of a mutable.Stack of Tuple2 per call (66M Tuple2$mcII$sp plus
++    // the Stack/ArrayDeque while linking dotc).
++    private var pendX = new Array[Int](64)
++    private var pendY = new Array[Int](64)
++    private var pendN = 0
++    private def pend(x: Int, y: Int): Unit = {
++      if (pendN == pendX.length) {
++        pendX = java.util.Arrays.copyOf(pendX, pendN * 2)
++        pendY = java.util.Arrays.copyOf(pendY, pendN * 2)
++      }
++      pendX(pendN) = x
++      pendY(pendN) = y
++      pendN += 1
++    }
++
+     private def union(a: Int, b: Int): Unit = {
+-      val stack = mutable.Stack[(Int, Int)]((a, b))
+-      while (stack.nonEmpty) {
+-        val (x, y) = stack.pop()
++      if (find(a) == find(b)) return
++      pend(a, b)
++      while (pendN > 0) {
++        pendN -= 1
++        val x = pendX(pendN)
++        val y = pendY(pendN)
+         val rx = find(x)
+         val ry = find(y)
+         if (rx != ry) {
+@@ -715,18 +734,15 @@
+           if (my != null) {
+             if (mx == null) fmap(rx) = my
+             else
+-              my.foreach {
+-                case (k, c2) =>
+-                  mx.get(k) match {
+-                    case Some(c1) => stack.push((c1, c2))
+-                    case None     => mx(k) = c2
+-                  }
++              my.foreachEntry { (k, c2) =>
++                if (mx.contains(k)) pend(mx(k), c2)
++                else mx(k) = c2
+               }
+           }
+           fmap(ry) = null
+           if ((flags(rx) & Collapsed) != 0) {
+             val m = fmap(rx)
+-            if (m != null) m.foreach { case (_, c) => stack.push((rx, c)) }
++            if (m != null) m.foreachValue(c => pend(rx, c))
+           }
+         }
+       }
+@@ -749,12 +765,11 @@
+       else {
+         var m = fmap(r)
+         if (m == null) { m = mutable.LongMap.empty[Int]; fmap(r) = m }
+-        m.get(k) match {
+-          case Some(c) => c
+-          case None =>
+-            val c = fresh()
+-            m(k) = c
+-            c
++        if (m.contains(k)) m(k)
++        else {
++          val c = fresh()
++          m(k) = c
++          c
+         }
+       }
+     }
+--- a/nir/src/main/scala/scala/scalanative/nir/Show.scala	2026-10-26 13:31:44
++++ b/nir/src/main/scala/scala/scalanative/nir/Show.scala	2026-10-26 13:31:44
+@@ -11,6 +11,9 @@
+ import nir.Defn.Define.DebugInfo
+ 
+ object Show {
++
++  // compiled once, not once per escaped string literal
++  private val newLineRegex = """([^\\]|^)\n""".r
+   def newBuilder: NirShowBuilder = new NirShowBuilder(new InMemoryShowBuilder)
+   def debug[T](msg: String)(f: => T): T = {
+     val value = f
+@@ -738,7 +741,7 @@
+     }
+ 
+     private def escapeNewLine(s: String): String =
+-      """([^\\]|^)\n""".r.replaceAllIn(
++      newLineRegex.replaceAllIn(
+         s,
+         _.matched.toSeq match {
+           case Seq(sngl)     => raw"\\n"
+@@ -748,23 +751,23 @@
+       )
+ 
+     private def escapeQuotes(s: String): String = {
+-      val chars = s.toArray
+-      val out = mutable.UnrolledBuffer.empty[Char]
++      val chars = s.toCharArray
++      val out = new java.lang.StringBuilder(chars.length + 8)
+       var i = 0
+       var escaped = false
+       while (i < chars.length) {
+         val char = chars(i)
+         char match {
+           case '"' =>
+-            if (!escaped) out += '\\'
+-            out += char
++            if (!escaped) out.append('\\')
++            out.append(char)
+           case _ =>
+-            out += char
++            out.append(char)
+         }
+         escaped = char == '\\'
+         i += 1
+       }
+-      new String(out.toArray)
++      out.toString
+     }
+ 
+     override def toString: String = builder.toString
+--- a/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala	2026-10-26 13:31:44
++++ b/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala	2026-10-26 13:31:44
+@@ -6,7 +6,9 @@
+ /** A class to build sequences of NIR instructions. */
+ class InstructionBuilder(implicit fresh: Fresh) {
+ 
+-  private val buffer = mutable.UnrolledBuffer.empty[Inst]
++  // ArrayBuffer, not UnrolledBuffer: one builder per Interflow state/block,
++  // and an UnrolledBuffer is three objects before the first instruction.
++  private val buffer = new mutable.ArrayBuffer[Inst](4)
+   def +=(inst: Inst): Unit = buffer += inst
+   def ++=(insts: Seq[Inst]): Unit = buffer ++= insts
+   def ++=(other: InstructionBuilder): Unit = buffer ++= other.buffer

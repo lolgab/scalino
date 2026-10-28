@@ -1,21 +1,97 @@
-diff --git a/ImmixGC.c b/ImmixGC.c
-index 732174f..11b69a7 100644
---- a/ImmixGC.c
-+++ b/ImmixGC.c
-@@ -21,7 +21,64 @@
+--- a/ImmixGC.c	2026-10-25 16:01:20
++++ b/ImmixGC.c	2026-10-25 16:34:19
+@@ -3,6 +3,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <memory.h>
++#include <dlfcn.h>
++#include <stdint.h>
+ #include "shared/GCTypes.h"
+ #include "Heap.h"
+ #include "datastructures/Stack.h"
+@@ -21,8 +23,134 @@
  #include "nativeThreadTLS.h"
  #include <assert.h>
  
 -void scalanative_afterexit() { Stats_OnExit(heap.stats); }
-+
+ 
 +/* ---- alloc profiler (dev only) ---- */
 +#define AP_CAP 131072
 +typedef struct { Rtti *info; unsigned long count; unsigned long bytes; } APSlot;
 +static APSlot apTable[AP_CAP];
 +static int apChecked = 0;
 +static const char *apPath = NULL;
++
++/* ---- sampled caller stacks: SCALINO_ALLOC_STACKS=<file>, 1 in 16 allocations ---- */
++#define ST_CAP (1<<18)
++#define ST_DEPTH 8
++#define ST_RATE 16
++typedef struct { unsigned long hash; Rtti *info; unsigned long count; unsigned long bytes; void *pcs[ST_DEPTH]; } STSlot;
++static STSlot stTable[ST_CAP];
++static int stChecked = 0;
++static const char *stPath = NULL;
++static __thread unsigned stTick = 0;
++static __attribute__((noinline)) void ST_Record(Rtti *info, size_t size) {
++    if (++stTick % ST_RATE != 0) return;
++    void *pcs[ST_DEPTH]; int n = 0;
++    void **fp = (void **)__builtin_frame_address(0);
++    unsigned long h = (unsigned long)info * 1099511628211UL;
++    int skip = 2;
++    while (fp != NULL && ((uintptr_t)fp & 7) == 0 && n < ST_DEPTH) {
++        void *ret = fp[1];
++        void **next = (void **)fp[0];
++        if (ret == NULL) break;
++        if (skip > 0) skip--; else { pcs[n++] = ret; h = (h ^ (unsigned long)ret) * 1099511628211UL; }
++        if (next <= fp || (uintptr_t)next - (uintptr_t)fp > (1UL << 24)) break;
++        fp = next;
++    }
++    if (h == 0) h = 1;
++    size_t idx = (h >> 3) % ST_CAP;
++    for (int p = 0; p < 64; p++) {
++        STSlot *s = &stTable[idx];
++        unsigned long cur = __atomic_load_n(&s->hash, __ATOMIC_ACQUIRE);
++        if (cur == 0) {
++            unsigned long exp = 0;
++            if (__atomic_compare_exchange_n(&s->hash, &exp, (unsigned long)-1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++                s->info = info; for (int i = 0; i < n; i++) s->pcs[i] = pcs[i];
++                __atomic_store_n(&s->hash, h, __ATOMIC_RELEASE); cur = h;
++            } else cur = __atomic_load_n(&s->hash, __ATOMIC_ACQUIRE);
++        }
++        if (cur == h) {
++            __atomic_fetch_add(&s->count, ST_RATE, __ATOMIC_RELAXED);
++            __atomic_fetch_add(&s->bytes, size * ST_RATE, __ATOMIC_RELAXED);
++            return;
++        }
++        idx = (idx + 1) % ST_CAP;
++    }
++}
++static int ST_Cmp(const void *a, const void *b) {
++    unsigned long x = ((const STSlot *)a)->bytes, y = ((const STSlot *)b)->bytes;
++    return x > y ? -1 : x < y ? 1 : 0;
++}
++static void ST_Dump(void) {
++    if (stPath == NULL) return;
++    FILE *f = fopen(stPath, "w");
++    if (!f) return;
++    qsort(stTable, ST_CAP, sizeof(STSlot), ST_Cmp);
++    for (int i = 0; i < ST_CAP && stTable[i].count != 0 && i < 3000; i++) {
++        STSlot *s = &stTable[i];
++        CharArray *chars = s->info->rt.name->value;
++        fprintf(f, "STACK %lu %lu ", s->count, s->bytes);
++        for (int j = 0; j < chars->header.length; j++) fputc((int)chars->values[j] & 0x7f, f);
++        fputc('\n', f);
++        for (int k = 0; k < ST_DEPTH && s->pcs[k]; k++) {
++            Dl_info di;
++            if (dladdr(s->pcs[k], &di) && di.dli_sname) fprintf(f, "  %s\n", di.dli_sname);
++            else if (dladdr(s->pcs[k], &di)) fprintf(f, "  ?%lx\n", (unsigned long)((char *)s->pcs[k] - (char *)di.dli_fbase));
++            else fprintf(f, "  ?%p\n", s->pcs[k]);
++        }
++    }
++    fclose(f);
++}
 +static inline void AP_Record(Rtti *info, size_t size) {
-+    if (!apChecked) { apPath = getenv("SCALINO_ALLOC_PROFILE_FILE"); apChecked = 1; }
++    if (!apChecked) { apPath = getenv("SCALINO_ALLOC_PROFILE_FILE"); stPath = getenv("SCALINO_ALLOC_STACKS"); apChecked = 1; }
++    if (stPath != NULL) ST_Record(info, size);
 +    if (apPath == NULL) return;
 +    size_t idx = (((size_t)info) >> 4) % AP_CAP;
 +    for (int p = 0; p < AP_CAP; p++) {
@@ -64,11 +140,12 @@ index 732174f..11b69a7 100644
 +    }
 +    fclose(f);
 +}
-+void scalanative_afterexit() { Stats_OnExit(heap.stats); AP_Dump(); Site_Dump(); }
- 
++void scalanative_afterexit() { Stats_OnExit(heap.stats); AP_Dump(); Site_Dump(); ST_Dump(); }
++
  NOINLINE void scalanative_GC_init() {
      volatile word_t dummy = 0;
-@@ -42,6 +99,7 @@ NOINLINE void scalanative_GC_init() {
+     dummy = (word_t)&dummy;
+@@ -42,6 +170,7 @@
  
  INLINE void *scalanative_GC_alloc(Rtti *info, size_t size) {
      size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
@@ -76,7 +153,7 @@ index 732174f..11b69a7 100644
  
      assert(size % ALLOCATION_ALIGNMENT == 0);
  
-@@ -57,6 +115,7 @@ INLINE void *scalanative_GC_alloc(Rtti *info, size_t size) {
+@@ -57,6 +186,7 @@
  
  INLINE void *scalanative_GC_alloc_small(Rtti *info, size_t size) {
      size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
@@ -84,7 +161,7 @@ index 732174f..11b69a7 100644
  
      Object *alloc = (Object *)Allocator_Alloc(&heap, size);
      Object_SetRtti(alloc, info);
-@@ -65,6 +124,7 @@ INLINE void *scalanative_GC_alloc_small(Rtti *info, size_t size) {
+@@ -65,6 +195,7 @@
  
  INLINE void *scalanative_GC_alloc_large(Rtti *info, size_t size) {
      size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
