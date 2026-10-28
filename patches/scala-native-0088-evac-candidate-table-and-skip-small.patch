@@ -1,0 +1,108 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c	2026-10-28 11:18:23
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c	2026-10-28 11:18:23
+@@ -512,6 +512,22 @@
+     return blockIndex < blockPinnedCapacity && blockPinned[blockIndex] != 0;
+ }
+ 
++// One byte per block, filled by Marker_Evacuate's scoring pass: 1 = evacuation
++// source block. Only an object inside such a block can ever be forwarded, so
++// the fixup passes test this (a table that fits in cache) before touching the
++// bytemap or the target object, which for a multi-GB heap are cache misses on
++// nearly every slot -- that made the fixup walk as slow as marking, even for
++// a cycle that moved a handful of blocks.
++static uint8_t *evacCandidateBlocks = NULL;
++static uint32_t evacCandidateBlocksCapacity = 0;
++static uint32_t evacCandidateBlocksCount = 0;
++
++static inline bool Evac_PointsIntoCandidateBlock(Heap *heap, word_t *value) {
++    uint32_t blockIndex = Block_GetBlockIndexForWord(heap->heapStart, value);
++    return blockIndex < evacCandidateBlocksCount &&
++           evacCandidateBlocks[blockIndex] != 0;
++}
++
+ static inline int EvacLog_enabled(void) {
+     if (!evacLogEnabledChecked) {
+         evacLogFilePath = getenv("SCALANATIVE_EVAC_LOG_FILE");
+@@ -797,6 +813,7 @@
+     if (EvacTrace_enabled())
+         EvacTrace_log("FixupSlot-seen", slot, value);
+     if (value != NULL && Heap_IsWordInHeap(heap, value) &&
++        Evac_PointsIntoCandidateBlock(heap, value) &&
+         Bytemap_isPtrAligned(value)) {
+         ObjectMeta *meta = Bytemap_Get(heap->bytemap, value);
+         // Forwarded objects are marked (they were live, real objects before
+@@ -845,6 +862,7 @@
+         return;
+     word_t *monitor = (word_t *)Field_allignedLockRef((Field_t)value);
+     if (monitor == NULL || !Heap_IsWordInHeap(heap, monitor) ||
++        !Evac_PointsIntoCandidateBlock(heap, monitor) ||
+         !Bytemap_isPtrAligned(monitor))
+         return;
+     ObjectMeta *meta = Bytemap_Get(heap->bytemap, monitor);
+@@ -960,7 +978,8 @@
+ // marking (the real reference keeping the target alive is another field).
+ static inline void Evac_FixupInteriorSlot(Heap *heap, word_t **slot) {
+     word_t *value = *slot;
+-    if (value == NULL || !Heap_IsWordInHeap(heap, value))
++    if (value == NULL || !Heap_IsWordInHeap(heap, value) ||
++        !Evac_PointsIntoCandidateBlock(heap, value))
+         return;
+     BlockMeta *blockMeta =
+         Block_GetBlockMeta(heap->blockMetaStart, heap->heapStart, value);
+@@ -1317,9 +1336,16 @@
+     uint32_t blockCount = heap->blockCount;
+     uint64_t totalLiveBytes = 0;
+     uint32_t candidateBlockCount = 0;
++    evacCandidateBlocksCount = 0;
++    if (blockCount > evacCandidateBlocksCapacity) {
++        evacCandidateBlocks =
++            (uint8_t *)realloc(evacCandidateBlocks, (size_t)blockCount);
++        evacCandidateBlocksCapacity = blockCount;
++    }
+     for (uint32_t i = 0; i < blockCount; i++) {
+         BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+         bool isCandidate = Evac_IsCandidateBlock(meta, blockLiveBytes[i], i);
++        evacCandidateBlocks[i] = isCandidate ? 1 : 0;
+         if (isCandidate) {
+             totalLiveBytes += blockLiveBytes[i];
+             candidateBlockCount++;
+@@ -1343,9 +1369,6 @@
+     if (candidateBlockCount == 0)
+         return;
+ 
+-    GC_LOG_INFO("Evacuating %u candidate blocks (%llu live bytes)",
+-               candidateBlockCount, (unsigned long long)totalLiveBytes);
+-
+     // Reserve destination space upfront so the copy loop below never needs
+     // to trigger growth or (far worse) a recursive Heap_Collect mid-cycle.
+     // Small safety margin for block-boundary rounding (objects here are a
+@@ -1353,6 +1376,28 @@
+     // negligible relative to the space being reclaimed).
+     uint32_t neededBlocks =
+         (uint32_t)(totalLiveBytes / BLOCK_TOTAL_SIZE) + 2;
++
++    // Evacuation is not free: besides the copy, the fixup pass revisits every
++    // live object in the heap, which costs about as much as marking it (~0.5s
++    // per cycle on a 500MB live set, however few blocks moved). Skip the cycle
++    // when it would free less than ~1.5% of the heap: the sweep still
++    // recycles those blocks' free lines, and fragmentation that small is not
++    // what compaction is for.
++    uint32_t reclaimedBlocks =
++        candidateBlockCount > neededBlocks ? candidateBlockCount - neededBlocks
++                                           : 0;
++    uint32_t minReclaimedBlocks = blockCount / 64 > 64 ? blockCount / 64 : 64;
++    if (reclaimedBlocks < minReclaimedBlocks) {
++        GC_LOG_INFO("Evacuation skipped: %u candidate blocks would free only "
++                   "%u blocks (< %u)",
++                   candidateBlockCount, reclaimedBlocks, minReclaimedBlocks);
++        return;
++    }
++    evacCandidateBlocksCount = blockCount;
++
++    GC_LOG_INFO("Evacuating %u candidate blocks (%llu live bytes)",
++               candidateBlockCount, (unsigned long long)totalLiveBytes);
++
+     // Only grow if the CURRENT free supply can't already cover the
+     // destination space -- growing unconditionally here defeats much of
+     // the point (a real, measured anomaly from the first test: heap size
