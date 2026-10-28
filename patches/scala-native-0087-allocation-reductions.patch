@@ -1,5 +1,5 @@
---- a/tools/src/main/scala/scala/scalanative/interflow/State.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/State.scala	2026-10-26 13:31:44
+--- a/tools/src/main/scala/scala/scalanative/interflow/State.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/State.scala	2026-10-28 14:57:03
 @@ -32,11 +32,14 @@
    var getClassCache = mutable.AnyRefMap.empty[nir.Val, nir.Val]
  
@@ -35,8 +35,8 @@
        newstate.localNames = localNames.clone()
      }
      newstate
---- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala	2026-10-26 13:31:44
+--- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala	2026-10-28 14:57:03
 @@ -98,8 +98,7 @@
          // Long-keyed (see State.locals's comment): mirrors the state-side
          // fix, since this map gets assigned directly to `mergeState.locals`.
@@ -97,13 +97,13 @@
            }
 -          headState.locals.foreach {
 -            case (localId, value) => mergeLocal(nir.Local(localId), value)
-+          headState.locals.foreachEntry { (localId, value) =>
-+            mergeLocal(nir.Local(localId), value)
++          headState.locals.foreachKey { localId =>
++            mergeLocal(nir.Local(localId), headState.locals(localId))
            }
  
            // 2. Merge heap
---- a/tools/src/main/scala/scala/scalanative/interflow/Eval.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/Eval.scala	2026-10-26 13:31:44
+--- a/tools/src/main/scala/scala/scalanative/interflow/Eval.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/Eval.scala	2026-10-28 14:57:03
 @@ -30,7 +30,7 @@
          param <- params
          name <- debugInfo.localNames.get(param.id)
@@ -122,8 +122,8 @@
                case nir.Val.Virtual(addr) =>
                  localName.foreach(state.virtualNames.getOrElseUpdate(addr, _))
                case _ => ()
---- a/tools/src/main/scala/scala/scalanative/interflow/Opt.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/Opt.scala	2026-10-26 13:31:44
+--- a/tools/src/main/scala/scala/scalanative/interflow/Opt.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/Opt.scala	2026-10-28 14:57:03
 @@ -71,7 +71,7 @@
            if (preserveDebugInfo) {
              origdefn.debugInfo.localNames
@@ -149,14 +149,14 @@
 -              localNames = localNames.toMap,
 +              localNames = {
 +                val b = Map.newBuilder[nir.Local, nir.LocalName]
-+                localNames.foreachEntry((id, n) => b += nir.Local(id) -> n)
++                localNames.foreachKey(id => b += nir.Local(id) -> localNames(id))
 +                b.result()
 +              },
                lexicalScopes = currentLexicalScopes.get.toSeq
              )
            } else DebugInfo.empty
---- a/tools/src/main/scala/scala/scalanative/interflow/package.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/package.scala	2026-10-26 13:31:44
+--- a/tools/src/main/scala/scala/scalanative/interflow/package.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/package.scala	2026-10-28 14:57:03
 @@ -6,11 +6,14 @@
  
    private[interflow] type Addr = Long
@@ -170,14 +170,14 @@
 -      case (key, value) => map.getOrElseUpdate(key, value)
 -    }
 +    def addMissing(other: mutable.LongMap[V]): Unit =
-+      other.foreachEntry { (key, value) =>
-+        if (!map.contains(key)) map.update(key, value)
++      other.foreachKey { key =>
++        if (!map.contains(key)) map.update(key, other(key))
 +      }
    }
  
  }
---- a/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala	2026-10-26 13:31:44
+--- a/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala	2026-10-28 14:57:03
 @@ -8,33 +8,48 @@
  
  object UseDef {
@@ -345,12 +345,14 @@
          case inst =>
            unreachable
        }
---- a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala	2026-10-26 13:31:44
-+++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala	2026-10-26 13:31:44
-@@ -701,10 +701,29 @@
+--- a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala	2026-10-28 14:57:03
++++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala	2026-10-28 14:57:03
+@@ -699,12 +699,31 @@
+         c = next
+       }
        r
-     }
- 
++    }
++
 +    // Pending (x, y) pairs of union(): two int arrays reused across calls
 +    // instead of a mutable.Stack of Tuple2 per call (66M Tuple2$mcII$sp plus
 +    // the Stack/ArrayDeque while linking dotc).
@@ -365,8 +367,8 @@
 +      pendX(pendN) = x
 +      pendY(pendN) = y
 +      pendN += 1
-+    }
-+
+     }
+ 
      private def union(a: Int, b: Int): Unit = {
 -      val stack = mutable.Stack[(Int, Int)]((a, b))
 -      while (stack.nonEmpty) {
@@ -380,7 +382,7 @@
          val rx = find(x)
          val ry = find(y)
          if (rx != ry) {
-@@ -715,18 +734,15 @@
+@@ -715,18 +734,16 @@
            if (my != null) {
              if (mx == null) fmap(rx) = my
              else
@@ -390,7 +392,8 @@
 -                    case Some(c1) => stack.push((c1, c2))
 -                    case None     => mx(k) = c2
 -                  }
-+              my.foreachEntry { (k, c2) =>
++              my.foreachKey { k =>
++                val c2 = my(k)
 +                if (mx.contains(k)) pend(mx(k), c2)
 +                else mx(k) = c2
                }
@@ -403,7 +406,7 @@
            }
          }
        }
-@@ -749,12 +765,11 @@
+@@ -749,12 +766,11 @@
        else {
          var m = fmap(r)
          if (m == null) { m = mutable.LongMap.empty[Int]; fmap(r) = m }
@@ -421,8 +424,8 @@
          }
        }
      }
---- a/nir/src/main/scala/scala/scalanative/nir/Show.scala	2026-10-26 13:31:44
-+++ b/nir/src/main/scala/scala/scalanative/nir/Show.scala	2026-10-26 13:31:44
+--- a/nir/src/main/scala/scala/scalanative/nir/Show.scala	2026-10-28 14:57:03
++++ b/nir/src/main/scala/scala/scalanative/nir/Show.scala	2026-10-28 14:57:03
 @@ -11,6 +11,9 @@
  import nir.Defn.Define.DebugInfo
  
@@ -472,8 +475,8 @@
      }
  
      override def toString: String = builder.toString
---- a/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala	2026-10-26 13:31:44
-+++ b/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala	2026-10-26 13:31:44
+--- a/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala	2026-10-28 14:57:03
++++ b/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala	2026-10-28 14:57:03
 @@ -6,7 +6,9 @@
  /** A class to build sequences of NIR instructions. */
  class InstructionBuilder(implicit fresh: Fresh) {
