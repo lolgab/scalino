@@ -13,8 +13,7 @@ ROOT="$PWD"
 
 # dotc's own source: everything under compiler/src, minus backend/jvm
 # (needs org.scala-lang.modules:scala-asm, no Scala Native cross-build),
-# backend/sjs + transform/sjs (Scala.js, irrelevant + same ASM dependency
-# transitively), debug (self-contained expression-evaluator, confirmed
+# debug (self-contained expression-evaluator, confirmed
 # zero references from dotc/), dotc/decompiler/dotc/semanticdb/scripting
 # (tooling-only), MainGenericCompiler.scala (separate multi-tool entry
 # point), util/ClasspathFromClassloader.scala (dead code), and
@@ -23,19 +22,21 @@ ROOT="$PWD"
 # don't and are kept, patched -- see patches/scala3-0006).
 find "$ROOT/vendor/scala3/compiler/src" -name "*.scala" \
   -not -path "*/dotty/tools/backend/jvm/*" \
-  -not -path "*/dotty/tools/backend/sjs/*" \
   -not -path "*/dotty/tools/debug/*" \
   -not -path "*/dotty/tools/dotc/decompiler/*" \
   -not -path "*/dotty/tools/dotc/semanticdb/*" \
   -not -path "*/dotty/tools/scripting/*" \
-  -not -path "*/dotty/tools/dotc/transform/sjs/*" \
   -not -name "MainGenericCompiler.scala" \
   -not -name "ClasspathFromClassloader.scala" \
   -not -name "ExtractAPI.scala" \
   -not -name "ShowAPI.scala" \
   -not -name "APIUtils.scala" \
-  -not -name "ThunkHolder.scala" \
-  -not -name "SJSPlatform.scala"
+  -not -name "ThunkHolder.scala"
+
+# Scala.js backend (`-scalajs`): backend/sjs, transform/sjs and SJSPlatform are part
+# of the find above. They need scalajs-ir, which dotc's own build also compiles from
+# source under `dotty.tools.sjs.ir` (build/00c-fetch-scalajs-ir.sh generates it).
+find "$ROOT/.build-work/generated/scalajs-ir-src" -name "*.scala"
 
 # `backend/jvm/DottyPrimitives.scala` (the one backend/jvm file this build
 # ever needed, since nscplugin's own NirPrimitives.scala imports it) was

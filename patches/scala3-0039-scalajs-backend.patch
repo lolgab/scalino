@@ -1,0 +1,435 @@
+diff --git a/compiler/src/dotty/tools/backend/sjs/ScopedVar.scala b/compiler/src/dotty/tools/backend/sjs/ScopedVar.scala
+index 42e859f5..6520f321 100644
+--- a/compiler/src/dotty/tools/backend/sjs/ScopedVar.scala
++++ b/compiler/src/dotty/tools/backend/sjs/ScopedVar.scala
+@@ -11,7 +11,7 @@ final class ScopedVar[A <: AnyRef] private (init: A | Null, internal: Boolean) {
+   def get: A =
+     val v = value
+     assert(v != null, "Trying to read a ScopedVar that is not set in the current scope")
+-    v
++    v.nn
+ 
+   def :=(newValue: A): Assignment[A] = new Assignment(this, newValue)
+ 
+diff --git a/compiler/src/dotty/tools/dotc/Compiler.scala b/compiler/src/dotty/tools/dotc/Compiler.scala
+index 0847e217..0bd6519a 100644
+--- a/compiler/src/dotty/tools/dotc/Compiler.scala
++++ b/compiler/src/dotty/tools/dotc/Compiler.scala
+@@ -39,6 +39,7 @@ class Compiler {
+     List(new sbt.ExtractDependencies) :: // Sends information on classes' dependencies to sbt via callbacks
+     List(new PostTyper) ::          // Additional checks and cleanups after type checking
+     List(new UnrollDefinitions) ::  // Unroll annotated methods if detected in PostTyper
++    List(new sjs.PrepJSInterop) ::  // Additional checks and transformations for Scala.js (Scala.js only)
+     List(new SetRootTree) ::        // Set the `rootTreeOrProvider` on class symbols
+     Nil
+ 
+@@ -84,6 +85,7 @@ class Compiler {
+     List(new cc.CheckCaptures) ::    // Check captures, enabled under captureChecking
+     List(CheckUnused.PostPatMat()) :: // Check for unused elements and report
+     List(new ElimOpaque,             // Turn opaque into normal aliases
++         new sjs.ExplicitJSClasses,  // Make all JS classes explicit (Scala.js only)
+          new ExplicitOuter,          // Add accessors to outer classes from nested ones.
+          new ExplicitSelf,           // Make references to non-trivial self types explicit as casts
+          new StringInterpolatorOpt,  // Optimizes raw and s and f string interpolators by rewriting them to string concatenations or formats
+@@ -111,6 +113,7 @@ class Compiler {
+          new VCElideAllocations,     // Peep-hole optimization to eliminate unnecessary value class allocations
+          new EtaReduce,              // Reduce eta expansions of pure paths to the underlying function reference
+          new ArrayApply,             // Optimize `scala.Array.apply([....])` and `scala.Array.apply(..., [....])` into `[...]`
++         new sjs.AddLocalJSFakeNews, // Adds fake new invocations to local JS classes in calls to `createLocalJSClass`
+          new ElimPolyFunction,       // Rewrite PolyFunction subclasses to FunctionN subclasses
+          new TailRec,                // Rewrite tail recursion to loops
+          new CompleteJavaEnums,      // Fill in constructors for Java enums
+@@ -136,19 +139,19 @@ class Compiler {
+          new RestoreScopes,          // Repair scopes rendered invalid by moving definitions in prior phases of the group
+          new SelectStatic,           // get rid of selects that would be compiled into GetStatic
+          new CollectEntryPoints,     // Collect all entry points and save them in the context
++         new sjs.JUnitBootstrappers, // Generate JUnit-specific bootstrapper classes for Scala.js (not enabled by default)
+          new RepeatableAnnotations) :: // Aggregate repeatable annotations
+     Nil
+ 
+   /** Generate the output of the compilation.
+    *
+-   *  Empty in this build: both `backend.sjs.GenSJSIR` (Scala.js) and
+-   *  `backend.jvm.GenBCode` (real JVM classfile emission, whose
+-   *  `org.scala-lang.modules:scala-asm` dependency has no Scala Native
+-   *  cross-build) are excluded from this reduced source set entirely -- see
+-   *  docs/findings.md's "frontend-only smoke test" scoping. Nothing in this
+-   *  variant emits JVM bytecode or Scala.js IR; it only parses+typechecks.
++   *  Only `backend.sjs.GenSJSIR` (active with `-scalajs`) is built in:
++   *  `backend.jvm.GenBCode`'s `org.scala-lang.modules:scala-asm` dependency has
++   *  no Scala Native cross-build. Native output comes from the nscplugin phases
++   *  instead (see plugins/Plugins.scala).
+    */
+   protected def backendPhases: List[List[Phase]] =
++    List(new backend.sjs.GenSJSIR) :: // Generate .sjsir files for Scala.js (not enabled by default)
+     Nil
+ 
+   // TODO: Initially InitialRunId - 1, so that the first nextRunId call would return InitialRunId
+diff --git a/compiler/src/dotty/tools/dotc/core/Contexts.scala b/compiler/src/dotty/tools/dotc/core/Contexts.scala
+index 7e460329..a790fd26 100644
+--- a/compiler/src/dotty/tools/dotc/core/Contexts.scala
++++ b/compiler/src/dotty/tools/dotc/core/Contexts.scala
+@@ -26,7 +26,7 @@ import io.{AbstractFile, NoAbstractFile, PlainFile, Path}
+ import scala.io.Codec
+ import collection.mutable
+ import printing.*
+-import config.{JavaPlatform, Platform, ScalaSettings}
++import config.{JavaPlatform, SJSPlatform, Platform, ScalaSettings}
+ import classfile.ReusableDataReader
+ import StdNames.nme
+ import compiletime.uninitialized
+@@ -929,15 +929,9 @@ object Contexts {
+       p
+     }
+ 
+-    // `SJSPlatform`/`config.SJSPlatform` (and its `backend.sjs.JSDefinitions`
+-    // dependency) are excluded from this reduced source set entirely --
+-    // Scala.js is irrelevant to this toolchain (see docs/findings.md's
+-    // "frontend-only smoke test" scoping). `-scalajs` is unsupported here;
+-    // this always builds the plain JVM-shaped platform.
+     protected def newPlatform(using Context): Platform =
+-      if settings.scalajs.value then
+-        report.warning("-scalajs is not supported by this toolchain.")
+-      new JavaPlatform
++      if (settings.scalajs.value) new SJSPlatform
++      else new JavaPlatform
+ 
+     /** The loader that loads the members of _root_ */
+     def rootLoader(root: TermSymbol)(using Context): SymbolLoader = platform.rootLoader(root)
+diff --git a/compiler/src/dotty/tools/dotc/core/SymUtils.scala b/compiler/src/dotty/tools/dotc/core/SymUtils.scala
+index 278625fe..ff1f8708 100644
+--- a/compiler/src/dotty/tools/dotc/core/SymUtils.scala
++++ b/compiler/src/dotty/tools/dotc/core/SymUtils.scala
+@@ -18,6 +18,7 @@ import Phases.*
+ import ast.tpd.Literal
+ import transform.Mixin
+ 
++import dotty.tools.dotc.transform.sjs.JSSymUtils.sjsNeedsField
+ 
+ import scala.annotation.tailrec
+ 
+@@ -301,13 +302,9 @@ class SymUtils:
+      *
+      *  This is the case if all of the following are true:
+      *
+-     *  - it is a `final val`, and
+-     *  - its result type is a `ConstantType`.
+-     *
+-     *  (Upstream also excludes symbols that need an explicit field because of
+-     *  Scala.js semantics, `JSSymUtils.sjsNeedsField` -- moot here, `transform.sjs`
+-     *  is excluded from this reduced source set, see docs/findings.md's
+-     *  "frontend-only smoke test" scoping.)
++     *  - it is a `final val`,
++     *  - its result type is a `ConstantType`, and
++     *  - it does not need an explicit field because of Scala.js semantics (see `JSSymUtils.sjsNeedsField`).
+      *
+      *  Constant expression final vals do not need an explicit field to store
+      *  their value. See the Memoize-Mixin-Constructors phase trio.
+@@ -315,7 +312,7 @@ class SymUtils:
+     def isConstExprFinalVal(using Context): Boolean =
+       atPhaseNoLater(erasurePhase) {
+         self.is(Final) && !self.isMutableVarOrAccessor && self.info.resultType.isInstanceOf[ConstantType]
+-      }
++      } && !self.sjsNeedsField
+ 
+     /** The `ConstantType` of a val known to be `isConstrExprFinalVal`.
+      *
+diff --git a/compiler/src/dotty/tools/dotc/core/TypeErasure.scala b/compiler/src/dotty/tools/dotc/core/TypeErasure.scala
+index fad7cc55..1db0e130 100644
+--- a/compiler/src/dotty/tools/dotc/core/TypeErasure.scala
++++ b/compiler/src/dotty/tools/dotc/core/TypeErasure.scala
+@@ -5,6 +5,7 @@ package core
+ import Symbols.*, Types.*, Contexts.*, Flags.*, Names.*, StdNames.*, Phases.*
+ import Flags.JavaDefined
+ import Uniques.unique
++import backend.sjs.JSDefinitions
+ import transform.ExplicitOuter.*
+ import transform.ValueClasses.*
+ import transform.ContextFunctionResults.*
+@@ -817,12 +818,21 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
+         val result = if e1.isInstanceOf[WildcardType] || e2.isInstanceOf[WildcardType]
+           then WildcardType
+           else TypeComparer.orType(e1, e2, isErased = true)
+-        // The Scala.js pseudo-union erasure special-case that used to live here (gated on
+-        // `isNullStripped`, whether either side was a stripped-null type) is dropped:
+-        // `backend.sjs`/`transform.sjs` are excluded from this reduced source set (see
+-        // docs/findings.md's "frontend-only smoke test" scoping), so `ctx.settings.scalajs.value`
+-        // can never be true.
+-        result
++        def isNullStripped =
++          tp2.isNullType && e1.derivesFrom(defn.ObjectClass)
++          || tp1.isNullType && e2.derivesFrom(defn.ObjectClass)
++        if isSymbol && sourceLanguage.isScala2 && ctx.settings.scalajs.value && !isNullStripped then
++          // In Scala2Unpickler we unpickle Scala.js pseudo-unions as if they were
++          // real unions, but we must still erase them as Scala 2 would to emit
++          // the correct signatures in SJSIR.
++          // We only do this when `isSymbol` is true since in other situations we
++          // cannot distinguish a Scala.js pseudo-union from a Scala 3 union that
++          // has been substituted into a Scala 2 type (e.g., via `asSeenFrom`),
++          // erasing these unions as if they were pseudo-unions could have an
++          // impact on overriding relationships so it's best to leave them
++          // alone (and this doesn't impact the SJSIR we generate).
++          JSDefinitions.jsdefn.PseudoUnionType
++        else result
+       case tp: MethodType =>
+         def paramErasure(tpToErase: Type) =
+           erasureFn(sourceLanguage, semiEraseVCs, isConstructor, isSymbol, inSigName = false)(tpToErase)
+@@ -1009,12 +1019,19 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
+     if semiEraseVCs && isConstructor && !tp.isInstanceOf[MethodOrPoly] then
+       erasureFn(sourceLanguage, semiEraseVCs = false, isConstructor, isSymbol, inSigName).eraseResult(tp)
+     else if tp =:= defn.UnitType then
+-      // Upstream preserves a Scala.js pseudo-union result type here (see e.g.
+-      // js.undefined, `Unit | Nothing`) when `ctx.settings.scalajs.value`.
+-      // Scala.js is excluded from this reduced build entirely (`SJSPlatform`
+-      // is never selected, see docs/findings.md), so that setting can never
+-      // be true -- this is the statically-always-taken `else` branch.
+-      defn.UnitType
++      // This should always be UnitType. However, there is one exception: if we
++      // are computing the erasure of a Scala 2 symbol whose result type is a
++      // Scala.js pseudo-union type, we must preserve the pseudo-union.
++      // Typical example: js.undefined, which returns a `Unit | Nothing`.
++      if ctx.settings.scalajs.value && isSymbol && sourceLanguage.isScala2 then
++        apply(tp) match {
++          case erased if erased.isRef(JSDefinitions.jsdefn.PseudoUnionClass) =>
++            erased
++          case _ =>
++            defn.UnitType
++        }
++      else
++        defn.UnitType
+     else
+       apply(tp)
+ 
+diff --git a/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala b/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala
+index d5856336..77afcb16 100644
+--- a/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala
++++ b/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala
+@@ -13,6 +13,7 @@ import NameKinds.{Scala2MethodNameKinds, SuperAccessorName, ExpandedName}
+ import util.Spans.*
+ import dotty.tools.dotc.ast.{tpd, untpd}, ast.tpd.*
+ import ast.untpd.Modifiers
++import backend.sjs.JSDefinitions
+ import printing.Texts.{*, given}
+ import printing.Printer
+ import io.AbstractFile
+@@ -855,10 +856,12 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
+         val tycon = select(pre, sym)
+         val args = until(end, () => readTypeRef())
+         if (sym == defn.ByNameParamClass2x) ExprType(args.head)
+-        // Moot in this build: Scala.js's `backend.sjs` is excluded from this reduced
+-        // source set (see docs/findings.md's "frontend-only smoke test" scoping), so
+-        // `ctx.settings.scalajs.value` can never be true here -- no Scala.js pseudo-union
+-        // special-casing (see TypeErasure#eraseInfo) is needed.
++        else if (ctx.settings.scalajs.value && args.length == 2 &&
++            sym.owner == JSDefinitions.jsdefn.ScalaJSJSPackageClass && sym.name == tpnme.raw.BAR) {
++          // Treat Scala.js pseudo-unions as real unions, this requires a
++          // special-case in erasure, see TypeErasure#eraseInfo.
++          OrType(args(0), args(1), soft = false)
++        }
+         else if args.nonEmpty then
+           tycon.safeAppliedTo(EtaExpandIfHK(sym.typeParams, args.map(translateTempPoly)))
+         else if (sym.typeParams.nonEmpty) tycon.etaExpand
+diff --git a/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala b/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala
+index 353bf39c..9ff0a576 100644
+--- a/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala
++++ b/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala
+@@ -26,12 +26,9 @@ import util.*
+ 
+ private class InteractiveContextBase(precomputedSourcePackages: Option[LogicalPackage]) extends ContextBase {
+ 
+-  // `SJSPlatform` is excluded from this reduced source set entirely (see
+-  // core/Contexts.scala's `newPlatform` and docs/findings.md's
+-  // "frontend-only smoke test" scoping) -- always the plain JVM-shaped
+-  // platform, `-scalajs` is unsupported here.
+   override protected def newPlatform(using Context): Platform =
+-      new JavaPlatform(precomputedSourcePackages)
++      if (settings.scalajs.value) new SJSPlatform(precomputedSourcePackages)
++      else new JavaPlatform(precomputedSourcePackages)
+ 
+ }
+ 
+diff --git a/compiler/src/dotty/tools/dotc/transform/Constructors.scala b/compiler/src/dotty/tools/dotc/transform/Constructors.scala
+index 8445b41f..c81b2de7 100644
+--- a/compiler/src/dotty/tools/dotc/transform/Constructors.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Constructors.scala
+@@ -367,11 +367,10 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
+     val finalConstrStats = copyParams ::: mappedSuperCalls ::: lazyAssignments ::: stats
+     val expandedConstr =
+       if (cls.isAllOf(NoInitsTrait)) {
+-        // The `|| (ctx.settings.scalajs.value && cls.isJSType)` escape hatch is dropped:
+-        // Scala.js's `backend.sjs`/`transform.sjs` are excluded from this reduced source
+-        // set (see docs/findings.md's "frontend-only smoke test" scoping), so
+-        // `ctx.settings.scalajs.value` can never be true here.
+-        assert(finalConstrStats.isEmpty)
++        assert(finalConstrStats.isEmpty || {
++          import dotty.tools.dotc.transform.sjs.JSSymUtils.*
++          ctx.settings.scalajs.value && cls.isJSType
++        })
+         constr
+       }
+       else cpy.DefDef(constr)(rhs = Block(finalConstrStats, unitLiteral))
+diff --git a/compiler/src/dotty/tools/dotc/transform/Memoize.scala b/compiler/src/dotty/tools/dotc/transform/Memoize.scala
+index 60e34465..0b4d4c7d 100644
+--- a/compiler/src/dotty/tools/dotc/transform/Memoize.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Memoize.scala
+@@ -16,6 +16,8 @@ import Flags.*
+ import Decorators.*
+ import StdNames.nme
+ 
++import sjs.JSSymUtils.*
++
+ import util.Store
+ import scala.compiletime.uninitialized
+ 
+@@ -130,12 +132,10 @@ class Memoize extends MiniPhase with IdentityDenotTransformer { thisPhase =>
+       def adaptToField(field: Symbol, tree: Tree): Tree =
+         if (tree.isEmpty) tree else tree.ensureConforms(field.info.widen)
+ 
+-      // The `&& !sym.sjsNeedsField` (Scala.js semantics) clause upstream is dropped:
+-      // `transform.sjs` is excluded from this reduced source set (see
+-      // docs/findings.md's "frontend-only smoke test" scoping), so it's always true.
+       def isErasableBottomField(field: Symbol, cls: Symbol): Boolean =
+         !field.isVolatile
+           && ((cls eq defn.NothingClass) || (cls eq defn.NullClass) || (cls eq defn.BoxedUnitClass))
++          && !sym.sjsNeedsField
+ 
+       if sym.isGetter then
+         if sym.isConstExprFinalVal then
+diff --git a/compiler/src/dotty/tools/dotc/transform/Mixin.scala b/compiler/src/dotty/tools/dotc/transform/Mixin.scala
+index 412c3b93..b514c210 100644
+--- a/compiler/src/dotty/tools/dotc/transform/Mixin.scala
++++ b/compiler/src/dotty/tools/dotc/transform/Mixin.scala
+@@ -17,6 +17,7 @@ import NameKinds.*
+ import NameOps.*
+ import Phases.erasurePhase
+ import ast.Trees.*
++import dotty.tools.dotc.transform.sjs.JSSymUtils.isJSType
+ 
+ object Mixin {
+   val name: String = "mixin"
+@@ -288,11 +289,15 @@ class Mixin extends MiniPhase with SymTransformer { thisPhase =>
+             else if (getter.is(Lazy, butNot = Module))
+               transformFollowing(superRef(getter).appliedToNone)
+             else if (getter.is(Module))
+-              // The `ctx.settings.scalajs.value && getter.moduleClass.isJSType` branch is
+-              // dropped: Scala.js's `backend.sjs`/`transform.sjs` are excluded from this
+-              // reduced source set (see docs/findings.md's "frontend-only smoke test"
+-              // scoping), so `ctx.settings.scalajs.value` can never be true here.
+-              New(getter.info.resultType, List(This(cls)))
++              if ctx.settings.scalajs.value && getter.moduleClass.isJSType then
++                if getter.is(Scala2x) then
++                  report.error(
++                      em"""Implementation restriction: cannot extend the Scala 2 trait $mixin
++                          |containing the object $getter that extends js.Any""",
++                      cls.srcPos)
++                transformFollowing(superRef(getter).appliedToNone)
++              else
++                New(getter.info.resultType, List(This(cls)))
+             else
+               Underscore(getter.info.resultType)
+           // transformFollowing call is needed to make memoize & lazy vals run
+diff --git a/compiler/src/dotty/tools/dotc/transform/sjs/JUnitBootstrappers.scala b/compiler/src/dotty/tools/dotc/transform/sjs/JUnitBootstrappers.scala
+index b7a179ac..e8973770 100644
+--- a/compiler/src/dotty/tools/dotc/transform/sjs/JUnitBootstrappers.scala
++++ b/compiler/src/dotty/tools/dotc/transform/sjs/JUnitBootstrappers.scala
+@@ -173,7 +173,8 @@ class JUnitBootstrappers extends MiniPhase {
+       genNewInstance(classSym, testClass)
+     )
+ 
+-    sbt.APIUtils.registerDummyClass(classSym)
++    // Upstream calls `sbt.APIUtils.registerDummyClass(classSym)` here, which only feeds
++    // zinc's API extraction; `sbt.ExtractAPI`/`APIUtils` are not part of this build.
+ 
+     ClassDef(classSym, constr, defs)
+   }
+diff --git a/compiler/src/dotty/tools/dotc/typer/Implicits.scala b/compiler/src/dotty/tools/dotc/typer/Implicits.scala
+index 96af35b7..b775c045 100644
+--- a/compiler/src/dotty/tools/dotc/typer/Implicits.scala
++++ b/compiler/src/dotty/tools/dotc/typer/Implicits.scala
+@@ -2,6 +2,7 @@ package dotty.tools
+ package dotc
+ package typer
+ 
++import backend.sjs.JSDefinitions
+ import core.*
+ import ast.{TreeTypeMap, untpd, tpd}
+ import util.Spans.*
+@@ -742,10 +743,8 @@ trait ImplicitRunInfo:
+             // `A | Unit` to `js.UndefOrOps[A]`. To keep this conversion in scope
+             // in Scala 3, where we re-interpret `js.|` as a real union, we inject
+             // it in the scope of `Unit`.
+-            //
+-            // Moot in this build: Scala.js's `backend.sjs` is excluded from this
+-            // reduced source set (see docs/findings.md's "frontend-only smoke test"
+-            // scoping), so `ctx.settings.scalajs.value` can never be true here.
++            if t.isRef(defn.UnitClass) && ctx.settings.scalajs.value then
++              companions += JSDefinitions.jsdefn.UnionOpsModuleRef
+ 
+             if sym.isClass then
+               for p <- t.parents do companions ++= iscopeRefs(p)
+diff --git a/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala b/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala
+index 45efc63c..d84da942 100644
+--- a/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala
++++ b/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala
+@@ -2,6 +2,7 @@ package dotty.tools
+ package dotc
+ package typer
+ 
++import backend.sjs.JSDefinitions
+ import core.*
+ import Contexts.*, Types.*, Symbols.*, Names.*, Decorators.*, ProtoTypes.*
+ import Flags.*, SymDenotations.*
+@@ -62,11 +63,8 @@ trait ImportSuggestions:
+         else !root.name.is(FlatName)
+           && !root.name.lastPart.contains('$')
+           && root.is(ModuleVal, butNot = JavaDefined)
+-          // The implicits in `scalajs.js.|` are implementation details and shouldn't be
+-          // suggested -- moot in this build (Scala.js's `backend.sjs` is excluded from this
+-          // reduced source set, see docs/findings.md's "frontend-only smoke test" scoping),
+-          // so this can never be a JS pseudo-union symbol.
+-          && true
++          // The implicits in `scalajs.js.|` are implementation details and shouldn't be suggested
++          && !(root.name == nme.raw.BAR && ctx.settings.scalajs.value && root == JSDefinitions.jsdefn.PseudoUnionModule)
+       }
+ 
+     def nestedRoots(site: Type, parentSymbols: Set[Symbol])(using Context): List[Symbol] =
+diff --git a/compiler/src/dotty/tools/dotc/typer/Typer.scala b/compiler/src/dotty/tools/dotc/typer/Typer.scala
+index 7eb7bf57..8649a49c 100644
+--- a/compiler/src/dotty/tools/dotc/typer/Typer.scala
++++ b/compiler/src/dotty/tools/dotc/typer/Typer.scala
+@@ -2,6 +2,7 @@ package dotty.tools
+ package dotc
+ package typer
+ 
++import backend.sjs.JSDefinitions
+ import core.*
+ import ast.*
+ import Trees.*
+@@ -363,10 +364,8 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
+                     mbr.matchesImportBound(if mbr.symbol.is(Given) then imp.givenBound else imp.wildcardBound)
+                   }
+                 else accessibleDenot
+-              // Scala.js's `backend.sjs` is excluded from this reduced source set (see
+-              // docs/findings.md's "frontend-only smoke test" scoping), so this can never
+-              // be a JS pseudo-union symbol.
+-              def isScalaJsPseudoUnion = false
++              def isScalaJsPseudoUnion =
++                denot.name == tpnme.raw.BAR && ctx.settings.scalajs.value && denot.symbol == JSDefinitions.jsdefn.PseudoUnionClass
+               // Just like Scala2Unpickler reinterprets Scala.js pseudo-unions
+               // as real union types, we want references to `A | B` in sources
+               // to be typed as a real union even if `js.|` has been imported,
+diff --git a/compiler/src/dotty/tools/backend/sjs/JSCodeGen.scala b/compiler/src/dotty/tools/backend/sjs/JSCodeGen.scala
+index 12e219c4..46f05794 100644
+--- a/compiler/src/dotty/tools/backend/sjs/JSCodeGen.scala
++++ b/compiler/src/dotty/tools/backend/sjs/JSCodeGen.scala
+@@ -304,7 +304,9 @@ class JSCodeGen()(using genCtx: Context) {
+        * without argument, which is not deterministic.
+        */
+       def caseInsensitiveNameOf(classDef: js.ClassDef): String =
+-        classDef.name.name.nameString.toLowerCase(java.util.Locale.ENGLISH)
++        // javalib-native has no java.util.Locale. Class names are ASCII, and Scala Native's toLowerCase does
++        // not depend on the OS locale, so this is just as deterministic.
++        classDef.name.name.nameString.toLowerCase
+ 
+       val generatedCaseInsensitiveNames =
+         generatedClasses.map(caseInsensitiveNameOf).toSet
