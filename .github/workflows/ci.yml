@@ -218,9 +218,10 @@ jobs:
           echo "$out"
           [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
 
-      - name: Smoke test -- Scala.js (no JVM: dotc -scalajs, scalino-jslink, node)
-        # Program arguments, optimized ES module packaging, Scala.js dependencies, `scalino test`
-        # on node and the client/server example. See tests/js/run.sh.
+      - name: Smoke test -- Scala.js
+        # No JVM anywhere: dotc -scalajs, scalino-jslink, node. Program arguments, optimized ES module
+        # packaging, Scala.js dependencies, `scalino test` on node, `run -w` and the client/server
+        # example. See tests/js/run.sh.
         shell: bash
         run: ./tests/js/run.sh dist/scalino
 
