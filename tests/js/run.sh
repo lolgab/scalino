@@ -9,7 +9,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCALINO="$(cd "$(dirname "${1:-$ROOT/dist/scalino}")" && pwd)/$(basename "${1:-$ROOT/dist/scalino}")"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; [[ -z "${SERVER_PID:-}" ]] || kill "$SERVER_PID" 2>/dev/null || true' EXIT
+trap 'rm -rf "$WORK"; for pid in "${SERVER_PID:-}" "${WATCH_PID:-}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done' EXIT
 command -v node >/dev/null || { echo "node not found" >&2; exit 1; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { [[ "$1" == *"$2"* ]] || fail "expected '$2' in: $1"; }
@@ -75,6 +75,26 @@ if [[ -f "$(dirname "$SCALINO")/jslibs.cp" ]]; then
   rm -rf .scalino-build
   out="$(SCALINO_OFFLINE=1 "$SCALINO" run . -q --offline -- x 2>&1)"; expect "$out" "hello x"
 fi
+
+echo "== run -w: restart the program after a rebuild, keep it on a failed build"
+mkdir "$WORK/watch" && cd "$WORK/watch"
+cat > W.scala <<'SCALA'
+//> using platform js
+@main def w() =
+  println("version 1")
+  scala.scalajs.js.timers.setInterval(1000)(())
+SCALA
+"$SCALINO" run -w . > watch.log 2>&1 &
+WATCH_PID=$!
+wait_for() { for _ in $(seq 1 150); do grep -q "$1" watch.log && return 0; sleep 0.2; done; fail "'$1' not in watch.log: $(cat watch.log)"; }
+wait_for "version 1"
+sed -i.bak 's/version 1/version 2/' W.scala && rm -f W.scala.bak
+wait_for "version 2"; grep -q "Restarting the application" watch.log || fail "no restart message"
+printf 'val broken: Int = "x"\n' >> W.scala
+sleep 6; ! grep -q "version 3" watch.log || fail "restarted on a failed build"
+pgrep -f '\.scalino-build/w/js/main\.js' >/dev/null || fail "the running program was stopped by a failed build"
+kill "$WATCH_PID" 2>/dev/null || true; wait "$WATCH_PID" 2>/dev/null || true
+cd "$WORK"
 
 echo "== scalino test (munit on node)"
 mkdir -p "$WORK/tests/test" && cd "$WORK/tests"

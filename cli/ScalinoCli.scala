@@ -202,6 +202,38 @@ object ScalinoCli:
     extraEnv.foreach { case (k, v) => pb.environment().put(k, v) }
     pb.start().waitFor()
 
+  /** `run -w`: the program keeps running while the sources are rebuilt, and is stopped and started again once
+   *  a build has succeeded (scala-cli's `--restart`). A failed build leaves the running program alone. */
+  private var managedApp: Option[Process] = None
+  private var managedShutdownHook = false
+
+  def stopManagedApp(): Unit =
+    managedApp.foreach { p =>
+      if p.isAlive then
+        p.destroy()
+        if !p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS) then p.destroyForcibly()
+        p.waitFor()
+    }
+    managedApp = None
+
+  /** Starts `cmd` with inherited IO and returns at once, after stopping the previous run. */
+  def runManaged(cmd: List[String]): Int =
+    if !managedShutdownHook then
+      managedShutdownHook = true
+      // Ctrl+C reaches the program anyway (same process group); this covers a plain `kill` of scalino.
+      try Runtime.getRuntime.addShutdownHook(new Thread(() => stopManagedApp()))
+      catch case _: Throwable => ()
+    if managedApp.exists(_.isAlive) then System.err.println(Color.gray("Restarting the application"))
+    stopManagedApp()
+    val pb = new JProcessBuilder(cmd.asJava)
+    pb.inheritIO()
+    managedApp = Some(pb.start())
+    0
+
+  /** Runs the built program: to completion, or, under `-w`, in the background. */
+  def runProgram(cmd: List[String], watch: Boolean): Int =
+    if watch then runManaged(cmd) else runInherited(cmd)
+
   /** Runs scalino-dotc with stdout+stderr merged and captured (stdin still
    *  inherited), so its plain-text diagnostics can be re-rendered
    *  scala-cli-style by `Diagnostics`. */
@@ -2783,7 +2815,7 @@ object ScalinoCli:
       case "run" =>
         // Scala.js has no process arguments: they are linked into the program, so a `run` is a fresh link.
         val (_, jsFile) = link(o.progArgs)
-        runInherited(jsRuntimeCommand() :+ jsFile.toString)
+        runProgram(jsRuntimeCommand() :+ jsFile.toString, o.watch)
       case "package" =>
         val (mainClass, jsFile) = link(Nil)
         val ext = jsFile.getFileName.toString.substring(jsFile.getFileName.toString.lastIndexOf('.'))
@@ -3034,7 +3066,8 @@ object ScalinoCli:
        |""".stripMargin
 
   private def oWatch: String =
-    s"""|  -w, --watch                rebuild (and, for `run`, rerun) on source changes
+    s"""|  -w, --watch                rebuild on source changes; for `run`, the program keeps running while it
+       |                             builds, and is restarted once the build succeeds (a failed build leaves it alone)
        |  --watching, --watching-path <path>   extra path to watch under -w (repeatable;
        |                             file or directory, watched recursively)
        |""".stripMargin
@@ -3692,7 +3725,7 @@ object ScalinoCli:
         val hostOpts = nativeOpts.copy(targetTriples = Nil, sysroots = Nil)
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
-        runInherited(binPathFor(mainClass).toString :: o.progArgs)
+        runProgram(binPathFor(mainClass).toString :: o.progArgs, o.watch)
       case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
         def binPathForTriple(mc: String, t: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(s"bin-$t")
