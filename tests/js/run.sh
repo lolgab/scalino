@@ -130,4 +130,27 @@ node -e 'global.document = { getElementById: () => ({ set innerHTML(v) { console
 expect "$(cat dom.log)" "<h1>Hello, Scala.js!</h1><p>2, 4, 6</p>"
 expect "$(cat server.log)" "Hello, Scala Native!"
 
+echo "== scalino test builds and embeds the jsClient (/client/main.js readable from a test)"
+mkdir -p "$WORK/cst/server" "$WORK/cst/client" && cd "$WORK/cst"
+cat > client/Client.scala <<'SCALA'
+//> using platform scala-js
+object Client:
+  def main(args: Array[String]): Unit = println("client")
+SCALA
+cat > server/Server.scala <<'SCALA'
+//> using jsClient ../client
+//> using test.dep org.scalameta::munit::1.0.2
+object Server:
+  def main(args: Array[String]): Unit = println("server")
+SCALA
+mkdir server/test && cat > server/test/ClientSuite.scala <<'SCALA'
+class ClientSuite extends munit.FunSuite:
+  test("the client bundle is embedded") {
+    val in = getClass.getResourceAsStream("/client/main.js")
+    assert(in != null, "missing resource client/main.js")
+    assert(in.readAllBytes().length > 0)
+  }
+SCALA
+out="$("$SCALINO" test server 2>&1)"; expect "$out" "1 passed, 0 failed"
+
 echo "OK: Scala.js smoke tests passed"

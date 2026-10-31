@@ -3856,12 +3856,15 @@ object ScalinoCli:
             s"scalino: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring"
           )
       }
+      if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
+      // Same as `run`: the client is built (dev mode unless --js-mode says otherwise) and embedded, so tests can read /client/main.js.
+      val clientResources = directives.jsClients.map(buildJsClient(_, directives.shared, o, forPackage = false))
       val repos = (directives.repositories ++ o.cliRepositories).distinct
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)
       val testOnlyClasspath = resolveDeps(directives.testDeps, depsCache, repos)
       val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
-      val testClasspath = (List(mainClasspath, testOnlyClasspath) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+      val testClasspath = (List(mainClasspath, testOnlyClasspath) ++ directives.jars ++ directives.resourceDirs ++ clientResources.map(_.toString)).filter(_.nonEmpty).mkString(CP_SEP)
       val options = directives.options ++ o.cliOptions ++ directives.testOptions
       val cc = computeCompileClasspath(testClasspath, extraCompileOnlyClasspath)
 
@@ -3919,11 +3922,14 @@ object ScalinoCli:
           println(Color.action(s"scalino: $why", System.out))
         if discovered.isEmpty || o.testOnly.isEmpty then 0 else 1
       else
+        val testNativeOpts =
+          val n = resolveNativeOpts(directives, o)
+          if clientResources.nonEmpty then n.copy(embedResources = true) else n
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
         def build(exclude: Set[String]) =
-          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, resolveNativeOpts(directives, o), o.watch, exclude)
+          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude)
         // Besides inheritance (handled above), a selected test could reference
         // an excluded test class some other way -- if the trimmed link fails,
         // fall back to the full link rather than failing the run.
