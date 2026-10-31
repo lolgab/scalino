@@ -12,4 +12,8 @@ echo "== smoke test: build/lsp-trace-drive.py against build/lsp-trace-fixture ==
 FIXTURE="$ROOT/build/lsp-trace-fixture"
 (cd "$FIXTURE" && "$DIST/scalino" setup-ide Model.scala Greeter.scala Main.scala >/dev/null)
 python3 "$ROOT/build/lsp-trace-drive.py" "$FIXTURE" "$DIST/scalino-lsp" -stdio
+echo "== smoke test: build/lsp-js-smoke.py against build/lsp-js-fixture (Scala.js project) =="
+JS_FIXTURE="$ROOT/build/lsp-js-fixture"
+(cd "$JS_FIXTURE" && "$DIST/scalino" setup-ide App.scala Union.scala >/dev/null)
+python3 "$ROOT/build/lsp-js-smoke.py" "$JS_FIXTURE" "$DIST/scalino-lsp" -stdio
 echo "OK: smoke test passed (scalino-lsp handled every endpoint lsp-trace-drive.py exercises)"
