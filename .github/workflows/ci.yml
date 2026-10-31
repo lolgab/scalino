@@ -31,7 +31,7 @@ jobs:
       - id: m
         shell: bash
         run: |
-          m='{"target":"linux-x86_64","os":"ubuntu-24.04"},{"target":"linux-arm64","os":"ubuntu-24.04-arm"},{"target":"macos-arm64","os":"macos-14"}'
+          m='{"target":"linux-x86_64","os":"ubuntu-24.04"},{"target":"linux-arm64","os":"ubuntu-24.04-arm"},{"target":"macos-arm64","os":"macos-15"}'
           # The Intel Mac runner is by far the slowest (~80 min before the
           # split), so PRs skip it; pushes to main and manual runs keep it.
           if [[ "${{ github.event_name }}" != pull_request ]]; then
