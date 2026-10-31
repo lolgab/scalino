@@ -32,6 +32,17 @@ vendor_cp() {
 vendor_cp "$WORK/compiler.cp" "$DIST/compiler.cp"
 vendor_cp "$WORK/nativelibs.cp" "$DIST/nativelibs.cp"
 
+# What every Scala.js build has on its class path (cli/ScalinoCli.scala's jsBaseDeps, plus alwaysIncludedArtifacts),
+# vendored so a Scala.js program with no further dependencies builds offline: the CLI uses jslibs.cp instead of
+# asking coursier when that is all a build needs.
+cs fetch \
+  "org.scala-lang:scala3-library_sjs1_3:$SCALA_VERSION" \
+  "org.scala-js:scalajs-library_2.13:$SCALAJS_VERSION" \
+  "org.scala-js:scalajs-javalib:$SCALAJS_VERSION" \
+  "org.typelevel:scalac-compat-annotation_3:0.1.4" \
+  --classpath | tr -d '\r' > "$WORK/jslibs.cp"
+vendor_cp "$WORK/jslibs.cp" "$DIST/jslibs.cp"
+
 # Vendors each nativelib's matching sources jar (built from vendor/scala-
 # native+patches for javalib/nativelib by 01b/01c, fetched upstream as-is
 # for the rest by 01-fetch-deps.sh) as a sibling of its main jar in dist/lib

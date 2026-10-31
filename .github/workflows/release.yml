@@ -63,6 +63,13 @@ jobs:
         shell: bash
         run: ./dist/scalino run examples/Hello.scala
 
+      - name: Smoke test -- Scala.js
+        # See ci.yml's identical step. A failure here must not keep the release from shipping
+        # assets either (same reasoning as the macro step below), but it shows in the log.
+        continue-on-error: true
+        shell: bash
+        run: ./tests/js/run.sh dist/scalino
+
       - name: Smoke test -- real macro
         # Known-failing, not a regression: see ci.yml's identical step for
         # the full explanation (jsoniter-scala's derivation macro hits a

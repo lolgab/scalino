@@ -9,8 +9,8 @@
 # self-contained, relocatable dist/ -- scalino resolves its dist root from
 # its own real path, so the /usr/bin symlinks below are safe and the rest
 # of /usr/lib/scalino/ never needs to move):
-#   /usr/lib/scalino/{scalino,scalino-dotc,scalino-linkdriver,scalino-lsp,
-#                     scalino-cs,java.base.jar,compiler.cp,nativelibs.cp,
+#   /usr/lib/scalino/{scalino,scalino-dotc,scalino-linkdriver,scalino-jslink,
+#                     scalino-lsp,scalino-cs,jslibs.cp,java.base.jar,compiler.cp,nativelibs.cp,
 #                     nscplugin.jar.txt,lib/,README.md,LICENSE,NOTICE}
 #   /usr/bin/scalino     -> /usr/lib/scalino/scalino     (symlink)
 #   /usr/bin/scalino-lsp -> /usr/lib/scalino/scalino-lsp (symlink)
@@ -60,6 +60,7 @@ mkdir -p assets
 
 fpm -s dir -C "$staging" \
   -t deb -n scalino -v "$deb_version" -a "$deb_arch" \
+  --deb-suggests nodejs \
   --license "Apache-2.0" \
   --url "https://github.com/lolgab/scalino" \
   --description "Scala toolchain compiling straight to native binaries (no JVM at runtime)." \
@@ -69,6 +70,7 @@ fpm -s dir -C "$staging" \
 
 fpm -s dir -C "$staging" \
   -t rpm -n scalino -v "$rpm_version" -a "$rpm_arch" \
+  --rpm-tag "Suggests: nodejs" \
   --license "Apache-2.0" \
   --url "https://github.com/lolgab/scalino" \
   --description "Scala toolchain compiling straight to native binaries (no JVM at runtime)." \

@@ -87,13 +87,14 @@
             runHook postInstall
           '';
 
+          # nodejs runs Scala.js programs (`scalino run --js`, `scalino test`).
           # clang and llvm-info is a hard runtime dependency (scala-native always links
           # through it, even for a zero-dependency Hello World) -- wrap the
           # binaries so it's on PATH without polluting the caller's own env (suffix: a clang
           # the caller already provides wins, which cross builds rely on, see
           # mkScalinoSysroot).
           postFixup = ''
-            wrapProgram "$out/bin/scalino" --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev ]}
+            wrapProgram "$out/bin/scalino" --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev pkgs.nodejs ]}
             wrapProgram "$out/bin/scalino-lsp" --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.clang pkgs.llvmPackages.llvm.dev ]}
           '';
 

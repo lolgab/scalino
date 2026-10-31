@@ -16,7 +16,7 @@ concurrency:
 # The toolchain build is split so the two slowest links run side by side:
 #
 #   core  (00b..06: patched javalib/nativelib, scalino-linkdriver, dist/)
-#     |-- dotc  (03, 03b, 07: scalino-dotc + the scalino CLI) + smoke tests
+#     |-- dotc  (03, 03b, 07, 04d: scalino-dotc, the scalino CLI, scalino-jslink) + smoke tests
 #     `-- lsp   (08: scalino-lsp; only needs core's output)
 #           `-- finish (LSP smoke test, needs dist/scalino from dotc)
 #
@@ -217,6 +217,12 @@ jobs:
           out="$(./dist/scalino run examples/Hello.scala)"
           echo "$out"
           [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
+
+      - name: Smoke test -- Scala.js (no JVM: dotc -scalajs, scalino-jslink, node)
+        # Program arguments, optimized ES module packaging, Scala.js dependencies, `scalino test`
+        # on node and the client/server example. See tests/js/run.sh.
+        shell: bash
+        run: ./tests/js/run.sh dist/scalino
 
       - name: Smoke test -- real macro
         # Known-failing, not a regression: examples/macro-hello/Test.scala

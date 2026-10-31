@@ -17,6 +17,7 @@ esac
 if [[ "$STAGE" == all || "$STAGE" == core ]]; then
 ./00b-setup-vendor.sh
 ./01-fetch-deps.sh
+./00c-fetch-scalajs-ir.sh
 ./01b-build-patched-javalib.sh
 ./01c-build-patched-nativelib.sh
 ./02-build-java-base.sh
@@ -38,6 +39,7 @@ if [[ "$STAGE" == all || "$STAGE" == dotc ]]; then
 ./03-build-scalino-dotc.sh
 ./03b-build-scalalib-retained.sh
 ./07-build-scalino.sh
+./04d-build-scalino-jslink.sh
 fi
 
 if [[ "$STAGE" == all || "$STAGE" == lsp ]]; then

@@ -16,6 +16,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/lolgab/scalino"
 license=('Apache-2.0')
 depends=('clang')
+optdepends=('nodejs: run Scala.js programs (`scalino run --js`)')
 provides=('scalino')
 conflicts=('scalino')
 

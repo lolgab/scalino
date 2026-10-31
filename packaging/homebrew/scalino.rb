@@ -35,6 +35,7 @@ class Scalino < Formula
     end
   end
 
+  depends_on "node" => :optional # runs Scala.js programs (`scalino run --js`); Scala Native builds don't need it
   depends_on "llvm" => :recommended # provides clang/clang++ where the OS doesn't already (Linux); macOS uses Xcode CLT's own
   # coursier's `cs` launcher (needed for `//> using dep`) is bundled in the
   # tarball as scalino-cs -- no separate dependency.

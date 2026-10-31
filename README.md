@@ -27,7 +27,8 @@ scalino package Hello.scala -o hello && ./hello
 scalino setup-ide                          # then open the folder in Zed / VS Code / Neovim
 ```
 
-The only other thing you need is `clang` (see [Install](#install)).
+The only other thing you need is `clang` (see [Install](#install)), except for
+Scala.js builds, which need no C toolchain, only `node` to run them.
 
 ## How it compares
 
@@ -38,9 +39,18 @@ flags where it implements them. `scalino-lsp` stands in for Metals.
 The differences:
 
 - **No JVM**, at build time or at run time.
-- **One Scala and one Scala Native version**: the ones it was built with
-  (`scalino version` prints them). You can't switch versions per project,
-  and there are no JVM or Scala.js targets.
+- **One Scala, one Scala Native and one Scala.js version**: the ones it was
+  built with (`scalino version` prints them). You can't switch versions per
+  project, and there is no JVM target.
+- **Scala.js** (`//> using platform js` or `--js`) builds without a JVM too:
+  `dotc -scalajs`, then `scalino-jslink` (the Scala.js linker compiled to
+  Scala Native), run with `node`; `test` and `setup-ide` work too.
+- **Server and client without a JVM**: a Scala Native server declares
+  `//> using jsClient ../client` (a Scala.js project) and
+  `//> using shared ../shared` (sources compiled into both). `scalino run`
+  builds the client and embeds it in the server binary as the resource
+  `/client/main.js`; `scalino package` links it in release mode. See
+  [`examples/client-server`](examples/client-server).
 
 ## Install
 
@@ -53,8 +63,10 @@ for your OS/arch, verifies its checksum, and installs `scalino` to
 `~/.local/bin`. You can override this with `$SCALINO_INSTALL_DIR`,
 `$SCALINO_BIN_DIR` or `$SCALINO_VERSION`.
 
-**Requirement:** `clang`/`clang++`. Every build links through clang, even a
-zero-dependency Hello World. It's already on macOS via the Xcode Command Line
+**Requirement:** `clang`/`clang++` for Scala Native builds (the default). Every one
+links through clang, even a zero-dependency Hello World. Scala.js builds need no
+C toolchain, only `node` (or `deno`/`bun`) to run them; the Scala.js base
+libraries ship in the tarball, so those build offline too. It's already on macOS via the Xcode Command Line
 Tools; elsewhere, install it with `apt install clang` or similar. Dependency
 resolution doesn't need a separate install: scalino bundles its own renamed copy
 of [coursier](https://get-coursier.io/)'s `cs` launcher (`scalino-cs`).
@@ -62,7 +74,7 @@ of [coursier](https://get-coursier.io/)'s `cs` launcher (`scalino-cs`).
 ### Other ways to install
 
 - **Tarball:** each release ships a self-contained `dist/` tarball (compiler +
-  linker + `scalino` + `scalino-lsp`) for Linux (x86_64/arm64), macOS
+  linker + Scala.js linker + `scalino` + `scalino-lsp`) for Linux (x86_64/arm64), macOS
   (x86_64/arm64), and Windows (x86_64, experimental, see
   [`docs/findings.md`](docs/findings.md)). Extract it and run `dist/scalino`.
 - **Debian/Ubuntu and Fedora/RHEL/openSUSE:** every release publishes
