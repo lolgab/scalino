@@ -14,6 +14,14 @@ command -v node >/dev/null || { echo "node not found" >&2; exit 1; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { [[ "$1" == *"$2"* ]] || fail "expected '$2' in: $1"; }
 
+echo "== shell completion of the Scala.js option values (bash)"
+"$SCALINO" completions bash > "$WORK/scalino.bash"
+complete_words() { bash -c 'source "$1"; shift; COMP_WORDS=("$@"); COMP_CWORD=$((${#COMP_WORDS[@]}-1)); COMPREPLY=(); _scalino; echo "${COMPREPLY[*]}"' _ "$WORK/scalino.bash" "$@"; }
+expect "$(complete_words scalino run --js-module-kind "")" "esmodule"
+expect "$(complete_words scalino run --js-mode "")" "fastLinkJS"
+expect "$(complete_words scalino run --platform "")" "scala-js"
+expect "$(complete_words scalino run --js-runtime "")" "deno"
+
 echo "== program arguments (platform from a directive, plain script output)"
 mkdir "$WORK/hello" && cd "$WORK/hello"
 cat > Hello.scala <<'SCALA'

@@ -4050,6 +4050,12 @@ object ScalinoCli:
 
   private val completionSubcommands = "run compile package test setup-ide lock clean sysroot version completions"
   private val completionSysrootActions = "build list path"
+  // Closed value sets of the Scala.js options (scala-cli's spellings, see resolveJsOpts/platformName)
+  private val completionJsModuleKinds = "commonjs common esmodule es nomodule none"
+  private val completionJsModes = "dev fast fastLinkJS release full fullLinkJS"
+  private val completionPlatforms = "scala-js scala-native js native"
+  private val completionJsRuntimes = "node deno bun"
+  private val completionJsEsVersions = "es5_1 es2015 es2016 es2017 es2018 es2019 es2020 es2021"
   private def completionTriples: String = Sysroot.Supported.mkString(" ")
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
@@ -4090,6 +4096,12 @@ object ScalinoCli:
        |    --native-lto) COMPREPLY=($$(compgen -W "none thin full" -- "$$cur")); return ;;
        |    --native-target) COMPREPLY=($$(compgen -W "app static dynamic" -- "$$cur")); return ;;
        |    --native-target-triple) COMPREPLY=($$(compgen -W "$completionTriples" -- "$$cur")); return ;;
+       |    --js-module-kind) COMPREPLY=($$(compgen -W "$completionJsModuleKinds" -- "$$cur")); return ;;
+       |    --js-mode) COMPREPLY=($$(compgen -W "$completionJsModes" -- "$$cur")); return ;;
+       |    --platform) COMPREPLY=($$(compgen -W "$completionPlatforms" -- "$$cur")); return ;;
+       |    --js-runtime) COMPREPLY=($$(compgen -W "$completionJsRuntimes" -- "$$cur")); return ;;
+       |    --js-es-version) COMPREPLY=($$(compgen -W "$completionJsEsVersions" -- "$$cur")); return ;;
+       |    --js-header) return ;;
        |    --format|--formats) COMPREPLY=($$(compgen -W "binary tar deb rpm docker brew" -- "$$cur")); return ;;
        |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
@@ -4140,6 +4152,12 @@ object ScalinoCli:
        |    --native-lto) _values 'lto' none thin full; return ;;
        |    --native-target) _values 'target' app static dynamic; return ;;
        |    --native-target-triple) _values 'target triple' $completionTriples; return ;;
+       |    --js-module-kind) _values 'module kind' $completionJsModuleKinds; return ;;
+       |    --js-mode) _values 'mode' $completionJsModes; return ;;
+       |    --platform) _values 'platform' $completionPlatforms; return ;;
+       |    --js-runtime) _values 'runtime' $completionJsRuntimes; return ;;
+       |    --js-es-version) _values 'ECMAScript version' $completionJsEsVersions; return ;;
+       |    --js-header) return ;;
        |    --format|--formats) _values 'format' binary tar deb rpm docker brew; return ;;
        |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
        |    completions) _values 'shell' bash zsh fish; return ;;
@@ -4183,6 +4201,12 @@ object ScalinoCli:
        |complete -c scalino -l native-lto -x -a "none thin full"
        |complete -c scalino -l native-target -x -a "app static dynamic"
        |complete -c scalino -l native-target-triple -x -a "$completionTriples"
+       |complete -c scalino -l js-module-kind -x -a "$completionJsModuleKinds"
+       |complete -c scalino -l js-mode -x -a "$completionJsModes"
+       |complete -c scalino -l platform -x -a "$completionPlatforms"
+       |complete -c scalino -l js-runtime -x -a "$completionJsRuntimes"
+       |complete -c scalino -l js-es-version -x -a "$completionJsEsVersions"
+       |complete -c scalino -l js-header -x
        |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l pkg-name -x
