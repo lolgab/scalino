@@ -301,6 +301,7 @@ object ScalinoCli:
   /** scala-cli's progress-line label: `Scala 3.9.0, JVM (27)` there, the
    *  platform this toolchain actually targets here. */
   def buildLabel: String = s"Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}"
+  def jsBuildLabel: String = s"Scala ${BuildInfo.scalaVersion}, Scala.js ${BuildInfo.scalaJsVersion}"
 
   /** Runs a command capturing stdout, with stderr passed straight through
    *  (matches `cs fetch --classpath`: download progress on stderr, the
@@ -449,8 +450,32 @@ object ScalinoCli:
     pkg: Map[String, List[String]] = Map.empty,
     nativeTargetTriples: List[String] = Nil,
     nativeSysroots: List[String] = Nil,
-    nativePkgConfig: List[String] = Nil
+    nativePkgConfig: List[String] = Nil,
+    platform: Option[String] = None,
+    jsModuleKind: Option[String] = None,
+    jsMode: Option[String] = None,
+    jsSourceMaps: Option[Boolean] = None,
+    // absolute directories of `//> using jsClient`, see buildJsClient
+    jsClients: List[String] = Nil,
+    // absolute files/directories of `//> using shared`: sources compiled into this project and its jsClient
+    shared: List[String] = Nil,
+    jsNoOpt: Option[Boolean] = None,
+    jsCheckIr: Option[Boolean] = None,
+    jsHeader: Option[String] = None,
+    jsEsVersion: Option[String] = None,
+    jsAvoidClasses: Option[Boolean] = None,
+    jsAvoidLetsAndConsts: Option[Boolean] = None,
+    jsAllowBigIntsForLongs: Option[Boolean] = None
   )
+
+  /** A path from a `//> using` line: relative to the declaring file, or, when nothing is there, to the
+   *  directory scalino runs in (`jsClient client` and `jsClient ./client` both work from either place). */
+  def directivePath(declaringFile: Path, value: String): Path =
+    val besideFile = declaringFile.toAbsolutePath.getParent.resolve(value).normalize()
+    if Files.exists(besideFile) then besideFile
+    else
+      val fromCwd = Paths.get("").toAbsolutePath.resolve(value).normalize()
+      if Files.exists(fromCwd) then fromCwd else besideFile
 
   private val quotedRe = """"([^"]*)"""".r
   private def usingRe(key: String) = s"""//>\\s*using\\s+${java.util.regex.Pattern.quote(key)}\\b(.*)$$""".r
@@ -470,6 +495,8 @@ object ScalinoCli:
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativePrune", "nativeTarget",
     "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot", "nativePkgConfig",
+    "platform", "platforms", "target.platform", "jsModuleKind", "jsMode", "jsEmitSourceMaps", "jsClient", "shared",
+    "jsNoOpt", "jsCheckIr", "jsHeader", "jsEsVersionStr", "jsAvoidClasses", "jsAvoidLetsAndConsts", "jsAllowBigIntsForLongs",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -545,6 +572,19 @@ object ScalinoCli:
     var resourceDirs = List.empty[String]
     var repositories = List.empty[String]
     var pkg = Map.empty[String, List[String]]
+    var platform = Option.empty[String]
+    var jsModuleKind = Option.empty[String]
+    var jsMode = Option.empty[String]
+    var jsSourceMaps = Option.empty[Boolean]
+    var jsClients = List.empty[String]
+    var shared = List.empty[String]
+    var jsNoOpt = Option.empty[Boolean]
+    var jsCheckIr = Option.empty[Boolean]
+    var jsHeader = Option.empty[String]
+    var jsEsVersion = Option.empty[String]
+    var jsAvoidClasses = Option.empty[Boolean]
+    var jsAvoidLetsAndConsts = Option.empty[Boolean]
+    var jsAllowBigIntsForLongs = Option.empty[Boolean]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must be a comment-only line, `//>` as its first
     // non-blank characters -- NOT just "contains `//>` anywhere". An
@@ -594,6 +634,19 @@ object ScalinoCli:
         directiveValues(line, "nativeTargetTriple", "nativeTargetTriples").foreach(vs => nativeTargetTriples = nativeTargetTriples ++ vs)
         directiveValues(line, "nativeSysroot").foreach(vs => nativeSysroots = nativeSysroots ++ vs)
         directiveValues(line, "nativePkgConfig").foreach(vs => nativePkgConfig = nativePkgConfig ++ vs)
+        directiveValues(line, "platform", "platforms").foreach(_.headOption.foreach(v => platform = Some(v)))
+        directiveBool(line, "jsNoOpt").foreach(v => jsNoOpt = Some(v))
+        directiveBool(line, "jsCheckIr").foreach(v => jsCheckIr = Some(v))
+        directiveValues(line, "jsHeader").foreach(_.headOption.foreach(v => jsHeader = Some(v)))
+        directiveValues(line, "jsEsVersionStr").foreach(_.headOption.foreach(v => jsEsVersion = Some(v)))
+        directiveBool(line, "jsAvoidClasses").foreach(v => jsAvoidClasses = Some(v))
+        directiveBool(line, "jsAvoidLetsAndConsts").foreach(v => jsAvoidLetsAndConsts = Some(v))
+        directiveBool(line, "jsAllowBigIntsForLongs").foreach(v => jsAllowBigIntsForLongs = Some(v))
+        directiveValues(line, "jsModuleKind").foreach(_.headOption.foreach(v => jsModuleKind = Some(v)))
+        directiveValues(line, "jsMode").foreach(_.headOption.foreach(v => jsMode = Some(v)))
+        directiveBool(line, "jsEmitSourceMaps").foreach(v => jsSourceMaps = Some(v))
+        directiveValues(line, "jsClient").foreach(vs => jsClients = jsClients ++ vs.map(v => directivePath(src, v).toString))
+        directiveValues(line, "shared").foreach(vs => shared = shared ++ vs.map(v => directivePath(src, v).toString))
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
@@ -611,7 +664,9 @@ object ScalinoCli:
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile, nativePrune,
       nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeDebugInfo, nativeOptimize,
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
-      nativeTargetTriples, nativeSysroots, nativePkgConfig
+      nativeTargetTriples, nativeSysroots, nativePkgConfig,
+      platform, jsModuleKind, jsMode, jsSourceMaps, jsClients.distinct, shared.distinct,
+      jsNoOpt, jsCheckIr, jsHeader, jsEsVersion, jsAvoidClasses, jsAvoidLetsAndConsts, jsAllowBigIntsForLongs
     )
 
   /** scala-cli's dependency formats (only `org::name::version` is advertised in
@@ -625,6 +680,10 @@ object ScalinoCli:
    *  the version with a single-colon name prefix is treated as malformed
    *  and passed through unchanged rather than guessed at.)
    */
+  /** Set by `buildAndMaybeRun` before anything resolves a dependency: true for a Scala.js build, whose
+   *  `org::name::version` means `name_sjs1_3` instead of `name_native0.5_3`. */
+  private var jsPlatform = false
+
   def toCoursierCoord(dep: String): String =
     val full = dep.indexOf(":::")
     if full >= 0 then
@@ -639,7 +698,8 @@ object ScalinoCli:
         if i < 0 then dep
         else s"$org:${nameAndVersion.substring(0, i)}_3:${nameAndVersion.substring(i + 1)}"
       case Array(org, name, version) =>
-        s"$org:${name}_native${BuildInfo.nativeBinaryVersion}_3:$version"
+        if jsPlatform then s"$org:${name}_sjs1_3:$version"
+        else s"$org:${name}_native${BuildInfo.nativeBinaryVersion}_3:$version"
       case _ => dep
 
   /** Filesystem-safe cache key. Short inputs are kept readable (and keep their
@@ -745,7 +805,7 @@ object ScalinoCli:
           System.err.println(Color.warn(
             s"scalino: warning: ${deps.mkString(", ")} not covered by $LockFileName -- run `scalino lock` to update it"))
         Files.createDirectories(cacheDir)
-        val key = sanitizeKey((deps.sorted ::: repositories.sorted).mkString(","))
+        val key = sanitizeKey(((if jsPlatform then List("platform=js") else Nil) ::: deps.sorted ::: repositories.sorted).mkString(","))
         val cacheFile = cacheDir.resolve(s"deps-$key.cp")
         val cached = Option.when(Files.exists(cacheFile))(readFile(cacheFile)).filter(cachedClasspathStillValid)
         cached.getOrElse {
@@ -761,7 +821,8 @@ object ScalinoCli:
   private def csFetchClasspath(deps: List[String], repositories: List[String]): String =
     val cs = s"$dist/scalino-cs"
     val coords = deps.map(toCoursierCoord) ::: alwaysIncludedArtifacts
-    val excludeFlags = excludedArtifacts.flatMap(a => List("-E", a))
+    // The native runtime libraries are scalino's own; a Scala.js build takes what its dependencies say.
+    val excludeFlags = if jsPlatform then Nil else excludedArtifacts.flatMap(a => List("-E", a))
     val repoFlags = repositories.flatMap(r => List("-r", r))
     val (code, cp) = runCaptureStdout(cs :: "fetch" :: coords ::: excludeFlags ::: repoFlags ::: List("--classpath"))
     if code != 0 then
@@ -807,7 +868,7 @@ object ScalinoCli:
   case class LockArtifact(path: String, url: Option[String], sha256: Option[String], local: Boolean)
 
   def lockKeyFor(deps: List[String], repositories: List[String]): String =
-    (deps.sorted ::: repositories.sorted).mkString(",")
+    ((if jsPlatform then List("platform=js") else Nil) ::: deps.sorted ::: repositories.sorted).mkString(",")
 
   private val Sha256K: Array[Int] = Array(
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -937,22 +998,43 @@ object ScalinoCli:
     if allExpanded.isEmpty then die("no .scala files found")
     val (mainSources, _) = partitionSources(allExpanded)
 
-    val groups = scala.collection.mutable.LinkedHashMap.empty[String, (List[String], List[String])]
+    // key -> (dependencies, repositories, is it a Scala.js set). The sets are the ones the builds resolve: for
+    // Scala.js `jsBaseDeps` come with them, test and main dependencies are one set, and a `jsClient` has its own.
+    val groups = scala.collection.mutable.LinkedHashMap.empty[String, (List[String], List[String], Boolean)]
+    def addSet(ds: List[String], repos: List[String], js: Boolean): Unit =
+      val saved = jsPlatform
+      jsPlatform = js
+      try groups.getOrElseUpdate(lockKeyFor(ds, repos), (ds, repos, js))
+      finally jsPlatform = saved
     for srcs <- List(mainSources, allExpanded).filter(_.nonEmpty) do
-      val d = parseDirectives(srcs)
+      val d0 = parseDirectives(srcs)
+      val platform = resolvePlatform(d0, o)
+      val filtered = forPlatform(srcs, platform)
+      val d = if filtered.size == srcs.size then d0 else parseDirectives(filtered)
       val repos = (d.repositories ++ o.cliRepositories).distinct
-      val sets = List(
-        (d.deps ++ o.cliDeps).distinct,
-        d.testDeps,
-        (d.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
-      )
-      for ds <- sets if ds.nonEmpty do groups.getOrElseUpdate(lockKeyFor(ds, repos), (ds, repos))
+      if platform == "js" then
+        val base = jsBaseDeps ++ d.deps ++ o.cliDeps
+        addSet(base.distinct, repos, true)
+        if d.testDeps.nonEmpty then addSet((base ++ d.testDeps).distinct, repos, true)
+        if d.compileOnlyDeps.nonEmpty || o.cliCompileOnlyDeps.nonEmpty then addSet((d.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, repos, true)
+      else
+        for ds <- List((d.deps ++ o.cliDeps).distinct, d.testDeps, (d.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct) if ds.nonEmpty do
+          addSet(ds, repos, false)
+        // a jsClient is a Scala.js project of its own
+        for dir <- d.jsClients do
+          val (clientSources, _) = partitionSources(forPlatform(expandSources(Paths.get(dir) :: d.shared.map(Paths.get(_))), "js"))
+          if clientSources.nonEmpty then
+            val cd = parseDirectives(clientSources)
+            addSet((jsBaseDeps ++ cd.deps).distinct, (cd.repositories ++ o.cliRepositories).distinct, true)
 
     try
-      val resolved = groups.toList.sortBy(_._1).map { case (key, (ds, repos)) =>
+      val resolved = groups.toList.sortBy(_._1).map { case (key, (ds, repos, js)) =>
         System.err.println(Color.action(s"scalino: locking ${ds.mkString(", ")}"))
-        val cp = csFetchClasspath(ds, repos)
-        (key, ds, repos, cp.split(CP_SEP).filter(_.nonEmpty).toList.map(lockArtifactFor), csFetchSourceJars(ds, repos).map(lockArtifactFor).filter(!_.local))
+        jsPlatform = js
+        try
+          val cp = csFetchClasspath(ds, repos)
+          (key, ds, repos, cp.split(CP_SEP).filter(_.nonEmpty).toList.map(lockArtifactFor), csFetchSourceJars(ds, repos).map(lockArtifactFor).filter(!_.local))
+        finally jsPlatform = false
       }
       def artifactJson(a: LockArtifact): String =
         val fields =
@@ -1096,7 +1178,7 @@ object ScalinoCli:
     if deps.nonEmpty then
       try
         Files.createDirectories(cacheDir)
-        val key = sanitizeKey((deps.sorted ::: repositories.sorted).mkString(","))
+        val key = sanitizeKey(((if jsPlatform then List("platform=js") else Nil) ::: deps.sorted ::: repositories.sorted).mkString(","))
         val marker = cacheDir.resolve(s"deps-$key.sources-fetched")
         if !offlineMode && !Files.exists(marker) then
           val cs = s"$dist/scalino-cs"
@@ -1542,12 +1624,15 @@ object ScalinoCli:
    *  like `munit.Suite`/`utest.TestSuite`) include `target`? A from-scratch,
    *  classfile-level substitute for the JVM's `Class#isAssignableFrom`. */
   def isAssignable(startClass: String, target: String, classesDir: Path, jars: List[String]): Boolean =
+    isAssignableVia(startClass, target, findClassInfo(_, classesDir, jars))
+
+  def isAssignableVia(startClass: String, target: String, lookup: String => Option[ClassInfo]): Boolean =
     val visited = scala.collection.mutable.Set.empty[String]
     def go(name: String): Boolean =
       if name == target then true
       else if name == "java.lang.Object" || !visited.add(name) then false
       else
-        findClassInfo(name, classesDir, jars) match
+        lookup(name) match
           case None => false
           case Some(info) => info.superClass.exists(go) || info.interfaces.exists(go)
     go(startClass)
@@ -1659,7 +1744,6 @@ object ScalinoCli:
    *  sbt-testing's own convention is that a module fingerprint's
    *  fullyQualifiedName excludes it). */
   def discoverTestClasses(classesDir: Path, specs: List[SubclassSpec], jars: List[String]): List[TestMatch] =
-    val found = scala.collection.mutable.LinkedHashMap.empty[String, TestMatch]
     // Same NIR fallback as `detectMainClass`: only reached when `classesDir`
     // has no `.class` files at all (a self-hosted scalino-dotc). Every
     // `.nir` file's single top-level `Defn.Class`/`Defn.Module` is scanned
@@ -1669,6 +1753,12 @@ object ScalinoCli:
         walkClassFiles(classesDir).flatMap(f => analyzeClassFile(Files.readAllBytes(f)))
       else
         walkNirFiles(classesDir).flatMap(f => nirClassInfoOf(readNirDefns(f)))
+    matchTestClasses(localInfos, specs, findClassInfo(_, classesDir, jars))
+
+  /** The matching half of `discoverTestClasses`: `localInfos` are the project's own classes, `lookup`
+   *  resolves any class (project or dependency) for the ancestry walk. */
+  def matchTestClasses(localInfos: List[ClassInfo], specs: List[SubclassSpec], lookup: String => Option[ClassInfo]): List[TestMatch] =
+    val found = scala.collection.mutable.LinkedHashMap.empty[String, TestMatch]
     for info <- localInfos do
       val isModuleClass = info.thisClass.endsWith("$") && info.isModule
       val reportedName = if isModuleClass then info.thisClass.stripSuffix("$") else info.thisClass
@@ -1676,7 +1766,7 @@ object ScalinoCli:
         specs
           .find(s => s.isModule == isModuleClass
                      && (s.isModule || !s.requireNoArgConstructor || info.hasPublicNoArgCtor)
-                     && isAssignable(info.thisClass, s.superclassName, classesDir, jars))
+                     && isAssignableVia(info.thisClass, s.superclassName, lookup))
           .foreach(s => found(reportedName) = TestMatch(reportedName, isModuleClass, s.frameworkFqcn, s.superclassName))
     found.values.toList
 
@@ -1822,7 +1912,13 @@ object ScalinoCli:
       directiveValuesOf(src, "file", "files").map(f => src.toAbsolutePath.getParent.resolve(f).normalize())
     }
     val excludeGlobs = base.flatMap(src => directiveValuesOf(src, "exclude"))
-    val combined = (base ++ extraFiles).distinct
+    // A `jsClient` directory is a project of its own (Scala.js), not part of the project declaring it.
+    val clientDirs = base.flatMap(src => directiveValuesOf(src, "jsClient").map(directivePath(src, _)))
+    // `shared`: sources the project and its jsClient have in common, files or directories
+    val sharedFiles = base.flatMap(src => directiveValuesOf(src, "shared").map(directivePath(src, _))).flatMap(p =>
+      if Files.isDirectory(p) then collectScalaFiles(p) else List(p))
+    // `./shared/A.scala` (from a directory scan) and the absolute path a directive gives are the same file
+    val combined = (base ++ extraFiles ++ sharedFiles).distinctBy(_.toAbsolutePath.normalize).filterNot(p => clientDirs.exists(d => p.toAbsolutePath.normalize.startsWith(d)))
     if excludeGlobs.isEmpty then combined
     else
       val cwd = Paths.get("").toAbsolutePath.normalize()
@@ -1959,6 +2055,31 @@ object ScalinoCli:
 
     CompileClasspath(javaBase, pluginJar, compileCp, nativelibsCp)
 
+  /** What a Scala.js build always has on its class path: the Scala 3 library for Scala.js (its
+   *  `scala-library`/`scalajs-scalalib` dependencies bring the TASTy and the `.sjsir`), the Scala.js
+   *  library and the JDK port. Pinned to the linker's version: scalajs-javalib wouldn't link otherwise. */
+  def jsBaseDeps: List[String] = List(
+    s"org.scala-lang:scala3-library_sjs1_3:${BuildInfo.scalaVersion}",
+    s"org.scala-js:scalajs-library_2.13:${BuildInfo.scalaJsVersion}",
+    s"org.scala-js:scalajs-javalib:${BuildInfo.scalaJsVersion}"
+  )
+
+  /** `resolveDeps` for a Scala.js build. When the build needs nothing beyond `jsBaseDeps` and the toolchain ships
+   *  them (`dist/jslibs.cp`, vendored by build/06-package.sh), the class path is simply that: no coursier, no
+   *  network, so a hello world builds offline. A lockfile still wins, like everywhere else. */
+  def resolveJsDeps(deps: List[String], cacheDir: Path, repositories: List[String] = Nil): String =
+    val vendored = Paths.get(s"$dist/jslibs.cp")
+    if deps.sorted == jsBaseDeps.sorted && Files.exists(vendored) && lockedClasspath(lockKeyFor(deps, repositories)).isEmpty then
+      resolveCp(readListFile("jslibs.cp"))
+    else resolveDeps(deps, cacheDir, repositories)
+
+  /** `-scalajs` compiles against the dependencies alone: no native runtime libraries and no nscplugin.
+   *  The JDK API still comes from `java.base.jar`. */
+  def computeJsCompileClasspath(extraClasspath: String, extraCompileOnlyClasspath: String = ""): CompileClasspath =
+    CompileClasspath(
+      s"$dist/java.base.jar", "",
+      List(extraClasspath, extraCompileOnlyClasspath).filter(_.nonEmpty).mkString(CP_SEP), "")
+
   // ---------------------------------------------------------------------
   // Incremental compilation -- own implementation, not real Zinc (see
   // docs/findings.md remaining-work item 7 for the design writeup). Real
@@ -2068,7 +2189,7 @@ object ScalinoCli:
     val dir = if pkg.isEmpty then classesDir else pkg.split("\\.").foldLeft(classesDir)(_.resolve(_))
     if Files.exists(dir) then
       names.foreach { n =>
-        Option(dir.toFile.listFiles((_, name) => name == s"$n.class" || name == s"$n.tasty" || name == s"$n.nir" || name.startsWith(s"$n$$")))
+        Option(dir.toFile.listFiles((_, name) => name == s"$n.class" || name == s"$n.tasty" || name == s"$n.nir" || name == s"$n.sjsir" || name.startsWith(s"$n$$")))
           .foreach(_.foreach(f => Files.deleteIfExists(f.toPath)))
       }
 
@@ -2082,7 +2203,8 @@ object ScalinoCli:
     classesDir: Path,
     cc: CompileClasspath,
     extraOptions: List[String] = Nil,
-    incremental: Boolean = true
+    incremental: Boolean = true,
+    js: Boolean = false
   ): Unit =
     val manifestPath = manifestPathFor(classesDir)
     val fingerprint = computeFingerprint(cc, extraOptions)
@@ -2160,7 +2282,7 @@ object ScalinoCli:
       // scala-cli/sbt both print a line before a real compile -- scalino-dotc
       // itself stays silent on success (no "compiling..." banner of its own),
       // so without this a multi-second compile looks like scalino hung.
-      System.err.println(Color.gray(s"Compiling project ($buildLabel)"))
+      System.err.println(Color.gray(s"Compiling project (${if js then jsBuildLabel else buildLabel})"))
       // classesDir on the compile classpath (harmless on a full rebuild --
       // it's freshly emptied above) is what lets scalino-dotc resolve
       // symbols from files it isn't recompiling this round out of their
@@ -2170,7 +2292,10 @@ object ScalinoCli:
         s"$dist/scalino-dotc",
         "-javabootclasspath", cc.javaBase,
         "-classpath", compileCp,
-        "-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative",
+      ) ++ (
+        if js then List("-scalajs")
+        else List("-Xplugin:" + cc.pluginJar, "-Xplugin-require:scalanative")
+      ) ++ List(
         "-Yretain-trees",
       ) ++ javalibTastyOptions ++ List(
         // The reduced dotc has no JVM backend, so this early (pipelined)
@@ -2183,9 +2308,9 @@ object ScalinoCli:
       val (compileExit, compileOut) = runCaptureAll(compileCmd)
       Diagnostics.render(compileOut).foreach(System.err.println)
       if compileExit != 0 then
-        System.err.println(Color.gray(s"Error compiling project ($buildLabel)"))
+        System.err.println(Color.gray(s"Error compiling project (${if js then jsBuildLabel else buildLabel})"))
         fail(CompilationFailed)
-      System.err.println(Color.gray(s"Compiled project ($buildLabel)"))
+      System.err.println(Color.gray(s"Compiled project (${if js then jsBuildLabel else buildLabel})"))
       // On failure, the manifest is deliberately left untouched: it still
       // describes the last known-good state, so the next attempt treats
       // every file in this failed batch as still-changed and retries it
@@ -2332,11 +2457,12 @@ object ScalinoCli:
     extraClasspath: String,
     extraOptions: List[String] = Nil,
     extraCompileOnlyClasspath: String = "",
-    incremental: Boolean = true
+    incremental: Boolean = true,
+    js: Boolean = false
   ): Path =
-    val classesDir = Paths.get(".scalino-build", "_scratch", "classes")
-    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
-    compileToClasses(sources, classesDir, cc, extraOptions, incremental)
+    val classesDir = Paths.get(".scalino-build", "_scratch", if js then "classes-js" else "classes")
+    val cc = if js then computeJsCompileClasspath(extraClasspath, extraCompileOnlyClasspath) else computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+    compileToClasses(sources, classesDir, cc, extraOptions, incremental, js)
     classesDir
 
   /** Mirrors `src` into `dst` (hard links, copy fallback) minus every class
@@ -2455,6 +2581,418 @@ object ScalinoCli:
     mainClass
 
   // ---------------------------------------------------------------------
+  // Scala.js: `//> using platform js` / `--js`. Same front half as a native build (directives,
+  // dependency resolution with `_sjs1_3` artifacts, incremental compile), but dotc runs with
+  // `-scalajs` (patches/scala3-0039) and emits `.sjsir`; dist/scalino-jslink (the Scala.js linker,
+  // itself a Scala Native binary) turns those into JavaScript; node runs it. No JVM anywhere.
+  // ---------------------------------------------------------------------
+
+  /** `moduleKind`: commonjs | esmodule | none. `mode`: fast (no optimizer) | full (optimizer + minifier). */
+  case class JsOpts(
+    moduleKind: String = "none", mode: String = "fast", sourceMaps: Boolean = false, checkIr: Boolean = false,
+    header: Option[String] = None, esVersion: Option[String] = None, avoidClasses: Boolean = false,
+    avoidLetsAndConsts: Boolean = false, bigIntsForLongs: Boolean = false)
+
+  def platformName(v: String): String = v.toLowerCase match
+    case "native" | "scala-native" | "scalanative" => "native"
+    case "js" | "scala-js" | "scalajs" => "js"
+    case "jvm" => fail("the jvm platform is not supported: there is no JVM in this toolchain (use scala-native or scala-js)")
+    case other => fail(s"unsupported platform '$other' (expected scala-native or scala-js)")
+
+  def resolvePlatform(d: Directives, o: RunOpts): String =
+    o.cliPlatform.orElse(d.platform).map(platformName).getOrElse("native")
+
+  /** `//> using target.platform scala-js`: the file only belongs to builds for those platforms. */
+  def forPlatform(sources: List[Path], platform: String): List[Path] =
+    sources.filter { src =>
+      val targets = readFile(src).linesIterator.filter(_.trim.startsWith("//>")).flatMap { l =>
+        directiveValues(l.trim, "target.platform").getOrElse(Nil)
+      }.toList
+      targets.isEmpty || targets.exists(platformName(_) == platform)
+    }
+
+  def resolveJsOpts(d: Directives, o: RunOpts, defaultMode: String = "dev"): JsOpts =
+    // scala-cli's defaults: a plain script (no module system), no source maps
+    val kind = o.cliJsModuleKind.orElse(d.jsModuleKind).map(_.toLowerCase) match
+      case None => "none"
+      case Some("commonjs" | "common") => "commonjs"
+      case Some("esmodule" | "es" | "mjs") => "esmodule"
+      case Some("nomodule" | "none") => "none"
+      case Some(other) => fail(s"unknown js module kind '$other' (expected commonjs, esmodule or nomodule)")
+    val mode = o.cliJsMode.orElse(d.jsMode).map(_.toLowerCase) match
+      case None => if defaultMode == "release" then "full" else "fast"
+      case Some("dev" | "fast" | "fastlinkjs" | "fastopt") => "fast"
+      case Some("release" | "full" | "fulllinkjs" | "fullopt") => "full"
+      case Some(other) => fail(s"unknown js mode '$other' (expected dev/fastLinkJS or release/fullLinkJS)")
+    JsOpts(
+      kind,
+      if o.cliJsNoOpt || d.jsNoOpt.contains(true) then "fast" else mode,
+      o.cliJsSourceMaps.orElse(d.jsSourceMaps).getOrElse(false),
+      o.cliJsCheckIr || d.jsCheckIr.contains(true),
+      o.cliJsHeader.orElse(d.jsHeader),
+      o.cliJsEsVersion.orElse(d.jsEsVersion).map(_.toLowerCase),
+      o.cliJsAvoidClasses || d.jsAvoidClasses.contains(true),
+      o.cliJsAvoidLetsAndConsts || d.jsAvoidLetsAndConsts.contains(true),
+      o.cliJsAllowBigInts || d.jsAllowBigIntsForLongs.contains(true))
+
+  /** Compiles with `-scalajs`, finds the entry point, links with scalino-jslink. Returns the main class
+   *  and the linked JavaScript file. */
+  def buildJs(
+    sources: List[Path],
+    progArgs: List[String],
+    explicitMainClass: Option[String],
+    extraClasspath: String,
+    extraOptions: List[String],
+    extraCompileOnlyClasspath: String,
+    logLevel: String,
+    incremental: Boolean,
+    js: JsOpts,
+    watch: Boolean = false
+  ): (String, Path) =
+    val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental, js = true)
+    val jslink = s"$dist/scalino-jslink"
+    val mainClass = explicitMainClass.getOrElse {
+      val (code, out) = runCaptureStdout(List(jslink, "--find-mains", compiledDir.toString))
+      if code != 0 then fail("could not scan the compiled classes for an entry point")
+      out.linesIterator.map(_.trim).filter(_.nonEmpty).toList match
+        case List(one) => one
+        case Nil => fail("no entry point found (looked for a static `main(Array[String])`) -- pass --main-class")
+        case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one")
+    }
+    val outDir = Paths.get(".scalino-build").resolve(mainClass).resolve("js")
+    System.err.println(Color.gray(s"Linking project (Scala.js ${BuildInfo.scalaJsVersion}, ${if js.mode == "full" then "release" else "dev"})"))
+    (mainClass, linkJs(mainClass, outDir, compiledDir.toString :: extraClasspath.split(CP_SEP).filter(_.nonEmpty).toList, progArgs, logLevel, js, watch))
+
+  /** The `-w` counterpart of `runCaptureStdout(jslink ...)`: one `scalino-jslink --long-running` process
+   *  reused across rebuilds (its analysis, optimizer and IR caches stay warm), respawned when its argv
+   *  changes. Same stdin/stdout protocol as `linkIncremental`; returns (exit code, the `module:` lines). */
+  private var jsLongRunningLinker: Option[LongRunningLinker] = None
+
+  private def linkJsIncremental(argv: List[String]): (Int, String) =
+    val (driver, alreadyBuilding) = jsLongRunningLinker match
+      case Some(d) if d.argv == argv && d.proc.isAlive => (d, false)
+      case existing =>
+        existing.foreach(terminateLinker)
+        val pb = new JProcessBuilder((argv :+ "--long-running").asJava)
+        pb.redirectError(JProcessBuilder.Redirect.INHERIT)
+        val proc = pb.start()
+        val d = LongRunningLinker(argv, proc, new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream)), proc.getOutputStream)
+        jsLongRunningLinker = Some(d)
+        (d, true)
+    // A fresh process links by itself; a live one waits for a line on stdin.
+    if !alreadyBuilding then
+      driver.in.write('\n'.toInt)
+      driver.in.flush()
+    val modules = new StringBuilder
+    var line = driver.out.readLine()
+    while line != null && line != "SCALINO_LINKING_DONE" && line != "SCALINO_LINKING_FAILED" do
+      modules.append(line).append('\n')
+      line = driver.out.readLine()
+    if line == "SCALINO_LINKING_DONE" then (0, modules.toString)
+    else
+      terminateLinker(driver)
+      jsLongRunningLinker = None
+      (1, "")
+
+  /** Runs scalino-jslink over `classpath` (entry point `mainClass`) into a fresh `outDir`; returns the JavaScript file. */
+  def linkJs(mainClass: String, outDir: Path, classpath: List[String], progArgs: List[String], logLevel: String, js: JsOpts, watch: Boolean = false): Path =
+    deleteRecursively(outDir)
+    Files.createDirectories(outDir)
+    val cmd =
+      List(s"$dist/scalino-jslink", "--out", outDir.toString, "--main", mainClass, "--module-kind", js.moduleKind, "--mode", js.mode, "--log", logLevel) ++
+      progArgs.flatMap(a => List("--main-arg", a)) ++
+      (if js.sourceMaps then Nil else List("--no-source-maps")) ++
+      (if js.checkIr then List("--check-ir") else Nil) ++
+      js.header.toList.flatMap(h => List("--header", h)) ++
+      js.esVersion.toList.flatMap(v => List("--es-version", v)) ++
+      (if js.avoidClasses then List("--avoid-classes") else Nil) ++
+      (if js.avoidLetsAndConsts then List("--avoid-lets-and-consts") else Nil) ++
+      (if js.bigIntsForLongs then List("--bigints-for-longs") else Nil) ++
+      classpath
+    val (linkExit, linkOut) = if watch then linkJsIncremental(cmd) else runCaptureStdout(cmd)
+    if linkExit != 0 then fail("linking failed")
+    val modules = linkOut.linesIterator.map(_.trim).filter(_.startsWith("module: ")).map(_.stripPrefix("module: ")).toList
+    modules match
+      case List(m) => outDir.resolve(m)
+      case _ => fail(s"expected one linked JavaScript module, scalino-jslink reported ${modules.size}")
+
+  /** `--js-runtime node|deno|bun`, set from the command line by the build entry points. */
+  private var jsRuntime = "node"
+
+  /** The command that runs a linked JavaScript file (append the file). `$SCALINO_NODE` names the node executable. */
+  def jsRuntimeCommand(): List[String] =
+    val name = jsRuntime
+    if name != "node" && name != "deno" && name != "bun" then fail(s"unknown js runtime '$name' (expected node, deno or bun)")
+    val exe = (if name == "node" then envOpt("SCALINO_NODE") else None).getOrElse {
+      val (code, found) = runCaptureStdout(List("sh", "-c", s"command -v $name"))
+      if code != 0 || found.isEmpty then fail(s"'$name' not found on PATH -- a Scala.js program runs on $name (--js-runtime picks another, $$SCALINO_NODE names node)")
+      found
+    }
+    if !Files.isExecutable(Paths.get(exe)) then fail(s"cannot run '$exe' -- is it an executable file?")
+    if name == "deno" then List(exe, "run", "--allow-all") else List(exe)
+
+  /** Copies the linked file to `out` (and its source map next to it, with the map reference renamed). */
+  def copyJs(jsFile: Path, out: Path): Unit =
+    Option(out.getParent).foreach(Files.createDirectories(_))
+    val mapName = out.getFileName.toString + ".map"
+    val map = jsFile.resolveSibling(jsFile.getFileName.toString + ".map")
+    val lines = readFile(jsFile).split("\n", -1).toList
+    val text = lines.map(l => if l.startsWith("//# sourceMappingURL=") then s"//# sourceMappingURL=$mapName" else l).mkString("\n")
+    Files.write(out, text.getBytes("UTF-8"))
+    if Files.exists(map) then Files.copy(map, out.resolveSibling(mapName), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+
+  /** `//> using jsClient ../client`: the directory is a Scala.js project (its own `//> using` lines, its
+   *  own entry point, plus the `//> using shared` sources of the project declaring it) built into a browser script and embedded in the server binary as the resource
+   *  `/client/main.js` (+ `/client/main.js.map`). Linked as a classic script (`nomodule`) unless the client
+   *  says otherwise, and optimized when the server is being packaged. Returns the resource directory to put
+   *  on the server's class path. */
+  def buildJsClient(dir: String, shared: List[String], o: RunOpts, forPackage: Boolean): Path =
+    val clientDir = Paths.get(dir)
+    if !Files.isDirectory(clientDir) then fail(s"jsClient: '$dir' is not a directory")
+    val (sources, _) = partitionSources(forPlatform(expandSources(clientDir :: shared.map(Paths.get(_))), "js"))
+    if sources.isEmpty then fail(s"jsClient: no .scala files in '$dir'")
+    val d = parseDirectives(sources)
+    val saved = jsPlatform
+    jsPlatform = true
+    try
+      System.err.println(Color.gray(s"Building JS client ${Paths.get("").toAbsolutePath.normalize.relativize(clientDir)}"))
+      val repos = (d.repositories ++ o.cliRepositories).distinct
+      val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
+      val classpath = (List(resolveJsDeps((jsBaseDeps ++ d.deps).distinct, depsCache, repos)) ++ d.jars ++ d.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+      val compileOnly = resolveDeps(d.compileOnlyDeps.distinct, depsCache, repos)
+      val jsOpts = resolveJsOpts(d, o, defaultMode = if forPackage then "release" else "dev")
+      val (_, jsFile) = buildJs(sources, Nil, d.mainClass, classpath, d.options ++ o.cliOptions, compileOnly, o.logLevel, !o.noIncremental, jsOpts, o.watch)
+      val resources = Paths.get(".scalino-build", "_client", "resources")
+      deleteRecursively(resources)
+      copyJs(jsFile, resources.resolve("client").resolve("main.js"))
+      resources.toAbsolutePath
+    finally jsPlatform = saved
+
+  def buildJsAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts, directives: Directives): Int =
+    if o.formats.nonEmpty then fail("--format is not supported for Scala.js")
+    val allDeps = (jsBaseDeps ++ directives.deps ++ o.cliDeps).distinct
+    val repos = (directives.repositories ++ o.cliRepositories).distinct
+    val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
+    val extraClasspath = (List(resolveJsDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+    val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
+    val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
+    val options = directives.options ++ o.cliOptions
+    val jsOpts = resolveJsOpts(directives, o)
+    def link(progArgs: List[String]) = buildJs(expanded, progArgs, explicitMainClass, extraClasspath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts, o.watch)
+    mode match
+      case "run" =>
+        // Scala.js has no process arguments: they are linked into the program, so a `run` is a fresh link.
+        val (_, jsFile) = link(o.progArgs)
+        runInherited(jsRuntimeCommand() :+ jsFile.toString)
+      case "package" =>
+        val (mainClass, jsFile) = link(Nil)
+        val ext = jsFile.getFileName.toString.substring(jsFile.getFileName.toString.lastIndexOf('.'))
+        val out = Paths.get(o.out.getOrElse(mainClass.substring(mainClass.lastIndexOf('.') + 1) + ext))
+        if Files.isDirectory(out) then fail(s"output path '$out' is a directory")
+        copyJs(jsFile, out)
+        if !o.quiet then
+          val shown = if out.isAbsolute || out.startsWith("..") then out.toString else "./" + out
+          println(s"Wrote ${out.toAbsolutePath.normalize}, run it with\n  node $shown")
+        0
+      case "compile" =>
+        compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental, js = true)
+        0
+
+  // ---------------------------------------------------------------------
+  // `scalino test` on Scala.js. Same structure as the native pipeline (see the note above
+  // `readAllBytes`): find the sbt-testing Frameworks on the class path, run a probe program for their
+  // fingerprints, match the project's classes against them, generate a driver, run it. What differs:
+  //  - Scala.js jars have no class files, so the class hierarchy comes from `scalino-jslink --class-table`;
+  //  - the probe and the driver are JavaScript programs run by node;
+  //  - Scala.js frameworks are asynchronous (`Task.execute` with a continuation), and the driver exits
+  //    by setting `process.exitCode` once the last continuation has run;
+  //  - no `--test-only` link trimming: the linker only keeps what the driver reaches.
+  // ---------------------------------------------------------------------
+
+  /** Class name -> `ClassInfo` for every class in `entries` (directories and jars). The IR has no access
+   *  flags: everything is public, and `abstract` means "declares a method without a body". */
+  def jsClassTable(entries: List[String]): Map[String, ClassInfo] =
+    val (code, out) = runCaptureStdout(List(s"$dist/scalino-jslink", "--class-table") ++ entries)
+    if code != 0 then fail("could not read the class hierarchy of the test class path")
+    out.linesIterator.flatMap { line =>
+      line.split("\t", -1) match
+        case Array(name, kind, sup, ifaces, flags) =>
+          val fl = flags.split(",").toSet
+          val access = 0x0001 | (if kind == "interface" then 0x0200 else 0) | (if fl("abstract") then 0x0400 else 0)
+          Some(name -> ClassInfo(name, Option.when(sup != "-")(sup), if ifaces == "-" then Nil else ifaces.split(",").toList,
+            access, kind == "module", fl("noargctor")))
+        case _ => None
+    }.toMap
+
+  /** `findFrameworkClasses` over a class table. */
+  def findFrameworkClassesJs(table: Map[String, ClassInfo]): List[String] =
+    table.values.filter { info =>
+      !info.thisClass.contains("$") && (info.accessFlags & (0x0200 | 0x0400)) == 0 && info.hasPublicNoArgCtor &&
+        info.thisClass != sbtTestingFramework && isAssignableVia(info.thisClass, sbtTestingFramework, table.get)
+    }.map(_.thisClass).toList.sorted
+
+  /** `probeFingerprints`, with the probe compiled with -scalajs, linked by scalino-jslink and run on node. */
+  def probeFingerprintsJs(frameworkFqcns: List[String], testClasspath: String, cc: CompileClasspath, userClassesDir: Path, cacheDir: Path, logLevel: String): List[SubclassSpec] =
+    Files.createDirectories(cacheDir)
+    val key = "js-" + sanitizeKey(frameworkFqcns.sorted.mkString(",")) + "-" + hashKey(testClasspath)
+    val cacheFile = cacheDir.resolve(s"probe-$key.tsv")
+    if Files.exists(cacheFile) then parseProbeOutput(readFile(cacheFile))
+    else
+      val scratch = Paths.get(".scalino-build", "_scratch", "probe-js")
+      Files.createDirectories(scratch)
+      val probeSrc = scratch.resolve("ScalinoCliProbeMain.scala")
+      Files.write(probeSrc, probeSourceFor(frameworkFqcns).getBytes("UTF-8"))
+      val probeClasses = scratch.resolve("classes")
+      compileToClasses(List(probeSrc), probeClasses, cc.copy(compileCp = s"$userClassesDir$CP_SEP${cc.compileCp}"), Nil, true, js = true)
+      val jsFile = linkJs("ScalinoCliProbeMain", scratch.resolve("link"),
+        probeClasses.toString :: userClassesDir.toString :: testClasspath.split(CP_SEP).filter(_.nonEmpty).toList,
+        Nil, logLevel, JsOpts(sourceMaps = false))
+      val (exit, out) = runCaptureStdout(jsRuntimeCommand() :+ jsFile.toString)
+      if exit != 0 then fail("test-framework probe failed to run")
+      Files.write(cacheFile, out.getBytes("UTF-8"))
+      parseProbeOutput(out)
+
+  /** The JavaScript counterpart of `generateTestMain`: one `Framework` per distinct framework class, a
+   *  `TaskDef` per discovered suite, tasks run through the asynchronous `execute` until none are left. */
+  def generateTestMainJs(matches: List[TestMatch]): String =
+    val groups = matches.groupBy(_.frameworkFqcn).toList.zipWithIndex.map { case ((fqcn, ms), idx) =>
+      val taskDefs = ms.map { m =>
+        s"""        new sbt.testing.TaskDef(${'"'}${m.className}${'"'}, pick(${'"'}${m.superclassName}${'"'}, ${m.isModule}), false, Array(new sbt.testing.SuiteSelector))"""
+      }.mkString(",\n")
+      s"""      (next: () => Unit) =>
+         |        val fw: sbt.testing.Framework = new $fqcn()
+         |        val fps = fw.fingerprints()
+         |        def pick(superclassName: String, isModule: Boolean): sbt.testing.Fingerprint =
+         |          fps.collectFirst { case s: sbt.testing.SubclassFingerprint if s.superclassName() == superclassName && s.isModule() == isModule => s }.get
+         |        val taskDefs: Array[sbt.testing.TaskDef] = Array(
+         |$taskDefs
+         |        )
+         |        val runner = fw.runner(args, Array.empty[String], null)
+         |        runTasks(runner.tasks(taskDefs), () => {
+         |          val summary = runner.done()
+         |          if summary != null && summary.nonEmpty then println(summary)
+         |          next()
+         |        })""".stripMargin
+    }.mkString(",\n")
+
+    s"""import scala.scalajs.js
+       |
+       |object ScalinoCliTestMain:
+       |  def main(args: Array[String]): Unit =
+       |    val process = js.Dynamic.global.process
+       |    def env(name: String): Option[String] = process.env.selectDynamic(name).asInstanceOf[js.UndefOr[String]].toOption
+       |    // Same NO_COLOR/CLICOLOR_FORCE/TERM=dumb/isatty convention as scalino itself (cli/ScalinoCli.scala's Color).
+       |    val colorOn =
+       |      env("NO_COLOR").isEmpty &&
+       |      ((env("CLICOLOR_FORCE").exists(_ != "0")) ||
+       |       (!env("TERM").contains("dumb") && process.stdout.isTTY.asInstanceOf[js.UndefOr[Boolean]].getOrElse(false)))
+       |    def paint(code: String, s: String): String = if colorOn then code + s + "\\u001b[0m" else s
+       |    def red(s: String): String = paint("\\u001b[1;31m", s)
+       |    def green(s: String): String = paint("\\u001b[1;32m", s)
+       |
+       |    val logger = new sbt.testing.Logger:
+       |      def ansiCodesSupported(): Boolean = false
+       |      def error(msg: String): Unit = System.err.println(msg)
+       |      def warn(msg: String): Unit = System.err.println(msg)
+       |      def info(msg: String): Unit = println(msg)
+       |      def debug(msg: String): Unit = ()
+       |      def trace(t: Throwable): Unit = t.printStackTrace()
+       |    val loggers = Array[sbt.testing.Logger](logger)
+       |
+       |    var passed = 0
+       |    var failed = 0
+       |    var errored = 0
+       |    var skipped = 0
+       |    val handler = new sbt.testing.EventHandler:
+       |      def handle(e: sbt.testing.Event): Unit =
+       |        e.status() match
+       |          case sbt.testing.Status.Success => passed += 1
+       |          case sbt.testing.Status.Failure =>
+       |            failed += 1
+       |            println(red("FAILED: " + e.fullyQualifiedName()))
+       |            if e.throwable().isDefined() then e.throwable().get().printStackTrace()
+       |          case sbt.testing.Status.Error =>
+       |            errored += 1
+       |            println(red("ERROR: " + e.fullyQualifiedName()))
+       |            if e.throwable().isDefined() then e.throwable().get().printStackTrace()
+       |          case sbt.testing.Status.Skipped | sbt.testing.Status.Ignored | sbt.testing.Status.Pending | sbt.testing.Status.Canceled =>
+       |            skipped += 1
+       |
+       |    // Runs `tasks`, then the tasks they return, and so on; `done` after the last one.
+       |    def runTasks(tasks: Array[sbt.testing.Task], done: () => Unit): Unit =
+       |      if tasks.isEmpty then done()
+       |      else
+       |        var pending = tasks.length
+       |        val following = scala.collection.mutable.ArrayBuffer.empty[sbt.testing.Task]
+       |        for t <- tasks do
+       |          t.execute(handler, loggers, (more: Array[sbt.testing.Task]) => {
+       |            following ++= more
+       |            pending -= 1
+       |            if pending == 0 then runTasks(following.toArray, done)
+       |          })
+       |
+       |    def finish(): Unit =
+       |      val summaryLine = "scalino: " + passed + " passed, " + failed + " failed, " + errored + " errored, " + skipped + " skipped"
+       |      println(if failed > 0 || errored > 0 then red(summaryLine) else green(summaryLine))
+       |      if failed > 0 || errored > 0 then process.exitCode = 1
+       |
+       |    def runGroups(groups: List[(() => Unit) => Unit]): Unit = groups match
+       |      case Nil => finish()
+       |      case group :: rest => group(() => runGroups(rest))
+       |
+       |    runGroups(List(
+       |$groups
+       |    ))
+       |""".stripMargin
+
+  def testJs(expanded: List[Path], o: RunOpts, directives: Directives): Int =
+    val repos = (directives.repositories ++ o.cliRepositories).distinct
+    val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
+    // One resolution for main and test dependencies: resolved apart, a framework's own (older) Scala 3
+    // and Scala.js libraries would sit next to ours on the class path.
+    val testDeps = (jsBaseDeps ++ directives.deps ++ o.cliDeps ++ directives.testDeps).distinct
+    val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
+    val testClasspath = (List(resolveJsDeps(testDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+    val options = directives.options ++ o.cliOptions ++ directives.testOptions
+    val jsOpts = resolveJsOpts(directives, o)
+    val cc = computeJsCompileClasspath(testClasspath, extraCompileOnlyClasspath)
+
+    // Pass 1: the project's own sources, to scan before the driver (which names those classes) exists.
+    val classesDir = Paths.get(".scalino-build", "_scratch", "test-classes-js")
+    compileToClasses(expanded, classesDir, cc, options, !o.noIncremental, js = true)
+
+    val testJars = testClasspath.split(CP_SEP).filter(_.nonEmpty).toList
+    val table = jsClassTable(classesDir.toString :: testJars)
+    val explicitFramework = o.testFrameworkOpt.orElse(directives.testFramework)
+    val frameworkFqcns = explicitFramework.map(List(_)).getOrElse(findFrameworkClassesJs(table))
+    if frameworkFqcns.isEmpty then
+      fail("no test framework found on the classpath -- add a `//> using test.dep \"org::name::version\"` for " +
+        "a framework with a Scala.js port (e.g. munit, utest, scalatest, zio-test-sbt), or pass --test-framework <class>")
+
+    val specs = probeFingerprintsJs(frameworkFqcns, testClasspath, cc, classesDir, Paths.get(".scalino-build").resolve("test-probe-cache"), o.logLevel)
+    if specs.isEmpty then
+      fail(s"${frameworkFqcns.mkString(", ")}: no SubclassFingerprint reported -- annotation-based (JUnit4-style) test discovery isn't supported")
+
+    val local = jsClassTable(List(classesDir.toString)).values.toList
+    val discovered = matchTestClasses(local, specs, table.get)
+    val matches = o.testOnly match
+      case Some(glob) =>
+        val re = globToRegex(glob)
+        discovered.filter(m => re.matches(m.className))
+      case None => discovered
+    if matches.isEmpty then
+      if !o.quiet then
+        val why = if discovered.isEmpty then "no tests found" else s"no test class matches --test-only ${o.testOnly.get}"
+        println(Color.action(s"scalino: $why", System.out))
+      if discovered.isEmpty || o.testOnly.isEmpty then 0 else 1
+    else
+      val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
+      Files.write(driverSrc, generateTestMainJs(matches).getBytes("UTF-8"))
+      // The framework's arguments (`--tests=...`) are the driver's `args`, linked in like any Scala.js program's.
+      val (_, jsFile) = buildJs(expanded :+ driverSrc, o.progArgs, Some("ScalinoCliTestMain"), testClasspath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts)
+      runInherited(jsRuntimeCommand() :+ jsFile.toString)
+
+  // ---------------------------------------------------------------------
   // CLI surface, scala-cli-shaped:
   //   scalino <sources...>                       run (default command, like
   //                                            `scala-cli Foo.scala`)
@@ -2469,7 +3007,7 @@ object ScalinoCli:
   // ---------------------------------------------------------------------
 
   def printVersion(): Unit =
-    println(s"scalino ${BuildInfo.scalinoVersion} -- Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}")
+    println(s"scalino ${BuildInfo.scalinoVersion} -- Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}, Scala.js ${BuildInfo.scalaJsVersion}")
 
   private def oMain: String =
     s"""|  --main-class <name>        explicit entry point (skips auto-detection)
@@ -2638,6 +3176,21 @@ object ScalinoCli:
        |                                  faster iterative builds or clearer debug binaries)
        |""".stripMargin
 
+  private def jsHeader: String =
+    """|Scala.js options (no JVM: dotc -scalajs, then scalino-jslink; run with node):
+       |  --js                      build for Scala.js, `//> using platform js`
+       |  --platform scala-js|scala-native   same as --js / --native
+       |  --js-mode dev|release     fastLinkJS (default), or fullLinkJS: optimizer + minifier
+       |  --js-module-kind <kind>   commonjs/common, esmodule/es (writes .mjs) or nomodule/none (default)
+       |  --js-emit-source-maps     emit source maps (off by default)
+       |  --js-no-opt               no optimizer, even with --js-mode release
+       |  --js-check-ir  --js-header <text>  --js-es-version <es2015...es2021>
+       |  --js-avoid-classes  --js-avoid-lets-and-consts  --js-allow-big-ints-for-longs
+       |  --js-runtime node|deno|bun  what `run` and `test` execute the program with
+       |  `org::name::version` dependencies resolve to `name_sjs1_3`; `package -o app.js` copies the bundle.
+       |  `test` and `setup-ide` work too (test frameworks need a Scala.js port). Not supported yet: --format.
+       |""".stripMargin
+
   private def directivesBlock: String =
     s"""|directives (in source files), one per line -- `dep`/`options`/etc also
        |accept scala-cli's own longer spellings (`dependency`/`scalacOption`/...):
@@ -2679,6 +3232,17 @@ object ScalinoCli:
        |  //> using nativeHeapHistogram true   (live-heap histogram GC debug dump; off by default, adds ~7.5MB to binary)
        |  //> using nativeDebugInfo true   (source-level debug info; off by default)
        |  //> using nativeOptimize false   (Interflow NIR optimizer; on by default)
+       |  //> using jsClient ../client         (a Scala.js project, built to a browser script and embedded in this
+       |                                             binary as resource /client/main.js; relative to this file, and
+       |                                             not compiled into this project)
+       |  //> using shared ../shared           (sources, files or directories, compiled into this project and
+       |                                             its jsClient; relative to this file, else to the cwd)
+       |  //> using platform js                (Scala.js instead of Scala Native)
+       |  //> using jsMode release             (dev|release)
+       |  //> using jsModuleKind esmodule      (commonjs|esmodule|nomodule)
+       |  //> using jsEmitSourceMaps true       (also jsNoOpt, jsCheckIr, jsHeader, jsEsVersionStr, jsAvoidClasses,
+       |                                             jsAvoidLetsAndConsts, jsAllowBigIntsForLongs)
+       |  //> using target.platform scala-js     (this file is only compiled for that platform)
        |""".stripMargin
 
   private def testNote: String =
@@ -2851,16 +3415,16 @@ object ScalinoCli:
         head("scalino run <sources...> [options] [-- <program args>]", "Compile and run.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
           opts(oMain + common + oWatch + oProgArgs) +
-          nativeHeader + nativeOpts + "\n" + directivesBlock
+          nativeHeader + nativeOpts + "\n" + jsHeader + "\n" + directivesBlock
       case "compile" =>
         head("scalino compile [options]", "Compile only, no link (see build output), the current directory by default.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
-          opts(common + oWatch) + directivesBlock
+          opts(common + oWatch) + jsHeader + "\n" + directivesBlock
       case "package" =>
         head("scalino package <sources...> -o <out> [--format <formats>] [options]", "Compile and link a native binary, or package it (deb, rpm, docker, tar, brew).") +
           sourcesNote + "\n" + incrementalNote + "\n" +
           opts(oMain + common + oOut + oPackage + oWatch) +
-          nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + packageDirectivesBlock
+          nativeHeader + nativeOpts + "\n" + jsHeader + "\n" + directivesBlock + "\n" + packageDirectivesBlock
       case "test" =>
         head("scalino test [options] [-- <framework args>]", "Compile and run tests in the current directory.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
@@ -2940,7 +3504,19 @@ object ScalinoCli:
     formats: List[String] = Nil,
     pkgName: Option[String] = None,
     pkgVersion: Option[String] = None,
-    releaseUrl: Option[String] = None
+    releaseUrl: Option[String] = None,
+    cliPlatform: Option[String] = None,
+    cliJsModuleKind: Option[String] = None,
+    cliJsMode: Option[String] = None,
+    cliJsSourceMaps: Option[Boolean] = None,
+    cliJsNoOpt: Boolean = false,
+    cliJsCheckIr: Boolean = false,
+    cliJsHeader: Option[String] = None,
+    cliJsEsVersion: Option[String] = None,
+    cliJsAvoidClasses: Boolean = false,
+    cliJsAvoidLetsAndConsts: Boolean = false,
+    cliJsAllowBigInts: Boolean = false,
+    cliJsRuntime: Option[String] = None
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (raw
     // clang/linker invocations, NativeConfig dumps), the default ("info")
@@ -2977,6 +3553,28 @@ object ScalinoCli:
         case "--test-only" => o = o.copy(testOnly = Some(args(i + 1))); i += 1
         case "--no-incremental" => o = o.copy(noIncremental = true)
         case "--offline" => offlineMode = true
+        case "--js" => o = o.copy(cliPlatform = Some("js"))
+        case "--native" => o = o.copy(cliPlatform = Some("native"))
+        case "--platform" => o = o.copy(cliPlatform = Some(args(i + 1))); i += 1
+        case "--js-mode" => o = o.copy(cliJsMode = Some(args(i + 1))); i += 1
+        case "--js-module-kind" => o = o.copy(cliJsModuleKind = Some(args(i + 1))); i += 1
+        case "--js-emit-source-maps" => o = o.copy(cliJsSourceMaps = Some(true))
+        case f if f.startsWith("--js-emit-source-maps=") =>
+          val v = f.drop("--js-emit-source-maps=".length)
+          if (v != "true" && v != "false") die(s"--js-emit-source-maps=$v: expected true or false")
+          o = o.copy(cliJsSourceMaps = Some(v == "true"))
+        case "--js-no-opt" => o = o.copy(cliJsNoOpt = true)
+        case "--js-check-ir" => o = o.copy(cliJsCheckIr = true)
+        case "--js-header" => o = o.copy(cliJsHeader = Some(args(i + 1))); i += 1
+        case "--js-es-version" => o = o.copy(cliJsEsVersion = Some(args(i + 1))); i += 1
+        case "--js-avoid-classes" => o = o.copy(cliJsAvoidClasses = true)
+        case "--js-avoid-lets-and-consts" => o = o.copy(cliJsAvoidLetsAndConsts = true)
+        case "--js-allow-big-ints-for-longs" => o = o.copy(cliJsAllowBigInts = true)
+        case "--js-runtime" => o = o.copy(cliJsRuntime = Some(args(i + 1))); i += 1
+        case "--js-version" =>
+          die("--js-version is not supported -- this toolchain only ever targets the one pinned Scala.js version it was built for")
+        case f @ ("--js-dom" | "--js-emit-wasm" | "--js-module-split-style" | "--js-small-module-for-package" | "--js-es-module-import-map" | "--js-source-maps-path") =>
+          die(s"$f is not supported")
         case "--native-version" =>
           die("--native-version is not supported -- this toolchain only ever targets the one pinned scala-native version it was built for")
         case "--native-mode" => o = o.copy(cliNativeMode = Some(args(i + 1))); i += 1
@@ -3050,22 +3648,33 @@ object ScalinoCli:
    *  and for `run` also executes the result. Throws BuildFailed on any
    *  recoverable failure -- never calls `die`/`sys.exit` directly, so a
    *  watch-mode caller can catch it and keep watching. */
-  def buildAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts): Int =
-    val directives = parseDirectives(expanded)
+  def buildAndMaybeRun(mode: String, expandedIn: List[Path], o: RunOpts): Int =
+    val directives0 = parseDirectives(expandedIn)
+    // `//> using target.platform` files drop out for the other platform (the platform itself comes from the rest)
+    val expanded = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
+    val directives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
     directives.scalaVersion.orElse(o.cliScala).foreach { v =>
       if !BuildInfo.scalaVersion.startsWith(v) then
         System.err.println(
           Color.warn(s"scalino: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring")
         )
     }
+    jsPlatform = resolvePlatform(directives, o) == "js"
+    jsRuntime = o.cliJsRuntime.getOrElse("node")
+    if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives)
+    if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
+    // `compile` only type-checks the server: it doesn't need the bundle.
+    val clientResources = if mode == "compile" then Nil else directives.jsClients.map(buildJsClient(_, directives.shared, o, forPackage = mode == "package"))
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs ++ clientResources.map(_.toString)).filter(_.nonEmpty).mkString(CP_SEP)
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
-    val nativeOpts0 = resolveNativeOpts(directives, o)
+    val nativeOpts0 =
+      val n = resolveNativeOpts(directives, o)
+      if clientResources.nonEmpty then n.copy(embedResources = true) else n
     // Cross targets need a sysroot each: the one given, else the installed one.
     val nativeOpts =
       if mode == "package" && nativeOpts0.targetTriples.nonEmpty then
@@ -3178,7 +3787,9 @@ object ScalinoCli:
     if o.watch then
       def resolve() =
         val srcs = try partitionSources(expandSources(o.sources.filter(Files.exists(_))))._1 catch case _: java.io.IOException => Nil
-        (srcs, expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)).filter(Files.exists(_))))
+        // the sources of a `jsClient` are not in `srcs` (they are another project) but a change rebuilds the server too
+        val clients = try parseDirectives(srcs).jsClients.map(Paths.get(_)).filter(Files.exists(_)) catch case _: java.io.IOException => Nil
+        (srcs, expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)).filter(Files.exists(_)) ++ clients))
       watchLoop(resolve) { current =>
         try buildAndMaybeRun(mode, current, o)
         catch case BuildFailed(msg) => reportBuildFailure(msg)
@@ -3199,8 +3810,13 @@ object ScalinoCli:
     val expanded = expandSources(o.sources)
     if expanded.isEmpty then die("no .scala files found")
 
-    def attempt(expanded: List[Path]): Int =
-      val directives = parseDirectives(expanded)
+    def attempt(expandedIn: List[Path]): Int =
+      val directives0 = parseDirectives(expandedIn)
+      val expanded = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
+      val directives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
+      jsPlatform = resolvePlatform(directives, o) == "js"
+      jsRuntime = o.cliJsRuntime.getOrElse("node")
+      if jsPlatform then return testJs(expanded, o, directives)
       directives.scalaVersion.orElse(o.cliScala).foreach { v =>
         if !BuildInfo.scalaVersion.startsWith(v) then
           System.err.println(
@@ -3327,10 +3943,11 @@ object ScalinoCli:
     // classpath and compiler arguments, no change to the format or to
     // scalino-lsp's per-project routing.
     val mainDirectives = parseDirectives(expanded)
+    jsPlatform = resolvePlatform(mainDirectives, o) == "js"
     val allDirectives = if testSources.isEmpty then mainDirectives else parseDirectives(allExpanded)
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
     val repos = (allDirectives.repositories ++ mainDirectives.repositories ++ o.cliRepositories).distinct
-    val mainDeps = (mainDirectives.deps ++ o.cliDeps).distinct
+    val mainDeps = ((if jsPlatform then jsBaseDeps else Nil) ++ mainDirectives.deps ++ o.cliDeps).distinct
     val testDeps = (allDirectives.testDeps ++ mainDirectives.testDeps).distinct
     val compileOnlyDeps = (mainDirectives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct
     val extraCompileOnlyClasspath = resolveDeps(compileOnlyDeps, depsCache, repos)
@@ -3347,20 +3964,23 @@ object ScalinoCli:
     def project(
         id: String, dependsOn: List[String], sources: List[Path], classpathParts: List[String], options: List[String]
     ): String =
-      val cc = computeCompileClasspath(classpathParts.filter(_.nonEmpty).mkString(CP_SEP), extraCompileOnlyClasspath)
-      val compilerArguments = List("-javabootclasspath", cc.javaBase, "-Yretain-trees") ++ javalibTastyOptions ++ options
+      val cpArg = classpathParts.filter(_.nonEmpty).mkString(CP_SEP)
+      val cc = if jsPlatform then computeJsCompileClasspath(cpArg, extraCompileOnlyClasspath) else computeCompileClasspath(cpArg, extraCompileOnlyClasspath)
+      // `-scalajs` makes the interactive compiler use SJSPlatform (js.| pseudo-unions, JS SAMs, ...).
+      val compilerArguments = List("-javabootclasspath", cc.javaBase) ++ (if jsPlatform then List("-scalajs") else Nil) ++
+        List("-Yretain-trees") ++ javalibTastyOptions ++ options
       val sourceDirectories = sources.map(_.toAbsolutePath.getParent.toString).distinct.sorted
       val dependencyClasspath = cc.compileCp.split(CP_SEP).filter(_.nonEmpty).toList
       s"""  {
          |    "id": ${jsonStr(id)},
-         |    "platform": "native",
+         |    "platform": ${jsonStr(if jsPlatform then "js" else "native")},
          |    "dependsOn": ${jsonArr(dependsOn)},
          |    "compilerArguments": ${jsonArr(compilerArguments)},
          |    "sourceDirectories": ${jsonArr(sourceDirectories)},
          |    "dependencyClasspath": ${jsonArr(dependencyClasspath)}
          |  }""".stripMargin
 
-    val mainCp = resolveDeps(mainDeps, depsCache, repos)
+    val mainCp = if jsPlatform then resolveJsDeps(mainDeps, depsCache, repos) else resolveDeps(mainDeps, depsCache, repos)
     val mainProject = project(
       "main", Nil, expanded,
       List(mainCp) ++ mainDirectives.jars ++ mainDirectives.resourceDirs,
@@ -3370,14 +3990,27 @@ object ScalinoCli:
       else
         // Same classpath handleTest compiles tests with: main's, plus
         // test.dep, plus the test sources' own jars/resources.
-        val testCp = List(
-          resolveDeps((allDirectives.deps ++ o.cliDeps).distinct, depsCache, repos),
-          resolveDeps(testDeps, depsCache, repos)) ++ allDirectives.jars ++ allDirectives.resourceDirs
+        val testCp =
+          if jsPlatform then List(resolveDeps((jsBaseDeps ++ allDirectives.deps ++ o.cliDeps ++ testDeps).distinct, depsCache, repos)) ++ allDirectives.jars ++ allDirectives.resourceDirs
+          else List(
+            resolveDeps((allDirectives.deps ++ o.cliDeps).distinct, depsCache, repos),
+            resolveDeps(testDeps, depsCache, repos)) ++ allDirectives.jars ++ allDirectives.resourceDirs
         List(
           mainProject,
           project("test", List("main"), testSources, testCp,
             allDirectives.options ++ o.cliOptions ++ allDirectives.testOptions))
-    val json = projects.mkString("[\n", ",\n", "\n]\n")
+    // A `jsClient` is a Scala.js project of its own: its sources plus the shared ones, its own class path.
+    val clientProjects = mainDirectives.jsClients.map { dir =>
+      val saved = jsPlatform
+      jsPlatform = true
+      try
+        val (clientSources, _) = partitionSources(forPlatform(expandSources(Paths.get(dir) :: mainDirectives.shared.map(Paths.get(_))), "js"))
+        val cd = parseDirectives(clientSources)
+        val cp = resolveJsDeps((jsBaseDeps ++ cd.deps).distinct, depsCache, repos)
+        project("client", Nil, clientSources, List(cp) ++ cd.jars ++ cd.resourceDirs, cd.options ++ o.cliOptions)
+      finally jsPlatform = saved
+    }
+    val json = (projects ++ clientProjects).mkString("[\n", ",\n", "\n]\n")
 
     // Lives inside .scalino-build/ (patches/scala3-0015 moves scalino-lsp's
     // own DottyLanguageServer.IDE_CONFIG_FILE to match) rather than at the
@@ -3426,6 +4059,8 @@ object ScalinoCli:
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
+    "--js --native --platform --js-mode --js-module-kind --js-emit-source-maps --js-no-opt --js-check-ir --js-header --js-es-version " +
+    "--js-avoid-classes --js-avoid-lets-and-consts --js-allow-big-ints-for-longs --js-runtime " +
     "--formats --package-name --package-version -h --help"
 
   private def bashCompletion: String =
