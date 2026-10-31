@@ -114,7 +114,7 @@ scalino package examples/Hello.scala -o hello && ./hello
 |---|---|
 | `run` (default) | compile, link and run |
 | `compile` | compile only, no link |
-| `package` | link a native binary; `--format` also wraps it as a deb/rpm/tar/docker/brew package ([Packaging](#packaging)) |
+| `package` | link a native binary (or, with `--js`, a JavaScript bundle); `--format` also wraps it as a deb/rpm/tar/docker/brew package ([Packaging](#packaging)) |
 | `test` | compile main + test scope, run the tests |
 | `setup-ide` | write the LSP config ([Editor support](#editor-support)) |
 | `lock` | write `scalino.lock.json` ([Hermetic builds](#hermetic--nix-builds)) |
@@ -136,6 +136,10 @@ scalino package examples/Hello.scala -o hello && ./hello
   //> using options -Wunused:all -deprecation
   //> using nativeMode release-fast
   ```
+- **Scala.js:** add `//> using platform js` (or pass `--js`) and the same
+  sources build for Scala.js, with no JVM: `dotc -scalajs`, then
+  `scalino-jslink`. `run` and `test` execute the output with `node`
+  (`--js-runtime node|deno|bun`). See [Scala.js](#scalajs).
 - **Debug info:** binaries are built without source-level debug info (DWARF).
   Opt in with `--native-debug-info` or `//> using nativeDebugInfo true` when
   you want lldb/gdb or profilers to show Scala sources and lines.
@@ -148,6 +152,53 @@ scalino package examples/Hello.scala -o hello && ./hello
   cached in `.scalino-build/`.
 
 `scalino --help` and `scalino <command> --help` list every flag and directive.
+
+## Scala.js
+
+Scala.js is a second target next to Scala Native, with scala-cli's flags and
+defaults (plain script, no source maps). The compiler is `dotc -scalajs` and
+the linker is `scalino-jslink`, the Scala.js linker compiled to Scala Native,
+so there is no JVM and no C toolchain involved. You only need `node` (or
+`deno`/`bun`) to run the result.
+
+```sh
+scalino run --js Hello.scala                                  # or //> using platform js
+scalino test --js                                             # munit etc. on node
+scalino package --js --js-mode release -o app.js Hello.scala  # fullLinkJS: optimizer + minifier
+scalino package --js --js-module-kind esmodule -o app.mjs
+```
+
+| flag | directive | does |
+|---|---|---|
+| `--js`, `--platform scala-js` | `platform js` | build for Scala.js |
+| `--js-mode dev\|release` | `jsMode` | `fastLinkJS` (default) or `fullLinkJS` |
+| `--js-module-kind <kind>` | `jsModuleKind` | `commonjs`, `esmodule` (writes `.mjs`) or `nomodule` (default) |
+| `--js-emit-source-maps` | `jsEmitSourceMaps` | emit source maps (off by default) |
+| `--js-runtime node\|deno\|bun` | | what `run` and `test` execute with |
+
+`--js-no-opt`, `--js-es-version` and a few other linker flags are listed in
+`scalino run --help`.
+
+- **Dependencies:** `//> using dep org::name::version` resolves to the
+  `_sjs1_3` artifact. The Scala.js base libraries ship with scalino, so plain
+  programs build offline.
+- **Watch mode:** `-w` keeps one linker process alive between rebuilds.
+- **Tests:** frameworks need a Scala.js port (munit, utest, ...).
+- **Editor:** `scalino setup-ide` adds Scala.js projects to the LSP config.
+- **Not supported yet:** `package --format`.
+
+### Server and client without a JVM
+
+A Scala Native server can embed a Scala.js frontend:
+
+```scala
+//> using jsClient ../client   // a Scala.js project
+//> using shared ../shared     // sources compiled into both sides
+```
+
+`scalino run` builds the client and embeds it in the server binary as the
+resource `/client/main.js`; `scalino package` links it in release mode. See
+[`examples/client-server`](examples/client-server).
 
 ## Editor support
 
@@ -185,6 +236,7 @@ What's verified to work:
 
 Known gaps:
 
+- **Scala.js `package --format`.** Deb/rpm/docker/brew wrapping is Native only.
 - **JUnit-style `@Test` discovery.** Test frameworks have to use
   `SubclassFingerprint`, which munit, utest, scalatest and zio-test-sbt all do.
 - **Windows** is experimental.

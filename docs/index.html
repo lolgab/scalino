@@ -161,6 +161,7 @@
       <a href="#install">Install</a>
       <a href="#action">In action</a>
       <a href="#benefits">Benefits</a>
+      <a href="#scalajs">Scala.js</a>
       <a href="#ship">Ship</a>
       <a href="#hermetic">Nix</a>
       <a href="#editors">Editors</a>
@@ -239,6 +240,7 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
     <button class="tab" data-panel="a-deps">Dependencies</button>
     <button class="tab" data-panel="a-watch">Watch mode</button>
     <button class="tab" data-panel="a-test">Tests</button>
+    <button class="tab" data-panel="a-js">Scala.js</button>
     <button class="tab" data-panel="a-compile">Build a binary</button>
     <button class="tab" data-panel="a-cross">Cross-compile</button>
     <button class="tab" data-panel="a-pkg">Package</button>
@@ -277,6 +279,11 @@ sudo apt install ./scalino_X.Y.Z_amd64.deb
 scalino test
 scalino test --test-only <span class="st">"*MySuite*"</span></pre>
       <div class="note">Finds munit, utest, scalatest and zio-test automatically. <code class="mono">--test-only &lt;glob&gt;</code> links only the selected test classes, so the rest never reach the binary.</div></div>
+
+    <div class="panel" id="a-js"><pre><span class="cm">//&gt; using platform js</span>
+
+<span class="kw">@main def</span> hello() = println(<span class="st">"hello from Scala.js"</span>)</pre>
+      <div class="note">$ scalino   <span class="cm">— or pass <code class="mono">--js</code>. No JVM: <code class="mono">dotc -scalajs</code>, then <code class="mono">scalino-jslink</code>; runs on node, deno or bun. <code class="mono">--js-mode release</code> for the optimizer and minifier, <code class="mono">--js-module-kind esmodule</code> for modules.</span></div></div>
 
     <div class="panel" id="a-compile"><pre>scalino package -o hello
 ./hello</pre>
@@ -320,12 +327,36 @@ scalino package --format brew --release-url https://github.com/me/app/releases/d
     <div class="benefit"><div class="icon">→</div>
       <h3>Cross-compile from anywhere</h3>
       <p>Build for Linux (musl and glibc), macOS and Windows from one machine with <code class="mono">--native-target-triple</code>. Sysroots are assembled client-side from pinned upstream packages.</p></div>
+    <div class="benefit"><div class="icon">JS</div>
+      <h3>Scala.js, also without a JVM</h3>
+      <p><code class="mono">--js</code> builds the same sources for the browser or node with a Scala.js linker compiled to Scala Native. A native server can embed its Scala.js client in one binary.</p></div>
     <div class="benefit"><div class="icon">▣</div>
       <h3>Ship it packaged</h3>
       <p><code class="mono">scalino package --format</code> emits tar, deb, rpm, docker and Homebrew artifacts — no extra packaging tools.</p></div>
     <div class="benefit"><div class="icon">$</div>
       <h3>Familiar by design</h3>
       <p>A mini scala-cli, shaped like the real one on purpose — same directives, same flags, same instinct for finding your entry point.</p></div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="scalajs" class="wrap">
+  <p class="eyebrow">Scala.js</p>
+  <h2>Native server, Scala.js client, one binary.</h2>
+  <p class="section-sub">Scala.js is a second target, with scala-cli's flags and defaults. The linker
+    (<code class="mono">scalino-jslink</code>) is the Scala.js linker compiled to Scala Native, so there is no JVM and
+    no C toolchain, only <code class="mono">node</code> to run the output. <code class="mono">run</code>,
+    <code class="mono">test</code>, <code class="mono">package</code>, <code class="mono">lock</code>, watch mode and
+    <code class="mono">setup-ide</code> all work.</p>
+  <div class="panelwrap">
+    <div class="panel-head"><span>scala</span><span>server/Server.scala</span></div>
+    <div class="panel active"><pre><span class="cm">//&gt; using jsClient ../client</span>   <span class="cm">// a Scala.js project</span>
+<span class="cm">//&gt; using shared ../shared</span>     <span class="cm">// sources compiled into both sides</span>
+
+<span class="cm">// serve the client as the embedded resource /client/main.js</span>
+<span class="kw">val</span> js = getClass.getResourceAsStream(<span class="st">"/client/main.js"</span>)</pre>
+      <div class="note">$ scalino run server   <span class="cm">— builds the client and embeds it in the server binary. <code class="mono">scalino package</code> links it in release mode.</span></div></div>
   </div>
 </section>
 
@@ -406,6 +437,7 @@ scalino.lib.${system}.mkScalinoApp {
         <li><code class="mono">scalino-lsp</code>: diagnostics, completion, hover, go-to-definition, type definition, references, rename, inlay hints, semantic tokens, code actions</li>
         <li>Direct LLVM codegen, incremental compile and link, 4-byte object headers, all on by default</li>
         <li><code class="mono">run</code>, <code class="mono">test</code>, <code class="mono">package</code>, <code class="mono">lock</code>, <code class="mono">--offline</code>, shell completions</li>
+        <li>Scala.js target (<code class="mono">--js</code>) with <code class="mono">run</code>, <code class="mono">test</code>, <code class="mono">package</code>, watch mode, and <code class="mono">jsClient</code> embedding in a native server</li>
         <li>Cross-compilation to Linux, macOS and Windows targets; <code class="mono">package --format</code> for tar, deb, rpm, docker, brew</li>
         <li>Escape analysis with stack-allocated objects, link-time method pruning, and an evacuating GC that returns memory to the OS</li>
         <li>Watch mode that survives renames, deletes and failed links; stale outputs purged on incremental rebuilds</li>
@@ -416,6 +448,7 @@ scalino.lib.${system}.mkScalinoApp {
       <h3><span class="pill next">Next</span> Gaps still open</h3>
       <ul>
         <li>VS Code Marketplace listing</li>
+        <li><code class="mono">package --format</code> for Scala.js builds</li>
         <li>Windows is experimental (host builds and the mingw cross target)</li>
         <li>JUnit-style <code class="mono">@Test</code> discovery — frameworks must use <code class="mono">SubclassFingerprint</code> (munit, utest, scalatest, zio-test do)</li>
         <li>Broader third-party library coverage cross-published for scala-native</li>
