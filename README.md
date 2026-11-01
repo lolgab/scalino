@@ -49,7 +49,7 @@ The differences:
   `//> using jsClient ../client` (a Scala.js project) and
   `//> using shared ../shared` (sources compiled into both). `scalino run`
   builds the client and embeds it in the server binary as the resource
-  `/client/main.js`; `scalino package` links it in release mode. See
+  `/client/main.js`, linked with fastLinkJS (fullLinkJS in a `release-*` native mode). See
   [`examples/client-server`](examples/client-server).
 
 ## Install
@@ -197,7 +197,8 @@ A Scala Native server can embed a Scala.js frontend:
 ```
 
 `scalino run` builds the client and embeds it in the server binary as the
-resource `/client/main.js`; `scalino package` links it in release mode. See
+resource `/client/main.js`; the client is linked with fastLinkJS, or with fullLinkJS when the server is built
+with a `release-*` `--native-mode` / `nativeMode` (`--js-mode` overrides). See
 [`examples/client-server`](examples/client-server).
 
 To host the client yourself (FreeUnit's `share` action, nginx, a CDN) instead

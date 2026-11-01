@@ -356,7 +356,7 @@ scalino package --format brew --release-url https://github.com/me/app/releases/d
 
 <span class="cm">// serve the client as the embedded resource /client/main.js</span>
 <span class="kw">val</span> js = getClass.getResourceAsStream(<span class="st">"/client/main.js"</span>)</pre>
-      <div class="note">$ scalino run server   <span class="cm">— builds the client and embeds it in the server binary. <code class="mono">scalino package</code> links it in release mode.</span></div></div>
+      <div class="note">$ scalino run server   <span class="cm">— builds the client and embeds it in the server binary. linked with fastLinkJS, or fullLinkJS in a <code class="mono">release-*</code> native mode.</span></div></div>
   </div>
 </section>
 

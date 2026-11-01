@@ -2826,9 +2826,9 @@ object ScalinoCli:
   /** `//> using jsClient ../client`: the directory is a Scala.js project (its own `//> using` lines, its
    *  own entry point, plus the `//> using shared` sources of the project declaring it) built into a browser script and embedded in the server binary as the resource
    *  `/client/main.js` (+ `/client/main.js.map`). Linked as a classic script (`nomodule`) unless the client
-   *  says otherwise, and optimized when the server is being packaged. Returns the resource directory to put
+   *  says otherwise, and optimized (fullLinkJS) when the server is built in a `release-*` native mode, like Scala Native itself (`package` alone does not change it). Returns the resource directory to put
    *  on the server's class path. */
-  def buildJsClient(dir: String, shared: List[String], o: RunOpts, forPackage: Boolean, out: Option[String] = None): Option[Path] =
+  def buildJsClient(dir: String, shared: List[String], o: RunOpts, out: Option[String] = None, serverNativeMode: Option[String] = None): Option[Path] =
     val clientDir = Paths.get(dir)
     if !Files.isDirectory(clientDir) then fail(s"jsClient: '$dir' is not a directory")
     val (sources, _) = partitionSources(forPlatform(expandSources(clientDir :: shared.map(Paths.get(_))), "js"))
@@ -2842,7 +2842,7 @@ object ScalinoCli:
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
       val classpath = (List(resolveJsDeps((jsBaseDeps ++ d.deps).distinct, depsCache, repos)) ++ d.jars ++ d.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
       val compileOnly = resolveDeps(d.compileOnlyDeps.distinct, depsCache, repos)
-      val jsOpts = resolveJsOpts(d, o, defaultMode = if forPackage then "release" else "dev")
+      val jsOpts = resolveJsOpts(d, o, defaultMode = if serverNativeMode.exists(_.startsWith("release")) then "release" else "dev")
       val outDir = out.map(Paths.get(_))
       val (_, jsFile) = buildJs(sources, Nil, d.mainClass, classpath, d.options ++ o.cliOptions, compileOnly, o.logLevel, !o.noIncremental, jsOpts, o.watch, outDirOverride = outDir)
       outDir match
@@ -3766,7 +3766,7 @@ object ScalinoCli:
     if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives)
     if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
     // `compile` only type-checks the server: it doesn't need the bundle.
-    val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, forPackage = mode == "package", out = o.cliJsClientOut.orElse(directives.jsClientOut)))
+    val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = directives.nativeMode.orElse(o.cliNativeMode)))
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
@@ -3927,7 +3927,7 @@ object ScalinoCli:
       }
       if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
       // Same as `run`: the client is built (dev mode unless --js-mode says otherwise) and embedded, so tests can read /client/main.js.
-      val clientResources = directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, forPackage = false, out = o.cliJsClientOut.orElse(directives.jsClientOut)))
+      val clientResources = directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = directives.nativeMode.orElse(o.cliNativeMode)))
       val repos = (directives.repositories ++ o.cliRepositories).distinct
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)

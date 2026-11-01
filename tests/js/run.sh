@@ -177,4 +177,10 @@ node --input-type=module -e 'globalThis.document = { getElementById: () => ({ se
 expect "$(cat dom3.log)" "<h1>Hello, Scala.js!</h1><p>2, 4, 6</p>"
 if "$SCALINO" package server -q --js-module-split-style smallestmodules --js-module-kind esmodule -o app-bad >/dev/null 2>&1; then fail "a split jsClient must not be embedded"; fi
 
+echo "== the client follows the native mode: fastLinkJS by default, fullLinkJS in a release-* mode, --js-mode wins"
+cd "$WORK/cs"
+out="$("$SCALINO" package server --js-client-out "$WORK/cs-m1" -o app-m1 2>&1)"; expect "$out" "Linking project (Scala.js"; expect "$out" ", dev)"
+out="$("$SCALINO" package server --native-mode release-fast --js-client-out "$WORK/cs-m2" -o app-m2 2>&1)"; expect "$out" "Linking project (Scala.js"; expect "$out" ", release)"
+out="$("$SCALINO" package server --native-mode release-fast --js-mode dev --js-client-out "$WORK/cs-m3" -o app-m3 2>&1)"; expect "$out" ", dev)"
+
 echo "OK: Scala.js smoke tests passed"
