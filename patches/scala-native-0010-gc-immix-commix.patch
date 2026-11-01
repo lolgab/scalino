@@ -2769,13 +2769,25 @@ index 2a8a200b..ba663d72 100644
  
  #endif // IMMIX_COMMIX_OBJECT_H
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h
-index 3840546d..799c7eb6 100644
+index 3840546d..28599446 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h
-@@ -27,6 +27,47 @@ typedef struct {
-     void *xmm[16 * 2];
- } RegistersBuffer[1];
+@@ -12,7 +12,7 @@ typedef struct {
+     void *ebx;
+     void *edi;
+     void *esi;
+-} RegistersBuffer[1];
++} RegistersBuffer;
  
+ #elif defined(__x86_64__)
+ #define CAPTURE_X86_64
+@@ -25,7 +25,48 @@ typedef struct {
+     void *r14;
+     void *r15;
+     void *xmm[16 * 2];
+-} RegistersBuffer[1];
++} RegistersBuffer;
++
 +#elif (defined(__aarch64__) || defined(__arm64__)) && !defined(_WIN32)
 +// Not part of upstream scala-native. Without this, arm64/Apple Silicon (and
 +// any other non-Windows aarch64 target) had NO dedicated case here at all --
@@ -2816,10 +2828,9 @@ index 3840546d..799c7eb6 100644
 +    void *x28;
 +    void *fp; // x29
 +} RegistersBuffer;
-+
+ 
  #else
  #define CAPTURE_SETJMP
- #include <setjmp.h>
 @@ -46,7 +87,29 @@ typedef jmp_buf RegistersBuffer;
  #ifdef CAPTURE_SETJMP
  #define RegistersCapture(out) (void)setjmp(out);
