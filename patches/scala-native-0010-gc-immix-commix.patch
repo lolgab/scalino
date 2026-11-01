@@ -398,7 +398,7 @@ index d6113b3d..b7342450 100644
      BlockAllocator_AddFreeBlocks(allocator->blockAllocator, blockMeta, 1);
      ObjectMeta_ClearBlockAt(Bytemap_Get(allocator->bytemap, blockStart));
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
-index 7ecf8924..6003cf54 100644
+index 7ecf8924..3af7252b 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
 @@ -87,6 +87,9 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
@@ -461,7 +461,7 @@ index 7ecf8924..6003cf54 100644
      uint32_t unavailableBlockCount =
          blockCount - (freeBlockCount + recycledBlockCount);
  
-@@ -259,11 +284,105 @@ bool Heap_shouldGrow(Heap *heap) {
+@@ -259,11 +284,116 @@ bool Heap_shouldGrow(Heap *heap) {
                   usedLines, (uint64_t)blockCount * LINE_COUNT,
                   (usedLines * LINE_SIZE) >> 20);
  
@@ -513,8 +513,19 @@ index 7ecf8924..6003cf54 100644
 +    if (liveBytes != 0) {
 +        uint64_t heapBytes = (uint64_t)blockCount * BLOCK_TOTAL_SIZE;
 +        bool plentyLive = liveBytes * 100 > heapBytes * 40;
++        // The allocator keeps a reserve of whole free blocks for itself (see
++        // BlockAllocator_getFreeBlock) and overflow/large allocations need real
++        // free blocks beyond it: recycled blocks do not help them. Without this
++        // floor a fragmented heap with plenty of recycled space never grew and
++        // collected on every such allocation.
++        uint32_t reserve = blockCount / 64;
++        if (reserve < 2)
++            reserve = 2;
++        if (reserve > 128)
++            reserve = 128;
 +        bool starving =
-+            10 * (uint64_t)(freeBlockCount + recycledBlockCount) < blockCount;
++            10 * (uint64_t)(freeBlockCount + recycledBlockCount) < blockCount ||
++            freeBlockCount < 4 * reserve;
 +        GC_LOG_DEBUG("Live bytes: %llu of %llu heap bytes (%.1f%%), "
 +                     "grow: %d (plentyLive: %d, starving: %d)",
 +                     (unsigned long long)liveBytes,
@@ -567,7 +578,7 @@ index 7ecf8924..6003cf54 100644
  void Heap_Recycle(Heap *heap) {
      Block_recycledFreeLines = 0;
      MutatorThreads_foreach(mutatorThreads, node) {
-@@ -272,6 +391,7 @@ void Heap_Recycle(Heap *heap) {
+@@ -272,6 +402,7 @@ void Heap_Recycle(Heap *heap) {
          LargeAllocator_Clear(&thread->largeAllocator);
      }
      BlockAllocator_Clear(&blockAllocator);
@@ -575,7 +586,7 @@ index 7ecf8924..6003cf54 100644
  
      BlockMeta *current = (BlockMeta *)heap->blockMetaStart;
      word_t *currentBlockStart = heap->heapStart;
-@@ -301,9 +421,8 @@ void Heap_Recycle(Heap *heap) {
+@@ -301,9 +432,8 @@ void Heap_Recycle(Heap *heap) {
              // Keep the empty reserve out of the allocator while it is held.
              BlockAllocator_SweepDone(&blockAllocator);
          } else if (BlockMeta_IsSimpleBlock(current)) {
@@ -587,7 +598,7 @@ index 7ecf8924..6003cf54 100644
          } else if (BlockMeta_IsSuperblockStart(current)) {
              size = BlockMeta_SuperblockSize(current);
              MutatorThread *recycleBlocksTo = NextMutatorThread();
-@@ -339,6 +458,7 @@ void Heap_Recycle(Heap *heap) {
+@@ -339,6 +469,7 @@ void Heap_Recycle(Heap *heap) {
              }
          }
      }
