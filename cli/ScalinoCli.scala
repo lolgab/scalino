@@ -202,37 +202,88 @@ object ScalinoCli:
     extraEnv.foreach { case (k, v) => pb.environment().put(k, v) }
     pb.start().waitFor()
 
+  /** SIGINT/SIGTERM sent to scalino while `run -w` manages a program. The handler only records the signal
+   *  (all it may safely do); the watch loop notices within 50ms and calls `shutdownOnSignal`. */
+  object Signals:
+    @volatile var pending = 0
+    @volatile private var installed = false
+    private def record(sig: Int): Unit =
+      // a second signal while shutting down escalates to a hard stop
+      if pending != 0 then pending = -1 else pending = sig
+
+    def install(): Unit =
+      if !installed then
+        installed = true
+        import scala.scalanative.unsafe.CFuncPtr1
+        val h = CFuncPtr1.fromScalaFunction(record)
+        try
+          scala.scalanative.libc.signal.signal(scala.scalanative.libc.signal.SIGINT, h)
+          scala.scalanative.libc.signal.signal(scala.scalanative.libc.signal.SIGTERM, h)
+        catch case _: Throwable => ()
+
+    def send(p: Process, sig: Int): Unit =
+      try scala.scalanative.posix.signal.kill(p.pid().toInt, sig)
+      catch case _: Throwable => p.destroy()
+
   /** `run -w`: the program keeps running while the sources are rebuilt, and is stopped and started again once
    *  a build has succeeded (scala-cli's `--restart`). A failed build leaves the running program alone. */
   private var managedApp: Option[Process] = None
   private var managedShutdownHook = false
 
+  private val RestartGraceSeconds = 10L
+
+  /** SIGTERM, then wait for the program to be gone (it may hold a port the next instance needs); a program
+   *  still alive after `RestartGraceSeconds` is killed. */
   def stopManagedApp(): Unit =
     managedApp.foreach { p =>
       if p.isAlive then
         p.destroy()
-        if !p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS) then p.destroyForcibly()
+        if !p.waitFor(RestartGraceSeconds, java.util.concurrent.TimeUnit.SECONDS) then
+          System.err.println(Color.gray(s"The application ignored SIGTERM for ${RestartGraceSeconds}s, killing it"))
+          p.destroyForcibly()
         p.waitFor()
     }
     managedApp = None
 
   /** Starts `cmd` with inherited IO and returns at once, after stopping the previous run. */
-  def runManaged(cmd: List[String]): Int =
+  def runManaged(cmd: List[String], env: Map[String, String] = Map.empty): Int =
     if !managedShutdownHook then
       managedShutdownHook = true
-      // Ctrl+C reaches the program anyway (same process group); this covers a plain `kill` of scalino.
+      // normal exits of scalino; a signal goes through `shutdownOnSignal` instead
       try Runtime.getRuntime.addShutdownHook(new Thread(() => stopManagedApp()))
       catch case _: Throwable => ()
+      // after the hook: the first addShutdownHook installs the runtime's own SIGINT/SIGTERM handlers
+      Signals.install()
+    if Signals.pending != 0 then return 0 // the watch loop is about to exit, don't start another one
     if managedApp.exists(_.isAlive) then System.err.println(Color.gray("Restarting the application"))
     stopManagedApp()
     val pb = new JProcessBuilder(cmd.asJava)
     pb.inheritIO()
+    env.foreach { case (k, v) => pb.environment().put(k, v) }
     managedApp = Some(pb.start())
     0
 
+  /** Called by the watch loop once a SIGINT/SIGTERM arrived: forwards it to the program, waits for it and
+   *  exits with its exit code (128 + signal when there was no program running). A terminal's Ctrl+C already
+   *  reached the program (same process group), so a SIGINT is only forwarded when it is still alive after
+   *  2s; a further signal kills it. */
+  def shutdownOnSignal(): Nothing =
+    val sig = Signals.pending
+    val sigNum = if sig > 0 then sig else 15
+    val code = managedApp.filter(_.isAlive) match
+      case None => 128 + sigNum
+      case Some(p) =>
+        val fromTerminal = sigNum == 2 && scala.scalanative.posix.unistd.isatty(0) != 0
+        if !fromTerminal || !p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) then Signals.send(p, sigNum)
+        while !p.waitFor(100, java.util.concurrent.TimeUnit.MILLISECONDS) do
+          if Signals.pending == -1 then p.destroyForcibly()
+        p.exitValue()
+    managedApp = None
+    sys.exit(code)
+
   /** Runs the built program: to completion, or, under `-w`, in the background. */
-  def runProgram(cmd: List[String], watch: Boolean): Int =
-    if watch then runManaged(cmd) else runInherited(cmd)
+  def runProgram(cmd: List[String], watch: Boolean, env: Map[String, String] = Map.empty): Int =
+    if watch then runManaged(cmd, env) else runInherited(cmd, extraEnv = env)
 
   /** Runs scalino-dotc with stdout+stderr merged and captured (stdin still
    *  inherited), so its plain-text diagnostics can be re-rendered
@@ -501,7 +552,11 @@ object ScalinoCli:
     // absolute output directory of `//> using jsClientOut`: write the client there instead of embedding it
     jsClientOut: Option[String] = None,
     jsModuleSplitStyle: Option[String] = None,
-    jsSmallModulePackages: List[String] = Nil
+    jsSmallModulePackages: List[String] = Nil,
+    // `//> using postLink <cmd>`: one command per directive, see runPostLink
+    postLink: List[String] = Nil,
+    // `//> using runEnv KEY=VALUE`: extra environment for the program `run`/`test` start
+    runEnv: List[String] = Nil
   )
 
   /** A path from a `//> using` line: relative to the declaring file, or, when nothing is there, to the
@@ -533,6 +588,7 @@ object ScalinoCli:
     "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot", "nativePkgConfig",
     "platform", "platforms", "target.platform", "jsModuleKind", "jsMode", "jsEmitSourceMaps", "jsClient", "jsClientOut", "shared",
     "jsNoOpt", "jsCheckIr", "jsHeader", "jsEsVersionStr", "jsModuleSplitStyleStr", "jsSmallModuleForPackage", "jsAvoidClasses", "jsAvoidLetsAndConsts", "jsAllowBigIntsForLongs",
+    "postLink", "runEnv",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -562,6 +618,15 @@ object ScalinoCli:
           case bare => bare.split("""\s*,\s+|\s+""").toList.filter(_.nonEmpty)
       }
     }.nextOption()
+
+  /** The whole value of a `//> using <key> <command...>` line as one command (`postLink snunit bundle`),
+   *  or one command per quoted value. */
+  private def directiveCommands(line: String, key: String): Option[List[String]] =
+    usingRe(key).findFirstMatchIn(line).map { m =>
+      val rest = m.group(1)
+      val quoted = quotedRe.findAllMatchIn(rest).map(_.group(1)).toList
+      if quoted.nonEmpty then quoted else List(rest.trim).filter(_.nonEmpty)
+    }
 
   /** Same as `directiveValues`, for the handful of boolean-valued directives
    *  (`nativeEmbedResources`/`nativeMultithreading`) -- `//> using nativeMultithreading true`
@@ -624,6 +689,8 @@ object ScalinoCli:
     var jsAvoidClasses = Option.empty[Boolean]
     var jsAvoidLetsAndConsts = Option.empty[Boolean]
     var jsAllowBigIntsForLongs = Option.empty[Boolean]
+    var postLink = List.empty[String]
+    var runEnv = List.empty[String]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must be a comment-only line, `//>` as its first
     // non-blank characters -- NOT just "contains `//>` anywhere". An
@@ -689,6 +756,8 @@ object ScalinoCli:
         directiveValues(line, "jsClient").foreach(vs => jsClients = jsClients ++ vs.map(v => directivePath(src, v).toString))
         directiveValues(line, "jsClientOut").foreach(_.headOption.foreach(v => jsClientOut = Some(src.toAbsolutePath.getParent.resolve(v).normalize().toString)))
         directiveValues(line, "shared").foreach(vs => shared = shared ++ vs.map(v => directivePath(src, v).toString))
+        directiveCommands(line, "postLink").foreach(cs => postLink = postLink ++ cs)
+        directiveValues(line, "runEnv").foreach(vs => runEnv = runEnv ++ vs)
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
@@ -708,7 +777,8 @@ object ScalinoCli:
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
       nativeTargetTriples, nativeSysroots, nativePkgConfig,
       platform, jsModuleKind, jsMode, jsSourceMaps, jsClients.distinct, shared.distinct,
-      jsNoOpt, jsCheckIr, jsHeader, jsEsVersion, jsAvoidClasses, jsAvoidLetsAndConsts, jsAllowBigIntsForLongs, jsClientOut, jsModuleSplitStyle, jsSmallModulePackages.distinct
+      jsNoOpt, jsCheckIr, jsHeader, jsEsVersion, jsAvoidClasses, jsAvoidLetsAndConsts, jsAllowBigIntsForLongs, jsClientOut, jsModuleSplitStyle, jsSmallModulePackages.distinct,
+      postLink, runEnv
     )
 
   /** scala-cli's dependency formats (only `org::name::version` is advertised in
@@ -2407,7 +2477,9 @@ object ScalinoCli:
     compile: List[String] = Nil,
     cCompile: List[String] = Nil,
     cppCompile: List[String] = Nil,
-    prune: List[String] = Nil
+    prune: List[String] = Nil,
+    // commands run on the linked binary, in order (see runPostLink)
+    postLink: List[String] = Nil
   )
 
   /** Directives win over the equivalent `--native-*` CLI flag for
@@ -2486,7 +2558,8 @@ object ScalinoCli:
       compile = directives.nativeCompile ++ o.cliNativeCompile ++ pkgConfig("--cflags", pkgModules),
       cCompile = directives.nativeCCompile ++ o.cliNativeCCompile,
       cppCompile = directives.nativeCppCompile ++ o.cliNativeCppCompile,
-      prune = directives.nativePrune ++ o.cliNativePrune
+      prune = directives.nativePrune ++ o.cliNativePrune,
+      postLink = directives.postLink ++ o.cliPostLink
     )
 
   /** The compile-only half of a build: parses/resolves nothing itself (that's
@@ -2536,6 +2609,49 @@ object ScalinoCli:
           catch case _: Exception => Files.copy(src.resolve(childRel), target, java.nio.file.StandardCopyOption.COPY_ATTRIBUTES)
     walk("")
     dst
+
+  /** Splits a command line on whitespace; single and double quotes group words, a backslash escapes the next
+   *  character outside single quotes. No expansion of any kind: `--post-link "snunit bundle"`. */
+  def splitCommand(cmd: String): List[String] =
+    val words = scala.collection.mutable.ListBuffer.empty[String]
+    val cur = new StringBuilder
+    var inWord = false
+    var quote = ' '
+    var i = 0
+    while i < cmd.length do
+      val c = cmd.charAt(i)
+      if quote != ' ' then
+        if c == quote then quote = ' '
+        else if c == '\\' && quote == '"' && i + 1 < cmd.length then { i += 1; cur.append(cmd.charAt(i)) }
+        else cur.append(c)
+      else if c == '"' || c == '\'' then { quote = c; inWord = true }
+      else if c == '\\' && i + 1 < cmd.length then { i += 1; cur.append(cmd.charAt(i)); inWord = true }
+      else if c.isWhitespace then
+        if inWord then { words += cur.toString; cur.clear(); inWord = false }
+      else { cur.append(c); inWord = true }
+      i += 1
+    if quote != ' ' then fail(s"unterminated quote in command: $cmd")
+    if inWord then words += cur.toString
+    words.toList
+
+  /** Runs each `--post-link`/`postLink` command, in order, on the freshly written binary `bin` and waits for it:
+   *  `SCALINO_OUTPUT` is its absolute path, which is also the last argument. A command that can't start or
+   *  exits non-zero fails the build. */
+  def runPostLink(commands: List[String], bin: Path): Unit =
+    for command <- commands do
+      val words = splitCommand(command)
+      if words.isEmpty then fail("post-link: empty command")
+      val exit =
+        try runInherited(words :+ bin.toString, extraEnv = Map("SCALINO_OUTPUT" -> bin.toString))
+        catch case e: java.io.IOException => fail(s"post-link command `$command` could not be started: ${e.getMessage}")
+      if exit != 0 then fail(s"post-link command `$command` failed with exit code $exit")
+
+  /** `KEY=VALUE` entries of `//> using runEnv` and `--run-env`; a later entry for a key wins (CLI over directives). */
+  def runEnvOf(directives: Directives, o: RunOpts): Map[String, String] =
+    (directives.runEnv ++ o.cliRunEnv).flatMap { kv =>
+      val eq = kv.indexOf('=')
+      if eq < 1 then fail(s"run-env '$kv': expected KEY=VALUE") else Some(kv.substring(0, eq) -> kv.substring(eq + 1))
+    }.toMap
 
   /** A binary can't be written over an existing directory. */
   def checkBinaryOutPath(out: Path): Unit =
@@ -2618,6 +2734,12 @@ object ScalinoCli:
         tmp.toFile.setExecutable(true)
         Files.move(tmp, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
       finally Files.deleteIfExists(tmp)
+      // `actual` stays the untouched link output (the copy above is what the hooks modify), so the next
+      // build starts from an unhooked binary whether or not it relinked. A failed hook leaves no binary.
+      try runPostLink(nativeOpts.postLink, out.toAbsolutePath.normalize)
+      catch case e: BuildFailed =>
+        Files.deleteIfExists(out)
+        throw e
     if nativeOpts.targetTriples.isEmpty then collect(linkDir, outFor(mainClass))
     else nativeOpts.targetTriples.foreach(t => collect(linkDir.resolve(t), outForTriple(mainClass, t)))
     mainClass
@@ -2872,7 +2994,7 @@ object ScalinoCli:
       case "run" =>
         // Scala.js has no process arguments: they are linked into the program, so a `run` is a fresh link.
         val (_, jsFile) = link(o.progArgs)
-        runProgram(jsRuntimeCommand() :+ jsFile.toString, o.watch)
+        runProgram(jsRuntimeCommand() :+ jsFile.toString, o.watch, runEnvOf(directives, o))
       case "package" =>
         if jsOpts.splitStyle != "fewest" then fail("package writes one file: a js module split style is not supported here (use a jsClient with --js-client-out)")
         val (mainClass, jsFile) = link(Nil)
@@ -3080,7 +3202,7 @@ object ScalinoCli:
       Files.write(driverSrc, generateTestMainJs(matches).getBytes("UTF-8"))
       // The framework's arguments (`--tests=...`) are the driver's `args`, linked in like any Scala.js program's.
       val (_, jsFile) = buildJs(expanded :+ driverSrc, o.progArgs, Some("ScalinoCliTestMain"), testClasspath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts)
-      runInherited(jsRuntimeCommand() :+ jsFile.toString)
+      runInherited(jsRuntimeCommand() :+ jsFile.toString, extraEnv = runEnvOf(directives, o))
 
   // ---------------------------------------------------------------------
   // CLI surface, scala-cli-shaped:
@@ -3224,6 +3346,12 @@ object ScalinoCli:
        |  --native-clangpp <path>    path to the clang++ command (autodetected from PATH by default)
        |  --native-pkg-config <mod>  add `pkg-config --cflags/--libs <mod>` to the compile and link options (repeatable)
        |  --native-linking <opt>     extra option passed to clang verbatim during linking (repeatable)
+       |  --post-link <cmd>          run <cmd> on the linked binary before it is started or packaged: its
+       |                             absolute path is the last argument and $$SCALINO_OUTPUT. Split like a shell
+       |                             would, no expansion (repeatable, run in order; a non-zero exit fails the
+       |                             build, a failed rebuild under -w keeps the old program). Scala.js: not run
+       |  --run-env <KEY=VALUE>     extra environment variable for the program run/test start, on top of
+       |                             scalino's own (repeatable; applied again after every -w restart)
        |  --native-compile <opt>     extra compile option, all sources (repeatable)
        |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
        |  --native-cpp-compile <opt> extra compile option, C++ files only (repeatable)
@@ -3311,6 +3439,8 @@ object ScalinoCli:
        |  //> using nativeClangPP /path/to/clang++
        |  //> using nativePkgConfig gtk4
        |  //> using nativeLinking -L/opt/homebrew/lib
+       |  //> using postLink snunit bundle           (command run on the linked binary, see --post-link; repeatable)
+       |  //> using runEnv PORT=8080                 (environment for run/test, see --run-env; repeatable)
        |  //> using nativeCompile -flag
        |  //> using nativeCCompile -flag
        |  //> using nativeCppCompile -flag
@@ -3615,7 +3745,9 @@ object ScalinoCli:
     cliJsAvoidClasses: Boolean = false,
     cliJsAvoidLetsAndConsts: Boolean = false,
     cliJsAllowBigInts: Boolean = false,
-    cliJsRuntime: Option[String] = None
+    cliJsRuntime: Option[String] = None,
+    cliPostLink: List[String] = Nil,
+    cliRunEnv: List[String] = Nil
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (raw
     // clang/linker invocations, NativeConfig dumps), the default ("info")
@@ -3693,6 +3825,10 @@ object ScalinoCli:
         case "--native-pkg-config" => o = o.copy(cliNativePkgConfig = o.cliNativePkgConfig :+ args(i + 1)); i += 1
         case "--native-cpp-compile" => o = o.copy(cliNativeCppCompile = o.cliNativeCppCompile :+ args(i + 1)); i += 1
         case "--native-prune" => o = o.copy(cliNativePrune = o.cliNativePrune :+ args(i + 1)); i += 1
+        case "--post-link" => o = o.copy(cliPostLink = o.cliPostLink :+ args(i + 1)); i += 1
+        case "--run-env" =>
+          if !args(i + 1).drop(1).contains('=') then die(s"--run-env ${args(i + 1)}: expected KEY=VALUE")
+          o = o.copy(cliRunEnv = o.cliRunEnv :+ args(i + 1)); i += 1
         case "--format" | "--formats" =>
           Packaging.parseFormats(List(args(i + 1))) match
             case Left(err) => die(err)
@@ -3794,7 +3930,7 @@ object ScalinoCli:
         val hostOpts = nativeOpts.copy(targetTriples = Nil, sysroots = Nil)
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
-        runProgram(binPathFor(mainClass).toString :: o.progArgs, o.watch)
+        runProgram(binPathFor(mainClass).toString :: o.progArgs, o.watch, runEnvOf(directives, o))
       case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
         def binPathForTriple(mc: String, t: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(s"bin-$t")
@@ -3857,16 +3993,22 @@ object ScalinoCli:
         val n = System.in.available()
         if n > 0 then { System.in.read(new Array[Byte](n)); true } else false
       catch case _: java.io.IOException => false
+    def checkSignal(): Unit = if Signals.pending != 0 then shutdownOnSignal()
     run()
+    checkSignal()
     watching()
     var last = mtimes()
     while true do
-      Thread.sleep(500)
+      // 10 x 50ms rather than one 500ms sleep: a SIGTERM is answered promptly
+      var slept = 0
+      while slept < 10 && Signals.pending == 0 do { Thread.sleep(50); slept += 1 }
+      checkSignal()
       val cur = mtimes()
       val enter = enterPressed()
       if cur != last || enter then
         last = cur
         run()
+        checkSignal()
         watching()
 
   def handleRunOrCompile(mode: String, args: Array[String]): Unit =
@@ -4006,7 +4148,7 @@ object ScalinoCli:
         catch case BuildFailed(_) if excluded.nonEmpty =>
           System.err.println("scalino: warning: link with --test-only exclusions failed (a selected test references an excluded test class?) -- retrying with every test class linked")
           build(Set.empty)
-        runInherited(binPath.toString :: o.progArgs)
+        runInherited(binPath.toString :: o.progArgs, extraEnv = runEnvOf(directives, o))
 
     if o.watch then
       def resolve() =
@@ -4171,7 +4313,7 @@ object ScalinoCli:
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
     "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
-    "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
+    "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --post-link --run-env --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
     "--js --native --platform --js-mode --js-client-out --js-module-kind --js-emit-source-maps --js-no-opt --js-check-ir --js-header --js-es-version --js-module-split-style --js-small-module-for-package " +
@@ -4217,7 +4359,7 @@ object ScalinoCli:
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking| \\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking|--post-link|--run-env| \\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      COMPREPLY=($$(compgen -f -- "$$cur")); return ;;
        |  esac
@@ -4274,7 +4416,7 @@ object ScalinoCli:
        |    completions) _values 'shell' bash zsh fish; return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking|\\
+       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking|--post-link|--run-env|\\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      _files; return ;;
        |  esac
@@ -4321,6 +4463,8 @@ object ScalinoCli:
        |complete -c scalino -l js-header -x
        |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"
+       |complete -c scalino -l post-link -x
+       |complete -c scalino -l run-env -x
        |complete -c scalino -l pkg-name -x
        |complete -c scalino -l pkg-version -x
        |complete -c scalino -l package-name -x

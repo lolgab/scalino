@@ -151,7 +151,57 @@ scalino package examples/Hello.scala -o hello && ./hello
   (`--no-incremental` turns this off). Resolved classpaths and build output are
   cached in `.scalino-build/`.
 
+- **Post-link hook and run environment:** `--post-link <cmd>` (`//> using postLink <cmd>`)
+  runs a command on the linked binary, and `--run-env KEY=VALUE`
+  (`//> using runEnv KEY=VALUE`) adds environment variables for the program
+  that `run` and `test` start. See [Wrapping scalino](#wrapping-scalino).
+
 `scalino --help` and `scalino <command> --help` list every flag and directive.
+
+## Wrapping scalino
+
+Tools that build on scalino (a deployment CLI that patches the binary, say)
+don't need their own watch loop: `scalino run -w` already rebuilds, restarts
+and shuts down the program properly. Two generic hooks cover the rest.
+
+| flag | directive | does |
+|---|---|---|
+| `--post-link <cmd>` | `//> using postLink <cmd>` | run `<cmd>` on the linked binary, once per link |
+| `--run-env KEY=VALUE` | `//> using runEnv KEY=VALUE` | extra environment for the program `run`/`test` start |
+
+```sh
+scalino run -w server --post-link "snunit bundle" --run-env PORT=8080 --run-env LOG=debug
+```
+
+- **`--post-link`** runs after every successful link of a Scala Native
+  executable: `run`, `package`, `test` and each rebuild under `-w`. It runs
+  before the program starts and, for `package`, before `--format` wraps the
+  binary. The binary's absolute path is the last argument and
+  `$SCALINO_OUTPUT`, so `--post-link "snunit bundle"` runs
+  `snunit bundle /abs/path/to/bin`. The command is split on whitespace
+  (quotes group words, nothing is expanded) and runs in the directory scalino
+  was started in. Repeat the flag to run several hooks in order.
+  - A non-zero exit fails the build with
+    ``post-link command `snunit bundle` failed with exit code 2``, and the
+    binary is removed. Under `-w` that is a failed build like a compile error:
+    the previous program keeps running.
+  - The hook always gets a fresh copy of the link output: relinks and
+    no-change rebuilds start from the unhooked file, so a rebuild never hooks
+    a binary twice or skips the hook.
+  - Each cross target (`--native-target-triple`) is hooked too, with its own path.
+  - Scala.js builds produce a `.js` file, not an executable: the hook is
+    skipped there.
+- **`--run-env`** is applied on top of scalino's own environment, and again
+  after each restart under `-w`. A flag wins over a directive for the same key.
+  It also applies to the node process of a Scala.js build.
+- **Signals under `run -w`:** SIGINT and SIGTERM sent to scalino are forwarded
+  to the program (a terminal's Ctrl+C already reaches it directly, so SIGINT
+  is only forwarded if it is still alive after 2s). scalino then waits for it
+  and exits with its exit code (128 + the signal if nothing was running); a
+  second signal kills the program. A restart sends the old program SIGTERM and
+  waits for it to exit before starting the new one, so a program that binds a
+  port never overlaps with its successor (one that ignores SIGTERM for 10s is
+  killed).
 
 ## Scala.js
 
