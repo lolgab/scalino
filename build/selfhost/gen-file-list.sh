@@ -10,6 +10,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 ROOT="$PWD"
+source "$ROOT/versions.env"
 
 # dotc's own source: everything under compiler/src, minus backend/jvm
 # (needs org.scala-lang.modules:scala-asm, no Scala Native cross-build),
@@ -31,24 +32,16 @@ find "$ROOT/vendor/scala3/compiler/src" -name "*.scala" \
   -not -name "ExtractAPI.scala" \
   -not -name "ShowAPI.scala" \
   -not -name "APIUtils.scala" \
-  -not -name "ThunkHolder.scala"
+  -not -name "ThunkHolder.scala" \
+  -not -name "ProfiledThreadPool.scala"
 
 # Scala.js backend (`-scalajs`): backend/sjs, transform/sjs and SJSPlatform are part
 # of the find above. They need scalajs-ir, which dotc's own build also compiles from
 # source under `dotty.tools.sjs.ir` (build/00c-fetch-scalajs-ir.sh generates it).
 find "$ROOT/.build-work/generated/scalajs-ir-src" -name "*.scala"
 
-# `backend/jvm/DottyPrimitives.scala` (the one backend/jvm file this build
-# ever needed, since nscplugin's own NirPrimitives.scala imports it) was
-# renamed+moved to `backend/ScalaPrimitives.scala` as of Scala 3.9 -- already
-# picked up under its new name by the plain `find` above (no longer under
-# backend/jvm at all). nscplugin's own vendored source (unpatched -- its
-# import of the *old* `backend.jvm.DottyPrimitives` name still needs to
-# resolve, and untouched because scala-native's own internal sbt build
-# compiles the same file against its own separately-pinned, pre-3.9 dotty)
-# needs a same-named compat shim under the old package+name, forwarding to
-# the real (renamed) class -- see build/selfhost/DottyPrimitivesCompat.scala.
-echo "$ROOT/build/selfhost/DottyPrimitivesCompat.scala"
+# (nscplugin's NirPrimitives extends CompilerCompat.NirPrimitivesBase, which builds on the renamed
+# backend/ScalaPrimitives.scala picked up by the plain `find` above.)
 
 # The Blocker-A-era generated MiniPhase override table (build/02b-gen-megaphase-overrides.sh).
 echo "$ROOT/.build-work/generated/MiniPhaseOverrides.scala"
@@ -71,6 +64,21 @@ find "$ROOT/vendor/scala3/interfaces/src" -name "*.scala"
 # patches/scala-native-0002 for the small fixups needed (symExtensions'
 # moved location, no backend.jvm.GenBCode to runsBefore, no java.util.Locale).
 find "$ROOT/vendor/scala-native/nscplugin/src/main/scala-3" -name "*.scala"
+# The compiler-version-specific sources (CompilerCompat) live in scala-between_<from>_<to> /
+# scala-since_<from> directories next to scala-3: take the ones that cover SCALA_VERSION.
+python3 -I - "$ROOT/vendor/scala-native/nscplugin/src/main" "$SCALA_VERSION" <<'PY'
+import os, re, sys
+base, version = sys.argv[1], sys.argv[2]
+def v(s): return tuple(int(x) for x in s.split('.'))
+for d in sorted(os.listdir(base)):
+    m = re.fullmatch(r'scala-between_([\d.]+)_([\d.]+)', d) or re.fullmatch(r'scala-since_([\d.]+)', d)
+    if not m: continue
+    lo = v(m.group(1)); hi = v(m.group(2)) if m.lastindex == 2 else (99, 99, 99)
+    if lo <= v(version) <= hi:
+        for root, _, files in os.walk(os.path.join(base, d)):
+            for f in files:
+                if f.endswith('.scala'): print(os.path.join(root, f))
+PY
 find "$ROOT/vendor/scala-native/nir/src/main/scala" -name "*.scala"
 find "$ROOT/vendor/scala-native/util/src/main/scala" -name "*.scala"
 

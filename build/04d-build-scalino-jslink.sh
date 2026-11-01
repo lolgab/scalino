@@ -26,7 +26,7 @@ mkdir -p "$CLASSES_DIR"
 
 # Same patched javalib as 07-build-scalino.sh: ZipFileSystemProvider, which the driver's jar reading needs.
 NATIVELIBS_CP="$WORK/jslink-nativelibs.cp"
-LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
+LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
   { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-' | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
 else
@@ -40,7 +40,7 @@ FILES="$WORK/jslink-files.txt"
   -javabootclasspath "$DIST/java.base.jar" \
   -classpath "$(cat "$NATIVELIBS_CP")" \
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
-  -language:implicitConversions -nowarn \
+  -language:implicitConversions -nowarn -source:3.3 \
   -d "$CLASSES_DIR" \
   "@$FILES"
 

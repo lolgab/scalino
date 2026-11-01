@@ -14,8 +14,8 @@
 #   SCALANATIVE_SITE_PROFILE=<table file>, SCALANATIVE_STACK_POISON, SCALANATIVE_EA_X, ...
 #   (see docs/findings.md, "Escape analysis, round 2")
 #
-# Needs build/04a-patch-tools.sh, 03-build-scalino-dotc.sh to have run once
-# (tools-patched-jvm.cp, driver-classes, selfhost/nir-out).
+# Needs build/01a-publish-scala-native.sh, 03-build-scalino-dotc.sh to have run once
+# (tools.cp, driver-classes, selfhost/nir-out).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 source build/00-env.sh >/dev/null 2>&1
@@ -27,20 +27,20 @@ mkdir -p "$EA_WORK"
 if [[ -z "${SKIP_COMPILE:-}" ]]; then
   rm -rf "$OV"; mkdir -p "$OV"
   "$JAVA" -Xss64m -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
-    -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")" -d "$OV" \
+    -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")" -d "$OV" \
     $V/interflow/EscapeAnalysis.scala $V/interflow/Inline.scala $V/codegen/Lower.scala \
     $V/checker/Check.scala $V/build/ScalaNative.scala
 fi
 NLCP=$(cat "$WORK/selfhost/nativelibs.cp")
 if [[ -n "${PROF:-}" ]]; then
   [[ -f "$EA_WORK/nativelib-prof.jar" ]] || { echo "run make-prof-nativelib.sh first" >&2; exit 1; }
-  OLDNL="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/$SCALA_NATIVE_VERSION-SNAPSHOT/jars/nativelib_native0.5_3.jar"
+  OLDNL="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/$SCALA_NATIVE_VERSION/jars/nativelib_native0.5_3.jar"
   [[ "$NLCP" == *"$OLDNL"* ]] || { echo "nativelib jar not found on nativelibs.cp" >&2; exit 1; }
   NLCP=${NLCP//"$OLDNL"/$EA_WORK/nativelib-prof.jar}
 fi
 LW=$EA_WORK/$TAG; rm -rf "$LW"; mkdir -p "$LW"
 "$JAVA" -Xss64m -XX:MaxRAMPercentage=80 \
-  -cp "$OV$CP_SEP$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$CP_SEP$WORK/driver-classes" LinkDriver \
+  -cp "$OV$CP_SEP$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")$CP_SEP$WORK/driver-classes" LinkDriver \
   "$WORK/selfhost/nir-out$CP_SEP$NLCP" "$LW" dotty.tools.dotc.Main "$CLANG" "$CLANGPP" info \
   --mode release-fast --multithreading --embed-resources 2>&1 | tee "$LW.log"
 # the native/ build dir is several GB: keep only the binary

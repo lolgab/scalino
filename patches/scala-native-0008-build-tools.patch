@@ -1,0 +1,1395 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/Build.scala b/tools/src/main/scala/scala/scalanative/build/Build.scala
+index 8eb17b0c..6b3e3979 100644
+--- a/tools/src/main/scala/scala/scalanative/build/Build.scala
++++ b/tools/src/main/scala/scala/scalanative/build/Build.scala
+@@ -156,7 +156,7 @@ object Build {
+             .map(objects => link(config, linkerResult, objects))
+             .map(artifact => postProcess(config, artifact))
+         }
+-        .andThen { case Success(_) => dumpUserConfigHash(config) }
++        .andThen { case Success(_) => dumpUserConfigHash(config, defaultUserConfigHashPath(config)) }
+     }
+   }
+ 
+@@ -172,7 +172,7 @@ object Build {
+         .sequence {
+           irGenerators.map(irGenerator =>
+             irGenerator.flatMap(generatedIR =>
+-              LLVM.compile(config, analysis, generatedIR)
++              LLVM.compile(config, analysis, generatedIR, defaultUserConfigHashPath(config))
+             )
+           )
+         }
+@@ -318,13 +318,40 @@ object Build {
+ 
+   private[scalanative] final val userConfigHashFile = "userConfigHash"
+ 
+-  private[scalanative] def userConfigHasChanged(config: Config): Boolean =
+-    IO.readFully(config.workDir.resolve(userConfigHashFile))
++  /** The original workDir-relative location, for call sites checking/dumping
++   *  the top-level config's own hash (as opposed to a per-library one, see
++   *  below). */
++  private[scalanative] def defaultUserConfigHashPath(config: Config): Path =
++    config.workDir.resolve(userConfigHashFile)
++
++  // own-implementation fix: hashPath is now an explicit, required parameter
++  // (was implicitly always config.workDir.resolve(userConfigHashFile); every
++  // pre-existing call site now passes defaultUserConfigHashPath(config) to
++  // keep identical behavior). NativeLib.compileNativeLibrary passes a
++  // *per-library* hashPath instead: it compiles each dependency with a
++  // per-library `projConfig` (configureNativeLibrary appends reachability-
++  // analysis-derived preprocessor flags per library, see NativeLib.scala),
++  // but before this fix every such check compared that per-library config's
++  // hash against the ONE shared file this module's dumpUserConfigHash writes
++  // from the top-level, un-augmented config -- a structural mismatch, so
++  // userConfigHasChanged effectively always returned true for every
++  // vendored C/S dependency file, defeating LLVM.needsCompiling's mtime
++  // check and forcing a full recompile of scala-native's own runtime
++  // sources on every single build regardless of whether anything changed.
++  // See docs/findings.md "Native-library object-file caching was inert".
++  private[scalanative] def userConfigHasChanged(
++      config: Config,
++      hashPath: Path
++  ): Boolean =
++    IO.readFully(hashPath)
+       .forall(_.trim() != config.compilerConfig.##.toString())
+ 
+-  private[scalanative] def dumpUserConfigHash(config: Config): Unit =
++  private[scalanative] def dumpUserConfigHash(
++      config: Config,
++      hashPath: Path
++  ): Unit =
+     IO.write(
+-      path = config.workDir.resolve(userConfigHashFile),
++      path = hashPath,
+       content = config.compilerConfig.##.toString()
+     )
+ 
+@@ -334,10 +361,33 @@ object Build {
+     // Fatal errors, e.g. StackOverflowErrors are not propagated by Futures
+     // Use a helper promise to get notified about the underlying problem
+     val promise = Promise[T]()
++    // SCALANATIVE_LINK_THREADS=N caps the link/codegen/clang pool, e.g. 1 on
++    // memory-constrained CI runners where parallel clang invocations OOM.
++    val poolSize = sys.env
++      .get("SCALANATIVE_LINK_THREADS")
++      .flatMap(v => scala.util.Try(v.trim.toInt).toOption)
++      .filter(_ > 0)
++      .getOrElse(Runtime.getRuntime().availableProcessors())
++    // The pool threads run the optimizer, escape analysis and codegen, which
++    // recurse deeply on big methods/call chains. The JVM-hosted driver runs
++    // them with -Xss64m; a native pool thread would get the OS default
++    // (512KB on macOS) and overflow on dotc-sized inputs. SCALANATIVE_LINK_STACK_MB
++    // overrides the 64MB default.
++    val stackBytes = sys.env
++      .get("SCALANATIVE_LINK_STACK_MB")
++      .flatMap(v => scala.util.Try(v.trim.toLong).toOption)
++      .filter(_ > 0)
++      .getOrElse(64L) * 1024L * 1024L
++    val threadCount = new java.util.concurrent.atomic.AtomicInteger(0)
+     val executor = Executors.newFixedThreadPool(
+-      Runtime.getRuntime().availableProcessors(),
++      poolSize,
+       (task: Runnable) => {
+-        val thread = Executors.defaultThreadFactory().newThread(task)
++        val thread = new Thread(
++          null,
++          task,
++          s"scalanative-link-${threadCount.incrementAndGet()}",
++          stackBytes
++        )
+         val defaultExceptionHandler = thread.getUncaughtExceptionHandler()
+         thread.setUncaughtExceptionHandler { (thread: Thread, ex: Throwable) =>
+           promise.tryFailure(ex)
+diff --git a/tools/src/main/scala/scala/scalanative/build/Discover.scala b/tools/src/main/scala/scala/scalanative/build/Discover.scala
+index 9163a5db..a9279e04 100644
+--- a/tools/src/main/scala/scala/scalanative/build/Discover.scala
++++ b/tools/src/main/scala/scala/scalanative/build/Discover.scala
+@@ -122,6 +122,53 @@ object Discover {
+     (libDirs ++ extraLibDirs).map(s => s"-L$s")
+   }
+ 
++  /** Info needed to bind against libLLVM's C API directly (experimental
++   *  direct codegen backend). See [[NativeConfig.useLLVMDirectCodeGen]].
++   */
++  private[scalanative] case class LLVMInfo(
++      libDir: Path,
++      majorVersion: Int
++  )
++
++  /** Minimum LLVM version whose C API surface the experimental direct codegen
++   *  backend is willing to call into. Chosen conservatively; widen only after
++   *  verifying the relevant `LLVMBuildXxx`/`LLVMCreateTargetMachine` etc.
++   *  signatures are stable back to a lower version.
++   */
++  private[scalanative] final val MinimumSupportedLLVMDirectCodeGenVersion = 13
++
++  /** Discover `libLLVM`'s lib directory and version via `llvm-config`, for
++   *  the experimental direct codegen backend. Returns `None` (rather than
++   *  throwing) when `llvm-config` isn't found or reports an unusable
++   *  version, so callers can decide whether that's fatal. Cached per
++   *  `NativeConfig`: CodeGen.scala's direct-codegen wiring calls this once
++   *  per partition (dozens, for a real program) to decide whether to even
++   *  attempt the direct path there, and re-shelling out to `llvm-config`
++   *  that often would eat into the very link-time savings the feature is
++   *  for.
++   */
++  private[scalanative] def discoverLibLLVM()(implicit
++      config: NativeConfig
++  ): Option[LLVMInfo] =
++    cache("discover-libllvm")(_ => discoverLibLLVMUncached())
++
++  private def discoverLibLLVMUncached(): Option[LLVMInfo] =
++    try {
++      val libDirLines = Process(s"$llvmConfigCLI --libdir")
++        .lineStream_!(silentLogger())
++        .toList
++      val versionLines = Process(s"$llvmConfigCLI --version")
++        .lineStream_!(silentLogger())
++        .toList
++      for {
++        libDirLine <- libDirLines.headOption
++        versionLine <- versionLines.headOption
++        major <- Try(versionLine.takeWhile(_.isDigit).toInt).toOption
++      } yield LLVMInfo(Paths.get(libDirLine), major)
++    } catch {
++      case _: Exception => None
++    }
++
+   private case class ClangInfo(
+       majorVersion: Int,
+       fullVersion: String,
+diff --git a/tools/src/main/scala/scala/scalanative/build/IO.scala b/tools/src/main/scala/scala/scalanative/build/IO.scala
+index fbf4be30..c9cc2d47 100644
+--- a/tools/src/main/scala/scala/scalanative/build/IO.scala
++++ b/tools/src/main/scala/scala/scalanative/build/IO.scala
+@@ -4,10 +4,9 @@ package build
+ import java.io.IOException
+ import java.nio.file.attribute.{BasicFileAttributes, DosFileAttributes}
+ import java.nio.file.{
+-  AccessDeniedException, FileSystems, FileVisitOption, FileVisitResult, Files,
+-  Path, Paths, SimpleFileVisitor, StandardCopyOption
++  AccessDeniedException, FileSystems, FileVisitOption, FileVisitResult,
++  Files, Path, Paths, SimpleFileVisitor, StandardCopyOption
+ }
+-import java.security.{DigestInputStream, MessageDigest}
+ import java.util.EnumSet
+ import java.util.zip.{ZipEntry, ZipInputStream}
+ 
+@@ -194,47 +193,195 @@ private[scalanative] object IO {
+ 
+   /** Compute a SHA-1 hash of `path`. */
+   def sha1(path: Path, bufSize: Int = 1024): Array[Byte] = {
+-    val digest = MessageDigest.getInstance("SHA-1")
++    val digest = new Sha1Digest()
+     val stream = Files.newInputStream(path)
+-    val digestStream = new DigestInputStream(stream, digest)
+     try {
+       val buf = new Array[Byte](bufSize)
+-      while (digestStream.read(buf, 0, bufSize) != -1) {}
++      var n = stream.read(buf, 0, bufSize)
++      while (n != -1) {
++        digest.update(buf, 0, n)
++        n = stream.read(buf, 0, bufSize)
++      }
+       digest.digest()
+     } finally {
+-      digestStream.close()
++      stream.close()
+     }
+   }
+ 
+   /** Compute a SHA-1 hash of `files`. */
+   def sha1files(files: Seq[Path], bufSize: Int = 1024): Array[Byte] = {
+-    val digest = MessageDigest.getInstance("SHA-1")
++    val digest = new Sha1Digest()
+     files.foreach { file =>
+       val stream = Files.newInputStream(file)
+-      val digestStream = new DigestInputStream(stream, digest)
+       val buf = new Array[Byte](bufSize)
+       try {
+-        while (digestStream.read(buf, 0, bufSize) != -1) {}
++        var n = stream.read(buf, 0, bufSize)
++        while (n != -1) {
++          digest.update(buf, 0, n)
++          n = stream.read(buf, 0, bufSize)
++        }
+       } finally {
+-        digestStream.close()
++        stream.close()
+       }
+     }
+     digest.digest()
+   }
+ 
++  // Standalone SHA-1 implementation -- Scala Native's own javalib doesn't
++  // port java.security.MessageDigest/DigestInputStream, and this is the only
++  // caller in the whole toolchain, so a private, self-contained digest here
++  // avoids adding a half-finished JCA surface to javalib just for this.
++  private final class Sha1Digest {
++    private val buffer = new Array[Byte](64)
++    private var bufferLen = 0
++    private var messageLen = 0L
++    private var h0 = 0x67452301
++    private var h1 = 0xefcdab89
++    private var h2 = 0x98badcfe
++    private var h3 = 0x10325476
++    private var h4 = 0xc3d2e1f0
++
++    private val w = new Array[Int](80)
++
++    private def processBlock(block: Array[Byte], off: Int): Unit = {
++      var i = 0
++      while (i < 16) {
++        val j = off + i * 4
++        w(i) = ((block(j) & 0xff) << 24) |
++          ((block(j + 1) & 0xff) << 16) |
++          ((block(j + 2) & 0xff) << 8) |
++          (block(j + 3) & 0xff)
++        i += 1
++      }
++      i = 16
++      while (i < 80) {
++        val v = w(i - 3) ^ w(i - 8) ^ w(i - 14) ^ w(i - 16)
++        w(i) = (v << 1) | (v >>> 31)
++        i += 1
++      }
++
++      var a = h0
++      var b = h1
++      var c = h2
++      var d = h3
++      var e = h4
++
++      i = 0
++      while (i < 80) {
++        var f = 0
++        var k = 0
++        if (i < 20) {
++          f = (b & c) | ((~b) & d)
++          k = 0x5a827999
++        } else if (i < 40) {
++          f = b ^ c ^ d
++          k = 0x6ed9eba1
++        } else if (i < 60) {
++          f = (b & c) | (b & d) | (c & d)
++          k = 0x8f1bbcdc
++        } else {
++          f = b ^ c ^ d
++          k = 0xca62c1d6
++        }
++
++        val temp = ((a << 5) | (a >>> 27)) + f + e + k + w(i)
++        e = d
++        d = c
++        c = (b << 30) | (b >>> 2)
++        b = a
++        a = temp
++        i += 1
++      }
++
++      h0 += a
++      h1 += b
++      h2 += c
++      h3 += d
++      h4 += e
++    }
++
++    private def updateByte(b: Byte): Unit = {
++      buffer(bufferLen) = b
++      bufferLen += 1
++      messageLen += 1
++      if (bufferLen == 64) {
++        processBlock(buffer, 0)
++        bufferLen = 0
++      }
++    }
++
++    def update(input: Array[Byte], offset: Int, len: Int): Unit = {
++      var i = 0
++      while (i < len) {
++        updateByte(input(offset + i))
++        i += 1
++      }
++    }
++
++    def digest(): Array[Byte] = {
++      val bitLen = messageLen * 8
++      updateByte(0x80.toByte)
++      while (bufferLen != 56) updateByte(0.toByte)
++      var i = 7
++      while (i >= 0) {
++        updateByte(((bitLen >>> (i * 8)) & 0xff).toByte)
++        i -= 1
++      }
++
++      val result = new Array[Byte](20)
++      val words = Array(h0, h1, h2, h3, h4)
++      i = 0
++      while (i < 5) {
++        result(i * 4) = ((words(i) >>> 24) & 0xff).toByte
++        result(i * 4 + 1) = ((words(i) >>> 16) & 0xff).toByte
++        result(i * 4 + 2) = ((words(i) >>> 8) & 0xff).toByte
++        result(i * 4 + 3) = (words(i) & 0xff).toByte
++        i += 1
++      }
++      result
++    }
++  }
++
++  /** Per-archive lock objects, keyed by absolute path -- see `unzip`'s doc
++   *  comment for why unzipping needs one.
++   */
++  private val archiveLocks =
++    new java.util.concurrent.ConcurrentHashMap[String, Object]()
++
++  private def lockFor(archive: Path): Object =
++    archiveLocks.computeIfAbsent(
++      archive.toAbsolutePath.toString,
++      _ => new Object
++    )
++
+   /** Unzip all members of the ZIP archive `archive` to `target`. */
+   def unzip(archive: Path, target: Path): Unit = {
+     Files.createDirectories(target)
+-    val zipFS = FileSystems.newFileSystem(archive, null: ClassLoader)
+-    try {
+-      val rootDirectories = zipFS.getRootDirectories().iterator
+-      while (rootDirectories.hasNext) {
+-        val root = rootDirectories.next()
+-        copyRecursive(root, target)
+-      }
+-    } finally zipFS.close()
++    // `findAndCompileNativeLibraries` unzips native libraries concurrently
++    // (`Future.traverse`), and more than one of them can point at the exact
++    // same archive path (e.g. two native-lib units bundled in one jar) --
++    // each `unzip()` call opens its own independent zip filesystem (see
++    // ZipFileSystemProvider), so this isn't needed to avoid a collision
++    // exception, only to avoid N callers redundantly decompressing the same
++    // archive into the same target directory at once.
++    lockFor(archive).synchronized {
++      val zipFS = FileSystems.newFileSystem(archive, null: ClassLoader)
++      try {
++        val rootDirectories = zipFS.getRootDirectories().iterator
++        while (rootDirectories.hasNext) {
++          val root = rootDirectories.next()
++          // Native-lib jars mix compiled `.class` files in with the C/C++/S
++          // sources this unpacks them for -- the driver only ever compiles
++          // the latter, so extracting the former is pure wasted time/disk.
++          copyRecursive(root, target, skip = isClassFile)
++        }
++      } finally zipFS.close()
++    }
+   }
+ 
++  private def isClassFile(file: Path): Boolean =
++    file.getFileName.toString.endsWith(".class")
++
+   /** Copy source directory and contents to target directory. */
+   def copyDirectory(source: Path, target: Path): Unit = {
+     Files.createDirectories(target)
+@@ -247,8 +394,15 @@ private[scalanative] object IO {
+    *  get a relative path. We can't use the following code because you can't
+    *  resolve across filesystems like UNIX FS to ZIP FS: val dest =
+    *  target.resolve(source.relativize(file))
++   *
++   *  @param skip
++   *    files for which this returns true are left out of `target` entirely.
+    */
+-  private def copyRecursive(source: Path, target: Path): Path = {
++  private def copyRecursive(
++      source: Path,
++      target: Path,
++      skip: Path => Boolean = _ => false
++  ): Path = {
+     Files.walkFileTree(
+       source,
+       new SimpleFileVisitor[Path]() {
+@@ -256,9 +410,11 @@ private[scalanative] object IO {
+             file: Path,
+             attrs: BasicFileAttributes
+         ): FileVisitResult = {
+-          val dest =
+-            Paths.get(target.toString, source.relativize(file).toString())
+-          Files.copy(file, dest, StandardCopyOption.REPLACE_EXISTING)
++          if (!skip(file)) {
++            val dest =
++              Paths.get(target.toString, source.relativize(file).toString())
++            Files.copy(file, dest, StandardCopyOption.REPLACE_EXISTING)
++          }
+           FileVisitResult.CONTINUE
+         }
+ 
+diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+index 1adf331f..f8ff6cd2 100644
+--- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
++++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+@@ -1,11 +1,10 @@
+ package scala.scalanative
+ package build
+ 
+-import java.io.{File, PrintWriter}
++import java.io.{BufferedReader, File, InputStreamReader, PrintWriter}
+ import java.nio.file.{Files, Path, Paths, StandardCopyOption}
+ 
+ import scala.concurrent._
+-import scala.sys.process._
+ import scala.util.{Failure, Success}
+ 
+ import scala.scalanative.build.IO.RichPath
+@@ -35,6 +34,43 @@ private[scalanative] object LLVM {
+   /** List of source patterns used: ".c, .cpp, .S" */
+   val srcExtensions = Seq(".c", cppExt, ".S")
+ 
++  /** Runs `cmd` to completion, logging its merged stdout/stderr via `logger`.
++   *
++   *  Uses `java.lang.ProcessBuilder` directly and reads its output on the
++   *  calling thread instead of `scala.sys.process`'s `Process(...) !`, which
++   *  spawns 2-3 short-lived reader/wait threads per invocation -- with one
++   *  call per compiled unit, that added up to hundreds of throwaway OS
++   *  threads over a build.
++   */
++  private def runProcess(
++      cmd: Seq[String],
++      cwd: File,
++      logger: Logger,
++      stdin: Option[File] = None
++  ): Int = {
++    val pb = new java.lang.ProcessBuilder(cmd*)
++      .directory(cwd)
++      .redirectErrorStream(true)
++    stdin.foreach(pb.redirectInput)
++    val proc = pb.start()
++    val reader = new BufferedReader(new InputStreamReader(proc.getInputStream))
++    // stdout and stderr are merged; keep the severity of compiler diagnostics
++    val log = Logger.compilerDiagnosticHandler(logger)
++    var line = reader.readLine()
++    while (line != null) {
++      log(line)
++      line = reader.readLine()
++    }
++    proc.waitFor()
++  }
++
++  /** An external command to run via [[runProcess]]. */
++  private final case class Cmd(
++      args: Seq[String],
++      cwd: File,
++      stdin: Option[File] = None
++  )
++
+   /** Compile the given files to object files
+    *
+    *  @param config
+@@ -49,18 +85,35 @@ private[scalanative] object LLVM {
+   def compile(
+       config: Config,
+       analysis: ReachabilityAnalysis.Result,
+-      path: Path
++      path: Path,
++      // own-implementation fix: explicit, required hash-file path for the
++      // userConfigHasChanged check (was implicitly always
++      // config.workDir.resolve(Build.userConfigHashFile) -- pass
++      // Build.defaultUserConfigHashPath(config) for identical behavior). See
++      // the comment on Build.userConfigHasChanged for why this exists.
++      hashPath: Path
+   )(implicit
+       ec: ExecutionContext
+   ): Future[Path] = {
+     implicit val _config: Config = config
+     implicit val _analysis: ReachabilityAnalysis.Result = analysis
+ 
++    // EXPERIMENTAL (NativeConfig.useLLVMDirectCodeGen): a partition already
++    // compiled straight to an object file by DirectCodeGen (CodeGen.scala)
++    // arrives here already ending in `oExt` -- pass it through unchanged.
++    // An `.ll` (or other source) path never does, since the normal path
++    // below always derives its own output path by *appending* oExt. An early
++    // `return` here (rather than wrapping the rest of the method in an
++    // `else` block) deliberately leaves every line below byte-for-byte
++    // unchanged, so it doesn't shift patches/scala-native-0001's own hunk
++    // against this exact method out of the context it expects.
++    if (path.abs.endsWith(oExt)) return Future.successful(path)
++
+     val inpath = path.abs
+     val outpath = inpath + oExt
+     val objPath = Paths.get(outpath)
+     // compile if out of date or no object file
+-    if (needsCompiling(path, objPath)) compileFile(path, objPath)
++    if (needsCompiling(path, objPath, hashPath)) compileFile(path, objPath)
+     else Future.successful(objPath)
+   }
+ 
+@@ -91,13 +144,17 @@ private[scalanative] object LLVM {
+         if (config.compilerConfig.multithreadingSupport)
+           Seq("-DSCALANATIVE_MULTITHREADING_ENABLED")
+         else Nil
++      val compactHeaders =
++        if (config.compilerConfig.compactHeadersEnabled)
++          Seq("-DSCALANATIVE_COMPACT_HEADERS")
++        else Nil
+       val usingCppExceptions =
+         if (config.usingCppExceptions)
+           Seq("-DSCALANATIVE_USING_CPP_EXCEPTIONS")
+         else Nil
+       val allowTargetOverrrides =
+         config.compilerConfig.targetTriple.map(_ => s"-Wno-override-module")
+-      multithreadingEnabled ++ usingCppExceptions ++ allowTargetOverrrides
++      multithreadingEnabled ++ compactHeaders ++ usingCppExceptions ++ allowTargetOverrrides
+     }
+     val debugFlags = sourceLevelDebugFlags
+ 
+@@ -106,14 +163,14 @@ private[scalanative] object LLVM {
+         target ++ langOptions ++ platformFlags ++ debugFlags ++
+         configFlags ++ Seq("-fvisibility=hidden", opt) ++
+         Seq("-fomit-frame-pointer") ++
++        (if (isLl) pgoIrFlags else Nil) ++
+         config.compileOptions
+     val compilec: Seq[String] =
+       Seq(compiler, "-c", inpath, "-o", outpath) ++ flags
+ 
+     // compile
+     config.logger.running(compilec)
+-    val result = Process(compilec, workDir.toFile) !
+-      Logger.toCompilerProcessLogger(config.logger)
++    val result = runProcess(compilec, workDir.toFile, config.logger)
+     if (result != 0) {
+       throw new BuildException(s"Failed to compile ${inpath}")
+     }
+@@ -155,7 +212,7 @@ private[scalanative] object LLVM {
+         prepareArchiveCommand(objectsPaths)
+     }
+     // link
+-    val result = command ! Logger.toCompilerProcessLogger(config.logger)
++    val result = runProcess(command.args, command.cwd, config.logger, command.stdin)
+     if (result != 0) {
+       throw new BuildException(s"Failed to link ${buildPath}")
+     }
+@@ -168,8 +225,11 @@ private[scalanative] object LLVM {
+    */
+   def dsymutil(config: Config, path: Path): Unit =
+     Discover.tryDiscover("dsymutil", "LLVM_BIN").flatMap { dsymutil =>
+-      val proc = Process(Seq(dsymutil.abs, path.abs), config.workDir.toFile())
+-      val result = proc ! Logger.toCompilerProcessLogger(config.logger)
++      val result = runProcess(
++        Seq(dsymutil.abs, path.abs),
++        config.workDir.toFile(),
++        config.logger
++      )
+       if (result != 0) {
+         Failure(
+           new BuildException(
+@@ -316,7 +376,7 @@ private[scalanative] object LLVM {
+ 
+     val command = Seq(compiler, s"@${configFile.getAbsolutePath()}")
+     config.logger.running(command)
+-    Process(command, config.workDir.toFile())
++    Cmd(command, config.workDir.toFile())
+   }
+ 
+   private def prepareArchiveCommand(
+@@ -357,7 +417,7 @@ private[scalanative] object LLVM {
+       val command = Seq(ar.abs, "-M")
+       config.logger.running(command)
+ 
+-      Process(command, config.workDir.toFile()) #< MIRScriptFile
++      Cmd(command, config.workDir.toFile(), stdin = Some(MIRScriptFile))
+     }
+ 
+     MRICompatibleAR match {
+@@ -365,7 +425,7 @@ private[scalanative] object LLVM {
+         val ar = Discover.discover("ar")
+         val command = Seq(ar.abs, "rc", config.buildPath.abs) ++ stageFiles()
+         config.logger.running(command)
+-        Process(command, config.workDir.toFile())
++        Cmd(command, config.workDir.toFile())
+       case Some(path) => useMRIScript(path)
+     }
+   }
+@@ -381,11 +441,11 @@ private[scalanative] object LLVM {
+    *  @return
+    *    true if it needs compiling false otherwise.
+    */
+-  @inline private def needsCompiling(in: Path, out: Path)(implicit
+-      config: Config
++  @inline private def needsCompiling(in: Path, out: Path, hashPath: Path)(
++      implicit config: Config
+   ): Boolean = {
+     in.toFile().lastModified() > out.toFile().lastModified() ||
+-    Build.userConfigHasChanged(config)
++    Build.userConfigHasChanged(config, hashPath)
+   }
+ 
+   /** Looks at all the object files to see if one is newer than the output
+@@ -457,6 +517,32 @@ private[scalanative] object LLVM {
+       case None     => Seq("-Wno-override-module")
+     }
+ 
++  /** IR-level profile guided optimization of the textual `.ll` files, for
++   *  links without direct codegen (the direct path runs the same passes itself,
++   *  see DirectCodeGen). `SCALANATIVE_PGO_GEN=1` instruments every function
++   *  (entry-first, like the direct path) -- the program must link the
++   *  compiler-rt profile runtime; `SCALANATIVE_PGO_USE=<indexed .profdata>`
++   *  annotates the IR with it. Only `.ll` files: the C/C++ runtime has no
++   *  profile and is not instrumented.
++   */
++  private lazy val pgoIrFlags: Seq[String] = {
++    def env(name: String) = sys.env.get(name).filter(_.nonEmpty)
++    val gen =
++      if (env("SCALANATIVE_PGO_GEN").exists(_ != "0"))
++        Seq("-fprofile-generate", "-mllvm", "-pgo-instrument-entry=true")
++      else Nil
++    val use = env("SCALANATIVE_PGO_USE").toSeq.flatMap { path =>
++      Seq(
++        s"-fprofile-use=$path",
++        // a profile of a slightly different build is expected, not an error
++        "-Wno-profile-instr-unprofiled",
++        "-Wno-profile-instr-out-of-date",
++        "-Wno-profile-instr-missing"
++      )
++    }
++    gen ++ use
++  }
++
+   private def opt(implicit config: Config): String =
+     config.mode match {
+       case Mode.Debug       => "-O0"
+diff --git a/tools/src/main/scala/scala/scalanative/build/Logger.scala b/tools/src/main/scala/scala/scalanative/build/Logger.scala
+index cc6bb2fd..01363ce2 100644
+--- a/tools/src/main/scala/scala/scalanative/build/Logger.scala
++++ b/tools/src/main/scala/scala/scalanative/build/Logger.scala
+@@ -1,7 +1,6 @@
+ package scala.scalanative.build
+ 
+ import java.lang.System.{err, lineSeparator => nl, out}
+-import java.util.Locale
+ 
+ import scala.concurrent._
+ import scala.sys.process.ProcessLogger
+@@ -115,30 +114,37 @@ object Logger {
+ 
+   /** Preserve compiler diagnostic severity, including following source lines.
+    */
+-  private[build] def toCompilerProcessLogger(logger: Logger): ProcessLogger = {
++  private[build] def toCompilerProcessLogger(logger: Logger): ProcessLogger =
++    ProcessLogger(logger.info, compilerDiagnosticHandler(logger))
++
++  /** Logs lines of compiler output keeping the diagnostic severity, including
++   *  the following source lines. Stateful: use one per process.
++   */
++  private[build] def compilerDiagnosticHandler(
++      logger: Logger
++  ): String => Unit = {
+     var diagnostic: String => Unit = logger.error
+-    ProcessLogger(
+-      logger.info,
+-      line => {
+-        val lower = line.toLowerCase(Locale.ROOT)
+-        val summary = line.endsWith(" generated.")
+-        def hasSeverity(level: String): Boolean =
+-          lower.startsWith(s"$level:") ||
+-            lower.contains(s": $level:")
+-        if (hasSeverity("error") || hasSeverity("fatal error") ||
+-            lower.contains("undefined reference") ||
+-            lower.contains("undefined symbol") ||
+-            (summary && line.contains(" error")))
+-          diagnostic = logger.error
+-        else if (hasSeverity("warning") ||
+-            (summary && line.contains(" warning")))
+-          diagnostic = logger.warn
+-        if (line.startsWith("In file included from ")
+-            || line.trim.startsWith("from "))
+-          logger.info(line)
+-        else diagnostic(line)
+-      }
+-    )
++    line => {
++      // Not `toLowerCase(Locale.ROOT)`: java.util.Locale does not exist on Scala Native, which
++      // this runs on when scalino self-hosts the linker (no per-locale tables to vary there).
++      val lower = line.toLowerCase()
++      val summary = line.endsWith(" generated.")
++      def hasSeverity(level: String): Boolean =
++        lower.startsWith(s"$level:") ||
++          lower.contains(s": $level:")
++      if (hasSeverity("error") || hasSeverity("fatal error") ||
++          lower.contains("undefined reference") ||
++          lower.contains("undefined symbol") ||
++          (summary && line.contains(" error")))
++        diagnostic = logger.error
++      else if (hasSeverity("warning") ||
++          (summary && line.contains(" warning")))
++        diagnostic = logger.warn
++      if (line.startsWith("In file included from ")
++          || line.trim.startsWith("from "))
++        logger.info(line)
++      else diagnostic(line)
++    }
+   }
+ 
+ }
+diff --git a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
+index 30cf99d3..27f8f483 100644
+--- a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
++++ b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
+@@ -71,6 +71,23 @@ sealed trait NativeConfig {
+   /** Shall we use the incremental compilation? */
+   def useIncrementalCompilation: Boolean
+ 
++  /** EXPERIMENTAL. Shall codegen call directly into libLLVM's C API to build
++   *  the LLVM module in memory and emit object files, instead of writing
++   *  textual `.ll` files and shelling out to `clang` to compile them?
++   *
++   *  Only takes effect when the toolchain itself is running as compiled
++   *  Scala Native code (not on the JVM) and a compatible `libLLVM`/
++   *  `llvm-config` is discoverable; otherwise this setting is ignored and the
++   *  regular `.ll` + `clang` path is used. Partitions using features the
++   *  direct backend does not yet support (exceptions, debug info, atomics)
++   *  automatically fall back to the regular path.
++   *
++   *  Default `false`. This is an experimental, opt-in optimization to reduce
++   *  the number of `clang` subprocesses spawned during linking; it may be
++   *  enabled by default in the future once proven.
++   */
++  def useLLVMDirectCodeGen: Boolean
++
+    // format: off
+   /** Shall be compiled with multithreading support.
+    *
+@@ -110,6 +127,55 @@ sealed trait NativeConfig {
+   private[scalanative] def multithreadingSupport: Boolean =
+     multithreading.getOrElse(true)
+ 
++  /** Use compact object headers: a single 32-bit word holding the class id
++   *  (and, with multithreading, the lock bits) instead of the rtti pointer +
++   *  optional lock word. Objects and arrays get 4-12 bytes smaller. On by
++   *  default, but only takes effect for 64-bit targets using the Immix GC, see
++   *  [[compactHeadersEnabled]].
++   */
++  def compactHeaders: Boolean
++
++  /** Also use the compact header for `Array[Byte]`. When disabled, byte arrays
++   *  keep the elements at the same offset as without compact headers (16 bytes
++   *  from the start, 24 with multithreading), because libraries such as
++   *  jsoniter-scala-core read and write them through raw pointers with a copy
++   *  of the runtime array layout. On by default, disable it if a dependency does
++   *  that. Has no effect without [[compactHeaders]].
++   */
++  def compactByteArrays: Boolean
++
++  /** EXPERIMENTAL. Create a new config with given compactByteArrays value. See
++   *  [[compactByteArrays]].
++   */
++  def withCompactByteArrays(value: Boolean): NativeConfig
++
++  /** Whether compact object headers are actually used for this configuration.
++   *  Not supported (yet) on 32-bit platforms, nor with GCs other than Immix.
++   */
++  private[scalanative] def compactHeadersEnabled: Boolean =
++    compactHeaders && !is32BitPlatform && gc == GC.Immix
++
++  private[scalanative] def compactByteArraysEnabled: Boolean =
++    compactHeadersEnabled && compactByteArrays
++
++  /** EXPERIMENTAL. Create a new config with given compactHeaders value. See
++   *  [[compactHeaders]].
++   */
++  def withCompactHeaders(value: Boolean): NativeConfig
++
++  /** EXPERIMENTAL, commix GC only. Keep mutator threads fully paused through
++   *  the parallel sweep phase instead of resuming them as soon as marking
++   *  finishes (commix's normal behavior). Commix's marking phase is already
++   *  parallel-STW (all mutators stay paused while multiple GC worker threads
++   *  drain the grey-packet queue); only sweep is normally allowed to run
++   *  concurrently with resumed mutators, at the cost of per-allocation
++   *  lazy-sweep bookkeeping mutators otherwise pay. When throughput matters
++   *  more than pause-time/concurrency, this trades that resumption back for
++   *  a longer, fully parallel STW pause with none of that bookkeeping.
++   *  Default `false`.
++   */
++  def gcStwSweep: Boolean
++
+   /** Map of user defined properties resolved at linktime */
+   def linktimeProperties: NativeConfig.LinktimeProperites
+ 
+@@ -264,12 +330,22 @@ sealed trait NativeConfig {
+   /** Create a new config with given incrementalCompilation value */
+   def withIncrementalCompilation(value: Boolean): NativeConfig
+ 
++  /** EXPERIMENTAL. Create a new config with given useLLVMDirectCodeGen value.
++   *  See [[useLLVMDirectCodeGen]].
++   */
++  def withLLVMDirectCodeGen(value: Boolean): NativeConfig
++
+   /** Create a new config with support for multithreading */
+   def withMultithreading(enabled: Boolean): NativeConfig
+ 
+   /** Create a new config with support for multithreading */
+   def withMultithreading(defined: Option[Boolean]): NativeConfig
+ 
++  /** EXPERIMENTAL. Create a new config with given gcStwSweep value. See
++   *  [[gcStwSweep]].
++   */
++  def withGCStwSweep(value: Boolean): NativeConfig
++
+   /** Create a new config with given linktime properites */
+   final def withLinktimeProperties(
+       value: NativeConfig.LinktimeProperites
+@@ -347,7 +423,11 @@ object NativeConfig {
+       linkStubs = false,
+       optimize = true,
+       useIncrementalCompilation = true,
++      useLLVMDirectCodeGen = false,
++      compactHeaders = true,
++      compactByteArrays = true,
+       multithreading = None, // detect
++      gcStwSweep = false,
+       linktimeProperties = Map.empty,
+       embedResources = false,
+       resourceIncludePatterns = Seq("**"),
+@@ -379,7 +459,11 @@ object NativeConfig {
+       linkStubs: Boolean,
+       optimize: Boolean,
+       useIncrementalCompilation: Boolean,
++      useLLVMDirectCodeGen: Boolean,
++      compactHeaders: Boolean,
++      compactByteArrays: Boolean,
+       multithreading: Option[Boolean],
++      gcStwSweep: Boolean,
+       linktimeProperties: LinktimeProperites,
+       embedResources: Boolean,
+       resourceIncludePatterns: Seq[String],
+@@ -458,12 +542,24 @@ object NativeConfig {
+     override def withIncrementalCompilation(value: Boolean): NativeConfig =
+       copy(useIncrementalCompilation = value)
+ 
++    override def withLLVMDirectCodeGen(value: Boolean): NativeConfig =
++      copy(useLLVMDirectCodeGen = value)
++
++    override def withCompactHeaders(value: Boolean): NativeConfig =
++      copy(compactHeaders = value)
++
++    override def withCompactByteArrays(value: Boolean): NativeConfig =
++      copy(compactByteArrays = value)
++
+     def withMultithreading(enabled: Boolean): NativeConfig =
+       copy(multithreading = Some(enabled))
+ 
+     def withMultithreading(defined: Option[Boolean]): NativeConfig =
+       copy(multithreading = defined)
+ 
++    override def withGCStwSweep(value: Boolean): NativeConfig =
++      copy(gcStwSweep = value)
++
+     def withLinktimeProperties(
+         update: Mapping[LinktimeProperites]
+     ): NativeConfig = {
+@@ -551,7 +647,11 @@ object NativeConfig {
+           | - linkStubs:               $linkStubs
+           | - optimize                 $optimize
+           | - incrementalCompilation:  $useIncrementalCompilation
++          | - useLLVMDirectCodeGen:    $useLLVMDirectCodeGen
++          | - compactHeaders:          $compactHeaders
++          | - compactByteArrays:       $compactByteArrays
+           | - multithreading           ${multithreading.getOrElse("detect")}
++          | - gcStwSweep:              $gcStwSweep
+           | - linktimeProperties:      ${showMap(linktimeProperties)}
+           | - embedResources:          $embedResources
+           | - resourceIncludePatterns: ${showSeq(resourceIncludePatterns)}
+diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+index d49c90f4..ebd6bbf0 100644
+--- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
++++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+@@ -44,9 +44,19 @@ private[scalanative] object NativeLib {
+     val destPath = unpackNativeCode(nativeLib)
+     val paths = findNativePaths(destPath)
+     val projConfig = configureNativeLibrary(config, analysis, destPath)
+-    Future.sequence {
+-      paths.map(LLVM.compile(projConfig, analysis, _))
+-    }
++    // own-implementation fix: a hash file scoped to THIS library's own
++    // dest dir/projConfig, instead of the shared top-level workDir one --
++    // see the comment on Build.userConfigHasChanged for why the shared file
++    // made this per-library cache check always report "changed". destPath
++    // already survives across runs (unpackNativeCode/unpackNativeJar only
++    // wipe it when the source jar itself actually changed), so this file
++    // does too.
++    val hashPath = destPath.resolve(Build.userConfigHashFile)
++    Future
++      .sequence {
++        paths.map(LLVM.compile(projConfig, analysis, _, hashPath))
++      }
++      .andThen { case Success(_) => Build.dumpUserConfigHash(projConfig, hashPath) }
+   }
+ 
+   /** Update the project configuration if a project `Descriptor` is present.
+@@ -139,7 +149,9 @@ private[scalanative] object NativeLib {
+         Seq(
+           Some(s"-DSCALANATIVE_GC_${gcName}"),
+           if (!config.useTrapBasedGCYieldPoints) None
+-          else Some("-DSCALANATIVE_GC_USE_YIELDPOINT_TRAPS")
++          else Some("-DSCALANATIVE_GC_USE_YIELDPOINT_TRAPS"),
++          if (!config.compilerConfig.gcStwSweep) None
++          else Some("-DSCALANATIVE_GC_COMMIX_STW_SWEEP")
+         ).flatten
+       }
+ 
+@@ -194,7 +206,7 @@ private[scalanative] object NativeLib {
+     val workDir = config.workDir
+     val classpath = config.classPath
+     val nativeCodeDir = workDir.resolve("dependencies")
+-    if (Build.userConfigHasChanged(config))
++    if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
+       IO.deleteRecursive(nativeCodeDir)
+ 
+     val nativeLibPaths = classpath.flatMap { path =>
+@@ -297,18 +309,16 @@ private[scalanative] object NativeLib {
+       IO.unzip(source, target)
+     }
+ 
+-    if (Platform.isJVM) {
+-      val jarhash = IO.sha1(source)
+-      val jarhashPath = target.resolve("jarhash")
+-      def unpacked =
+-        Files.exists(target) &&
+-          Files.exists(jarhashPath) &&
+-          Arrays.equals(jarhash, Files.readAllBytes(jarhashPath))
+-      if (!unpacked) {
+-        unpack()
+-        IO.write(jarhashPath, jarhash)
+-      }
+-    } else unpack()
++    val jarhash = IO.sha1(source)
++    val jarhashPath = target.resolve("jarhash")
++    def unpacked =
++      Files.exists(target) &&
++        Files.exists(jarhashPath) &&
++        Arrays.equals(jarhash, Files.readAllBytes(jarhashPath))
++    if (!unpacked) {
++      unpack()
++      IO.write(jarhashPath, jarhash)
++    }
+     target
+   }
+ 
+diff --git a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+index 51607936..840becc5 100644
+--- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
++++ b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
+@@ -66,7 +66,22 @@ private[scalanative] object ScalaNative {
+         ) {
+           Interflow
+             .optimize(config, analysis)
+-            .map(Link(config, analysis.entries, _))
++            .map { defns =>
++              if (sys.env.contains("SCALANATIVE_ESCAPE_REPORT"))
++                config.logger.time("Escape analysis report") {
++                  interflow.EscapeAnalysis.report(config, analysis, defns)
++                }
++              if (interflow.Inline.pgoStats) interflow.Inline.dumpStats(m => config.logger.info(m))
++              if (sys.env.contains("SCALANATIVE_ESCAPE_EXIT")) sys.exit(0)
++              val finalDefns =
++                if (stackObjectsEnabled(config))
++                  config.logger.time("Analyzing object escapes") {
++                    interflow.EscapeAnalysis.transform(config, analysis, defns)
++                  }
++                else defns
++              if (sys.env.contains("SCALANATIVE_STACK_EXIT")) sys.exit(0)
++              Link(config, analysis.entries, finalDefns)
++            }
+         }
+       }
+     else {
+@@ -75,6 +90,17 @@ private[scalanative] object ScalaNative {
+     }
+   }
+ 
++  /** Stack allocation of non-escaping objects is on by default in release
++   *  modes only. `SCALANATIVE_STACK_OBJECTS` forces it: `0`/`false` disables
++   *  it, any other value enables it.
++   */
++  private def stackObjectsEnabled(config: Config): Boolean =
++    sys.env.get("SCALANATIVE_STACK_OBJECTS") match {
++      case Some("0") | Some("false") => false
++      case Some(_)                   => true
++      case None                      => config.mode != Mode.Debug
++    }
++
+   private def withReachabilityPostprocessing(
+       config: Config,
+       stage: String,
+@@ -220,7 +246,21 @@ private[scalanative] object ScalaNative {
+         .flatMap(Future.sequence(_))
+         .andThen {
+           case Success(paths) =>
+-            config.logger.info(s"Produced ${paths.length} LLVM IR files")
++            // useLLVMDirectCodeGen (CodeGen.scala) makes some/all of these
++            // straight-to-object-file, not the old always-.ll path -- report
++            // what was actually produced instead of a hardcoded "LLVM IR
++            // files" that's wrong (0 of them) once direct codegen covers a
++            // whole build.
++            val llCount = paths.count(_.toString.endsWith(".ll"))
++            val objCount = paths.length - llCount
++            val message =
++              if (llCount == 0)
++                s"Produced ${paths.length} object files (direct codegen)"
++              else if (objCount == 0)
++                s"Produced ${paths.length} LLVM IR files"
++              else
++                s"Produced $objCount object files (direct codegen) and $llCount LLVM IR files"
++            config.logger.info(message)
+         }
+     }
+     codeGen
+@@ -298,7 +338,7 @@ private[scalanative] object ScalaNative {
+     log(s"\n${errors.size} errors found")
+   }
+ 
+-  def dumpDefns(config: Config, phase: String, defns: Seq[nir.Defn]): Unit = {
++  def dumpDefns(config: Config, phase: String, defns: collection.Seq[nir.Defn]): Unit = {
+     if (config.dump) {
+       config.logger.time(s"Dumping intermediate code ($phase)") {
+         val path = config.workDir.resolve(phase + ".hnir")
+diff --git a/tools/src/main/scala/scala/scalanative/build/Validator.scala b/tools/src/main/scala/scala/scalanative/build/Validator.scala
+index 1e5c2811..fb07c8a6 100644
+--- a/tools/src/main/scala/scala/scalanative/build/Validator.scala
++++ b/tools/src/main/scala/scala/scalanative/build/Validator.scala
+@@ -58,6 +58,22 @@ private[build] object Validator {
+         "LTO.thin is unstable on MacOS, it can lead to compilation errors. Consider using LTO.full (legacy, slower) or LTO.none (disabled)"
+       )
+ 
++    // Only warn about the one gap left that's actually still true: this
++    // backend calls directly into libLLVM's C API, which requires the
++    // toolchain itself to be running as compiled Scala Native code (not
++    // plain JVM-hosted tools) with a discoverable, compatible libLLVM --
++    // there, it silently has no effect at all (CodeGen.scala keeps using the
++    // regular .ll + clang path). Exceptions/debug info/atomics/multithreading
++    // are all supported now (Phase 3); the remaining per-definition fallback
++    // (an `if` whose two branches target the same block with different
++    // phi args, a rare shape) doesn't warrant a standing warning.
++    if (c.useLLVMDirectCodeGen && Platform.isJVM)
++      warn(
++        "useLLVMDirectCodeGen has no effect on a plain JVM-hosted toolchain " +
++          "(it calls directly into libLLVM's C API, which requires the toolchain " +
++          "itself to be compiled Scala Native code); the regular .ll + clang path is used instead."
++      )
++
+     issues.result() match {
+       case Nil    => config
+       case issues =>
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
+index d0137c97..2b5d849f 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
+@@ -117,7 +117,7 @@ class InliningTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           assertEquals(nir.Attr.DidOpt, defn.attrs.opt)
+           // Do nothing, it did not lead to StackOverflowError
+         }
+@@ -146,7 +146,7 @@ class InliningTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val jlInteger = nir.Type.Ref(nir.Global.Top("java.lang.Integer"))
+           assertContainsAll(
+             "Not all expression were inlined and constant folded",
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
+index 620fce85..a55f8b07 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
+@@ -112,7 +112,7 @@ class LexicalScopesTest extends OptimizerSpec {
+           assertEquals("innerResult-parent", result.id, innerResult.parent)
+           assertEquals("deep-parent", innerResult.id, deep.parent)
+       }
+-      test(result.defns)
++      test(result.defns.toSeq)
+       afterLowering(config, result)(test)
+   }
+ 
+@@ -179,7 +179,7 @@ class LexicalScopesTest extends OptimizerSpec {
+             )
+           }
+       }
+-      test(result.defns)
++      test(result.defns.toSeq)
+       afterLowering(config, result)(test)
+   }
+ 
+@@ -207,7 +207,7 @@ class LexicalScopesTest extends OptimizerSpec {
+     setupConfig = _.withMode(build.Mode.releaseFast)
+   ) {
+     case (config, result) =>
+-      findEntry(result.defns).foreach { implicit defn =>
++      findEntry(result.defns.toSeq).foreach { implicit defn =>
+         assertContainsAll(
+           "named vals",
+           Seq("a", "myTmp"),
+@@ -254,7 +254,7 @@ class LexicalScopesTest extends OptimizerSpec {
+     setupConfig = _.withMode(build.Mode.releaseFast)
+   ) {
+     case (config, result) =>
+-      findEntry(result.defns).foreach { implicit defn =>
++      findEntry(result.defns.toSeq).foreach { implicit defn =>
+         assertContainsAll(
+           "named vals",
+           Seq("a", "b", "myTmp"),
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
+index 0d3fcc48..ad4f3ea6 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
+@@ -79,7 +79,7 @@ class LocalNamesTest extends OptimizerSpec {
+           )
+           assertDistinct(lets)
+         }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+       afterLowering(config, result)(checkLocalNames)
+   }
+ 
+@@ -242,7 +242,7 @@ class LocalNamesTest extends OptimizerSpec {
+               Seq("buffer", "addr", "rawptr", "toPtr", "fromPtr", "size")
+             assertDistinct(lets.values.toSeq.filterNot(filteredOut.contains))
+           }
+-      checkLocalNames(result.defns, beforeLowering = true)
++      checkLocalNames(result.defns.toSeq, beforeLowering = true)
+       afterLowering(config, result) {
+         checkLocalNames(_, beforeLowering = false)
+       }
+@@ -306,7 +306,7 @@ class LocalNamesTest extends OptimizerSpec {
+               }
+               .getOrElse(fail("not found label with expected params"))
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+   @Test def inlinedNames(): Unit = optimize(
+@@ -356,7 +356,7 @@ class LocalNamesTest extends OptimizerSpec {
+               defn.debugInfo.localNames.values
+             )
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+   @Test def inlinedNames2(): Unit = optimize(
+@@ -406,7 +406,7 @@ class LocalNamesTest extends OptimizerSpec {
+               defn.debugInfo.localNames.values
+             )
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+   @Test def polyInlinedNames(): Unit = optimize(
+@@ -453,7 +453,7 @@ class LocalNamesTest extends OptimizerSpec {
+               defn.debugInfo.localNames.values
+             )
+           }
+-      checkLocalNames(result.defns)
++      checkLocalNames(result.defns.toSeq)
+   }
+ 
+ }
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala
+new file mode 100644
+index 00000000..63cef374
+--- /dev/null
++++ b/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala
+@@ -0,0 +1,81 @@
++package scala.scalanative
++package optimizer
++
++import org.junit.Assert._
++import org.junit._
++
++import scala.scalanative.OptimizerSpec
++
++class MergePhiScalarJoinTest extends OptimizerSpec {
++
++  /** Two branches allocate distinct instances of the same shape
++   *  (`Point`), merged at a phi into a single local. Before the
++   *  MergeProcessor phi-merge scalar join, this forced both branches to
++   *  materialize a real `Op.Classalloc`, even though the merged value is
++   *  only ever used for scalar field reads (never escapes as a whole
++   *  reference). With the join in place, the merge keeps a single virtual
++   *  instance whose fields are themselves phi-merged, so no allocation is
++   *  ever emitted.
++   */
++  @Test def noAllocationForJoinableBranches(): Unit = {
++    optimize(
++      entry = "Test",
++      sources = Map(
++        "Test.scala" ->
++          """|final class Point(val x: Int, val y: Int)
++             |
++             |object Test {
++             |  def main(args: Array[String]): Unit = {
++             |    val cond = args.length == 0
++             |    val p = if (cond) new Point(1, 2) else new Point(3, 4)
++             |    println(p.x + p.y)
++             |  }
++             |}
++             |""".stripMargin
++      ),
++      setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
++    ) {
++      case (_, result) =>
++        findEntry(result.defns.toSeq).foreach { defn =>
++          val classallocs = defn.insts.collect {
++            case nir.Inst.Let(_, op: nir.Op.Classalloc, _)
++                if op.name.toString.contains("Point") =>
++              op
++          }
++          assertTrue(
++            "Expected no Op.Classalloc for Point - branches should have " +
++              s"been joined into a single virtual instance; got: $classallocs",
++            classallocs.isEmpty
++          )
++        }
++    }
++  }
++
++  /** Branches allocating arrays of different lengths must NOT be joined
++   *  (field count differs), so the existing materialize-based fallback
++   *  still applies and behavior is unchanged from before the join.
++   */
++  @Test def differentLengthArraysAreNotJoined(): Unit = {
++    optimize(
++      entry = "Test",
++      sources = Map(
++        "Test.scala" ->
++          """|object Test {
++             |  def main(args: Array[String]): Unit = {
++             |    val cond = args.length == 0
++             |    val a = if (cond) new Array[Int](2) else new Array[Int](3)
++             |    println(a.length)
++             |  }
++             |}
++             |""".stripMargin
++      ),
++      setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
++    ) {
++      case (_, result) =>
++        // Just confirming this compiles/optimizes without crashing the
++        // joinability check (arrays of differing length are a real fixture
++        // that must fall through to materialize, not a hypothetical).
++        assertTrue(findEntry(result.defns.toSeq).isDefined)
++    }
++  }
++}
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
+index d30d6a7d..c47d3a18 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
+@@ -182,7 +182,7 @@ class PolyInlineGetClassTest extends OptimizerSpec {
+       setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val getClassByReceiver = defn.insts
+             .collect {
+               case nir.Inst.Let(_, nir.Op.Method(obj, sig), _)
+@@ -251,7 +251,7 @@ class PolyInlineGetClassTest extends OptimizerSpec {
+       setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val receivers = defn.insts.collect {
+             case nir.Inst.Let(_, nir.Op.Method(obj, sig), _)
+                 if sig == nir.Rt.GetClassSig =>
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
+index d3d4939c..4f599d2f 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
+@@ -47,7 +47,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -101,7 +101,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       setupConfig = _.withMode(scala.scalanative.build.Mode.releaseFast)
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -152,7 +152,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -205,7 +205,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -260,7 +260,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -320,7 +320,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+ 
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+@@ -378,7 +378,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+@@ -442,7 +442,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
+       )
+     ) {
+       case (_, result) =>
+-        findEntry(result.defns).foreach { defn =>
++        findEntry(result.defns.toSeq).foreach { defn =>
+           val stackallocId = defn.insts.collectFirst {
+             case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
+           }
+diff --git a/tools/src/test/scala/scala/scalanative/optimizer/package.scala b/tools/src/test/scala/scala/scalanative/optimizer/package.scala
+index 3882202c..1ab55464 100644
+--- a/tools/src/test/scala/scala/scalanative/optimizer/package.scala
++++ b/tools/src/test/scala/scala/scalanative/optimizer/package.scala
+@@ -111,7 +111,7 @@ package object optimizer {
+     implicit val platform: PlatformInfo = PlatformInfo(config)
+     implicit val meta: Metadata =
+       new Metadata(optimized, config, Nil)
+-    val lowered = llvm.CodeGen.lower(defns)
++    val lowered = llvm.CodeGen.lower(defns.toSeq)
+     Await.result(lowered.map(fn), duration.Duration.Inf)
+   }
+ 

@@ -72,7 +72,10 @@ mkdir -p "$OUT_CLASSES"
 DEPS_CP="$(tr "$CP_SEP" '\n' < "$WORK/compiler.cp" | grep -v '/scala3-compiler_3-' | paste -sd"$CP_SEP" -)"
 
 echo "== compiling patched dotc+nscplugin source to plain JVM classes (bootstrap, for MiniPhase discovery only) =="
+# The compiler sources of Scala 3.10+ are written for -Yexplicit-nulls (scala3/project/Build.scala); the
+# rest of the source set (nscplugin, nir, our patches) is not, hence unsafeNulls for the whole compile.
 "$JAVA" -Xss64m -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+  -Yexplicit-nulls -language:unsafeNulls -language:implicitConversions \
   -classpath "$DEPS_CP" \
   -d "$OUT_CLASSES" \
   "@$FILE_LIST"

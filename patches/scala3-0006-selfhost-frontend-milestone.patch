@@ -1,539 +1,6 @@
-diff --git a/compiler/src/dotty/tools/dotc/Compiler.scala b/compiler/src/dotty/tools/dotc/Compiler.scala
-index a47cbefe..0847e217 100644
---- a/compiler/src/dotty/tools/dotc/Compiler.scala
-+++ b/compiler/src/dotty/tools/dotc/Compiler.scala
-@@ -7,7 +7,6 @@ import typer.{TyperPhase, RefChecks}
- import parsing.Parser
- import Phases.Phase
- import transform.*
--import backend.jvm.GenBCode
- import localopt.{StringInterpolatorOpt, DropForMap}
- 
- /** The central class of the dotc compiler. The job of a compiler is to create
-@@ -38,17 +37,14 @@ class Compiler {
-          CheckShadowing()) ::       // Check for shadowed elements
-     List(new YCheckPositions) ::    // YCheck positions
-     List(new sbt.ExtractDependencies) :: // Sends information on classes' dependencies to sbt via callbacks
--    List(new semanticdb.ExtractSemanticInfo) :: // Extract info into .semanticdb files
-     List(new PostTyper) ::          // Additional checks and cleanups after type checking
-     List(new UnrollDefinitions) ::  // Unroll annotated methods if detected in PostTyper
--    List(new sjs.PrepJSInterop) ::  // Additional checks and transformations for Scala.js (Scala.js only)
-     List(new SetRootTree) ::        // Set the `rootTreeOrProvider` on class symbols
-     Nil
- 
-   /** Phases dealing with TASTY tree pickling and unpickling */
-   protected def picklerPhases: List[List[Phase]] =
-     List(new Pickler) ::            // Generate TASTY info
--    List(new sbt.ExtractAPI) ::     // Sends a representation of the API of classes to sbt via callbacks
-     List(new Inlining) ::           // Inline and execute macros
-     List(new PostInlining) ::       // Add mirror support for inlined code
-     List(new Staging) ::            // Check staging levels and heal staged types
-@@ -87,9 +83,7 @@ class Compiler {
-     List(new cc.Setup) ::            // Preparations for check captures phase, enabled under captureChecking
-     List(new cc.CheckCaptures) ::    // Check captures, enabled under captureChecking
-     List(CheckUnused.PostPatMat()) :: // Check for unused elements and report
--    List(new semanticdb.AppendDiagnostics) :: // Attach warnings to extracted SemanticDB and write to .semanticdb file
-     List(new ElimOpaque,             // Turn opaque into normal aliases
--         new sjs.ExplicitJSClasses,  // Make all JS classes explicit (Scala.js only)
-          new ExplicitOuter,          // Add accessors to outer classes from nested ones.
-          new ExplicitSelf,           // Make references to non-trivial self types explicit as casts
-          new StringInterpolatorOpt,  // Optimizes raw and s and f string interpolators by rewriting them to string concatenations or formats
-@@ -117,7 +111,6 @@ class Compiler {
-          new VCElideAllocations,     // Peep-hole optimization to eliminate unnecessary value class allocations
-          new EtaReduce,              // Reduce eta expansions of pure paths to the underlying function reference
-          new ArrayApply,             // Optimize `scala.Array.apply([....])` and `scala.Array.apply(..., [....])` into `[...]`
--         new sjs.AddLocalJSFakeNews, // Adds fake new invocations to local JS classes in calls to `createLocalJSClass`
-          new ElimPolyFunction,       // Rewrite PolyFunction subclasses to FunctionN subclasses
-          new TailRec,                // Rewrite tail recursion to loops
-          new CompleteJavaEnums,      // Fill in constructors for Java enums
-@@ -142,14 +135,20 @@ class Compiler {
-          new ExpandPrivate,          // Widen private definitions accessed from nested classes
-          new RestoreScopes,          // Repair scopes rendered invalid by moving definitions in prior phases of the group
-          new SelectStatic,           // get rid of selects that would be compiled into GetStatic
--         new sjs.JUnitBootstrappers, // Generate JUnit-specific bootstrapper classes for Scala.js (not enabled by default)
-+         new CollectEntryPoints,     // Collect all entry points and save them in the context
-          new RepeatableAnnotations) :: // Aggregate repeatable annotations
-     Nil
- 
--  /** Generate the output of the compilation */
-+  /** Generate the output of the compilation.
-+   *
-+   *  Empty in this build: both `backend.sjs.GenSJSIR` (Scala.js) and
-+   *  `backend.jvm.GenBCode` (real JVM classfile emission, whose
-+   *  `org.scala-lang.modules:scala-asm` dependency has no Scala Native
-+   *  cross-build) are excluded from this reduced source set entirely -- see
-+   *  docs/findings.md's "frontend-only smoke test" scoping. Nothing in this
-+   *  variant emits JVM bytecode or Scala.js IR; it only parses+typechecks.
-+   */
-   protected def backendPhases: List[List[Phase]] =
--    List(new backend.sjs.GenSJSIR) :: // Generate .sjsir files for Scala.js (not enabled by default)
--    List(new GenBCode) ::             // Generate JVM bytecode
-     Nil
- 
-   // TODO: Initially InitialRunId - 1, so that the first nextRunId call would return InitialRunId
-diff --git a/compiler/src/dotty/tools/dotc/Driver.scala b/compiler/src/dotty/tools/dotc/Driver.scala
-index a3ff0384..12489762 100644
---- a/compiler/src/dotty/tools/dotc/Driver.scala
-+++ b/compiler/src/dotty/tools/dotc/Driver.scala
-@@ -87,15 +87,14 @@ class Driver {
-       fileNamesOrNone.map(fileNames =>
-         MacroClassLoader.init(ictx)
-         Positioned.init
-+        // `-Yreporter <class>`'s reflective instantiation (`Class#getDeclaredConstructor`) is
-+        // unsupported by this toolchain: Scala Native has no general reflection API (only the
-+        // narrow, per-class opt-in `@EnableReflectiveInstantiation`, which doesn't cover an
-+        // arbitrary user-named class), and even the *type* `java.lang.reflect.Constructor`
-+        // doesn't link without a real JVM behind it. Same posture as `--compiler-plugin`
-+        // (see docs/findings.md's "frontend-only smoke test" scoping).
-         if !ctx.settings.Yreporter.isDefault && ctx.settings.Yreporter.value != "help" then
--          try
--            Class.forName(ctx.settings.Yreporter.value).getDeclaredConstructor().newInstance() match
--              case userReporter: Reporter =>
--                ictx.setReporter(userReporter)
--              case badReporter =>
--                report.error(em"Not a reporter: ${ctx.settings.Yreporter.value}")
--          catch case e: ReflectiveOperationException =>
--            report.error(em"Could not create reporter ${ctx.settings.Yreporter.value}: $e")
-+          report.error(em"-Yreporter is not supported by this toolchain.")
-         val files = fileNames.map(ctx.getFile)
-         (files, fromTastySetup(files))
-       )
-diff --git a/compiler/src/dotty/tools/dotc/Run.scala b/compiler/src/dotty/tools/dotc/Run.scala
-index fb77ef3a..4248635f 100644
---- a/compiler/src/dotty/tools/dotc/Run.scala
-+++ b/compiler/src/dotty/tools/dotc/Run.scala
-@@ -39,7 +39,6 @@ import dotty.tools.dotc.transform.MegaPhase
- import dotty.tools.dotc.transform.Pickler.AsyncTastyHolder
- import dotty.tools.io.FileWriters
- import dotty.tools.dotc.util.chaining.*
--import java.util.{Timer, TimerTask}
- 
- /** A compiler run. Exports various methods to compile source files */
- class Run(comp: Compiler, ictx: Context)
-@@ -512,16 +511,15 @@ extends ImplicitRunInfo, ConstraintRunInfo, cc.CaptureRunInfo {
-   /** Period between progress reports, in ms */
-   private inline val printProgressPeriod = 10000
- 
--  /** Shows progress if debugPrintProgress is true */
--  private def showProgress(proc: => Unit)(using Context): Unit =
--    if !debugPrintProgress then proc
--    else
--      val watchdog = new TimerTask:
--        def run() = println(i"[compiling $units]")
--      try
--        new Timer().schedule(watchdog, printProgressPeriod, printProgressPeriod)
--        proc
--      finally watchdog.cancel()
-+  /** Shows progress if debugPrintProgress is true.
-+   *
-+   *  The `Timer`/`TimerTask`-based periodic progress printer upstream is dropped: `debugPrintProgress`
-+   *  is a hardcoded `false` `inline val` (this branch was already dead code, a debug-only feature
-+   *  never enabled by any real build), and `java.util.Timer`/`TimerTask` need real JVM scheduling,
-+   *  unsupported by this toolchain (no Scala Native port confirmed) regardless. See
-+   *  docs/findings.md's "frontend-only smoke test" scoping.
-+   */
-+  private def showProgress(proc: => Unit)(using Context): Unit = proc
- 
-   private sealed trait PrintedTree
-   private /*final*/ case class SomePrintedTree(phase: String, tree: String) extends PrintedTree
-diff --git a/compiler/src/dotty/tools/dotc/classpath/AggregateClassPath.scala b/compiler/src/dotty/tools/dotc/classpath/AggregateClassPath.scala
-index 73b6b65b..c4b06a3c 100644
---- a/compiler/src/dotty/tools/dotc/classpath/AggregateClassPath.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/AggregateClassPath.scala
-@@ -4,7 +4,7 @@
- package dotty.tools
- package dotc.classpath
- 
--import java.net.URL
-+import java.net.URI
- import scala.collection.mutable.ArrayBuffer
- import scala.collection.immutable.ArraySeq
- import dotc.util
-@@ -31,7 +31,7 @@ case class AggregateClassPath(aggregates: Seq[ClassPath]) extends ClassPath {
-     packageIndex.getOrElseUpdate(pkg.dottedString, aggregates.filter(_.hasPackage(pkg)))
-   }
- 
--  override def asURLs: Seq[URL] = aggregates.flatMap(_.asURLs)
-+  override def asURLs: Seq[URI] = aggregates.flatMap(_.asURLs)
- 
-   override def asClassPathStrings: Seq[String] = aggregates.map(_.asClassPathString).distinct
- 
-diff --git a/compiler/src/dotty/tools/dotc/classpath/ClassPathFactory.scala b/compiler/src/dotty/tools/dotc/classpath/ClassPathFactory.scala
-index c4797440..c0de738a 100644
---- a/compiler/src/dotty/tools/dotc/classpath/ClassPathFactory.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/ClassPathFactory.scala
-@@ -75,7 +75,7 @@ class ClassPathFactory(precomputedSourcePackages: Option[LogicalPackage] = None)
-         for
-           file <- files
-           a <- ClassPath.expandManifestPath(file.absolutePath)
--          path = java.nio.file.Paths.get(a.toURI())
-+          path = java.nio.file.Paths.get(a)
-           if Files.exists(path)
-         yield
-           newClassPath(AbstractFile.getFile(path).nn) // .nn ok because of Files.exists(path)
-diff --git a/compiler/src/dotty/tools/dotc/classpath/DirectoryClassPath.scala b/compiler/src/dotty/tools/dotc/classpath/DirectoryClassPath.scala
-index 3c0f2fb7..faa34895 100644
---- a/compiler/src/dotty/tools/dotc/classpath/DirectoryClassPath.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/DirectoryClassPath.scala
-@@ -4,7 +4,7 @@
- package dotty.tools.dotc.classpath
- 
- import java.io.{File => JFile}
--import java.net.{URI, URL}
-+import java.net.URI
- import java.nio.file.{FileSystems, Files}
- 
- import dotty.tools.dotc.classpath.PackageNameUtils.{packageContains, separatePkgAndClassNames}
-@@ -118,25 +118,19 @@ trait JFileDirectoryLookup[FileEntryType <: ClassRepresentation] extends Directo
- 
-   assert(dir.asInstanceOf[JFile | Null] != null, "Directory file in DirectoryFileLookup cannot be null")
- 
--  def asURLs: Seq[URL] = Seq(dir.toURI.toURL)
-+  def asURLs: Seq[URI] = Seq(dir.toURI)
-   def asClassPathStrings: Seq[String] = Seq(dir.getPath)
- }
- 
- object JrtClassPath {
--  import java.nio.file.*, java.net.URI, scala.util.Properties
--  def apply(release: Option[String]): Option[ClassPath] =
--    // Longer term we'd like an official API for this in the JDK
--    // Discussion: http://mail.openjdk.java.net/pipermail/compiler-dev/2018-March/thread.html#11738
--    release match
--      case Some(v) if v.toInt < Runtime.version().feature() =>
--        try
--          val ctSym = Paths.get(Properties.javaHome).resolve("lib").resolve("ct.sym")
--          if (Files.notExists(ctSym)) None
--          else Some(new CtSymClassPath(ctSym, v.toInt))
--        catch case _: Exception => None
--      case _ =>
--        try Some(new JrtClassPath(FileSystems.getFileSystem(URI.create("jrt:/"))))
--        catch case _: ProviderNotFoundException | _: FileSystemNotFoundException => None
-+  // Always `None` on this toolchain: the `jrt:/` virtual filesystem this whole object is built
-+  // around doesn't exist without a real JDK install (see docs/findings.md's "Blocker 1" -- the
-+  // `-javabootclasspath`/extracted `java.base.jar` workaround bypasses this entirely), and
-+  // `Runtime.version()` needs a real JVM too (no Scala Native port, confirmed absent from
-+  // `vendor/scala-native`'s `java.lang.Runtime`). `PathResolver.scala`'s own caller comment
-+  // already documents this as one of several classpath sources tried "if available" -- `None`
-+  // is exactly the already-intended fallback here, not a behavior change.
-+  def apply(release: Option[String]): Option[ClassPath] = None
-   end apply
- }
- 
-@@ -178,7 +172,7 @@ final class JrtClassPath(fs: java.nio.file.FileSystem) extends ClassPath with No
-     if (inPackage.isRoot) ClassPathEntries(packages(inPackage), Nil)
-     else ClassPathEntries(packages(inPackage), classes(inPackage))
- 
--  def asURLs: Seq[URL] = Seq(new URI("jrt:/").toURL)
-+  def asURLs: Seq[URI] = Seq(new URI("jrt:/"))
-   // We don't yet have a scheme to represent the JDK modules in our `-classpath`.
-   // java models them as entries in the new "module path", we'll probably need to follow this.
-   def asClassPathStrings: Seq[String] = Nil
-@@ -244,7 +238,7 @@ final class CtSymClassPath(ctSym: java.nio.file.Path, release: Int) extends Clas
-     if (inPackage.isRoot) ClassPathEntries(packages(inPackage), Nil)
-     else ClassPathEntries(packages(inPackage), classes(inPackage))
- 
--  def asURLs: Seq[URL] = Nil
-+  def asURLs: Seq[URI] = Nil
-   def asClassPathStrings: Seq[String] = Nil
-   def findClassFileAndModuleFile(className: String, findModule: Boolean): Option[(AbstractFile, Option[AbstractFile])] = {
-     if (!className.contains(".")) None
-diff --git a/compiler/src/dotty/tools/dotc/classpath/FileUtils.scala b/compiler/src/dotty/tools/dotc/classpath/FileUtils.scala
-index d6bc4be2..fb0039fa 100644
---- a/compiler/src/dotty/tools/dotc/classpath/FileUtils.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/FileUtils.scala
-@@ -5,7 +5,7 @@ package dotty.tools
- package dotc.classpath
- 
- import java.io.{File => JFile, FileFilter}
--import java.net.URL
-+import java.net.URI
- import dotty.tools.io.AbstractFile
- 
- /**
-@@ -38,9 +38,7 @@ object FileUtils {
-      * Safe method returning a sequence containing one URL representing this file, when underlying file exists,
-      * and returning given default value in other case
-      */
--    def toURLs(default: => Seq[URL] = Seq.empty): Seq[URL] =
--      val url = file.toURL
--      if (url == null) default else Seq(url)
-+    def toURLs(default: => Seq[URI] = Seq.empty): Seq[URI] = if (file.file == null) default else Seq(file.toURL)
- 
-     /**
-      * Returns if there is an existing sibling `.tasty` file.
-diff --git a/compiler/src/dotty/tools/dotc/classpath/VirtualDirectoryClassPath.scala b/compiler/src/dotty/tools/dotc/classpath/VirtualDirectoryClassPath.scala
-index 0ce52a94..e7a57757 100644
---- a/compiler/src/dotty/tools/dotc/classpath/VirtualDirectoryClassPath.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/VirtualDirectoryClassPath.scala
-@@ -3,7 +3,7 @@ package dotty.tools.dotc.classpath
- import dotty.tools.io.{ClassPath, ClassRepresentation}
- import dotty.tools.io.{AbstractFile, VirtualDirectory}
- import FileUtils.*
--import java.net.{URI, URL}
-+import java.net.URI
- 
- case class VirtualDirectoryClassPath(dir: VirtualDirectory) extends ClassPath with DirectoryLookup[BinaryFileEntry] with NoSourcePaths {
-   type F = AbstractFile
-@@ -34,7 +34,7 @@ case class VirtualDirectoryClassPath(dir: VirtualDirectory) extends ClassPath wi
-   def isPackage(f: AbstractFile): Boolean = f.isPackage
- 
-   // mimic the behavior of the old nsc.util.DirectoryClassPath
--  def asURLs: Seq[URL] = Seq(new URI(dir.name).toURL)
-+  def asURLs: Seq[URI] = Seq(new URI(dir.name))
-   def asClassPathStrings: Seq[String] = Seq(dir.path)
- 
-   override def findClassFileAndModuleFile(className: String, findModule: Boolean): Option[(AbstractFile, Option[AbstractFile])] = {
-diff --git a/compiler/src/dotty/tools/dotc/classpath/ZipAndJarFileLookupFactory.scala b/compiler/src/dotty/tools/dotc/classpath/ZipAndJarFileLookupFactory.scala
-index aa6e5804..a909a56f 100644
---- a/compiler/src/dotty/tools/dotc/classpath/ZipAndJarFileLookupFactory.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/ZipAndJarFileLookupFactory.scala
-@@ -5,7 +5,7 @@ package dotty.tools.dotc
- package classpath
- 
- import java.io.File
--import java.net.URL
-+import java.net.URI
- import java.nio.file.Files
- import java.nio.file.attribute.{BasicFileAttributes, FileTime}
- 
-@@ -74,7 +74,7 @@ object ZipAndJarClassPathFactory extends ZipAndJarFileLookupFactory {
- 
-     override def asClassPathStrings: Seq[String] = Seq(file.path)
- 
--    override def asURLs: Seq[URL] = file.toURLs()
-+    override def asURLs: Seq[URI] = file.toURLs()
- 
-     import ManifestResourcesClassPath.PackageFileInfo
-     import ManifestResourcesClassPath.PackageInfo
-diff --git a/compiler/src/dotty/tools/dotc/classpath/ZipArchiveFileLookup.scala b/compiler/src/dotty/tools/dotc/classpath/ZipArchiveFileLookup.scala
-index 1f00baf7..2ebcf2d0 100644
---- a/compiler/src/dotty/tools/dotc/classpath/ZipArchiveFileLookup.scala
-+++ b/compiler/src/dotty/tools/dotc/classpath/ZipArchiveFileLookup.scala
-@@ -5,7 +5,7 @@ package dotty.tools.dotc.classpath
- 
- 
- import java.io.File
--import java.net.URL
-+import java.net.URI
- 
- import dotty.tools.io.{ AbstractFile, FileZipArchive }
- import FileUtils.*
-@@ -20,7 +20,9 @@ trait ZipArchiveFileLookup[FileEntryType <: ClassRepresentation] extends Efficie
-   val zipFile: File
-   def release: Option[String]
- 
--  override def asURLs: Seq[URL] = Seq(zipFile.toURI.toURL)
-+  assert(zipFile ne null, "Zip file in ZipArchiveFileLookup cannot be null")
-+
-+  override def asURLs: Seq[URI] = Seq(zipFile.toURI)
-   override def asClassPathStrings: Seq[String] = Seq(zipFile.getPath)
- 
-   private val archive = new FileZipArchive(zipFile.toPath, release)
-diff --git a/compiler/src/dotty/tools/dotc/config/PathResolver.scala b/compiler/src/dotty/tools/dotc/config/PathResolver.scala
-index 7acc950d..8fd4d229 100644
---- a/compiler/src/dotty/tools/dotc/config/PathResolver.scala
-+++ b/compiler/src/dotty/tools/dotc/config/PathResolver.scala
-@@ -270,5 +270,5 @@ class PathResolver(precomputedSourcePackages: Option[LogicalPackage] = None)(usi
-     cp
-   }
- 
--  def asURLs: Seq[java.net.URL] = result.asURLs
-+  def asURLs: Seq[java.net.URI] = result.asURLs
- }
-diff --git a/compiler/src/dotty/tools/dotc/config/ScalaSettingsProperties.scala b/compiler/src/dotty/tools/dotc/config/ScalaSettingsProperties.scala
-index 631da73b..af6fc2b8 100644
---- a/compiler/src/dotty/tools/dotc/config/ScalaSettingsProperties.scala
-+++ b/compiler/src/dotty/tools/dotc/config/ScalaSettingsProperties.scala
-@@ -2,20 +2,33 @@ package dotty.tools.dotc
- package config
- 
- import Settings.Setting.ChoiceWithHelp
-+import dotty.tools.io.{AbstractFile, Directory, PlainDirectory, NoAbstractFile}
- 
- object ScalaSettingsProperties:
- 
--  private val minTargetVersion = 17
--  private val maxTargetVersion = 26
-+  // Only the supported *keys* (JDK release numbers) matter here, not their
-+  // ASM classfile-version values -- so this is a local copy of
-+  // `backend.jvm.BackendUtils.classfileVersionMap`'s key set, avoiding a
-+  // dependency on `backend.jvm` (whose `org.scala-lang.modules:scala-asm`
-+  // dependency has no Scala Native cross-build) from this reduced source
-+  // set. Keep in sync with `BackendUtils.classfileVersionMap`'s keys.
-+  private val supportedTargetVersionKeys = 17 to 26
-+  private lazy val minTargetVersion = supportedTargetVersionKeys.min
-+  private lazy val maxTargetVersion = supportedTargetVersionKeys.max
-+
-   private val minReleaseVersion = 17
- 
-   def supportedTargetVersions: List[String] =
-     (minTargetVersion to maxTargetVersion).toList.map(_.toString)
- 
-   def supportedReleaseVersions: List[String] =
--    val jdkVersion = Runtime.version().feature()
--    val maxVersion = Math.min(jdkVersion, maxTargetVersion)
--    (minReleaseVersion to maxVersion).toList.map(_.toString)
-+    // Upstream caps this at the *running* JDK's own feature version
-+    // (`Runtime.version().feature()`, no Scala Native port -- confirmed absent from
-+    // `vendor/scala-native`'s `java.lang.Runtime`) since you can't target a release newer than
-+    // the JDK actually running the compiler. There is no running JDK at all once self-hosted,
-+    // so this just reports the full known range instead. See docs/findings.md's
-+    // "frontend-only smoke test" scoping.
-+    (minReleaseVersion to maxTargetVersion).toList.map(_.toString)
- 
-   def supportedSourceVersions: List[String] =
-     SourceVersion.values.diff(SourceVersion.illegalInSettings)
-diff --git a/compiler/src/dotty/tools/dotc/config/Settings.scala b/compiler/src/dotty/tools/dotc/config/Settings.scala
-index 4165546c..71ec50b2 100644
---- a/compiler/src/dotty/tools/dotc/config/Settings.scala
-+++ b/compiler/src/dotty/tools/dotc/config/Settings.scala
-@@ -267,7 +267,12 @@ object Settings:
- 
-         if arg1 == "help" then update(arg1, arg1, args1)
-         else if ct == BooleanTag then setBoolean(arg1, args1)
--        else if ct == OptionTag then update(Some(propertyClass.get.getConstructor().newInstance()), "", args1)
-+        else if ct == OptionTag then
-+          // Reflective instantiation (`Class#getConstructor`) is unsupported by this toolchain,
-+          // same posture as `-Yreporter` (see Driver.scala) -- the only real user of this path
-+          // is `-rewrite` (`OptionSetting[Rewrites]`, config/ScalaSettings.scala), which becomes
-+          // unsupported here rather than reflectively instantiated.
-+          state.fail(s"$name is not supported by this toolchain.", args1)
-         else if preferPrevious && changed then
-           if ignoreInvalidArgs then state.shifted(args1)
-           else state.warn(s"Ignoring update of option $name", args1)
-diff --git a/compiler/src/dotty/tools/dotc/core/Contexts.scala b/compiler/src/dotty/tools/dotc/core/Contexts.scala
-index a790fd26..7e460329 100644
---- a/compiler/src/dotty/tools/dotc/core/Contexts.scala
-+++ b/compiler/src/dotty/tools/dotc/core/Contexts.scala
-@@ -26,7 +26,7 @@ import io.{AbstractFile, NoAbstractFile, PlainFile, Path}
- import scala.io.Codec
- import collection.mutable
- import printing.*
--import config.{JavaPlatform, SJSPlatform, Platform, ScalaSettings}
-+import config.{JavaPlatform, Platform, ScalaSettings}
- import classfile.ReusableDataReader
- import StdNames.nme
- import compiletime.uninitialized
-@@ -929,9 +929,15 @@ object Contexts {
-       p
-     }
- 
-+    // `SJSPlatform`/`config.SJSPlatform` (and its `backend.sjs.JSDefinitions`
-+    // dependency) are excluded from this reduced source set entirely --
-+    // Scala.js is irrelevant to this toolchain (see docs/findings.md's
-+    // "frontend-only smoke test" scoping). `-scalajs` is unsupported here;
-+    // this always builds the plain JVM-shaped platform.
-     protected def newPlatform(using Context): Platform =
--      if (settings.scalajs.value) new SJSPlatform
--      else new JavaPlatform
-+      if settings.scalajs.value then
-+        report.warning("-scalajs is not supported by this toolchain.")
-+      new JavaPlatform
- 
-     /** The loader that loads the members of _root_ */
-     def rootLoader(root: TermSymbol)(using Context): SymbolLoader = platform.rootLoader(root)
-diff --git a/compiler/src/dotty/tools/dotc/core/MacroClassLoader.scala b/compiler/src/dotty/tools/dotc/core/MacroClassLoader.scala
-index dc68c9e1..54767074 100644
---- a/compiler/src/dotty/tools/dotc/core/MacroClassLoader.scala
-+++ b/compiler/src/dotty/tools/dotc/core/MacroClassLoader.scala
-@@ -3,8 +3,6 @@ package dotty.tools.dotc.core
- import dotty.tools.dotc.core.Contexts.*
- import dotty.tools.dotc.core.Mode
- import dotty.tools.dotc.util.Property
--import dotty.tools.dotc.reporting.trace
--import dotty.tools.io.ClassPath
- 
- object MacroClassLoader {
- 
-@@ -24,21 +22,12 @@ object MacroClassLoader {
-   def init(ctx: FreshContext): ctx.type =
-     ctx.setProperty(MacroClassLoaderKey, makeMacroClassLoader(using ctx))
- 
--  private def makeMacroClassLoader(using Context): ClassLoader = trace("new macro class loader") {
--    val urls: List[java.net.URL] =
--      def settingsUrls: List[java.net.URL] =
--        val entries = ClassPath.expandPath(ctx.settings.classpath.value, expandStar=true)
--        entries.map(cp => java.nio.file.Paths.get(cp).toUri.toURL).toList
--
--      if ctx.mode.is(Mode.Interactive) then
--        try
--          ctx.platform.classPath.asURLs.toList
--        catch
--          case _: IllegalStateException =>
--            settingsUrls
--      else
--        settingsUrls
--    val out = Option(ctx.settings.outputDir.value.toURL) // to find classes in case of suspended compilation
--    new java.net.URLClassLoader((urls ++ out.toList).toArray, getClass.getClassLoader)
--  }
-+  // `java.net.URLClassLoader` needs real reflection/dynamic classloading, unsupported by this
-+  // toolchain the same way `-Yreporter`'s `getConstructor` is (see Driver.scala). This value is
-+  // only ever passed as a constructor parameter to `Interpreter`/`Splicer.splice` (see their own
-+  // callers) -- neither ever calls `.loadClass` on it, since both are this project's own
-+  // reflection-free, tree-based macro execution (see docs/findings.md, "Macro execution") -- so
-+  // a real, already-existing classloader reference works just as well as constructing a new
-+  // classpath-derived one.
-+  private def makeMacroClassLoader(using Context): ClassLoader = getClass.getClassLoader
- }
-diff --git a/compiler/src/dotty/tools/dotc/core/Phases.scala b/compiler/src/dotty/tools/dotc/core/Phases.scala
-index 4a083516..669701d8 100644
---- a/compiler/src/dotty/tools/dotc/core/Phases.scala
-+++ b/compiler/src/dotty/tools/dotc/core/Phases.scala
-@@ -253,6 +253,11 @@ object Phases {
-     private var myMixinPhase: Phase = uninitialized
-     private var myCountOuterAccessesPhase: Phase = uninitialized
-     private var myFlattenPhase: Phase = uninitialized
-+    // `backend.jvm.GenBCode` is excluded from this reduced source set
-+    // entirely (its `org.scala-lang.modules:scala-asm` dependency has no
-+    // Scala Native cross-build) -- there is no such phase to ever find, but
-+    // TreeChecker.scala still reads `genBCodePhase` unconditionally.
-+    private var myGenBCodePhase: Phase = uninitialized
-     private var myCheckCapturesPhase: Phase = uninitialized
- 
-     private var myCheckCapturesPhaseId: PhaseId = -2
-@@ -285,6 +290,7 @@ object Phases {
-     final def lambdaLiftPhase: Phase = myLambdaLiftPhase
-     final def countOuterAccessesPhase = myCountOuterAccessesPhase
-     final def flattenPhase: Phase = myFlattenPhase
-+    final def genBCodePhase: Phase = myGenBCodePhase
-     final def checkCapturesPhase: Phase = myCheckCapturesPhase
-     final def checkCapturesPhaseId: PhaseId = myCheckCapturesPhaseId
- 
-@@ -295,7 +301,11 @@ object Phases {
-       myTyperPhase = phaseOfClass(classOf[TyperPhase])
-       myPostTyperPhase = phaseOfClass(classOf[PostTyper])
-       mySbtExtractDependenciesPhase = phaseOfClass(classOf[sbt.ExtractDependencies])
--      mySbtExtractAPIPhase = phaseOfClass(classOf[sbt.ExtractAPI])
-+      // `sbt.ExtractAPI` is excluded from this reduced source set entirely
-+      // (needs the rest of the real `xsbti.api.*` surface, unlike
-+      // `sbt.ExtractDependencies` -- see docs/findings.md's "frontend-only
-+      // smoke test" scoping) -- there is no such phase to ever find.
-+      mySbtExtractAPIPhase = NoPhase
-       mySetRootTreePhase = phaseOfClass(classOf[SetRootTree])
-       myPicklerPhase = phaseOfClass(classOf[Pickler])
-       myInliningPhase = phaseOfClass(classOf[Inlining])
-@@ -317,6 +327,10 @@ object Phases {
-       myFlattenPhase = phaseOfClass(classOf[Flatten])
-       myExplicitOuterPhase = phaseOfClass(classOf[ExplicitOuter])
-       myGettersPhase = phaseOfClass(classOf[Getters])
-+      // `backend.jvm.GenBCode` is excluded from this reduced source set
-+      // entirely (its `org.scala-lang.modules:scala-asm` dependency has no
-+      // Scala Native cross-build) -- there is no such phase to ever find.
-+      myGenBCodePhase = NoPhase
-       myCheckCapturesPhase = phaseOfClass(classOf[CheckCaptures])
-     }
- 
-@@ -576,6 +590,7 @@ object Phases {
-   def mixinPhase(using Context): Phase                  = ctx.base.mixinPhase
-   def lambdaLiftPhase(using Context): Phase             = ctx.base.lambdaLiftPhase
-   def flattenPhase(using Context): Phase                = ctx.base.flattenPhase
-+  def genBCodePhase(using Context): Phase               = ctx.base.genBCodePhase
-   def checkCapturesPhase(using Context): Phase          = ctx.base.checkCapturesPhase
-   def checkCapturesPhaseId(using Context): PhaseId      = ctx.base.checkCapturesPhaseId
- 
 diff --git a/compiler/src/dotty/tools/dotc/core/SymExtensions.scala b/compiler/src/dotty/tools/dotc/core/SymExtensions.scala
 new file mode 100644
-index 00000000..e7796f17
+index 0000000000..e7796f1721
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/core/SymExtensions.scala
 @@ -0,0 +1,91 @@
@@ -629,7 +96,7 @@ index 00000000..e7796f17
 +  end symExtensions
 +}
 diff --git a/compiler/src/dotty/tools/dotc/core/SymUtils.scala b/compiler/src/dotty/tools/dotc/core/SymUtils.scala
-index ff1f8708..278625fe 100644
+index c439214391..021f579a1c 100644
 --- a/compiler/src/dotty/tools/dotc/core/SymUtils.scala
 +++ b/compiler/src/dotty/tools/dotc/core/SymUtils.scala
 @@ -18,7 +18,6 @@ import Phases.*
@@ -640,7 +107,7 @@ index ff1f8708..278625fe 100644
  
  import scala.annotation.tailrec
  
-@@ -302,9 +301,13 @@ class SymUtils:
+@@ -303,9 +302,13 @@ class SymUtils:
       *
       *  This is the case if all of the following are true:
       *
@@ -657,7 +124,7 @@ index ff1f8708..278625fe 100644
       *
       *  Constant expression final vals do not need an explicit field to store
       *  their value. See the Memoize-Mixin-Constructors phase trio.
-@@ -312,7 +315,7 @@ class SymUtils:
+@@ -313,7 +316,7 @@ class SymUtils:
      def isConstExprFinalVal(using Context): Boolean =
        atPhaseNoLater(erasurePhase) {
          self.is(Final) && !self.isMutableVarOrAccessor && self.info.resultType.isInstanceOf[ConstantType]
@@ -666,86 +133,8 @@ index ff1f8708..278625fe 100644
  
      /** The `ConstantType` of a val known to be `isConstrExprFinalVal`.
       *
-diff --git a/compiler/src/dotty/tools/dotc/core/SymbolLoaders.scala b/compiler/src/dotty/tools/dotc/core/SymbolLoaders.scala
-index e3dab9c2..e21e7b52 100644
---- a/compiler/src/dotty/tools/dotc/core/SymbolLoaders.scala
-+++ b/compiler/src/dotty/tools/dotc/core/SymbolLoaders.scala
-@@ -8,6 +8,7 @@ import java.nio.channels.ClosedByInterruptException
- import dotty.tools.dotc.classpath.{ ClassPathFactory, PackageNameUtils }
- import dotty.tools.dotc.classpath.FileUtils.{hasTastyExtension, hasBetastyExtension}
- import dotty.tools.io.{ ClassPath, ClassRepresentation, AbstractFile, NoAbstractFile }
-+import dotty.tools.dotc.core.SymExtensions.symExtensions
- 
- import Contexts.*, Symbols.*, Flags.*, SymDenotations.*, Types.*, Scopes.*, Names.*
- import NameOps.*
-diff --git a/compiler/src/dotty/tools/dotc/core/TypeErasure.scala b/compiler/src/dotty/tools/dotc/core/TypeErasure.scala
-index 1db0e130..fad7cc55 100644
---- a/compiler/src/dotty/tools/dotc/core/TypeErasure.scala
-+++ b/compiler/src/dotty/tools/dotc/core/TypeErasure.scala
-@@ -5,7 +5,6 @@ package core
- import Symbols.*, Types.*, Contexts.*, Flags.*, Names.*, StdNames.*, Phases.*
- import Flags.JavaDefined
- import Uniques.unique
--import backend.sjs.JSDefinitions
- import transform.ExplicitOuter.*
- import transform.ValueClasses.*
- import transform.ContextFunctionResults.*
-@@ -818,21 +817,12 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
-         val result = if e1.isInstanceOf[WildcardType] || e2.isInstanceOf[WildcardType]
-           then WildcardType
-           else TypeComparer.orType(e1, e2, isErased = true)
--        def isNullStripped =
--          tp2.isNullType && e1.derivesFrom(defn.ObjectClass)
--          || tp1.isNullType && e2.derivesFrom(defn.ObjectClass)
--        if isSymbol && sourceLanguage.isScala2 && ctx.settings.scalajs.value && !isNullStripped then
--          // In Scala2Unpickler we unpickle Scala.js pseudo-unions as if they were
--          // real unions, but we must still erase them as Scala 2 would to emit
--          // the correct signatures in SJSIR.
--          // We only do this when `isSymbol` is true since in other situations we
--          // cannot distinguish a Scala.js pseudo-union from a Scala 3 union that
--          // has been substituted into a Scala 2 type (e.g., via `asSeenFrom`),
--          // erasing these unions as if they were pseudo-unions could have an
--          // impact on overriding relationships so it's best to leave them
--          // alone (and this doesn't impact the SJSIR we generate).
--          JSDefinitions.jsdefn.PseudoUnionType
--        else result
-+        // The Scala.js pseudo-union erasure special-case that used to live here (gated on
-+        // `isNullStripped`, whether either side was a stripped-null type) is dropped:
-+        // `backend.sjs`/`transform.sjs` are excluded from this reduced source set (see
-+        // docs/findings.md's "frontend-only smoke test" scoping), so `ctx.settings.scalajs.value`
-+        // can never be true.
-+        result
-       case tp: MethodType =>
-         def paramErasure(tpToErase: Type) =
-           erasureFn(sourceLanguage, semiEraseVCs, isConstructor, isSymbol, inSigName = false)(tpToErase)
-@@ -1019,19 +1009,12 @@ class TypeErasure(sourceLanguage: SourceLanguage, semiEraseVCs: Boolean, isConst
-     if semiEraseVCs && isConstructor && !tp.isInstanceOf[MethodOrPoly] then
-       erasureFn(sourceLanguage, semiEraseVCs = false, isConstructor, isSymbol, inSigName).eraseResult(tp)
-     else if tp =:= defn.UnitType then
--      // This should always be UnitType. However, there is one exception: if we
--      // are computing the erasure of a Scala 2 symbol whose result type is a
--      // Scala.js pseudo-union type, we must preserve the pseudo-union.
--      // Typical example: js.undefined, which returns a `Unit | Nothing`.
--      if ctx.settings.scalajs.value && isSymbol && sourceLanguage.isScala2 then
--        apply(tp) match {
--          case erased if erased.isRef(JSDefinitions.jsdefn.PseudoUnionClass) =>
--            erased
--          case _ =>
--            defn.UnitType
--        }
--      else
--        defn.UnitType
-+      // Upstream preserves a Scala.js pseudo-union result type here (see e.g.
-+      // js.undefined, `Unit | Nothing`) when `ctx.settings.scalajs.value`.
-+      // Scala.js is excluded from this reduced build entirely (`SJSPlatform`
-+      // is never selected, see docs/findings.md), so that setting can never
-+      // be true -- this is the statically-always-taken `else` branch.
-+      defn.UnitType
-     else
-       apply(tp)
- 
 diff --git a/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala b/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala
-index 77afcb16..d5856336 100644
+index 07bf41ed1f..c90eaa80e8 100644
 --- a/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala
 +++ b/compiler/src/dotty/tools/dotc/core/unpickleScala2/Scala2Unpickler.scala
 @@ -13,7 +13,6 @@ import NameKinds.{Scala2MethodNameKinds, SuperAccessorName, ExpandedName}
@@ -756,7 +145,7 @@ index 77afcb16..d5856336 100644
  import printing.Texts.{*, given}
  import printing.Printer
  import io.AbstractFile
-@@ -856,12 +855,10 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
+@@ -854,12 +853,10 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
          val tycon = select(pre, sym)
          val args = until(end, () => readTypeRef())
          if (sym == defn.ByNameParamClass2x) ExprType(args.head)
@@ -773,52 +162,11 @@ index 77afcb16..d5856336 100644
          else if args.nonEmpty then
            tycon.safeAppliedTo(EtaExpandIfHK(sym.typeParams, args.map(translateTempPoly)))
          else if (sym.typeParams.nonEmpty) tycon.etaExpand
-diff --git a/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala b/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala
-index 9ff0a576..353bf39c 100644
---- a/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala
-+++ b/compiler/src/dotty/tools/dotc/interactive/InteractiveDriver.scala
-@@ -26,9 +26,12 @@ import util.*
- 
- private class InteractiveContextBase(precomputedSourcePackages: Option[LogicalPackage]) extends ContextBase {
- 
-+  // `SJSPlatform` is excluded from this reduced source set entirely (see
-+  // core/Contexts.scala's `newPlatform` and docs/findings.md's
-+  // "frontend-only smoke test" scoping) -- always the plain JVM-shaped
-+  // platform, `-scalajs` is unsupported here.
-   override protected def newPlatform(using Context): Platform =
--      if (settings.scalajs.value) new SJSPlatform(precomputedSourcePackages)
--      else new JavaPlatform(precomputedSourcePackages)
-+      new JavaPlatform(precomputedSourcePackages)
- 
- }
- 
-diff --git a/compiler/src/dotty/tools/dotc/interactive/LogicalSourcePath.scala b/compiler/src/dotty/tools/dotc/interactive/LogicalSourcePath.scala
-index 86236a96..1b254073 100644
---- a/compiler/src/dotty/tools/dotc/interactive/LogicalSourcePath.scala
-+++ b/compiler/src/dotty/tools/dotc/interactive/LogicalSourcePath.scala
-@@ -10,7 +10,7 @@ import dotty.tools.io.AbstractFile
- import dotty.tools.io.ClassPath
- 
- import java.io.File
--import java.net.URL
-+import java.net.URI
- import java.nio.file.Path
- 
- /**
-@@ -59,7 +59,7 @@ class LogicalSourcePath(val sourcepath: String, rootPackage: LogicalPackage)
-       case None => ClassPathEntries(Seq(), Seq())
-     res
- 
--  override def asURLs: Seq[URL] = sourcepath.split(File.pathSeparator).toIndexedSeq.map(new File(_)).map(_.toURI.toURL)
-+  override def asURLs: Seq[URI] = sourcepath.split(File.pathSeparator).toIndexedSeq.map(new File(_)).map(_.toURI)
- 
-   override def asClassPathStrings: Seq[String] = Seq()
- 
 diff --git a/compiler/src/dotty/tools/dotc/parsing/Parsers.scala b/compiler/src/dotty/tools/dotc/parsing/Parsers.scala
-index 875ac7cc..05125d8e 100644
+index 161275146c..e34d3d4dad 100644
 --- a/compiler/src/dotty/tools/dotc/parsing/Parsers.scala
 +++ b/compiler/src/dotty/tools/dotc/parsing/Parsers.scala
-@@ -747,12 +747,12 @@ object Parsers {
+@@ -749,12 +749,12 @@ object Parsers {
      var possibleColonOffset: Int = -1
  
      def testChar(idx: Int, p: Char => Boolean): Boolean = {
@@ -833,24 +181,11 @@ index 875ac7cc..05125d8e 100644
        idx >= 0 && idx < txt.length && txt(idx) == c
      }
  
-diff --git a/compiler/src/dotty/tools/dotc/parsing/Scanners.scala b/compiler/src/dotty/tools/dotc/parsing/Scanners.scala
-index 842ec7f7..690bf386 100644
---- a/compiler/src/dotty/tools/dotc/parsing/Scanners.scala
-+++ b/compiler/src/dotty/tools/dotc/parsing/Scanners.scala
-@@ -94,7 +94,7 @@ object Scanners {
-   }
- 
-   abstract class ScannerCommon(source: SourceFile)(using Context) extends CharArrayReader with TokenData {
--    val buf: Array[Char] = source.content
-+    val buf: Array[Char] = source.content()
-     def nextToken(): Unit
- 
-     // Errors -----------------------------------------------------------------
 diff --git a/compiler/src/dotty/tools/dotc/plugins/Plugin.scala b/compiler/src/dotty/tools/dotc/plugins/Plugin.scala
-index de70138d..7381dbbf 100644
+index b2a4122bc1..23428b6249 100644
 --- a/compiler/src/dotty/tools/dotc/plugins/Plugin.scala
 +++ b/compiler/src/dotty/tools/dotc/plugins/Plugin.scala
-@@ -88,27 +88,27 @@ object Plugin {
+@@ -87,27 +87,27 @@ object Plugin {
  
    /** Create a class loader with the specified locations plus
     *  the loader that loaded the Scala compiler.
@@ -893,7 +228,7 @@ index de70138d..7381dbbf 100644
  
    /** Load all plugins specified by the arguments.
     *  Each location of `paths` must be a valid plugin archive or exploded archive.
-@@ -202,8 +202,16 @@ object Plugin {
+@@ -201,8 +201,16 @@ object Plugin {
  
    /** Instantiate a plugin class, given the class and
     *  the compiler it is to be used in.
@@ -911,465 +246,8 @@ index de70138d..7381dbbf 100644
  }
  
  class PluginLoadException(val path: String, message: String, cause: Exception | Null) extends Exception(message, cause) {
-diff --git a/compiler/src/dotty/tools/dotc/profile/Profiler.scala b/compiler/src/dotty/tools/dotc/profile/Profiler.scala
-index 75732513..a7f934df 100644
---- a/compiler/src/dotty/tools/dotc/profile/Profiler.scala
-+++ b/compiler/src/dotty/tools/dotc/profile/Profiler.scala
-@@ -1,34 +1,28 @@
- package dotty.tools.dotc.profile
- 
--import scala.annotation.*
--import java.io.{FileWriter, PrintWriter}
--import java.nio.file.Paths
--import java.lang.management.{ManagementFactory, GarbageCollectorMXBean, RuntimeMXBean, MemoryMXBean, ClassLoadingMXBean, CompilationMXBean}
--import java.util.concurrent.TimeUnit
--import java.util.concurrent.atomic.AtomicInteger
--import javax.management.openmbean.CompositeData
--import javax.management.{Notification, NotificationEmitter, NotificationListener}
--
- import dotty.tools.dotc.core.Phases.Phase
- import dotty.tools.dotc.core.Contexts.*
- import dotty.tools.dotc.CompilationUnit
- import dotty.tools.dotc.core.Types.Type
--import dotty.tools.dotc.core.Symbols.{Symbol, NoSymbol}
--import dotty.tools.dotc.core.Flags
-+import dotty.tools.dotc.core.Symbols.Symbol
-+import dotty.tools.dotc.report
- import dotty.tools.io.AbstractFile
--import annotation.internal.sharable
--import dotty.tools.dotc.core.Periods.InitialRunId
--import scala.collection.mutable.UnrolledBuffer
- 
-+/** `-Yprofile-enabled`'s real implementation (`RealProfiler`, JMX-based:
-+ *  `java.lang.management`/`javax.management` thread/GC/heap introspection)
-+ *  is excluded from this reduced source set -- JMX has no meaning on a
-+ *  target with no running JVM to introspect, so unlike most other
-+ *  exclusions in this build this isn't a Scala Native *maturity* gap to
-+ *  work around, it's a feature that's inherently JVM-only. Always resolves
-+ *  to `NoOpProfiler`, same posture as this project's other
-+ *  deliberately-unsupported flags (`-Yreporter`, `--compiler-plugin`). See
-+ *  docs/findings.md's "frontend-only smoke test" scoping.
-+ */
- object Profiler {
-   def apply()(using Context): Profiler =
--    if (!ctx.settings.YprofileEnabled.value) NoOpProfiler
--    else {
--      val reporter = if (ctx.settings.YprofileDestination.value != "")
--        new StreamProfileReporter(new PrintWriter(new FileWriter(ctx.settings.YprofileDestination.value, true)))
--      else ConsoleProfileReporter
--      new RealProfiler(reporter)
--    }
-+    if (ctx.settings.YprofileEnabled.value)
-+      report.warning("-Yprofile-enabled is not supported by this toolchain (profiling needs a real JVM to introspect via JMX); proceeding without profiling.")
-+    NoOpProfiler
- 
-   final def NoOp: Profiler = NoOpProfiler
- 
-@@ -133,297 +127,3 @@ private [profile] object NoOpProfiler extends Profiler {
-   override def finished(): Unit = ()
- }
- 
--private [profile] object RealProfiler {
--  import scala.jdk.CollectionConverters.*
--  val runtimeMx: RuntimeMXBean = ManagementFactory.getRuntimeMXBean
--  val memoryMx: MemoryMXBean = ManagementFactory.getMemoryMXBean
--  val gcMx: List[GarbageCollectorMXBean] = ManagementFactory.getGarbageCollectorMXBeans.asScala.toList
--  val classLoaderMx: ClassLoadingMXBean = ManagementFactory.getClassLoadingMXBean
--  val compileMx: CompilationMXBean = ManagementFactory.getCompilationMXBean
--  val threadMx: ExtendedThreadMxBean = ExtendedThreadMxBean.proxy
--  if (threadMx.isThreadCpuTimeSupported) threadMx.setThreadCpuTimeEnabled(true)
--  private val idGen = new AtomicInteger()
--
--  @nowarn("cat=deprecation")
--  private[profile] def snapThread(idleTimeNanos: Long): ProfileSnap = {
--    import RealProfiler.*
--    val current = Thread.currentThread()
--
--    ProfileSnap(
--      threadId = current.getId,
--      threadName = current.getName,
--      snapTimeNanos = System.nanoTime(),
--      idleTimeNanos = idleTimeNanos,
--      cpuTimeNanos = threadMx.getCurrentThreadCpuTime,
--      userTimeNanos = threadMx.getCurrentThreadUserTime,
--      allocatedBytes = threadMx.getThreadAllocatedBytes(Thread.currentThread().getId),
--      heapBytes = readHeapUsage(),
--      totalClassesLoaded = classLoaderMx.getTotalLoadedClassCount,
--      totalJITCompilationTime = compileMx.getTotalCompilationTime
--    )
--  }
--  private def readHeapUsage() = RealProfiler.memoryMx.getHeapMemoryUsage.getUsed
--}
--
--private [profile] class RealProfiler(reporter : ProfileReporter)(using Context) extends Profiler with NotificationListener {
--  val id: Int = RealProfiler.idGen.incrementAndGet()
--  private val mainThread = Thread.currentThread()
--  private val gcEvents = UnrolledBuffer[GcEventData]()
--  private var nextAfterUnitSnap: Long = System.nanoTime()
--
--  private final val GcThreadId = "GC"
--
--  enum Category:
--    def name: String = this.toString().toLowerCase()
--    case Run, Phase, File, TypeCheck, Implicit, Inline, Completion
--  private [profile] val chromeTrace =
--    if ctx.settings.YprofileTrace.isDefault
--    then null
--    else
--      val filename = ctx.settings.YprofileTrace.value
--      // Compilation units requiring multi-stage compilation (macros) would create a new profiler instances
--      // We need to store the traces in the seperate file to prevent overriding its content.
--      // Alternatives: sharing ChromeTrace instance between all runs / manual concatation after all runs are done
--      // FIXME: The first assigned runId is equal to 2 instead of 1 (InitialRunId).
--      // Fix me when bug described in Compiler.runId is resolved by removing +/- 1 adjustments
--      val suffix = if ctx.runId > InitialRunId + 1 then s".${ctx.runId - 1}" else ""
--      ChromeTrace(Paths.get(s"$filename$suffix"))
--
--  private val compilerRunEvent: TracedEventId = traceDurationStart(Category.Run, s"scalac-$id")
--
--  def completeBackground(threadRange: ProfileRange): Unit =
--    reporter.reportBackground(this, threadRange)
--
--  def outDir: AbstractFile = ctx.settings.outputDir.value
--
--  @nowarn
--  private def doGC(): Unit = {
--    System.gc()
--    System.runFinalization()
--  }
--
--  RealProfiler.gcMx foreach {
--    case emitter: NotificationEmitter => emitter.addNotificationListener(this, null, null)
--    case gc => println(s"Cant connect gcListener to ${gc.getClass}")
--  }
--
--  reporter.header(this)
--
--  override def finished(): Unit = {
--    //we may miss a GC event if gc is occurring as we call this
--    RealProfiler.gcMx foreach {
--      case emitter: NotificationEmitter => emitter.removeNotificationListener(this)
--      case gc =>
--    }
--    reporter.close(this)
--    if chromeTrace != null then
--      traceDurationEnd(Category.Run, compilerRunEvent)
--      for gcEvent <- gcEvents
--      do {
--        val durationNanos = TimeUnit.MILLISECONDS.toNanos(gcEvent.durationMillis)
--        val startNanos = gcEvent.endNanos - durationNanos
--        chromeTrace.traceDurationEvent(gcEvent.name, startNanos, durationNanos, tid = GcThreadId)
--      }
--      chromeTrace.close()
--  }
--
--
--  override def handleNotification(notification: Notification, handback: scala.Any): Unit = {
--    import java.lang.{Long => jLong}
--    import java.lang.{Integer => jInt}
--    val reportNs = System.nanoTime()
--    val data = notification.getUserData
--    val tpe = notification.getType
--    data match {
--      case cd: CompositeData if tpe == "com.sun.management.gc.notification" =>
--        val name = cd.get("gcName").toString
--        val action = cd.get("gcAction").toString
--        val cause = cd.get("gcCause").toString
--        val info = cd.get("gcInfo").asInstanceOf[CompositeData]
--        val duration = info.get("duration").asInstanceOf[jLong].longValue()
--        val startTime = info.get("startTime").asInstanceOf[jLong].longValue()
--        val endTime = info.get("endTime").asInstanceOf[jLong].longValue()
--        val threads = info.get("GcThreadCount").asInstanceOf[jInt].longValue()
--        val gcEvent = GcEventData("", reportNs, startTime, endTime, duration, name, action, cause, threads)
--        synchronized { gcEvents += gcEvent }
--        reporter.reportGc(gcEvent)
--    }
--  }
--
--  override def afterPhase(event: TracedEventId, phase: Phase, snapBefore: ProfileSnap): Unit = {
--    assert(mainThread eq Thread.currentThread())
--    val initialSnap = RealProfiler.snapThread(0)
--    if (ctx.settings.YprofileExternalTool.value.contains(phase.toString)) {
--      println("Profile hook stop")
--      ExternalToolHook.after()
--    }
--    val finalSnap = if (ctx.settings.YprofileRunGcBetweenPhases.value.contains(phase.toString)) {
--      doGC()
--      initialSnap.updateHeap(RealProfiler.readHeapUsage())
--    }
--    else initialSnap
--    traceDurationEnd(Category.Phase, event)
--    traceThreadSnapshotCounters()
--    reporter.reportForeground(this, ProfileRange(snapBefore, finalSnap, phase, "", 0, Thread.currentThread))
--  }
--
--  override def beforePhase(phase: Phase): (TracedEventId, ProfileSnap) = {
--    assert(mainThread eq Thread.currentThread())
--    traceThreadSnapshotCounters()
--    val eventId = traceDurationStart(Category.Phase, escapeSpecialChars(phase.phaseName))
--    if (ctx.settings.YprofileRunGcBetweenPhases.value.contains(phase.toString))
--      doGC()
--    if (ctx.settings.YprofileExternalTool.value.contains(phase.toString)) {
--      println("Profile hook start")
--      ExternalToolHook.before()
--    }
--    (eventId, RealProfiler.snapThread(0))
--  }
--
--  override def beforeUnit(phase: Phase, unit: CompilationUnit): TracedEventId = {
--    assert(mainThread eq Thread.currentThread())
--    if chromeTrace != null then
--      traceThreadSnapshotCounters()
--      traceDurationStart(Category.File, escapeSpecialChars(unit.source.name))
--    else TracedEventId.Empty
--  }
--
--  override def afterUnit(event: TracedEventId): Unit = {
--    assert(mainThread eq Thread.currentThread())
--    if chromeTrace != null then
--      traceDurationEnd(Category.File, event)
--      traceThreadSnapshotCounters()
--  }
--
--  private def traceThreadSnapshotCounters(initialSnap: => ProfileSnap = RealProfiler.snapThread(0)) =
--    if chromeTrace != null && System.nanoTime() > nextAfterUnitSnap then {
--      val snap = initialSnap
--      chromeTrace.traceCounterEvent("allocBytes", "allocBytes", snap.allocatedBytes, processWide = false)
--      chromeTrace.traceCounterEvent("heapBytes", "heapBytes", snap.heapBytes, processWide = true)
--      chromeTrace.traceCounterEvent("classesLoaded", "classesLoaded", snap.totalClassesLoaded, processWide = true)
--      chromeTrace.traceCounterEvent("jitCompilationTime", "jitCompilationTime", snap.totalJITCompilationTime, processWide = true)
--      chromeTrace.traceCounterEvent("userTime", "userTime", snap.userTimeNanos, processWide = false)
--      chromeTrace.traceCounterEvent("cpuTime", "cpuTime", snap.cpuTimeNanos, processWide = false)
--      chromeTrace.traceCounterEvent("idleTime", "idleTime", snap.idleTimeNanos, processWide = false)
--      nextAfterUnitSnap = System.nanoTime() + 10 * 1000 * 1000
--    }
--
--  override def beforeTypedDef(sym: Symbol): TracedEventId = traceDurationStart(Category.TypeCheck, symbolName(sym))
--  override def afterTypedDef(event: TracedEventId): Unit = traceDurationEnd(Category.TypeCheck, event)
--
--  override def beforeImplicitSearch(pt: Type): TracedEventId = traceDurationStart(Category.Implicit, s"?[${symbolName(pt.typeSymbol)}]", colour = "yellow")
--  override def afterImplicitSearch(event: TracedEventId): Unit = traceDurationEnd(Category.Implicit, event, colour = "yellow")
--
--  override def beforeInlineCall(inlineSym: Symbol): TracedEventId = traceDurationStart(Category.Inline, s"«${symbolName(inlineSym)}»", colour = "olive")
--  override def afterInlineCall(event: TracedEventId): Unit = traceDurationEnd(Category.Inline, event, colour = "olive")
--
--  override def beforeCompletion(root: Symbol, associatedFile: => AbstractFile): (TracedEventId, String) =
--    if chromeTrace == null
--    then EmptyCompletionEvent
--    else
--      val completionName = this.completionName(root, associatedFile)
--      val event = TracedEventId(escapeSpecialChars(associatedFile.name))
--      chromeTrace.traceDurationEventStart(Category.Completion.name, "↯", colour = "thread_state_sleeping")
--      chromeTrace.traceDurationEventStart(Category.File.name, event)
--      chromeTrace.traceDurationEventStart(Category.Completion.name, completionName)
--      (event, completionName)
--
--  override def afterCompletion(event: TracedEventId, completionName: String): Unit =
--    if chromeTrace != null
--    then
--      chromeTrace.traceDurationEventEnd(Category.Completion.name, completionName)
--      chromeTrace.traceDurationEventEnd(Category.File.name, event)
--      chromeTrace.traceDurationEventEnd(Category.Completion.name, "↯", colour = "thread_state_sleeping")
--
--  private inline def traceDurationStart(category: Category, inline eventName: String, colour: String = ""): TracedEventId =
--    if chromeTrace == null
--    then TracedEventId.Empty
--    else
--      val event = TracedEventId(eventName)
--      chromeTrace.traceDurationEventStart(category.name, event, colour)
--      event
--
--  private inline def traceDurationEnd(category: Category, event: TracedEventId, colour: String = ""): Unit =
--    if chromeTrace != null then
--      chromeTrace.traceDurationEventEnd(category.name, event, colour)
--
--  private inline def escapeSpecialChars(value: String): String =
--    JsonNameTransformer.encode(value)
--
--  private def symbolName(sym: Symbol): String = escapeSpecialChars:
--    s"${sym.showKind} ${sym.showName}"
--
--  private def completionName(root: Symbol, associatedFile: AbstractFile): String = escapeSpecialChars:
--    def isTopLevel = root.owner != NoSymbol && root.owner.is(Flags.Package)
--    if root.is(Flags.Package) || isTopLevel
--    then root.javaBinaryName
--    else
--      val enclosing = root.enclosingClass
--      s"${enclosing.javaBinaryName}::${root.name}"
--}
--
--enum EventType(name: String):
--  // main thread with other tasks
--  case MAIN extends EventType("main")
--  // other task ( background thread)
--  case BACKGROUND extends EventType("background")
--  // total for compile
--  case GC extends EventType("GC")
--
--sealed trait ProfileReporter {
--  def reportBackground(profiler: RealProfiler, threadRange: ProfileRange): Unit
--  def reportForeground(profiler: RealProfiler, threadRange: ProfileRange): Unit
--
--  def reportGc(data: GcEventData): Unit
--
--  def header(profiler: RealProfiler) :Unit
--  def close(profiler: RealProfiler) :Unit
--}
--
--object ConsoleProfileReporter extends ProfileReporter {
--  @sharable var totalAlloc = 0L
--
--  override def reportBackground(profiler: RealProfiler, threadRange: ProfileRange): Unit =
--    reportCommon(EventType.BACKGROUND, profiler, threadRange)
--  override def reportForeground(profiler: RealProfiler, threadRange: ProfileRange): Unit =
--    reportCommon(EventType.MAIN, profiler, threadRange)
--  @nowarn("cat=deprecation")
--  private def reportCommon(tpe:EventType, profiler: RealProfiler, threadRange: ProfileRange): Unit =
--    totalAlloc += threadRange.allocatedBytes
--    println(s"${threadRange.phase.phaseName.replace(',', ' ')},run ns = ${threadRange.runNs},idle ns = ${threadRange.idleNs},cpu ns = ${threadRange.cpuNs},user ns = ${threadRange.userNs},allocated = ${threadRange.allocatedBytes},heap at end = ${threadRange.end.heapBytes}, total allocated = $totalAlloc ")
--
--  override def close(profiler: RealProfiler): Unit = ()
--
--  override def header(profiler: RealProfiler): Unit =
--    println(s"Profiler start (${profiler.id}) ${profiler.outDir}")
--
--  override def reportGc(data: GcEventData): Unit =
--    println(s"Profiler GC reported ${data.gcEndMillis - data.gcStartMillis}ms")
--}
--
--class StreamProfileReporter(out:PrintWriter) extends ProfileReporter {
--  override def header(profiler: RealProfiler): Unit = {
--    out.println(s"info, ${profiler.id}, version, 2, output, ${profiler.outDir}")
--    out.println(s"header(main/background),startNs,endNs,runId,phaseId,phaseName,purpose,task-count,threadId,threadName,runNs,idleNs,cpuTimeNs,userTimeNs,allocatedByte,heapSize")
--    out.println(s"header(GC),startNs,endNs,startMs,endMs,name,action,cause,threads")
--  }
--
--  override def reportBackground(profiler: RealProfiler, threadRange: ProfileRange): Unit =
--    reportCommon(EventType.BACKGROUND, profiler, threadRange)
--  override def reportForeground(profiler: RealProfiler, threadRange: ProfileRange): Unit =
--    reportCommon(EventType.MAIN, profiler, threadRange)
--  @nowarn("cat=deprecation")
--  private def reportCommon(tpe:EventType, profiler: RealProfiler, threadRange: ProfileRange): Unit =
--    out.println(s"$tpe,${threadRange.start.snapTimeNanos},${threadRange.end.snapTimeNanos},${profiler.id},${threadRange.phase.id},${threadRange.phase.phaseName.replace(',', ' ')},${threadRange.purpose},${threadRange.taskCount},${threadRange.thread.getId},${threadRange.thread.getName},${threadRange.runNs},${threadRange.idleNs},${threadRange.cpuNs},${threadRange.userNs},${threadRange.allocatedBytes},${threadRange.end.heapBytes} ")
--
--  override def reportGc(data: GcEventData): Unit = {
--    val duration = TimeUnit.MILLISECONDS.toNanos(data.gcEndMillis - data.gcStartMillis + 1)
--    val start = data.reportTimeNs - duration
--    out.println(s"${EventType.GC},$start,${data.reportTimeNs},${data.gcStartMillis}, ${data.gcEndMillis},${data.name},${data.action},${data.cause},${data.threads}")
--  }
--
--  override def close(profiler: RealProfiler): Unit = {
--    out.flush()
--    out.close()
--  }
--}
-diff --git a/compiler/src/dotty/tools/dotc/profile/ThreadPoolFactory.scala b/compiler/src/dotty/tools/dotc/profile/ThreadPoolFactory.scala
-index 8c48d15e..127351c2 100644
---- a/compiler/src/dotty/tools/dotc/profile/ThreadPoolFactory.scala
-+++ b/compiler/src/dotty/tools/dotc/profile/ThreadPoolFactory.scala
-@@ -1,6 +1,5 @@
- package dotty.tools.dotc.profile
- 
--import java.util.concurrent.ThreadPoolExecutor.AbortPolicy
- import java.util.concurrent.*
- import java.util.concurrent.atomic.AtomicInteger
- 
-@@ -24,10 +23,11 @@ sealed trait ThreadPoolFactory {
- 
- 
- object ThreadPoolFactory {
--  def apply(phase: Phase, profiler: Profiler): ThreadPoolFactory = profiler match {
--    case NoOpProfiler => new BasicThreadPoolFactory(phase)
--    case r: RealProfiler => new ProfilingThreadPoolFactory(phase, r)
--  }
-+  // `RealProfiler` (JMX-based) is excluded from this reduced source set --
-+  // `ctx.profiler` is always `NoOpProfiler` here, so this always builds a
-+  // plain, uninstrumented thread pool. See profile/Profiler.scala and
-+  // docs/findings.md's "frontend-only smoke test" scoping.
-+  def apply(phase: Phase)(using Context): ThreadPoolFactory = new BasicThreadPoolFactory(phase)
- 
-   private abstract class BaseThreadPoolFactory(phase: Phase) extends ThreadPoolFactory {
-     val baseGroup = new ThreadGroup(s"dotc-${phase.phaseName}")
-@@ -73,77 +73,4 @@ object ThreadPoolFactory {
-     }
-   }
- 
--  private class ProfilingThreadPoolFactory(phase: Phase, private val profiler: RealProfiler) extends BaseThreadPoolFactory(phase) {
--
--    override def newUnboundedQueueFixedThreadPool(nThreads: Int, shortId: String, priority: Int): ThreadPoolExecutor = {
--      val threadFactory = new CommonThreadFactory(shortId, priority = priority)
--      //like Executors.newFixedThreadPool
--      new SinglePhaseInstrumentedThreadPoolExecutor(nThreads, nThreads, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue[Runnable], threadFactory, new AbortPolicy)
--    }
--
--    override def newBoundedQueueFixedThreadPool(nThreads: Int, maxQueueSize: Int, rejectHandler: RejectedExecutionHandler, shortId: String, priority: Int): ThreadPoolExecutor = {
--      val threadFactory = new CommonThreadFactory(shortId, priority = priority)
--      //like Executors.newFixedThreadPool
--      new SinglePhaseInstrumentedThreadPoolExecutor(nThreads, nThreads, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue[Runnable](maxQueueSize), threadFactory, rejectHandler)
--    }
--
--    override protected def wrapWorker(worker: Runnable, shortId: String): Runnable = {
--      () =>
--      val data = new ThreadProfileData
--      localData.set(data)
--
--      val profileStart = RealProfiler.snapThread(0)
--      try worker.run finally {
--        val snap = RealProfiler.snapThread(data.idleNs)
--        val threadRange = ProfileRange(profileStart, snap, phase, shortId, data.taskCount, Thread.currentThread())
--        profiler.completeBackground(threadRange)
--      }
--    }
--
--    /**
--     * data for thread run. Not threadsafe, only written from a single thread
--     */
--    final class ThreadProfileData {
--      var firstStartNs = 0L
--      var taskCount = 0
--
--      var idleNs = 0L
--      var runningNs = 0L
--
--      var lastStartNs = 0L
--      var lastEndNs = 0L
--    }
--
--    val localData = new ThreadLocal[ThreadProfileData]
--
--    private class SinglePhaseInstrumentedThreadPoolExecutor
--    (   corePoolSize: Int, maximumPoolSize: Int, keepAliveTime: Long, unit: TimeUnit,
--        workQueue: BlockingQueue[Runnable], threadFactory: ThreadFactory, handler: RejectedExecutionHandler
--    ) extends ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler) {
--
--      override def beforeExecute(t: Thread, r: Runnable): Unit = {
--        val data = localData.get
--        data.taskCount += 1
--        val now = System.nanoTime()
--
--        if (data.firstStartNs == 0) data.firstStartNs = now
--        else data.idleNs += now - data.lastEndNs
--
--        data.lastStartNs = now
--
--        super.beforeExecute(t, r)
--      }
--
--      override def afterExecute(r: Runnable, t: Throwable): Unit = {
--        val now = System.nanoTime()
--        val data = localData.get
--
--        data.lastEndNs = now
--        data.runningNs += now - data.lastStartNs
--
--        super.afterExecute(r, t)
--      }
--    }
--  }
- }
--
 diff --git a/compiler/src/dotty/tools/dotc/reporting/WConf.scala b/compiler/src/dotty/tools/dotc/reporting/WConf.scala
-index 80d2ac0f..efe9a18e 100644
+index 80d2ac0fab..efe9a18e86 100644
 --- a/compiler/src/dotty/tools/dotc/reporting/WConf.scala
 +++ b/compiler/src/dotty/tools/dotc/reporting/WConf.scala
 @@ -26,10 +26,10 @@ enum MessageFilter:
@@ -1386,22 +264,9 @@ index 80d2ac0f..efe9a18e 100644
        pattern.findFirstIn(path).nonEmpty
      case Origin(pattern) =>
        message match
-diff --git a/compiler/src/dotty/tools/dotc/rewrites/Rewrites.scala b/compiler/src/dotty/tools/dotc/rewrites/Rewrites.scala
-index da678890..d9cd9f02 100644
---- a/compiler/src/dotty/tools/dotc/rewrites/Rewrites.scala
-+++ b/compiler/src/dotty/tools/dotc/rewrites/Rewrites.scala
-@@ -72,7 +72,7 @@ object Rewrites {
-     }
- 
-     def writeBack(): Unit =
--      val chars = apply(source.underlying.content)
-+      val chars = apply(source.underlying.content())
-       val osw = OutputStreamWriter(source.file.output, UTF_8)
-       try osw.write(chars, 0, chars.length)
-       finally osw.close()
 diff --git a/compiler/src/dotty/tools/dotc/sbt/DependencyTypes.scala b/compiler/src/dotty/tools/dotc/sbt/DependencyTypes.scala
 new file mode 100644
-index 00000000..4a738b9f
+index 0000000000..4a738b9fef
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/sbt/DependencyTypes.scala
 @@ -0,0 +1,22 @@
@@ -1427,113 +292,9 @@ index 00000000..4a738b9f
 +
 +enum UseScope derives CanEqual:
 +  case Default, PatMatTarget
-diff --git a/compiler/src/dotty/tools/dotc/sbt/ExtractDependencies.scala b/compiler/src/dotty/tools/dotc/sbt/ExtractDependencies.scala
-index c86d8f93..9ae2ccf4 100644
---- a/compiler/src/dotty/tools/dotc/sbt/ExtractDependencies.scala
-+++ b/compiler/src/dotty/tools/dotc/sbt/ExtractDependencies.scala
-@@ -3,7 +3,6 @@ package sbt
- 
- import java.io.File
- import java.nio.file.Path
--import java.util.EnumSet
- 
- import dotty.tools.dotc.ast.tpd
- import dotty.tools.dotc.classpath.FileUtils.{hasClassExtension, hasTastyExtension}
-@@ -20,11 +19,7 @@ import dotty.tools.dotc.core.Types.*
- import dotty.tools.dotc.util.{SrcPos, NoSourcePosition}
- import dotty.tools.io
- import dotty.tools.io.{AbstractFile, PlainFile, ZipArchive, NoAbstractFile, FileExtension}
--import xsbti.UseScope
--import xsbti.api.DependencyContext
--import xsbti.api.DependencyContext.*
--
--import scala.jdk.CollectionConverters.*
-+import DependencyContext.*
- 
- import scala.collection.{Set, mutable}
- import scala.compiletime.uninitialized
-@@ -185,11 +180,15 @@ trait AbstractExtractDependenciesCollector(rec: DependencyRecorder) extends tpd.
-         rec.addClassDependency(parent.tpe.classSymbol, depContext)
-     }
- 
--  // Only reference DependencyByMacroExpansion if it an be found on the classpath,
--  // as it was added later to the zinc.apiinfo DependencyContext enum
--  // e.g. pre 1.10.x sbt would throw java.lang.NoSuchFieldError errors here
--  lazy val allowsDependencyByMacroExpansion =
--    classOf[DependencyContext].getFields().exists(_.getName() == "DependencyByMacroExpansion")
-+  // Upstream reflectively probes the real `xsbti.api.DependencyContext` (an
-+  // external zinc enum, added a `DependencyByMacroExpansion` case only in
-+  // later zinc releases) to stay compatible with older sbt/zinc on the
-+  // classpath. `DependencyContext` here is this project's own local
-+  // stand-in (see sbt/DependencyTypes.scala's own doc comment) -- it always
-+  // has this case, and general reflection (`Class#getFields`) isn't
-+  // supported by this toolchain anyway (see docs/findings.md's reflection
-+  // findings) -- so this is statically always true.
-+  val allowsDependencyByMacroExpansion = true
- 
-   private def addMacroDependency(trees: List[Tree])(using Context): Unit =
-     if (allowsDependencyByMacroExpansion) {
-@@ -405,8 +404,8 @@ class DependencyRecorder {
- 
-   // The two possible value of `UseScope`. To avoid unnecessary allocations,
-   // we use vals here, but that means we must be careful to never mutate these sets.
--  private val DefaultScopes = EnumSet.of(UseScope.Default)
--  private val PatMatScopes = EnumSet.of(UseScope.Default, UseScope.PatMatTarget)
-+  private val DefaultScopes = Set(UseScope.Default)
-+  private val PatMatScopes = Set(UseScope.Default, UseScope.PatMatTarget)
- 
-   /** An object that maintain the set of used names and class dependencies from within a class */
-   final class FoundDepsInClass {
-@@ -418,15 +417,15 @@ class DependencyRecorder {
- 
-     /** Each key corresponds to a class dependency used in the class.
-      */
--    private val _classes = util.EqHashMap[Symbol, EnumSet[DependencyContext]]()
-+    private val _classes = util.EqHashMap[Symbol, mutable.Set[DependencyContext]]()
- 
-     def addDependency(fromClass: Symbol, context: DependencyContext): Unit =
--      val set = _classes.getOrElseUpdate(fromClass, EnumSet.noneOf(classOf[DependencyContext]))
-+      val set = _classes.getOrElseUpdate(fromClass, mutable.Set.empty[DependencyContext])
-       set.add(context)
- 
--    def classes: Iterator[(Symbol, EnumSet[DependencyContext])] = _classes.iterator
-+    def classes: Iterator[(Symbol, mutable.Set[DependencyContext])] = _classes.iterator
- 
--    def names: Iterator[(Name, EnumSet[UseScope])] = _names.iterator
-+    def names: Iterator[(Name, Set[UseScope])] = _names.iterator
- 
-     private[DependencyRecorder] def recordName(name: Name, includeSealedChildren: Boolean): Unit = {
-       if (includeSealedChildren)
-@@ -440,7 +439,7 @@ class DependencyRecorder {
-       names.foreach { case (name, scopes) =>
-         builder.append(name.mangledString)
-         builder.append(" in [")
--        scopes.forEach(scope => builder.append(scope.toString))
-+        scopes.foreach(scope => builder.append(scope.toString))
-         builder.append("]")
-         builder.append(", ")
-       }
-@@ -452,7 +451,7 @@ class DependencyRecorder {
-       classes.foreach { case (clazz, scopes) =>
-         builder.append(clazz.toString)
-         builder.append(" in [")
--        scopes.forEach(scope => builder.append(scope.toString))
-+        scopes.foreach(scope => builder.append(scope.toString))
-         builder.append("]")
-         builder.append(", ")
-       }
-@@ -480,7 +479,7 @@ class DependencyRecorder {
-           foundDeps.names.foreach: (usedName, scopes) =>
-             cb.usedName(className, usedName.toString, scopes)
-           for (toClass, deps) <- foundDeps.classes do
--            for dep <- deps.asScala do
-+            for dep <- deps do
-               recordClassDependency(cb, clazz, toClass, dep, siblingClassfiles)
-     clear()
- 
 diff --git a/compiler/src/dotty/tools/dotc/sbt/interfaces/IncrementalCallback.java b/compiler/src/dotty/tools/dotc/sbt/interfaces/IncrementalCallback.java
 deleted file mode 100644
-index ebdb1b7b..00000000
+index ebdb1b7b24..0000000000
 --- a/compiler/src/dotty/tools/dotc/sbt/interfaces/IncrementalCallback.java
 +++ /dev/null
 @@ -1,46 +0,0 @@
@@ -1585,7 +346,7 @@ index ebdb1b7b..00000000
 -}
 diff --git a/compiler/src/dotty/tools/dotc/sbt/interfaces/IncrementalCallback.scala b/compiler/src/dotty/tools/dotc/sbt/interfaces/IncrementalCallback.scala
 new file mode 100644
-index 00000000..8edbaf1e
+index 0000000000..8edbaf1eb6
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/sbt/interfaces/IncrementalCallback.scala
 @@ -0,0 +1,44 @@
@@ -1635,7 +396,7 @@ index 00000000..8edbaf1e
 +}
 diff --git a/compiler/src/dotty/tools/dotc/sbt/interfaces/ProgressCallback.java b/compiler/src/dotty/tools/dotc/sbt/interfaces/ProgressCallback.java
 deleted file mode 100644
-index 39f5ca39..00000000
+index 39f5ca3996..0000000000
 --- a/compiler/src/dotty/tools/dotc/sbt/interfaces/ProgressCallback.java
 +++ /dev/null
 @@ -1,21 +0,0 @@
@@ -1662,7 +423,7 @@ index 39f5ca39..00000000
 -}
 diff --git a/compiler/src/dotty/tools/dotc/sbt/interfaces/ProgressCallback.scala b/compiler/src/dotty/tools/dotc/sbt/interfaces/ProgressCallback.scala
 new file mode 100644
-index 00000000..7bfa770c
+index 0000000000..7bfa770c1e
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/sbt/interfaces/ProgressCallback.scala
 @@ -0,0 +1,28 @@
@@ -1695,10 +456,10 @@ index 00000000..7bfa770c
 +  def progress(current: Int, total: Int, currPhase: String, nextPhase: String): Boolean = true
 +}
 diff --git a/compiler/src/dotty/tools/dotc/transform/CheckUnused.scala b/compiler/src/dotty/tools/dotc/transform/CheckUnused.scala
-index f12c70ef..a3b39b43 100644
+index a7bca31d75..d82596134d 100644
 --- a/compiler/src/dotty/tools/dotc/transform/CheckUnused.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/CheckUnused.scala
-@@ -1011,16 +1011,13 @@ object CheckUnused:
+@@ -1024,16 +1024,13 @@ object CheckUnused:
            () // just recurse into args
          else
            if unapplied.exists && unapplied.owner == defn.Quotes_reflectModule then
@@ -1724,7 +485,7 @@ index f12c70ef..a3b39b43 100644
  
 diff --git a/compiler/src/dotty/tools/dotc/transform/CollectEntryPoints.scala b/compiler/src/dotty/tools/dotc/transform/CollectEntryPoints.scala
 new file mode 100644
-index 00000000..6ed26696
+index 0000000000..6ed2669611
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/transform/CollectEntryPoints.scala
 @@ -0,0 +1,50 @@
@@ -1779,7 +540,7 @@ index 00000000..6ed26696
 +  val name: String = "Collect entry points"
 +  val description: String = "collect all entry points and save them in the context"
 diff --git a/compiler/src/dotty/tools/dotc/transform/Constructors.scala b/compiler/src/dotty/tools/dotc/transform/Constructors.scala
-index c81b2de7..8445b41f 100644
+index 984f3061dd..f960caf232 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Constructors.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Constructors.scala
 @@ -367,10 +367,11 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
@@ -1799,7 +560,7 @@ index c81b2de7..8445b41f 100644
        }
        else cpy.DefDef(constr)(rhs = Block(finalConstrStats, unitLiteral))
 diff --git a/compiler/src/dotty/tools/dotc/transform/Dependencies.scala b/compiler/src/dotty/tools/dotc/transform/Dependencies.scala
-index 041359f0..62da8821 100644
+index 041359f0f8..62da8821cc 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Dependencies.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Dependencies.scala
 @@ -9,8 +9,6 @@ import collection.mutable.{LinkedHashMap, LinkedHashSet}
@@ -1812,10 +573,10 @@ index 041359f0..62da8821 100644
   *  `freeVars`, `tracked`, and `logicalOwner`.
   */
 diff --git a/compiler/src/dotty/tools/dotc/transform/InstrumentCoverage.scala b/compiler/src/dotty/tools/dotc/transform/InstrumentCoverage.scala
-index fd859158..0cd688aa 100644
+index 659d7bb729..bc438a4626 100644
 --- a/compiler/src/dotty/tools/dotc/transform/InstrumentCoverage.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/InstrumentCoverage.scala
-@@ -264,7 +264,7 @@ class InstrumentCoverage extends MacroTransform with IdentityDenotTransformer:
+@@ -292,7 +292,7 @@ class InstrumentCoverage extends MacroTransform with IdentityDenotTransformer:
          // +1 to account for the line number starting at 1
          // the internal line number is 0-base https://github.com/scala/scala3/blob/18ada516a85532524a39a962b2ddecb243c65376/compiler/src/dotty/tools/dotc/util/SourceFile.scala#L173-L176
          line = pos.line + 1,
@@ -1825,7 +586,7 @@ index fd859158..0cd688aa 100644
          treeName = tree.getClass.getSimpleName,
          branch,
 diff --git a/compiler/src/dotty/tools/dotc/transform/Memoize.scala b/compiler/src/dotty/tools/dotc/transform/Memoize.scala
-index 0b4d4c7d..60e34465 100644
+index 0b4d4c7dbf..60e344656e 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Memoize.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Memoize.scala
 @@ -16,8 +16,6 @@ import Flags.*
@@ -1851,41 +612,8 @@ index 0b4d4c7d..60e34465 100644
  
        if sym.isGetter then
          if sym.isConstExprFinalVal then
-diff --git a/compiler/src/dotty/tools/dotc/transform/Mixin.scala b/compiler/src/dotty/tools/dotc/transform/Mixin.scala
-index b514c210..412c3b93 100644
---- a/compiler/src/dotty/tools/dotc/transform/Mixin.scala
-+++ b/compiler/src/dotty/tools/dotc/transform/Mixin.scala
-@@ -17,7 +17,6 @@ import NameKinds.*
- import NameOps.*
- import Phases.erasurePhase
- import ast.Trees.*
--import dotty.tools.dotc.transform.sjs.JSSymUtils.isJSType
- 
- object Mixin {
-   val name: String = "mixin"
-@@ -289,15 +288,11 @@ class Mixin extends MiniPhase with SymTransformer { thisPhase =>
-             else if (getter.is(Lazy, butNot = Module))
-               transformFollowing(superRef(getter).appliedToNone)
-             else if (getter.is(Module))
--              if ctx.settings.scalajs.value && getter.moduleClass.isJSType then
--                if getter.is(Scala2x) then
--                  report.error(
--                      em"""Implementation restriction: cannot extend the Scala 2 trait $mixin
--                          |containing the object $getter that extends js.Any""",
--                      cls.srcPos)
--                transformFollowing(superRef(getter).appliedToNone)
--              else
--                New(getter.info.resultType, List(This(cls)))
-+              // The `ctx.settings.scalajs.value && getter.moduleClass.isJSType` branch is
-+              // dropped: Scala.js's `backend.sjs`/`transform.sjs` are excluded from this
-+              // reduced source set (see docs/findings.md's "frontend-only smoke test"
-+              // scoping), so `ctx.settings.scalajs.value` can never be true here.
-+              New(getter.info.resultType, List(This(cls)))
-             else
-               Underscore(getter.info.resultType)
-           // transformFollowing call is needed to make memoize & lazy vals run
 diff --git a/compiler/src/dotty/tools/dotc/transform/TreeChecker.scala b/compiler/src/dotty/tools/dotc/transform/TreeChecker.scala
-index e725eaef..a27d7208 100644
+index e95a3826f0..68aa470837 100644
 --- a/compiler/src/dotty/tools/dotc/transform/TreeChecker.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/TreeChecker.scala
 @@ -26,6 +26,10 @@ import staging.StagingLevel
@@ -1900,7 +628,7 @@ index e725eaef..a27d7208 100644
   *  and verifies that the type of each tree node so obtained conforms to the type found in the tree node.
   *  It also performs the following checks:
 diff --git a/compiler/src/dotty/tools/dotc/typer/Implicits.scala b/compiler/src/dotty/tools/dotc/typer/Implicits.scala
-index b775c045..96af35b7 100644
+index 04ac34c1a1..34d7a3d71e 100644
 --- a/compiler/src/dotty/tools/dotc/typer/Implicits.scala
 +++ b/compiler/src/dotty/tools/dotc/typer/Implicits.scala
 @@ -2,7 +2,6 @@ package dotty.tools
@@ -1911,7 +639,7 @@ index b775c045..96af35b7 100644
  import core.*
  import ast.{TreeTypeMap, untpd, tpd}
  import util.Spans.*
-@@ -743,8 +742,10 @@ trait ImplicitRunInfo:
+@@ -736,8 +735,10 @@ trait ImplicitRunInfo:
              // `A | Unit` to `js.UndefOrOps[A]`. To keep this conversion in scope
              // in Scala 3, where we re-interpret `js.|` as a real union, we inject
              // it in the scope of `Unit`.
@@ -1925,7 +653,7 @@ index b775c045..96af35b7 100644
              if sym.isClass then
                for p <- t.parents do companions ++= iscopeRefs(p)
 diff --git a/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala b/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala
-index a907c045..45efc63c 100644
+index fcc8b3f32e..30330d3a9a 100644
 --- a/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala
 +++ b/compiler/src/dotty/tools/dotc/typer/ImportSuggestions.scala
 @@ -2,7 +2,6 @@ package dotty.tools
@@ -1958,7 +686,7 @@ index a907c045..45efc63c 100644
        }
  
      def nestedRoots(site: Type, parentSymbols: Set[Symbol])(using Context): List[Symbol] =
-@@ -152,7 +153,6 @@ trait ImportSuggestions:
+@@ -153,7 +154,6 @@ trait ImportSuggestions:
    private def importSuggestions(pt: Type)(using Context): (List[TermRef], List[TermRef]) =
      val allotted = ctx.run.nn.importSuggestionBudget
      if allotted <= 1 then return (Nil, Nil)
@@ -1966,7 +694,7 @@ index a907c045..45efc63c 100644
      implicits.println(i"looking for import suggestions, timeout = ${allotted}ms")
      val start = System.currentTimeMillis()
      val deadLine = start + allotted
-@@ -196,10 +196,6 @@ trait ImportSuggestions:
+@@ -197,10 +197,6 @@ trait ImportSuggestions:
      def deepTest(ref: TermRef): Boolean =
        System.currentTimeMillis < deadLine
        && {
@@ -1977,7 +705,7 @@ index a907c045..45efc63c 100644
          val span = ctx.owner.srcPos.span
          val (expectedType, argument, kind) = pt match
            case ViewProto(argType, resType) =>
-@@ -210,17 +206,14 @@ trait ImportSuggestions:
+@@ -211,17 +207,14 @@ trait ImportSuggestions:
            case _ =>
              (pt, EmptyTree, Candidate.Value)
          val candidate = Candidate(ref, kind, 0)
@@ -2003,7 +731,7 @@ index a907c045..45efc63c 100644
        }
      end deepTest
  
-@@ -261,7 +254,6 @@ trait ImportSuggestions:
+@@ -262,7 +255,6 @@ trait ImportSuggestions:
          ex.printStackTrace()
        (Nil, Nil)
      finally
@@ -2012,10 +740,10 @@ index a907c045..45efc63c 100644
    end importSuggestions
  
 diff --git a/compiler/src/dotty/tools/dotc/typer/Migrations.scala b/compiler/src/dotty/tools/dotc/typer/Migrations.scala
-index 0fd99465..54d97872 100644
+index 7b8708560c..13d2e834de 100644
 --- a/compiler/src/dotty/tools/dotc/typer/Migrations.scala
 +++ b/compiler/src/dotty/tools/dotc/typer/Migrations.scala
-@@ -166,7 +166,7 @@ trait Migrations:
+@@ -167,7 +167,7 @@ trait Migrations:
      val ptSpan = pt.args.head.span
      ptSpan.exists
      && tree.span.exists
@@ -2025,7 +753,7 @@ index 0fd99465..54d97872 100644
        .exists(_ == '(')
  
 diff --git a/compiler/src/dotty/tools/dotc/typer/Synthesizer.scala b/compiler/src/dotty/tools/dotc/typer/Synthesizer.scala
-index deae8bbc..50612649 100644
+index a3f89506ff..308b04ed96 100644
 --- a/compiler/src/dotty/tools/dotc/typer/Synthesizer.scala
 +++ b/compiler/src/dotty/tools/dotc/typer/Synthesizer.scala
 @@ -19,7 +19,7 @@ import ast.tpd
@@ -2038,7 +766,7 @@ index deae8bbc..50612649 100644
  
  /** Synthesize terms for special classes */
 diff --git a/compiler/src/dotty/tools/dotc/typer/Typer.scala b/compiler/src/dotty/tools/dotc/typer/Typer.scala
-index 8649a49c..7eb7bf57 100644
+index 968a994dcd..2a7fc1e6ac 100644
 --- a/compiler/src/dotty/tools/dotc/typer/Typer.scala
 +++ b/compiler/src/dotty/tools/dotc/typer/Typer.scala
 @@ -2,7 +2,6 @@ package dotty.tools
@@ -2049,7 +777,7 @@ index 8649a49c..7eb7bf57 100644
  import core.*
  import ast.*
  import Trees.*
-@@ -364,8 +363,10 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
+@@ -366,8 +365,10 @@ class Typer(@constructorOnly nestingLevel: Int = 0) extends Namer
                      mbr.matchesImportBound(if mbr.symbol.is(Given) then imp.givenBound else imp.wildcardBound)
                    }
                  else accessibleDenot
@@ -2063,7 +791,7 @@ index 8649a49c..7eb7bf57 100644
                // as real union types, we want references to `A | B` in sources
                // to be typed as a real union even if `js.|` has been imported,
 diff --git a/compiler/src/dotty/tools/dotc/util/Signatures.scala b/compiler/src/dotty/tools/dotc/util/Signatures.scala
-index c0a8d636..e4fc53e7 100644
+index dc0f9baade..7352393080 100644
 --- a/compiler/src/dotty/tools/dotc/util/Signatures.scala
 +++ b/compiler/src/dotty/tools/dotc/util/Signatures.scala
 @@ -296,7 +296,7 @@ object Signatures {
@@ -2075,39 +803,8 @@ index c0a8d636..e4fc53e7 100644
        commaIndex = text.indexOf(',')
        if commaIndex != -1
      yield
-diff --git a/compiler/src/dotty/tools/dotc/util/SourceFile.scala b/compiler/src/dotty/tools/dotc/util/SourceFile.scala
-index 0a0a31bb..a060d0e0 100644
---- a/compiler/src/dotty/tools/dotc/util/SourceFile.scala
-+++ b/compiler/src/dotty/tools/dotc/util/SourceFile.scala
-@@ -53,7 +53,7 @@ object ScriptSourceFile {
-         }
- 
-     new SourceFile(file, content) {
--      override val underlying = new SourceFile(this.file, this.content)
-+      override val underlying = new SourceFile(this.file, this.content())
-     }
-   }
- }
-@@ -80,7 +80,7 @@ object WrappedSourceFile:
-         val result =
-           if magicHeader.isEmpty then NoHeader
-           else
--            val text = new String(sourceFile.content)
-+            val text = new String(sourceFile.content())
-             val headerQuoted = java.util.regex.Pattern.quote("///" + magicHeader)
-             val regex = s"(?m)^$headerQuoted:(.+)$$".r
-             regex.findFirstMatchIn(text) match
-@@ -228,7 +228,7 @@ class SourceFile(val file: AbstractFile, computeContent: => Array[Char]) extends
- 
-   /** The content of the line containing position `offset` */
-   def lineContent(offset: Int): String =
--    content.slice(startOfLine(offset), nextLine(offset)).mkString
-+    content().slice(startOfLine(offset), nextLine(offset)).mkString
- 
-   /** The column corresponding to `offset`, starting at 0 */
-   def column(offset: Int): Int = {
 diff --git a/compiler/src/dotty/tools/dotc/util/SourcePosition.scala b/compiler/src/dotty/tools/dotc/util/SourcePosition.scala
-index 7ba78d46..d4f7e0aa 100644
+index e7ad54d6ce..c86b03863f 100644
 --- a/compiler/src/dotty/tools/dotc/util/SourcePosition.scala
 +++ b/compiler/src/dotty/tools/dotc/util/SourcePosition.scala
 @@ -34,7 +34,7 @@ extends SrcPos, interfaces.SourcePosition, Showable:
@@ -2119,99 +816,8 @@ index 7ba78d46..d4f7e0aa 100644
  
    /** The lines of the position */
    def lines: Range = {
-diff --git a/compiler/src/dotty/tools/io/AbstractFile.scala b/compiler/src/dotty/tools/io/AbstractFile.scala
-index 321efb9b..1167a5ef 100644
---- a/compiler/src/dotty/tools/io/AbstractFile.scala
-+++ b/compiler/src/dotty/tools/io/AbstractFile.scala
-@@ -9,7 +9,7 @@ import java.io.{
-   IOException, InputStream, OutputStream, BufferedOutputStream,
-   ByteArrayOutputStream
- }
--import java.net.URL
-+import java.net.{URI, URL}
- import java.nio.file.{FileAlreadyExistsException, Files, Paths}
- 
- /**
-@@ -162,9 +162,11 @@ abstract class AbstractFile extends Iterable[AbstractFile] with dotty.tools.dotc
-   /** size of this file if it is a concrete file. */
-   def sizeOption: Option[Int] = None
- 
--  def toURL: URL | Null =
--    val jpath = this.jpath
--    if (jpath == null) null else jpath.toUri.toURL
-+  // `java.net.URL` doesn't exist on Scala Native -- see io/ClassPath.scala's `asURLs` doc
-+  // comment. (`getURL`/`getResources` above still use real `URL`, but are unreachable from
-+  // this reduced build's entry point -- confirmed no callers anywhere in this source set --
-+  // so left as-is rather than touched speculatively.)
-+  def toURL: URI = if (jpath == null) null else jpath.toUri
- 
-   /** Returns contents of file (if applicable) in a Char array.
-    *  warning: use `Global.getSourceFile()` to use the proper
-diff --git a/compiler/src/dotty/tools/io/ClassPath.scala b/compiler/src/dotty/tools/io/ClassPath.scala
-index df18fa95..b5261d02 100644
---- a/compiler/src/dotty/tools/io/ClassPath.scala
-+++ b/compiler/src/dotty/tools/io/ClassPath.scala
-@@ -7,7 +7,9 @@
- package dotty.tools
- package io
- 
--import java.net.{MalformedURLException, URI, URISyntaxException, URL}
-+import scala.language.unsafeNulls
-+
-+import java.net.{URI, URISyntaxException, URL}
- import java.util.regex.PatternSyntaxException
- 
- import File.pathSeparator
-@@ -20,7 +22,15 @@ import dotc.classpath.{ PackageEntry, ClassPathEntries, PackageName }
-   */
- trait ClassPath {
-   import dotty.tools.dotc.classpath.*
--  def asURLs: Seq[URL]
-+  // `java.net.URL` doesn't exist at all on Scala Native (confirmed: no `URL.scala` anywhere in
-+  // `vendor/scala-native`'s javalib) -- unlike every other exclusion in this reduced build,
-+  // this isn't a narrow call site, `ClassPath`'s own abstract API bakes it in across 9 override
-+  // sites. Nothing in this reduced source set actually reads an `asURLs` value (its one
-+  // real historical consumer, `core/MacroClassLoader.scala`'s `URLClassLoader` construction,
-+  // is gone too, see that file), so this returns `URI` instead -- real, Scala-Native-supported,
-+  // and every implementation already builds one before calling the now-missing `.toURL()` on
-+  // it. See docs/findings.md's "frontend-only smoke test" scoping.
-+  def asURLs: Seq[URI]
- 
-   final def hasPackage(pkg: String): Boolean = hasPackage(PackageName(pkg))
-   final def packages(inPackage: String): Seq[PackageEntry] = packages(PackageName(inPackage))
-@@ -149,24 +159,24 @@ object ClassPath {
-   /** Expand manifest jar classpath entries: these are either urls, or paths
-    *  relative to the location of the jar.
-    */
--  def expandManifestPath(jarPath: String): List[URL] = {
-+  def expandManifestPath(jarPath: String): List[URI] = {
-     val file = File(jarPath)
-     if (!file.isFile) return Nil
- 
-     val baseDir = file.parent
-     new Jar(file).classPathElements map (elem =>
--      specToURL(elem, baseDir) getOrElse (baseDir / elem).toURL
-+      specToURL(elem, baseDir) getOrElse (baseDir / elem).toURI
-     )
-   }
- 
--  def specToURL(spec: String, basedir: Directory): Option[URL] =
-+  def specToURL(spec: String, basedir: Directory): Option[URI] =
-     try
-       val uri = new URI(spec)
--      if uri.isAbsolute() then Some(uri.toURL())
-+      if uri.isAbsolute() then Some(uri)
-       else
--        Some(basedir.resolve(Path(spec)).toURL)
-+        Some(basedir.resolve(Path(spec)).toURI)
-     catch
--      case _: MalformedURLException | _: URISyntaxException => None
-+      case _: URISyntaxException => None
- 
-   def manifests: List[java.net.URL] = {
-     import scala.jdk.CollectionConverters.EnumerationHasAsScala
 diff --git a/compiler/src/dotty/tools/io/Path.scala b/compiler/src/dotty/tools/io/Path.scala
-index ee5b2cd8..802b10c1 100644
+index 02d4deeb4b..a34f7891c3 100644
 --- a/compiler/src/dotty/tools/io/Path.scala
 +++ b/compiler/src/dotty/tools/io/Path.scala
 @@ -6,7 +6,7 @@
@@ -2223,7 +829,7 @@ index ee5b2cd8..802b10c1 100644
  import java.nio.file.attribute.{BasicFileAttributes, FileTime}
  import java.io.IOException
  import scala.jdk.CollectionConverters.*
-@@ -72,7 +72,8 @@ class Path private[io] (val jpath: JPath) {
+@@ -63,7 +63,8 @@ class Path private[io] (val jpath: JPath) {
    def toAbsolute: Path = if (isAbsolute) this else new Path(jpath.toAbsolutePath)
    def toCanonical: Path = normalize.toAbsolute
    def toURI: URI = jpath.toUri()
@@ -2233,35 +839,9 @@ index ee5b2cd8..802b10c1 100644
  
    /** Creates a new Path with the specified path appended.  Assumes
     *  the type of the new component implies the type of the result.
-diff --git a/compiler/src/dotty/tools/io/ZipArchive.scala b/compiler/src/dotty/tools/io/ZipArchive.scala
-index 106017f8..a77f486f 100644
---- a/compiler/src/dotty/tools/io/ZipArchive.scala
-+++ b/compiler/src/dotty/tools/io/ZipArchive.scala
-@@ -112,13 +112,15 @@ abstract class ZipArchive(override val jpath: JPath | Null, release: Option[Stri
- }
- /** ''Note:  This library is considered experimental and should not be used unless you know what you are doing.'' */
- final class FileZipArchive(jpath: JPath, release: Option[String]) extends ZipArchive(jpath, release) {
-+  // The multi-release-jar-aware `JarFile(File, Boolean, Int, Runtime.Version)` constructor
-+  // upstream is dropped: `Runtime.Version` needs a real JVM (no Scala Native port, confirmed
-+  // absent from `vendor/scala-native`'s `java.lang.Runtime`), same as `Runtime.version()`
-+  // elsewhere (see classpath/DirectoryClassPath.scala's `JrtClassPath`). Always uses the plain
-+  // `ZipFile` constructor instead -- `release`-specific classfile variants inside a
-+  // multi-release jar won't be selected, but the jar still reads. See docs/findings.md's
-+  // "frontend-only smoke test" scoping.
-   private def openZipFile(): ZipFile = try {
--    release match {
--      case Some(r) if file.nn.getName.endsWith(".jar") =>
--        new JarFile(file, true, ZipFile.OPEN_READ, Runtime.Version.parse(r))
--      case _ =>
--        new ZipFile(file)
--    }
-+    new ZipFile(file)
-   } catch {
-     case ioe: IOException => throw new IOException("Error accessing " + file.nn.getPath, ioe)
-   }
 diff --git a/interfaces/src/dotty/tools/dotc/interfaces/AbstractFile.java b/interfaces/src/dotty/tools/dotc/interfaces/AbstractFile.java
 deleted file mode 100644
-index 286e7b2c..00000000
+index 286e7b2cf5..0000000000
 --- a/interfaces/src/dotty/tools/dotc/interfaces/AbstractFile.java
 +++ /dev/null
 @@ -1,24 +0,0 @@
@@ -2291,7 +871,7 @@ index 286e7b2c..00000000
 -}
 diff --git a/interfaces/src/dotty/tools/dotc/interfaces/AbstractFile.scala b/interfaces/src/dotty/tools/dotc/interfaces/AbstractFile.scala
 new file mode 100644
-index 00000000..51d31950
+index 0000000000..51d3195029
 --- /dev/null
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/AbstractFile.scala
 @@ -0,0 +1,32 @@
@@ -2331,7 +911,7 @@ diff --git a/interfaces/src/dotty/tools/dotc/interfaces/CompilerCallback.java b/
 similarity index 75%
 rename from interfaces/src/dotty/tools/dotc/interfaces/CompilerCallback.java
 rename to interfaces/src/dotty/tools/dotc/interfaces/CompilerCallback.scala
-index 25696f74..f06fcc38 100644
+index 25696f7404..f06fcc3872 100644
 --- a/interfaces/src/dotty/tools/dotc/interfaces/CompilerCallback.java
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/CompilerCallback.scala
 @@ -1,4 +1,4 @@
@@ -2371,7 +951,7 @@ diff --git a/interfaces/src/dotty/tools/dotc/interfaces/Diagnostic.java b/interf
 similarity index 57%
 rename from interfaces/src/dotty/tools/dotc/interfaces/Diagnostic.java
 rename to interfaces/src/dotty/tools/dotc/interfaces/Diagnostic.scala
-index 19878a2f..be959fb1 100644
+index 19878a2fa1..be959fb154 100644
 --- a/interfaces/src/dotty/tools/dotc/interfaces/Diagnostic.java
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/Diagnostic.scala
 @@ -1,7 +1,6 @@
@@ -2422,7 +1002,7 @@ index 19878a2f..be959fb1 100644
  }
 diff --git a/interfaces/src/dotty/tools/dotc/interfaces/DiagnosticRelatedInformation.java b/interfaces/src/dotty/tools/dotc/interfaces/DiagnosticRelatedInformation.java
 deleted file mode 100644
-index 3ebea03f..00000000
+index 3ebea03f43..0000000000
 --- a/interfaces/src/dotty/tools/dotc/interfaces/DiagnosticRelatedInformation.java
 +++ /dev/null
 @@ -1,6 +0,0 @@
@@ -2434,7 +1014,7 @@ index 3ebea03f..00000000
 -}
 diff --git a/interfaces/src/dotty/tools/dotc/interfaces/DiagnosticRelatedInformation.scala b/interfaces/src/dotty/tools/dotc/interfaces/DiagnosticRelatedInformation.scala
 new file mode 100644
-index 00000000..5e8c3934
+index 0000000000..5e8c3934e4
 --- /dev/null
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/DiagnosticRelatedInformation.scala
 @@ -0,0 +1,7 @@
@@ -2449,7 +1029,7 @@ diff --git a/interfaces/src/dotty/tools/dotc/interfaces/ReporterResult.java b/in
 similarity index 61%
 rename from interfaces/src/dotty/tools/dotc/interfaces/ReporterResult.java
 rename to interfaces/src/dotty/tools/dotc/interfaces/ReporterResult.scala
-index f75519db..46dedca4 100644
+index f75519db2d..46dedca48f 100644
 --- a/interfaces/src/dotty/tools/dotc/interfaces/ReporterResult.java
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/ReporterResult.scala
 @@ -1,18 +1,20 @@
@@ -2483,7 +1063,7 @@ diff --git a/interfaces/src/dotty/tools/dotc/interfaces/SimpleReporter.java b/in
 similarity index 67%
 rename from interfaces/src/dotty/tools/dotc/interfaces/SimpleReporter.java
 rename to interfaces/src/dotty/tools/dotc/interfaces/SimpleReporter.scala
-index f4c80c0c..50787bfb 100644
+index f4c80c0cf9..50787bfbfb 100644
 --- a/interfaces/src/dotty/tools/dotc/interfaces/SimpleReporter.java
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/SimpleReporter.scala
 @@ -1,4 +1,4 @@
@@ -2511,7 +1091,7 @@ diff --git a/interfaces/src/dotty/tools/dotc/interfaces/SourceFile.java b/interf
 similarity index 52%
 rename from interfaces/src/dotty/tools/dotc/interfaces/SourceFile.java
 rename to interfaces/src/dotty/tools/dotc/interfaces/SourceFile.scala
-index 6c72a512..1f1bb37d 100644
+index 6c72a5125b..1f1bb37d50 100644
 --- a/interfaces/src/dotty/tools/dotc/interfaces/SourceFile.java
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/SourceFile.scala
 @@ -1,11 +1,13 @@
@@ -2535,7 +1115,7 @@ diff --git a/interfaces/src/dotty/tools/dotc/interfaces/SourcePosition.java b/in
 similarity index 72%
 rename from interfaces/src/dotty/tools/dotc/interfaces/SourcePosition.java
 rename to interfaces/src/dotty/tools/dotc/interfaces/SourcePosition.scala
-index 8e0d1c5a..c29f3cf6 100644
+index 8e0d1c5a2e..c29f3cf6c3 100644
 --- a/interfaces/src/dotty/tools/dotc/interfaces/SourcePosition.java
 +++ b/interfaces/src/dotty/tools/dotc/interfaces/SourcePosition.scala
 @@ -1,4 +1,4 @@

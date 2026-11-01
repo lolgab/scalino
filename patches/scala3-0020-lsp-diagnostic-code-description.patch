@@ -1,5 +1,5 @@
 diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
-index a1435f2d..e9595a56 100644
+index 1837e8454f..539d01e178 100644
 --- a/language-server/src/dotty/tools/languageserver/Lsp.scala
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
 @@ -97,7 +97,13 @@ object Lsp {
@@ -17,7 +17,7 @@ index a1435f2d..e9595a56 100644
    final case class PublishDiagnosticsParams(uri: String, diagnostics: List[Diagnostic])
    /** `window/showMessage`'s `type`: 1 = Error, 2 = Warning, 3 = Info, 4 = Log. */
    final case class ShowMessageParams(`type`: Int, message: String)
-@@ -863,6 +869,12 @@ object Lsp {
+@@ -865,6 +871,12 @@ object Lsp {
        out.writeNonEscapedAsciiKey("severity"); out.writeVal(x.severity)
        out.writeNonEscapedAsciiKey("source"); out.writeVal(x.source)
        out.writeNonEscapedAsciiKey("code"); out.writeVal(x.code)

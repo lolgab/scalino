@@ -1,0 +1,12 @@
+diff --git a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+--- a/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
++++ b/presentation-compiler/src/main/dotty/tools/pc/PcDefinitionProvider.scala
+@@ -248,7 +248,7 @@
+     try
+       val file = symbol.associatedFile
+       val backedByJavaBase =
+-        file != null && file.underlyingSource.exists(_.name == "java.base.jar")
++        file != null && file.enclosing.exists(_.name == "java.base.jar")
+       if !backedByJavaBase then Nil
+       else
+         val cp = ctx.settings.classpath.value

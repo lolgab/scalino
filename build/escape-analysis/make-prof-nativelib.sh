@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 source build/00-env.sh >/dev/null 2>&1
 EA_WORK=${EA_WORK:-$WORK/ea-dev}
-NLJAR="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/$SCALA_NATIVE_VERSION-SNAPSHOT/jars/nativelib_native0.5_3.jar"
+NLJAR="$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/$SCALA_NATIVE_VERSION/jars/nativelib_native0.5_3.jar"
 PATCH="$PWD/build/escape-analysis/gc-alloc-profile.patch"
 GCDIR="$EA_WORK/gc/scala-native/gc/immix"
 rm -rf "$EA_WORK/gc"; mkdir -p "$GCDIR"

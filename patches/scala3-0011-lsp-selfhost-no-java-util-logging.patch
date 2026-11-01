@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/interactive/Completion.scala b/compiler/src/dotty/tools/dotc/interactive/Completion.scala
-index ed1171c8..c66b24f8 100644
+index ed1171c8e8..c66b24f874 100644
 --- a/compiler/src/dotty/tools/dotc/interactive/Completion.scala
 +++ b/compiler/src/dotty/tools/dotc/interactive/Completion.scala
 @@ -34,8 +34,6 @@ import dotty.tools.dotc.core.Constants

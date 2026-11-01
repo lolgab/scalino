@@ -1,20 +1,5 @@
-diff --git a/compiler/src/dotty/tools/dotc/semanticdb/ExtractSemanticDB.scala b/compiler/src/dotty/tools/dotc/semanticdb/ExtractSemanticDB.scala
-index c8d9a9e9..e8a9bd0f 100644
---- a/compiler/src/dotty/tools/dotc/semanticdb/ExtractSemanticDB.scala
-+++ b/compiler/src/dotty/tools/dotc/semanticdb/ExtractSemanticDB.scala
-@@ -167,8 +167,8 @@ private[semanticdb] object ExtractSemanticDB:
-       schema = Schema.SEMANTICDB4,
-       language = Language.SCALA,
-       uri = Tools.mkURIstring(Paths.get(relPath(source, sourceRoot))),
--      text = if semanticdbText then String(source.content) else "",
--      md5 = internal.MD5.compute(String(source.content)),
-+      text = if semanticdbText then String(source.content()) else "",
-+      md5 = internal.MD5.compute(String(source.content())),
-       symbols = symbolInfos,
-       occurrences = occurrences,
-       synthetics = synthetics,
 diff --git a/compiler/src/dotty/tools/dotc/semanticdb/PPrint.scala b/compiler/src/dotty/tools/dotc/semanticdb/PPrint.scala
-index f96a4839..b30ecfdb 100644
+index f96a48392e..b30ecfdb04 100644
 --- a/compiler/src/dotty/tools/dotc/semanticdb/PPrint.scala
 +++ b/compiler/src/dotty/tools/dotc/semanticdb/PPrint.scala
 @@ -328,14 +328,14 @@ private[semanticdb] class SyntheticPrinter(symtab: PrinterSymtab, source: Source
@@ -35,10 +20,10 @@ index f96a4839..b30ecfdb 100644
  
    // def pprint(tree: s.Tree, range: Option[Range]): String =
 diff --git a/presentation-compiler/src/main/dotty/tools/pc/CachingDriver.scala b/presentation-compiler/src/main/dotty/tools/pc/CachingDriver.scala
-index 352157bd..84dc8ff6 100644
+index e617b874ff..430ea4e25d 100644
 --- a/presentation-compiler/src/main/dotty/tools/pc/CachingDriver.scala
 +++ b/presentation-compiler/src/main/dotty/tools/pc/CachingDriver.scala
-@@ -52,7 +52,7 @@ class CachingDriver private (
+@@ -55,7 +55,7 @@ class CachingDriver private (
        case _ => false
  
    override def run(uri: URI, source: SourceFile): List[Diagnostic] =
@@ -48,7 +33,7 @@ index 352157bd..84dc8ff6 100644
      previousDiags
  
 diff --git a/presentation-compiler/src/main/dotty/tools/pc/completions/OverrideCompletions.scala b/presentation-compiler/src/main/dotty/tools/pc/completions/OverrideCompletions.scala
-index 3d9f48fd..ef3e83a7 100644
+index a034042752..ddc62422bb 100644
 --- a/presentation-compiler/src/main/dotty/tools/pc/completions/OverrideCompletions.scala
 +++ b/presentation-compiler/src/main/dotty/tools/pc/completions/OverrideCompletions.scala
 @@ -120,7 +120,7 @@ object OverrideCompletions:
@@ -61,7 +46,7 @@ index 3d9f48fd..ef3e83a7 100644
          )
        )
 diff --git a/presentation-compiler/src/main/dotty/tools/pc/utils/InteractiveEnrichments.scala b/presentation-compiler/src/main/dotty/tools/pc/utils/InteractiveEnrichments.scala
-index 1f2e10f2..25ebcd15 100644
+index 1f2e10f236..25ebcd1566 100644
 --- a/presentation-compiler/src/main/dotty/tools/pc/utils/InteractiveEnrichments.scala
 +++ b/presentation-compiler/src/main/dotty/tools/pc/utils/InteractiveEnrichments.scala
 @@ -193,7 +193,7 @@ object InteractiveEnrichments extends CommonMtagsEnrichments:

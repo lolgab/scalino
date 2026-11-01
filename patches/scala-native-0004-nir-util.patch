@@ -1,0 +1,579 @@
+diff --git a/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala b/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala
+index c5600285..51487f01 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala
+@@ -43,29 +43,60 @@ private[scalanative] object ControlFlow {
+   final class Graph(
+       val entry: Block,
+       val all: Seq[Block],
+-      val find: mutable.Map[Local, Block]
+-  )
++      blocksById: mutable.LongMap[Block]
++  ) {
++
++    // `find` is public API (mutable.Map[Local, Block], used well beyond this
++    // file) but DirectCodeGen -- the hot path -- never touches it, only the
++    // legacy Lower.scala backend does. Building it eagerly meant boxing every
++    // block id/Local/Tuple2 on every Graph construction for nothing on the
++    // hot path. Lazy + built once from the unboxed LongMap on first access.
++    lazy val find: mutable.Map[Local, Block] = {
++      val m = mutable.Map.empty[Local, Block]
++      blocksById.foreach { case (id, b) => m(Local(id)) = b }
++      m
++    }
++  }
+ 
+   object Graph {
+     def apply(insts: Seq[Inst]): Graph = {
+       assert(insts.nonEmpty)
+ 
+-      val locations = {
+-        val entries = mutable.Map.empty[Local, (Int, Inst.Label)]
++      // Single linear pass: for every label, record its start index and the
++      // index of the terminating control-flow instruction that closes its
++      // body. Doing this once avoids re-scanning `insts` with `indexWhere`
++      // for every block, which made Graph construction O(n^2) on large
++      // generated functions.
++      //
++      // Keyed by the raw Long id (mutable.LongMap), not by Local itself: a
++      // generic mutable.Map[Local, _] boxes every Local (an AnyVal wrapping
++      // a Long) on every insert/lookup, which shows up as its own hot
++      // allocation site (ControlFlow$Graph$$anon$1.applyOrElse et al.) once
++      // the O(n^2) rescan above is fixed and this becomes the dominant cost
++      // on large generated functions. LongMap has no such boxing.
++      val locations = mutable.LongMap.empty[(Int, Inst.Label)]
++      val blockEnd = mutable.LongMap.empty[Int]
++      locally {
+         var i = 0
++        var pendingLabel: Long = -1L
++        var hasPending = false
+         insts.foreach { inst =>
+           inst match {
+-            case inst: Inst.Label => entries(inst.id) = (i, inst)
+-            case _                => ()
++            case inst: Inst.Label =>
++              locations(inst.id.id) = (i, inst)
++              pendingLabel = inst.id.id
++              hasPending = true
++            case _: Inst.Cf if hasPending =>
++              blockEnd(pendingLabel) = i
++              hasPending = false
++            case _ => ()
+           }
+ 
+           i += 1
+         }
+-
+-        entries
+       }
+ 
+-      val blocks = mutable.Map.empty[Local, Block]
++      val blocks = mutable.LongMap.empty[Block]
+       var todo = List.empty[Block]
+ 
+       def edge(from: Block, to: Block, next: Next) = {
+@@ -76,16 +107,13 @@ private[scalanative] object ControlFlow {
+ 
+       def block(local: Local)(implicit pos: SourcePosition): Block =
+         blocks.getOrElseUpdate(
+-          local, {
+-            val (k, Inst.Label(n, params)) = locations(local)
++          local.id, {
++            val (k, Inst.Label(n, params)) = locations(local.id)
+ 
+             // copy all instruction up until and including
+             // first control-flow instruction after the label
+             val firstInst = k + 1
+-            val body = insts.slice(
+-              firstInst,
+-              insts.indexWhere(_.isInstanceOf[Inst.Cf], from = firstInst) + 1
+-            )
++            val body = insts.slice(firstInst, blockEnd(local.id) + 1)
+ 
+             val block = Block(n, params, body, isEntry = k == 0)
+             todo ::= block
+@@ -132,21 +160,19 @@ private[scalanative] object ControlFlow {
+ 
+       val entryInst = insts.head.asInstanceOf[Inst.Label]
+       val entry = block(entryInst.id)(entryInst.pos)
+-      val visited = mutable.Set.empty[Local]
+ 
++      // No separate "visited" set needed: `block()` only ever pushes a given
++      // local onto `todo` the FIRST time it's discovered (getOrElseUpdate),
++      // so every element popped here is visited exactly once already.
+       while (todo.nonEmpty) {
+         val block = todo.head
+         todo = todo.tail
+-        val id = block.id
+-        if (!visited(id)) {
+-          visited += id
+-          visit(block)
+-        }
++        visit(block)
+       }
+ 
+       val all = insts.collect {
+-        case Inst.Label(id, _) if visited.contains(id) =>
+-          blocks(id)
++        case Inst.Label(id, _) if blocks.contains(id.id) =>
++          blocks(id.id)
+       }
+ 
+       new Graph(entry, all, blocks)
+diff --git a/nir/src/main/scala/scala/scalanative/nir/Global.scala b/nir/src/main/scala/scala/scalanative/nir/Global.scala
+index 75676808..582fbe9c 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/Global.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/Global.scala
+@@ -1,8 +1,17 @@
+ package scala.scalanative
+ package nir
+ 
++import scala.annotation.nowarn
++import scala.util.hashing.MurmurHash3
++
+ /** The identifier of a type or method (aka a symbol). */
+ sealed abstract class Global {
++  self: Product =>
++  // Caches structural hashCode (MurmurHash3.productHash) the same way
++  // nir.Val/Type/Inst do -- Global.Member/Top instances are the map/set keys
++  // for most of linker/interflow's reachability & dedup tables, and the
++  // default case-class hashCode recomputes this every lookup.
++  override lazy val hashCode = MurmurHash3.productHash(self): @nowarn
+ 
+   /** Returns the owner of `this`. */
+   def top: Global.Top
+diff --git a/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala b/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala
+index 40d88089..e820215c 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/InstructionBuilder.scala
+@@ -6,7 +6,9 @@ import scala.collection.mutable
+ /** A class to build sequences of NIR instructions. */
+ class InstructionBuilder(implicit fresh: Fresh) {
+ 
+-  private val buffer = mutable.UnrolledBuffer.empty[Inst]
++  // ArrayBuffer, not UnrolledBuffer: one builder per Interflow state/block,
++  // and an UnrolledBuffer is three objects before the first instruction.
++  private val buffer = new mutable.ArrayBuffer[Inst](4)
+   def +=(inst: Inst): Unit = buffer += inst
+   def ++=(insts: Seq[Inst]): Unit = buffer ++= insts
+   def ++=(other: InstructionBuilder): Unit = buffer ++= other.buffer
+diff --git a/nir/src/main/scala/scala/scalanative/nir/Insts.scala b/nir/src/main/scala/scala/scalanative/nir/Insts.scala
+index 586605fb..322ef03a 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/Insts.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/Insts.scala
+@@ -1,7 +1,13 @@
+ package scala.scalanative
+ package nir
+ 
++import scala.annotation.nowarn
++import scala.util.hashing.MurmurHash3
++
+ sealed abstract class Inst extends Positioned {
++  self: Product =>
++  override lazy val hashCode = MurmurHash3.productHash(self): @nowarn
++
+   final def show: String = nir.Show(this)
+ }
+ 
+@@ -22,7 +28,7 @@ object Inst {
+       Let(fresh(), op, unwind)
+   }
+ 
+-  sealed abstract class Cf extends Inst
++  sealed abstract class Cf extends Inst with Product
+   final case class Ret(value: Val)(implicit val pos: SourcePosition) extends Cf
+   final case class Jump(next: Next)(implicit val pos: SourcePosition) extends Cf
+   final case class If(value: Val, thenp: Next, elsep: Next)(implicit
+diff --git a/nir/src/main/scala/scala/scalanative/nir/Show.scala b/nir/src/main/scala/scala/scalanative/nir/Show.scala
+index 69f98b07..96507987 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/Show.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/Show.scala
+@@ -11,6 +11,9 @@ import scalanative.util.{ShowBuilder, unreachable}
+ import nir.Defn.Define.DebugInfo
+ 
+ object Show {
++
++  // compiled once, not once per escaped string literal
++  private val newLineRegex = """([^\\]|^)\n""".r
+   def newBuilder: NirShowBuilder = new NirShowBuilder(new InMemoryShowBuilder)
+   def debug[T](msg: String)(f: => T): T = {
+     val value = f
+@@ -42,7 +45,7 @@ object Show {
+ 
+   type DefnString = (Global, String)
+ 
+-  def dump(defns: Seq[Defn], fileName: String): Unit = {
++  def dump(defns: collection.Seq[Defn], fileName: String): Unit = {
+     val pw = new java.io.PrintWriter(fileName)
+ 
+     try {
+@@ -738,7 +741,7 @@ object Show {
+     }
+ 
+     private def escapeNewLine(s: String): String =
+-      """([^\\]|^)\n""".r.replaceAllIn(
++      newLineRegex.replaceAllIn(
+         s,
+         _.matched.toSeq match {
+           case Seq(sngl)     => raw"\\n"
+@@ -748,23 +751,23 @@ object Show {
+       )
+ 
+     private def escapeQuotes(s: String): String = {
+-      val chars = s.toArray
+-      val out = mutable.UnrolledBuffer.empty[Char]
++      val chars = s.toCharArray
++      val out = new java.lang.StringBuilder(chars.length + 8)
+       var i = 0
+       var escaped = false
+       while (i < chars.length) {
+         val char = chars(i)
+         char match {
+           case '"' =>
+-            if (!escaped) out += '\\'
+-            out += char
++            if (!escaped) out.append('\\')
++            out.append(char)
+           case _ =>
+-            out += char
++            out.append(char)
+         }
+         escaped = char == '\\'
+         i += 1
+       }
+-      new String(out.toArray)
++      out.toString
+     }
+ 
+     override def toString: String = builder.toString
+diff --git a/nir/src/main/scala/scala/scalanative/nir/SourcePosition.scala b/nir/src/main/scala/scala/scalanative/nir/SourcePosition.scala
+index 410d0e20..ca689774 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/SourcePosition.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/SourcePosition.scala
+@@ -7,6 +7,31 @@ import scala.util.Try
+ sealed case class NIRSource(directory: Path, path: Path) {
+   def debugName = s"${directory}:${path}"
+   def exists: Boolean = this ne NIRSource.None
++
++  // Path.hashCode/equals for a non-default FileSystemProvider (e.g. a jar/
++  // zip-backed dependency path) isn't guaranteed to be pure string content --
++  // it commonly folds in the owning FileSystem instance's own identity, and
++  // each build run opens a dependency jar via a fresh FileSystem, so two
++  // builds' "same" NIRSource for a library-provided defn hash differently
++  // even though `directory`/`path` stringify identically (confirmed
++  // empirically: same printed jar+entry path, different Path#hashCode,
++  // every run). That silently propagates into every Defn's cached hashCode
++  // via DebugInfo.lexicalScopes' embedded SourcePosition.nirSource,
++  // defeating IncrementalCodeGenContext's cache for nearly every defn that
++  // originates from a dependency jar rather than the project's own sources.
++  // Compare/hash by path string content instead, which is what "same
++  // source location" actually means here.
++  private def pathToString(p: Path): String = if (p eq null) null else p.toString
++
++  override def hashCode: Int =
++    pathToString(directory).## * 31 + pathToString(path).##
++
++  override def equals(other: Any): Boolean = other match {
++    case that: NIRSource =>
++      pathToString(directory) == pathToString(that.directory) &&
++        pathToString(path) == pathToString(that.path)
++    case _ => false
++  }
+ }
+ object NIRSource {
+   object None extends NIRSource(null, null) {
+diff --git a/nir/src/main/scala/scala/scalanative/nir/Types.scala b/nir/src/main/scala/scala/scalanative/nir/Types.scala
+index 7d4d46c8..baaeefc5 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/Types.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/Types.scala
+@@ -1,9 +1,14 @@
+ package scala.scalanative
+ package nir
+ 
++import scala.annotation.nowarn
++import scala.util.hashing.MurmurHash3
++
+ import util.{unreachable, unsupported}
+ 
+ sealed abstract class Type {
++  self: Product =>
++  override lazy val hashCode = MurmurHash3.productHash(self): @nowarn
+ 
+   final def elemty(path: Seq[Val]): Type = (this, path) match {
+     case (_, Seq()) =>
+@@ -37,7 +42,7 @@ sealed abstract class Type {
+ object Type {
+ 
+   /** The type of an aggregate or primitive value. */
+-  sealed abstract class ValueKind extends Type
++  sealed abstract class ValueKind extends Type with Product
+ 
+   /** A primitive value type.
+    *
+@@ -117,7 +122,7 @@ object Type {
+   final case class StructValue(tys: Seq[Type]) extends AggregateKind
+ 
+   /** A reference type. */
+-  sealed abstract class RefKind extends Type {
++  sealed abstract class RefKind extends Type with Product {
+ 
+     /** The identifier of the class corresponding to this type. */
+     final def className: Global.Top = this match {
+@@ -173,7 +178,7 @@ object Type {
+   ) extends RefKind
+ 
+   /** Second-class types. */
+-  sealed abstract class SpecialKind extends Type
++  sealed abstract class SpecialKind extends Type with Product
+   case object Vararg extends SpecialKind
+   case object Nothing extends SpecialKind
+   case object Virtual extends SpecialKind
+@@ -236,6 +241,189 @@ object Type {
+   def isUnsignedType(ty: Type): Boolean =
+     unsigned.values.contains(normalize(ty))
+ 
++  /** SMI-style tagged-pointer boxing.
++   *
++   *  Single source of truth for the tagged-pointer encoding used to box
++   *  `Boolean`/`Byte`/`Short`/`Char`/`Int`/`Float` inline into the pointer
++   *  word itself on 64-bit targets, instead of allocating a real
++   *  `java.lang.X` heap object. Consumed by `codegen.Lower` (box/unbox,
++   *  virtual dispatch, `isInstanceOf`/`asInstanceOf`) and mirrored (by
++   *  value, not by reference - different compilation universe) in the
++   *  runtime-side helpers under `nativelib` and in the GC's `Marker.c`.
++   *
++   *  Word layout (64-bit, MSB-first):
++   *  {{{
++   *  bit 63      : tag           1 = tagged immediate, 0 = real pointer
++   *  bits 58-62  : discriminant  5 bits, 9 of 32 values used currently
++   *  bits 0-57   : payload       stored unshifted/right-justified - decoding
++   *                a fixed-width primitive (e.g. Int) is a plain truncating
++   *                cast to that width, no shift needed
++   *  }}}
++   *
++   *  Tag lives at the *top* of the word, deliberately disjoint from
++   *  `PtrTag` below, which uses the *bottom* 3 bits of a real (8-byte
++   *  aligned) pointer - the two schemes never collide, so a blind bit-test
++   *  on an arbitrary `AnyRef` can tell "Smi" from "real pointer or
++   *  PtrTag-tagged pointer" from bit 63 alone, no type context needed.
++   *
++   *  Encode: `tagged = (payloadBits & <type's own width mask>) |
++   *  (discriminant << DiscriminantShift) | TagMask`. Decode: `discriminant =
++   *  (tagged >>> DiscriminantShift) & DiscriminantMask`; `payloadBits` is
++   *  just a truncating cast of `tagged` to the primitive's own width (no
++   *  shift) - sign-extending types (Byte/Short/Int) get the sign back for
++   *  free from the cast, unsigned-width types (Char + the 3 unsigned box
++   *  types) additionally mask to their width since a narrowing cast alone
++   *  doesn't clear high bits for those.
++   */
++  object Smi {
++    // Bit positions/widths - single source of truth for the encoding.
++    final val TagBit: Int = 63
++    final val TagMask: Long = 1L << TagBit
++    final val DiscriminantBits: Int = 5
++    final val DiscriminantShift: Int = TagBit - DiscriminantBits // 58
++    final val DiscriminantMask: Long = (1L << DiscriminantBits) - 1L // 0x1F
++    // Mask over the payload region (bits 0-57): protects the discriminant
++    // and tag bits above it from a sign-extended negative payload (e.g. a
++    // negative Byte/Short/Int widened to Long) leaking upward on encode.
++    final val PayloadMask: Long = (1L << DiscriminantShift) - 1L
++
++    // Discriminant values. 9 of 32 possible values used today; 9-31 remain
++    // reserved for further follow-ups (Double - see design doc for why it
++    // does not fit this scheme as-is). UByte/UShort/UInt added here: they
++    // fit trivially (unsigned, so decode is a logical zero-extend/mask,
++    // same shape as Char - never sign-extended). ULong/USize are excluded,
++    // same reasoning that excludes Long/Double: both are 64-bit-wide, no
++    // room left for tag+discriminant bits without a NaN-boxing-style
++    // redesign.
++    final val BooleanDiscriminant: Int = 0
++    final val ByteDiscriminant: Int = 1
++    final val ShortDiscriminant: Int = 2
++    final val CharDiscriminant: Int = 3
++    final val IntDiscriminant: Int = 4
++    final val FloatDiscriminant: Int = 5
++    final val UByteDiscriminant: Int = 6
++    final val UShortDiscriminant: Int = 7
++    final val UIntDiscriminant: Int = 8
++
++    /** The 9 box reference types eligible for tagged-pointer boxing
++     *  (`java.lang.X` plus Scala Native's own unsigned wrapper types),
++     *  together with their fixed discriminant value.
++     */
++    val discriminantOfBox: Map[Type, Int] = Map(
++      Type.Ref(Global.Top("java.lang.Boolean")) -> BooleanDiscriminant,
++      Type.Ref(Global.Top("java.lang.Byte")) -> ByteDiscriminant,
++      Type.Ref(Global.Top("java.lang.Short")) -> ShortDiscriminant,
++      Type.Ref(Global.Top("java.lang.Character")) -> CharDiscriminant,
++      Type.Ref(Global.Top("java.lang.Integer")) -> IntDiscriminant,
++      Type.Ref(Global.Top("java.lang.Float")) -> FloatDiscriminant,
++      unsigned.Byte -> UByteDiscriminant,
++      unsigned.Short -> UShortDiscriminant,
++      unsigned.Int -> UIntDiscriminant
++    )
++
++    /** Same, keyed by the corresponding primitive representation type
++     *  (`Type.Bool`, ..., or - for the 3 unsigned types, which share their
++     *  underlying primitive representation type with their signed
++     *  counterpart - the primitive type paired with `isUnsignedBoxType`).
++     */
++    val discriminantOfPrimitive: Map[Type, Int] = Map(
++      Type.Bool -> BooleanDiscriminant,
++      Type.Byte -> ByteDiscriminant,
++      Type.Short -> ShortDiscriminant,
++      Type.Char -> CharDiscriminant,
++      Type.Int -> IntDiscriminant,
++      Type.Float -> FloatDiscriminant
++    )
++
++    /** Discriminant for the 3 unsigned box types, keyed by box type (not by
++     *  primitive type: `UByte`/`Byte`, `UShort`/`Short`, `UInt`/`Int` all
++     *  share the same underlying primitive representation type, so a
++     *  primitive-type-keyed map can't distinguish "boxing a `Byte`" from
++     *  "boxing a `UByte`" the way `discriminantOfPrimitive` does for the
++     *  other 6 - `Lower.scala`'s `genBoxOp`/`genUnboxOp` already dispatch
++     *  on the concrete box type `ty` for `Op.Box`/`Op.Unbox`, not on the
++     *  primitive type, precisely to allow this.
++     */
++    val discriminantOfUnsignedBox: Map[Type, Int] = Map(
++      unsigned.Byte -> UByteDiscriminant,
++      unsigned.Short -> UShortDiscriminant,
++      unsigned.Int -> UIntDiscriminant
++    )
++
++    val eligibleBoxTypes: Set[Type] = discriminantOfBox.keySet
++    val eligiblePrimitiveTypes: Set[Type] = discriminantOfPrimitive.keySet
++    val eligibleUnsignedBoxTypes: Set[Type] = discriminantOfUnsignedBox.keySet
++
++    /** Is `ty` one of the 9 box reference types eligible for tagged-pointer
++     *  boxing? (`ty` is normalized first, so `exact`/`nullable` flags on
++     *  `Type.Ref` don't matter.)
++     */
++    def isEligibleBoxType(ty: Type): Boolean =
++      discriminantOfBox.contains(normalize(ty))
++
++    /** Is `ty` one of the 6 primitive types
++     *  (`Boolean`/`Byte`/`Short`/`Char`/`Int`/`Float`) eligible for
++     *  tagged-pointer boxing? Note this does NOT cover the 3 unsigned
++     *  types' primitive representations (`Type.Byte`/`Type.Short`/
++     *  `Type.Int`) - those are ambiguous with the signed types' own
++     *  primitives, so callers boxing/unboxing a value of unsigned-box type
++     *  must branch on `isEligibleUnsignedBoxType`/`discriminantOfBoxType`
++     *  using the concrete box type instead, exactly as `genBoxOp`/
++     *  `genUnboxOp` already do.
++     */
++    def isEligiblePrimitiveType(ty: Type): Boolean =
++      discriminantOfPrimitive.contains(ty)
++
++    /** Is `ty` one of the 3 unsigned box types (`UByte`/`UShort`/`UInt`)
++     *  eligible for tagged-pointer boxing?
++     */
++    def isEligibleUnsignedBoxType(ty: Type): Boolean =
++      discriminantOfUnsignedBox.contains(normalize(ty))
++
++    def discriminantOfBoxType(ty: Type): Option[Int] =
++      discriminantOfBox.get(normalize(ty))
++  }
++
++  /** Low-3-bit pointer-kind tagging, orthogonal to `Smi` above (`Smi`'s tag
++   *  lives at bit 63 of the word; this scheme lives at bits 0-2 - a single
++   *  word can never satisfy both, so a blind `TagBit`-then-`PtrTag.Mask`
++   *  check tells the three cases apart with no type context: bit 63 set =>
++   *  Smi; bit 63 clear and low 3 bits all zero => real (8-byte aligned)
++   *  pointer; bit 63 clear and low 3 bits non-zero => `PtrTag`).
++   *
++   *  Exploits the same alignment fact `Smi` avoids relying on: a real,
++   *  untagged heap/native pointer is always 8-byte aligned, so its low 3
++   *  bits are always zero. Overwriting just those 3 (otherwise-wasted) bits
++   *  with a small kind tag needs no shift at all - the payload *is* the
++   *  original pointer value, bits 3-63 untouched.
++   *
++   *  Word layout: `tagged = rawptr | kind` (kind in bits 0-2, rawptr's own
++   *  low 3 bits are 0 going in, so `|` is exact - no information lost).
++   *  Decode: `rawptr = tagged & ~Mask`.
++   *
++   *  Currently only `Ptr[T]` (kind 1) is wired up end to end - kinds 2-7
++   *  are reserved for future boxed reference-ish types whose payload is
++   *  itself pointer-shaped/aligned (`Some`, `Right`, `Success`, ...).
++   */
++  object PtrTag {
++    final val Bits: Int = 3
++    final val Mask: Long = (1L << Bits) - 1L // 0x7
++
++    final val RealPointer: Int = 0
++    final val PtrDiscriminant: Int = 1
++    // 2-7 reserved for future boxed reference kinds.
++
++    val discriminantOfBox: Map[Type, Int] = Map(
++      Type.Ref(Global.Top("scala.scalanative.unsafe.Ptr")) -> PtrDiscriminant
++    )
++
++    def isEligibleBoxType(ty: Type): Boolean =
++      discriminantOfBox.contains(normalize(ty))
++
++    def discriminantOfBoxType(ty: Type): Option[Int] =
++      discriminantOfBox.get(normalize(ty))
++  }
++
+   object NothingType {
+     def unapply(v: nir.Type): Option[nir.Type] =
+       if (isNothing(v)) Some(v) else None
+diff --git a/nir/src/main/scala/scala/scalanative/nir/Vals.scala b/nir/src/main/scala/scala/scalanative/nir/Vals.scala
+index 98f70788..6970a0a3 100644
+--- a/nir/src/main/scala/scala/scalanative/nir/Vals.scala
++++ b/nir/src/main/scala/scala/scalanative/nir/Vals.scala
+@@ -4,8 +4,13 @@ package nir
+ import java.lang.Double.doubleToRawLongBits
+ import java.lang.Float.floatToRawIntBits
+ 
++import scala.annotation.nowarn
++import scala.util.hashing.MurmurHash3
++
+ /** A NIR value. */
+ sealed abstract class Val {
++  self: Product =>
++  override lazy val hashCode = MurmurHash3.productHash(self): @nowarn
+ 
+   /** The type of the value. */
+   final def ty: Type = this match {
+diff --git a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
+index 53de0929..c6e82cf0 100644
+--- a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
++++ b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
+@@ -37,6 +37,14 @@ sealed trait VirtualDirectory {
+   /** List all files in this directory. */
+   def files: Seq[Path]
+ 
++  /** Last-modified time of the file at `path`, used by scalino's persistent
++   *  in-process NIR parse cache (ClassPath.Impl) to invalidate a single
++   *  cached Defn without a full directory rescan/reparse. For a jar entry
++   *  this is the zip entry's own stored mtime, not the jar file's -- distinct
++   *  entries in an unchanged jar never spuriously invalidate each other.
++   */
++  def lastModified(path: Path): java.nio.file.attribute.FileTime
++
+   /** Merges content of source paths into single file in target */
+   def merge(sources: Seq[Path], target: Path): Path
+ 
+@@ -98,6 +106,9 @@ object VirtualDirectory {
+       buffer
+     }
+ 
++    override def lastModified(path: Path): java.nio.file.attribute.FileTime =
++      Files.getLastModifiedTime(resolve(path))
++
+     override def read(path: Path, len: Int): ByteBuffer = {
+       val stream = Files.newInputStream(resolve(path))
+       try {
+@@ -215,6 +226,11 @@ object VirtualDirectory {
+ 
+     override def read(path: Path, len: Int): ByteBuffer = read(path)
+ 
++    override def lastModified(path: Path): java.nio.file.attribute.FileTime =
++      throw new UnsupportedOperationException(
++        "Can't read mtime from empty directory."
++      )
++
+     override def write(path: Path)(fn: Writer => Unit): Path =
+       throw new UnsupportedOperationException("Can't write to empty directory.")
+ 

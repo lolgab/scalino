@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/core/NameOps.scala b/compiler/src/dotty/tools/dotc/core/NameOps.scala
-index a433ed43..22df9058 100644
+index 50b8351a17..c0d5de2f16 100644
 --- a/compiler/src/dotty/tools/dotc/core/NameOps.scala
 +++ b/compiler/src/dotty/tools/dotc/core/NameOps.scala
 @@ -2,9 +2,6 @@ package dotty.tools

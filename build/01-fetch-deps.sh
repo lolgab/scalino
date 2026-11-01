@@ -17,8 +17,10 @@ echo "== dotc compiler classpath =="
 cs fetch "org.scala-lang:scala3-compiler_3:$SCALA_VERSION" "org.scala-lang:scala3-library_3:$SCALA_VERSION" \
   --classpath | tr -d '\r' > "$WORK/compiler.cp"
 
+# Everything below resolves org.scala-native:* from ~/.ivy2/local: build/01a-publish-scala-native.sh
+# built it from vendor/scala-native (upstream main + patches/), nothing here is a released jar.
 echo "== scala-native compiler plugin =="
-cs fetch "org.scala-native:nscplugin_$SCALA_VERSION:$SCALA_NATIVE_VERSION" \
+cs fetch -r ivy2Local "org.scala-native:nscplugin_$SCALA_VERSION:$SCALA_NATIVE_VERSION" \
   --classpath | tr -d '\r' > "$WORK/nscplugin.cp"
 # jar path alone, for -Xplugin:
 tr "$CP_SEP" '\n' < "$WORK/nscplugin.cp" | grep "nscplugin_$SCALA_VERSION" > "$WORK/nscplugin.jar.txt"
@@ -27,7 +29,7 @@ echo "== scala-native target runtime libs (java.base-for-native, stdlib port, et
 # NOTE: scalalib_native0.5_3 is an empty/decoy artifact for this version line.
 # The real Scala stdlib port lives in scala3lib_native0.5_3. Do not add
 # scalalib_native0.5_3 here -- see docs/findings.md.
-cs fetch \
+cs fetch -r ivy2Local \
   "org.scala-native:nativelib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:javalib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:auxlib_native0.5_3:$SCALA_NATIVE_VERSION" \
@@ -39,12 +41,12 @@ cs fetch \
 echo "== scala-native JVM-side build/link tool (tools_3, NOT tools_native0.5_3) =="
 # tools_native0.5_3 is the self-hosted variant meant to run AS a native binary;
 # it uses link-time intrinsics that throw UndefinedBehaviorError on a plain JVM.
-cs fetch "org.scala-native:tools_3:$SCALA_NATIVE_VERSION" --classpath | tr -d '\r' > "$WORK/tools.cp"
+cs fetch -r ivy2Local "org.scala-native:tools_3:$SCALA_NATIVE_VERSION" --classpath | tr -d '\r' > "$WORK/tools.cp"
 
 echo "== scala-native Native-side build/link tool (tools_native0.5_3) =="
 # it includes the classpath for nativelibs since in the scalino-linkdriver we need a classpath with both
 # tools and nativelibs and if we merge two separate classpaths we end up with duplicates.
-cs fetch \
+cs fetch -r ivy2Local \
   "org.scala-native:nativelib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:javalib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:auxlib_native0.5_3:$SCALA_NATIVE_VERSION" \
@@ -52,6 +54,13 @@ cs fetch \
   "org.scala-native:clib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:scala3lib_native0.5_3:$SN_COMBINED_VERSION" \
   "org.scala-native:tools_native0.5_3:$SCALA_NATIVE_VERSION" --classpath | tr -d '\r' > "$WORK/tools-native.cp"
+
+# The locally published scala3lib's ivy descriptor lists its dependencies' sources jars as ordinary
+# artifacts, which a Maven-resolved release did not: they don't belong on a compile/link classpath.
+for cp in nativelibs.cp tools-native.cp; do
+  tr "$CP_SEP" '\n' < "$WORK/$cp" | grep -v -- '-sources\.jar$' | paste -sd"$CP_SEP" - > "$WORK/$cp.tmp"
+  mv "$WORK/$cp.tmp" "$WORK/$cp"
+done
 
 echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) =="
 # Previously lsp4j + Gson (reflection-based) -- replaced after discovering a
@@ -70,13 +79,13 @@ echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) 
 cs fetch "com.github.plokhotnyuk.jsoniter-scala:jsoniter-scala-core_3:2.37.3" \
   --classpath | tr -d '\r' > "$WORK/lsp.cp"
 
-echo "== scala-native target runtime libs sources (unmodified upstream artifacts only -- javalib/nativelib are patched, so 01b/01c supply their sources instead, built from vendor/scala-native+patches) =="
-cs fetch \
+echo "== scala-native target runtime libs sources (from the local Scala Native build) =="
+cs fetch -r ivy2Local \
+  "org.scala-native:nativelib_native0.5_3:$SCALA_NATIVE_VERSION" \
+  "org.scala-native:javalib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:auxlib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:posixlib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:clib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:scala3lib_native0.5_3:$SN_COMBINED_VERSION" \
   --classifier sources --classpath 2>/dev/null | tr -d '\r' > "$WORK/nativelibs-sources.cp" \
   || : > "$WORK/nativelibs-sources.cp"
-
-echo "OK: classpaths written to $WORK/*.cp"
