@@ -40,7 +40,7 @@ FILES="$WORK/jslink-files.txt"
   -javabootclasspath "$DIST/java.base.jar" \
   -classpath "$(cat "$NATIVELIBS_CP")" \
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
-  -language:implicitConversions -nowarn \
+  -language:implicitConversions -nowarn -source:3.3 \
   -d "$CLASSES_DIR" \
   "@$FILES"
 

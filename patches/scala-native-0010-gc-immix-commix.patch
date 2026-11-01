@@ -2644,7 +2644,7 @@ index dbcefb25..eefdd1b1 100644
  #endif // IMMIX_COMMON_CONSTANTS_H
 \ No newline at end of file
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c
-index 050bc40d..81edd40c 100644
+index 050bc40d..e4e32b48 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c
 @@ -81,8 +81,7 @@ bool MutatorThread_register(Field_t *stackbottom) {
@@ -2657,6 +2657,30 @@ index 050bc40d..81edd40c 100644
  #endif
  
      /* Publication must not make GC wait for an unadmitted thread. */
+@@ -99,9 +98,8 @@ bool MutatorThread_register(Field_t *stackbottom) {
+ 
+ failure:
+     currentMutatorThread = NULL;
+-#ifdef SCALANATIVE_GC_USE_YIELDPOINT_TRAPS
+-    scalanative_GC_yieldpoint_trap = NULL;
+-#endif
++    // scalanative_GC_yieldpoint_trap is the process-wide shared trap page (YieldPointTrap.c), not a
++    // per-thread value: a thread leaving must not clear it for the others.
+     MutatorThread_dispose(self);
+     return false;
+ }
+@@ -147,9 +145,8 @@ void MutatorThread_delete(MutatorThread *self) {
+ 
+     assert(currentMutatorThread == self);
+     currentMutatorThread = NULL;
+-#ifdef SCALANATIVE_GC_USE_YIELDPOINT_TRAPS
+-    scalanative_GC_yieldpoint_trap = NULL;
+-#endif
++    // scalanative_GC_yieldpoint_trap is the process-wide shared trap page (YieldPointTrap.c), not a
++    // per-thread value: a thread leaving must not clear it for the others.
+     MutatorThread_dispose(self);
+ }
+ 
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c
 index 78b6da01..d9c520d6 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c
