@@ -1,0 +1,813 @@
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
+index 1ffdfa98..d0d9b7ed 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
+@@ -21,12 +21,17 @@ object ClassLoader {
+ 
+   def fromDisk(config: build.Config)(implicit in: Scope): ClassLoader = {
+     val classpath = config.classPath.map { path =>
+-      ClassPath(VirtualDirectory.real(path), config.logger)
++      // ClassPath.forPath, not ClassPath(VirtualDirectory.real(path), ...):
++      // the latter would construct (and, for a jar, reopen the zip
++      // FileSystem of) a `VirtualDirectory` on every single call regardless
++      // of whether ClassPath's own persistent-cache registry already has
++      // this entry -- see ClassPath.forPath's own doc comment.
++      ClassPath.forPath(path, config.logger)(VirtualDirectory.real(path))
+     }
+     new FromDisk(classpath)
+   }
+ 
+-  def fromMemory(defns: Seq[nir.Defn]): ClassLoader =
++  def fromMemory(defns: collection.Seq[nir.Defn]): ClassLoader =
+     new FromMemory(defns)
+ 
+   final class FromDisk(classpath: Seq[ClassPath]) extends ClassLoader {
+@@ -44,7 +49,7 @@ object ClassLoader {
+       }.flatten
+   }
+ 
+-  final class FromMemory(defns: Seq[nir.Defn]) extends ClassLoader {
++  final class FromMemory(defns: collection.Seq[nir.Defn]) extends ClassLoader {
+ 
+     private val scopes = {
+       val out =
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+index 98b63367..243e6d23 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+@@ -28,54 +28,129 @@ sealed trait ClassPath {
+ 
+ object ClassPath {
+ 
++  /** Persistent, process-wide registry of already-built `Impl`s, keyed by the
++   *  underlying directory/jar's own classpath entry `Path`. Only scalino's
++   *  `--longRunning` LinkDriver loop lives long enough for this to matter:
++   *  within that one process, `ClassLoader.fromDisk(config)` is called again
++   *  on every incremental relink, and without this registry each call would
++   *  rebuild a brand-new `Impl` (and reparse every reachable `.nir` file on
++   *  the classpath from scratch, dependencies included) even though only the
++   *  user's own recompiled classes actually changed. A one-shot build still
++   *  populates this once and simply exits, so it pays only a `ConcurrentHashMap`
++   *  lookup, not a behavior change.
++   */
++  private val registry =
++    new java.util.concurrent.ConcurrentHashMap[Path, Impl]()
++
+   /** Create classpath based on the virtual directory. */
+   private[scalanative] def apply(directory: VirtualDirectory): ClassPath =
+-    new Impl(directory, Logger.nullLogger)
++    apply(directory, Logger.nullLogger)
+ 
+   /** Create classpath based on the virtual directory. */
+   private[scalanative] def apply(
+       directory: VirtualDirectory,
+       log: Logger
+-  ): ClassPath =
+-    new Impl(directory, log)
++  ): ClassPath = {
++    val impl = registry.computeIfAbsent(directory.path, _ => new Impl(directory, log))
++    impl.refresh()
++    impl
++  }
++
++  /** Same as `apply`, but never evaluates `mkDirectory` on a cache hit --
++   *  constructing a real `VirtualDirectory` for a jar opens its zip
++   *  `FileSystem`, and `apply` above still had to construct one for EVERY
++   *  call regardless of the registry (Scala evaluates the argument before
++   *  `apply` ever gets to check its own cache). On a `--longRunning` relink
++   *  that reopens every jar's `FileSystem` on every single build, discarding
++   *  the redundant one each time -- wasteful, and observed to occasionally
++   *  throw outright (a real project's build failed with a bare jar filename
++   *  as the error, consistent with a `FileSystemAlreadyExistsException`-style
++   *  race between the leaked, discarded reopen and the cached `Impl` still
++   *  using the original). `ClassLoader.fromDisk` uses this one, not `apply`.
++   */
++  private[scalanative] def forPath(path: Path, log: Logger)(
++      mkDirectory: => VirtualDirectory
++  ): ClassPath = {
++    registry.get(path) match {
++      case null =>
++        val impl = new Impl(mkDirectory, log)
++        val result = Option(registry.putIfAbsent(path, impl)).getOrElse(impl)
++        result.refresh()
++        result
++      case impl =>
++        impl.refresh()
++        impl
++    }
++  }
+ 
+   private final class Impl(directory: VirtualDirectory, log: Logger)
+       extends ClassPath {
+     val nirFiles = mutable.Map.empty[nir.Global.Top, Path]
+     val serviceProviders = mutable.Map.empty[nir.Global.Top, Path]
+ 
+-    directory.files
+-      .foreach {
+-        case path if path.toString.endsWith(".nir") =>
+-          val name = nir.Global.Top(io.packageNameFromPath(path))
+-          nirFiles.update(name, path)
+-
+-        // First variant for jars, seconds for local directories
+-        case path
+-            if (path.startsWith("/META-INF/services/") ||
+-              path.startsWith("META-INF/services/")) =>
+-          val serviceName = nir.Global.Top(path.getFileName().toString())
+-          serviceProviders.update(serviceName, path)
+-
+-        case _ => ()
+-      }
+-
++    // (mtime as of last successful parse, parsed result) -- reused across
++    // `refresh()` calls as long as the backing file's mtime hasn't moved, so
++    // a recompiled subset of the classpath only reparses that subset.
+     private val cache =
+-      mutable.Map.empty[nir.Global.Top, Option[Seq[nir.Defn]]]
++      mutable.Map.empty[nir.Global.Top, (java.nio.file.attribute.FileTime, Option[Seq[nir.Defn]])]
++
++    /** Re-scans `directory.files` and drops any cached entry whose backing
++     *  file is gone (deleted/renamed since the last scan) so a stale parsed
++     *  `Defn` can never linger and be linked in by mistake. Idempotent and
++     *  cheap to call on every `ClassPath.apply` -- the directory walk itself
++     *  is unavoidable already (scala-native re-walks the classpath for its
++     *  own `Build.checkSum` on every build regardless), only the per-file
++     *  *parse* is what this cache is actually saving.
++     */
++    def refresh(): Unit = {
++      nirFiles.clear()
++      serviceProviders.clear()
++      directory.files
++        .foreach {
++          case path if path.toString.endsWith(".nir") =>
++            val name = nir.Global.Top(io.packageNameFromPath(path))
++            nirFiles.update(name, path)
++
++          // First variant for jars, seconds for local directories
++          case path
++              if (path.startsWith("/META-INF/services/") ||
++                path.startsWith("META-INF/services/")) =>
++            val serviceName = nir.Global.Top(path.getFileName().toString())
++            serviceProviders.update(serviceName, path)
++
++          case _ => ()
++        }
++      // Not `cache.filterInPlace` (mutable.Map, added in 2.13's collections
++      // rework): this file also cross-builds under Scala 2.12 for
++      // scala-native's own sbt meta-build project, where `mutable.Map` has
++      // no such method.
++      cache.keysIterator.filterNot(nirFiles.contains).toList.foreach(cache.remove)
++    }
+ 
+     def contains(name: nir.Global) =
+       nirFiles.contains(name.top)
+ 
+     def load(name: nir.Global.Top): Option[Seq[nir.Defn]] =
+-      cache.getOrElseUpdate(
+-        name, {
+-          nirFiles.get(name.top).map { file =>
+-            deserializeBinary(directory, file)
++      nirFiles.get(name.top) match {
++        case None => None
++        case Some(file) =>
++          val mtime = directory.lastModified(file)
++          cache.get(name) match {
++            case Some((cachedMtime, cachedResult)) if cachedMtime == mtime =>
++              cachedResult
++            case _ =>
++              val result = Some(deserializeBinary(directory, file))
++              cache.update(name, (mtime, result))
++              result
+           }
+-        }
+-      )
++      }
+ 
+-    lazy val classesWithEntryPoints: Iterable[nir.Global.Top] = {
++    // Not `lazy val`: `Impl` now outlives a single build (see `registry`
++    // above), and `refresh()` mutates `nirFiles`/`serviceProviders` in place
++    // on every incremental relink, so a value memoized from the first build
++    // would silently go stale (e.g. a newly-added entry point or service
++    // provider file would never be picked up in a later build).
++    def classesWithEntryPoints: Iterable[nir.Global.Top] = {
+       nirFiles.filter {
+         case (_, file) =>
+           def logUnreadableFile(err: NirDeserializationException): Unit =
+@@ -91,7 +166,7 @@ object ClassPath {
+       }.keySet
+     }
+ 
+-    lazy val definedServicesProviders
++    def definedServicesProviders
+         : Map[nir.Global.Top, Seq[nir.Global.Top]] = {
+       serviceProviders.map {
+         case (name, path) =>
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Infos.scala b/tools/src/main/scala/scala/scalanative/linker/Infos.scala
+index 8af346d8..a1220013 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Infos.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Infos.scala
+@@ -15,7 +15,28 @@ sealed abstract class ScopeInfo extends Info {
+   override def name: nir.Global.Top
+   def ty: nir.Type.Ref = nir.Type.Ref(name)
+   val members = mutable.UnrolledBuffer.empty[MemberInfo]
+-  val calls = mutable.Set.empty[nir.Sig]
++  // SortedSet (ordered by Sig.mangle, the only stable key Sig has -- Sig
++  // itself has no Ordering, so one's given locally here rather than adding
++  // a top-level implicit -- nir/Sig.scala isn't in either patch's source
++  // list) so vtable-slot assignment (VirtualTable.scala) and itable method
++  // layout (ITable.scala) -- both of
++  // which number entries by `methods`'/this set's iteration position --
++  // depend only on which Sigs are reachable, not on insertion order (calls
++  // is populated incrementally as Reach's single-threaded worklist visits
++  // call sites; an unrelated edit elsewhere in the reachable graph can
++  // reorder that walk's visitation order for the exact same final reachable
++  // Sig set, silently reshuffling every embedded vtable/itable index
++  // otherwise). Keeping the set itself sorted (insert is O(log n)) means
++  // `methods` -- read twice per trait in ITable.scala, once per class in
++  // VirtualTable.scala and Lower.scala -- no longer pays an O(n log n)
++  // sortBy on every read; it's already in order.
++  // Declared type stays mutable.Set, not SortedSet, matching `subclasses`
++  // below: keeps callers outside SHARED_SOURCES binary-compatible against
++  // the stock published jar's erased `Set`-returning signature.
++  val calls: mutable.Set[nir.Sig] = {
++    implicit val sigOrdering: Ordering[nir.Sig] = Ordering.by(_.mangle)
++    mutable.SortedSet.empty[nir.Sig]
++  }
+   val responds = mutable.Map.empty[nir.Sig, nir.Global.Member]
+ 
+   def methods = calls.toSeq.filter(_.isVirtual)
+@@ -230,27 +251,31 @@ final class Field(
+ }
+ 
+ sealed trait ReachabilityAnalysis {
+-  def defns: Seq[nir.Defn]
++  def defns: collection.Seq[nir.Defn]
+   def foundServiceProviders: FoundServiceProviders
+   def isSuccessful: Boolean = this.isInstanceOf[ReachabilityAnalysis.Result]
+ }
+ 
+ object ReachabilityAnalysis {
+   final class Failure(
+-      val defns: Seq[nir.Defn],
+-      val unreachable: Seq[Reach.UnreachableSymbol],
+-      val unsupportedFeatures: Seq[Reach.UnsupportedFeature],
++      val defns: collection.Seq[nir.Defn],
++      val unreachable: collection.Seq[Reach.UnreachableSymbol],
++      val unsupportedFeatures: collection.Seq[Reach.UnsupportedFeature],
+       val foundServiceProviders: FoundServiceProviders
+   ) extends ReachabilityAnalysis
+   final class Result(
+       val infos: mutable.Map[nir.Global, Info],
+-      val entries: Seq[nir.Global],
+-      val links: Seq[nir.Attr.Link],
++      val entries: collection.Seq[nir.Global],
++      // Sets, not Seqs: both are mutable.Set at the Reach.scala call site --
++      // exposing them as-is skips a Set->Seq copy on every build. Order
++      // doesn't matter for either (see call sites: .exists/.map/.contains),
++      // unlike dynsigs below, whose Seq position IS the dynmap slot index.
++      val links: collection.Set[nir.Attr.Link],
+       val linkCppRuntime: Boolean,
+       val preprocessorDefinitions: Seq[nir.Attr.Define],
+-      val defns: Seq[nir.Defn],
+-      val dynsigs: Seq[nir.Sig],
+-      val dynimpls: Seq[nir.Global.Member],
++      val defns: collection.Seq[nir.Defn],
++      val dynsigs: collection.Seq[nir.Sig],
++      val dynimpls: collection.Set[nir.Global.Member],
+       val resolvedVals: mutable.Map[String, nir.Val],
+       val foundServiceProviders: FoundServiceProviders
+   ) extends ReachabilityAnalysis {
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Link.scala b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+index e10d3a6c..547f8982 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Link.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+@@ -5,17 +5,38 @@ import scalanative.util.Scope
+ 
+ object Link {
+ 
++  /** Persisted across calls so scalino's `--long-running` LinkDriver
++   *  (patches/scala-native-0047/0048) can hand a relink the SAME `Reach`
++   *  instance it built last time instead of a fresh one -- see
++   *  `Reach.incrementalReprocess`, which is the only thing that actually
++   *  reads this. A one-shot (non-long-running) process only ever calls
++   *  `apply` once, so this is dead weight for it, not a behavior change.
++   *  Process-global like `ClassPath`'s own registry, for the same reason:
++   *  one scalino-linkdriver process links exactly one `mainClass`/config.
++   */
++  private var previousReach: Option[Reach] = None
++
+   /** Load all clases and methods reachable from the entry points. */
+-  def apply(config: build.Config, entries: Seq[nir.Global])(implicit
++  def apply(config: build.Config, entries: collection.Seq[nir.Global])(implicit
+       scope: Scope
+-  ): ReachabilityAnalysis =
+-    Reach(config, entries, ClassLoader.fromDisk(config))
++  ): ReachabilityAnalysis = {
++    val loader = ClassLoader.fromDisk(config)
++    previousReach
++      .flatMap(_.incrementalReprocess(config, entries, loader))
++      .getOrElse {
++        val reach = new Reach(config, entries, loader)
++        reach.process()
++        reach.processDelayed()
++        previousReach = Some(reach)
++        reach.result()
++      }
++  }
+ 
+   /** Run reachability analysis on already loaded methods. */
+   def apply(
+       config: build.Config,
+-      entries: Seq[nir.Global],
+-      defns: Seq[nir.Defn]
++      entries: collection.Seq[nir.Global],
++      defns: collection.Seq[nir.Defn]
+   ): ReachabilityAnalysis =
+     Reach(config, entries, ClassLoader.fromMemory(defns))
+ 
+diff --git a/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala b/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
+index 8bfe217d..0bbb4bc8 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
+@@ -24,6 +24,8 @@ private[linker] trait LinktimeValueResolver { self: Reach =>
+       s"$linktimeInfo.debugMode" -> (conf.mode == Mode.debug),
+       s"$linktimeInfo.releaseMode" -> (conf.mode == Mode.releaseFast || conf.mode == Mode.releaseFull || conf.mode == Mode.releaseSize),
+       s"$linktimeInfo.isMultithreadingEnabled" -> conf.multithreadingSupport,
++      s"$linktimeInfo.isCompactHeaders" -> conf.compactHeadersEnabled,
++      s"$linktimeInfo.isCompactByteArrays" -> conf.compactByteArraysEnabled,
+       s"$linktimeInfo.isWeakReferenceSupported" -> {
+         conf.gc == GC.Immix ||
+         conf.gc == GC.Commix ||
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Reach.scala b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+index 23a07026..f6bc42fc 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Reach.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+@@ -8,14 +8,23 @@ import scala.collection.mutable
+ 
+ private[linker] class Reach(
+     protected val config: build.Config,
+-    entries: Seq[nir.Global],
+-    protected val loader: ClassLoader
++    protected val entries: collection.Seq[nir.Global],
++    protected var loader: ClassLoader
+ ) extends LinktimeValueResolver
+     with LinktimeIntrinsicCallsResolver {
+   import Reach._
+ 
+   val loaded =
+     mutable.Map.empty[nir.Global.Top, mutable.Map[nir.Global, nir.Defn]]
++  // The exact `Seq[nir.Defn]` `loader.load(top)` returned for each Top
++  // that's ever been demanded, kept purely so `incrementalReprocess` (below)
++  // can tell "definitely unchanged" apart from "might have changed" with a
++  // cheap `eq` check instead of a deep structural diff of every Top on every
++  // relink -- ClassPath's own persistent parse cache (patches/scala-native-
++  // 0047) returns the SAME `Seq` object when a file's mtime hasn't moved, so
++  // `eq` here is exactly as precise as re-reading the mtime would be, without
++  // Reach needing to know anything about mtimes itself.
++  val rawLoaded = mutable.Map.empty[nir.Global.Top, Seq[nir.Defn]]
+   val unreachable = mutable.Map.empty[nir.Global, UnreachableSymbol]
+   val unsupported = mutable.Map.empty[nir.Global, UnsupportedFeature]
+   val enqueued = mutable.Set.empty[nir.Global]
+@@ -70,6 +79,7 @@ private[linker] class Reach(
+ 
+   def result(): ReachabilityAnalysis = {
+     cleanup()
++    reportPruned()
+ 
+     val defns = mutable.UnrolledBuffer.empty[nir.Defn]
+     defns.sizeHint(done.size)
+@@ -80,21 +90,24 @@ private[linker] class Reach(
+     if (unreachable.isEmpty && unsupported.isEmpty)
+       new ReachabilityAnalysis.Result(
+         infos = infos,
+-        entries = (entries ++ exports.toSeq).distinct,
+-        links = links.toSeq,
++        entries = (entries ++ exports).distinct,
++        links = links,
+         linkCppRuntime = linkCppRuntime,
+         preprocessorDefinitions = preprocessorDefinitions.toSeq.sortBy(_.name),
+-        defns = defns.toSeq,
+-        dynsigs = dynsigs.toSeq,
+-        dynimpls = dynimpls.toSeq,
++        defns = defns,
++        // Sorted (by mangle): DynmethodPerfectHashMap assigns each signature's
++        // dynmap slot by its position here, and the set's own iteration order
++        // depends on insertion order.
++        dynsigs = dynsigs.toVector.sortBy(_.mangle),
++        dynimpls = dynimpls,
+         resolvedVals = resolvedNirValues,
+         foundServiceProviders = foundServiceProviders
+       )
+     else
+       new ReachabilityAnalysis.Failure(
+-        defns = defns.toSeq,
+-        unreachable = unreachable.values.toSeq,
+-        unsupportedFeatures = unsupported.values.toSeq,
++        defns = defns,
++        unreachable = unreachable.values.toVector,
++        unsupportedFeatures = unsupported.values.toVector,
+         foundServiceProviders = foundServiceProviders
+       )
+   }
+@@ -143,6 +156,7 @@ private[linker] class Reach(
+           val scope = mutable.Map.empty[nir.Global, nir.Defn]
+           defns.foreach { defn => scope(defn.name) = defn }
+           loaded(owner) = scope
++          rawLoaded(owner) = defns.toSeq
+         }
+     }
+ 
+@@ -235,12 +249,103 @@ private[linker] class Reach(
+     done(defn.name) = defn
+   }
+ 
++  /** `//> using nativePrune <pattern>` (scalino): link-time pruning. Every
++   *  method whose owner class matches one of the patterns gets its body
++   *  replaced by a throw of `UnsupportedOperationException`, so whatever was reachable only
++   *  through those bodies is never loaded, optimized or code-generated.
++   *  Patterns arrive `;`-joined in the `scalino.prune` link-time property
++   *  (a String, so it is part of the config hash and a changed list forces
++   *  a full relink). A pattern is `pkg.Class` (also matches `pkg.Class$`,
++   *  `pkg.Class$Inner`, ...), a package `pkg.sub` (everything below it), or
++   *  `pkg.Class#method` to prune a single method name.
++   */
++  private lazy val prunePatterns: Seq[(String, Option[String])] =
++    config.compilerConfig.linktimeProperties
++      .get(PruneProperty)
++      .collect { case s: String => s }
++      .map(_.split(';').iterator.map(_.trim).filter(_.nonEmpty).map { p =>
++        p.indexOf('#') match {
++          case -1 => (p, None)
++          case i  => (p.substring(0, i), Some(p.substring(i + 1)))
++        }
++      }.toVector)
++      .getOrElse(Vector.empty)
++  private lazy val pruneHits = new Array[Int](prunePatterns.length)
++
++  private def matchesPrunedOwner(owner: String, pattern: String): Boolean =
++    owner.startsWith(pattern) && (
++      owner.length == pattern.length || {
++        val c = owner.charAt(pattern.length)
++        c == '$' || c == '.'
++      }
++    )
++
++  private def pruneBody(defn: nir.Defn.Define): Option[nir.Defn.Define] =
++    if (prunePatterns.isEmpty || defn.insts.isEmpty) None
++    else
++      defn.name match {
++        case nir.Global.Member(owner, sig) =>
++          val method = sig.unmangled match {
++            case nir.Sig.Method(id, _, _) => id
++            case nir.Sig.Ctor(_)          => "<init>"
++            case _                        => ""
++          }
++          val idx = prunePatterns.indexWhere { case (cls, onlyMethod) =>
++            matchesPrunedOwner(owner.id, cls) && onlyMethod.forall(_ == method)
++          }
++          if (idx < 0) None
++          else {
++            pruneHits(idx) += 1
++            config.logger.debug(s"nativePrune: ${owner.id}.$method")
++            implicit val pos: nir.SourcePosition = defn.pos
++            implicit val scopeId: nir.ScopeId = nir.ScopeId.TopLevel
++            implicit val fresh: nir.Fresh = nir.Fresh(defn.insts)
++            val buf = new nir.InstructionBuilder()
++            buf += defn.insts.head // keeps the original entry label + params
++            val exc = nir.Global.Top("java.lang.UnsupportedOperationException")
++            val excTy = nir.Type.Ref(exc)
++            val obj = buf.classalloc(exc, nir.Next.None)
++            buf.call(
++              nir.Type.Function(Seq(excTy, nir.Rt.String), nir.Type.Unit),
++              nir.Val.Global(
++                exc.member(nir.Sig.Ctor(Seq(nir.Rt.String))),
++                nir.Type.Ptr
++              ),
++              Seq(
++                obj,
++                nir.Val.String(
++                  s"${owner.id}.$method was pruned at link time (nativePrune)"
++                )
++              ),
++              nir.Next.None
++            )
++            buf.raise(obj, nir.Next.None)
++            Some(defn.copy(insts = buf.toSeq)(defn.pos))
++          }
++        case null => None
++      }
++
++  private def reportPruned(): Unit =
++    if (prunePatterns.nonEmpty) {
++      val total = pruneHits.sum
++      config.logger.info(s"nativePrune: replaced $total method bodies with a throw")
++      prunePatterns.zip(pruneHits).foreach { case ((cls, m), hits) =>
++        if (hits == 0)
++          config.logger.info(
++            s"nativePrune: '${cls}${m.fold("")("#" + _)}' matched no reachable method"
++          )
++      }
++    }
++
+   private def preprocessDefn(defn: nir.Defn): nir.Defn = {
+     defn match {
+       case defn: nir.Defn.Define =>
+-        (resolveLinktimeDefine(_))
+-          .andThen(resolveDefineIntrinsics)
+-          .apply(defn)
++        pruneBody(defn).getOrElse {
++          (resolveLinktimeDefine(_))
++            .andThen(resolveDefineIntrinsics)
++            .andThen(rewriteSmiAllocs)
++            .apply(defn)
++        }
+ 
+       case _ => defn
+     }
+@@ -254,6 +359,84 @@ private[linker] class Reach(
+     else defn
+   }
+ 
++  /** Rewrites `new java.lang.Integer(5)` (and the other 8 SMI-eligible box
++   *  types, see `nir.Type.Smi`) from a real `Classalloc` + constructor `Call`
++   *  into the same zero-allocation `Op.Box` autoboxing already uses on
++   *  64-bit targets - so these 9 types can never be allocated through `new`
++   *  either, not just through implicit boxing. `Op.Box`'s own reach handling
++   *  (below, in `reachOp`) needs no special-casing for this: it already
++   *  reaches correctly for every ordinary autobox site today, and an
++   *  `Op.Box` introduced here is indistinguishable from one the frontend
++   *  emitted directly.
++   *
++   *  Runs as part of `preprocessDefn` - right here, on the raw NIR loaded
++   *  from the classpath, before `reachDefine` walks these same instructions
++   *  to compute reachability, is the only point in the whole pipeline where
++   *  the `Classalloc`+`Call` pattern this rewrite matches is guaranteed to
++   *  still look like what the frontend produced. `Interflow` (the
++   *  optimizer, which runs later, over already-reachability-checked NIR)
++   *  routinely inlines these one-line constructors (`this._rawValue = v`)
++   *  away entirely, replacing the `Call` with a direct field store - so
++   *  this can't be a separate pass over the linked result, and it can't be
++   *  done at the `nscplugin` frontend either, since javalib/nativelib/the
++   *  Scala standard library aren't necessarily compiled by this project's
++   *  own patched compiler (an unpatched/vanilla one may bootstrap them).
++   */
++  /** Constructor of one of the 9 SMI-eligible box types, keyed by its NIR
++   *  global, mapped to the box type it constructs.
++   */
++  private lazy val SmiBoxCtors: Map[nir.Global, nir.Type] =
++    nir.Type.Smi.discriminantOfBox.keys.map { boxTy =>
++      val nir.Type.Ref(name, _, _) = boxTy: @unchecked
++      val ctor = name.member(nir.Sig.Ctor(Seq(nir.Type.unbox(boxTy))))
++      ctor -> boxTy
++    }.toMap
++
++  private def rewriteSmiAllocs(defn: nir.Defn.Define): nir.Defn.Define = {
++    val pending = mutable.Map.empty[nir.Local, nir.Type]
++    val out = Vector.newBuilder[nir.Inst]
++    out.sizeHint(defn.insts.size)
++    var changed = false
++
++    defn.insts.foreach {
++      case nir.Inst.Let(n, nir.Op.Classalloc(clsName, None), _)
++          if nir.Type.Smi.isEligibleBoxType(nir.Type.Ref(clsName)) =>
++        // Dropped, not appended - the matching Call case below emits the
++        // real replacement (an Op.Box `Let` bound to this same local) once
++        // it's found.
++        pending(n) = nir.Type.Ref(clsName)
++        changed = true
++
++      case inst @ nir.Inst.Let(
++            _,
++            nir.Op.Call(_, nir.Val.Global(ctorGlobal, _), Seq(nir.Val.Local(recv, _), arg)),
++            unwind
++          ) if SmiBoxCtors.get(ctorGlobal).exists(pending.get(recv).contains) =>
++        val boxTy = pending.remove(recv).get
++        out += nir.Inst.Let(recv, nir.Op.Box(boxTy, arg), unwind)(inst.pos, inst.scopeId)
++
++      case inst =>
++        out += inst
++    }
++
++    if (!changed) defn
++    else {
++      // Correctness net: every deferred Classalloc is expected to be
++      // resolved by exactly one matching constructor Call. If one is still
++      // pending here, this `new X(...)` didn't have the shape every
++      // compiler's frontend is known to always emit (e.g. the receiver
++      // escaped before its constructor ran) - fail loud rather than
++      // silently miscompile a box object that never got initialized.
++      if (pending.nonEmpty) {
++        util.unsupported(
++          s"SMI box allocation in ${defn.name} never reached its " +
++            s"constructor call: ${pending.keys.mkString(", ")}"
++        )
++      }
++      defn.copy(insts = out.result())(defn.pos)
++    }
++  }
++
+   def reachEntry(
+       name: nir.Global
+   )(implicit srcPosition: nir.SourcePosition): Unit = {
+@@ -340,7 +523,17 @@ private[linker] class Reach(
+       case info: MemberInfo =>
+         info.owner match {
+           case owner: ScopeInfo =>
+-            owner.members += info
++            // `incrementalReprocess` (below) can call `reachDefine`/`newInfo`
++            // a second time for the same member's Global.Name, on a relink
++            // where only that member's body changed -- replace the stale
++            // entry in place instead of appending a duplicate. A normal
++            // (non-incremental) build never has an existing entry here
++            // (each member is visited exactly once), so `indexWhere` always
++            // misses and this is exactly the old `owner.members += info`.
++            owner.members.indexWhere(_.name == info.name) match {
++              case -1  => owner.members += info
++              case idx => owner.members(idx) = info
++            }
+           case _ =>
+             ()
+         }
+@@ -1169,15 +1362,169 @@ private[linker] class Reach(
+     )
+ 
+   lazy val injects: Seq[nir.Defn] = UnsupportedFeatureExtractor.injects
++
++  // ---------------------------------------------------------------------
++  // Incremental reprocessing (patches/scala-native-0048): reusing THIS Reach
++  // instance for a relink instead of building a fresh one from scratch --
++  // only ever attempted by scalino's `--long-running` LinkDriver, the one
++  // caller (Link.scala's `previousReach`) that keeps a Reach instance alive
++  // across builds at all.
++  //
++  // Deliberately narrow: the ONLY thing `incrementalReprocess` ever patches
++  // in place is a `Defn.Define`'s instructions (a method BODY edit) where
++  // that method's owning Top's class hierarchy, attrs, and full member-
++  // signature set are byte-identical to what this instance was already
++  // built from. Anything else it can't prove safe -- a changed Var/Const/
++  // Declare, an added/removed/re-signatured member, a changed parent/
++  // traits/attrs, a Top that disappeared, changed entry points/service
++  // providers, changed `config`/`entries`, or a lingering unreachable/
++  // unsupported failure from the last build -- makes it return `None`, and
++  // the caller falls back to a completely fresh `Reach` (today's behavior,
++  // unconditionally correct).
++  //
++  // Why this narrower slice is safe where the abandoned per-method fact
++  // cache (patches/scala-native-0043, `incremental-reach` branch) wasn't:
++  // that attempt tried to *replay* memoized edges/call-targets/allocation
++  // facts without re-running the worklist at all, which silently dropped
++  // targets whenever the cache missed a fact kind (the documented
++  // Function1.apply miscompile). This instead *re-runs* the real worklist
++  // (`process()`/`processDelayed()`) over the changed bodies, so every
++  // ordinary reach rule (reachOp/reachMethodTargets/reachAllocation/dynamic
++  // dispatch registration/...) still executes exactly as it does for a
++  // fresh build -- nothing is memoized or replayed, only *skipped* for
++  // Tops that provably can't have produced new reachability facts. And
++  // because every one of those rules only ever ADDS to `done`/`infos`/
++  // `dyncandidates`/`dynimpls`/responds maps (never removes), a stale fact
++  // left over from a method body that changed to no longer need something
++  // is merely dead code kept reachable -- a bigger binary, never a wrong
++  // one. `cleanup()` (called from `result()`, unchanged) still prunes
++  // `responds`/`defaultResponds` down to whatever's actually in `done`.
++  def incrementalReprocess(
++      newConfig: build.Config,
++      newEntries: collection.Seq[nir.Global],
++      newLoader: ClassLoader
++  ): Option[ReachabilityAnalysis] = {
++    if (unreachable.nonEmpty || unsupported.nonEmpty) None
++    else if (newConfig != config) None
++    else if (newEntries != entries) None
++    else {
++      val newEntryPointClasses = newLoader.classesWithEntryPoints.toSet
++      val newServiceProviders = newLoader.definedServicesProviders
++      if (newEntryPointClasses != lastEntryPointClasses) None
++      else if (newServiceProviders != lastServiceProviders) None
++      else {
++        // First pass: only decide whether reuse is safe at all. Nothing is
++        // mutated here -- a single disqualifying Top must be able to bail
++        // out to a fresh Reach with this instance's state untouched, since
++        // the caller's fallback path (`new Reach(...)`) doesn't know or
++        // care whether we got partway through mutating the old one.
++        case class TopPatch(freshDefns: Seq[nir.Defn], changed: Seq[nir.Defn.Define])
++        val bodyPatches = mutable.Map.empty[nir.Global.Top, TopPatch]
++        var safe = true
++        val tops = rawLoaded.keysIterator
++        while (safe && tops.hasNext) {
++          val top = tops.next()
++          val oldDefns = rawLoaded(top)
++          newLoader.load(top) match {
++            case None =>
++              safe = false // the file backing this Top disappeared
++            case Some(freshDefns) if freshDefns eq oldDefns =>
++              () // definitely unchanged (ClassPath's own mtime cache hit)
++            case Some(freshDefns) =>
++              val oldByName = loaded(top)
++              if (freshDefns.size != oldByName.size) safe = false
++              else {
++                val freshByName = freshDefns.iterator.map(d => d.name -> d).toMap
++                if (freshByName.keySet != oldByName.keySet) safe = false
++                else {
++                  val changed = List.newBuilder[nir.Defn.Define]
++                  val it = freshByName.iterator
++                  while (safe && it.hasNext) {
++                    val (name, freshDefn) = it.next()
++                    val oldDefn = oldByName(name)
++                    if (freshDefn != oldDefn) {
++                      (freshDefn, oldDefn) match {
++                        case (fd: nir.Defn.Define, od: nir.Defn.Define)
++                            if structuralKey(fd) == structuralKey(od) =>
++                          changed += fd
++                        case _ =>
++                          // A changed Var/Const/Declare, or a Define/Class/
++                          // Trait/Module whose own shape (not just its
++                          // body) differs -- can't prove local reuse safe.
++                          safe = false
++                      }
++                    }
++                  }
++                  val cd = changed.result()
++                  if (safe && cd.nonEmpty) bodyPatches(top) = TopPatch(freshDefns, cd)
++                }
++              }
++          }
++        }
++
++        if (!safe) None
++        else if (bodyPatches.isEmpty) {
++          // Nothing changed at all (every Top hit the `eq` fast path) --
++          // still a legitimate relink (e.g. only C sources changed), just
++          // with literally nothing new for Reach to do.
++          loader = newLoader
++          lastEntryPointClasses = newEntryPointClasses
++          lastServiceProviders = newServiceProviders
++          Some(result())
++        } else {
++          // Second pass: only now, having proven every changed Top safe,
++          // actually mutate this instance.
++          loader = newLoader
++          bodyPatches.foreach {
++            case (top, TopPatch(freshDefns, defines)) =>
++              val scope = loaded(top)
++              defines.foreach { fresh =>
++                scope(fresh.name) = fresh
++                done -= fresh.name
++              }
++              rawLoaded(top) = freshDefns
++          }
++          // Force reprocessing regardless of `enqueued` -- these names were
++          // very likely already enqueued (and `done`) from the LAST build,
++          // and `reachGlobal`'s own `enqueued` dedup would otherwise skip
++          // pushing them onto `todo` a second time.
++          bodyPatches.valuesIterator.foreach {
++            case TopPatch(_, defines) =>
++              defines.foreach(fresh => todo ::= fresh.name)
++          }
++          process()
++          processDelayed()
++          lastEntryPointClasses = newEntryPointClasses
++          lastServiceProviders = newServiceProviders
++          Some(result())
++        }
++      }
++    }
++  }
++
++  private def structuralKey(defn: nir.Defn): Any = defn match {
++    case d: nir.Defn.Define => (d.attrs, d.name, d.ty)
++    case other              => other
++  }
++
++  private var lastEntryPointClasses: Set[nir.Global.Top] =
++    loader.classesWithEntryPoints.toSet
++  private var lastServiceProviders
++      : Map[nir.Global.Top, Iterable[nir.Global.Top]] =
++    loader.definedServicesProviders
+ }
+ 
+ private[scalanative] object Reach {
++  /** Link-time property carrying scalino's `nativePrune` patterns, see
++   *  `Reach.prunePatterns`. */
++  final val PruneProperty = "scalino.prune"
++
+   private final val ExternForwarderSig =
+     nir.Sig.Generated("$extern$forwarder").mangled
+ 
+   def apply(
+       config: build.Config,
+-      entries: Seq[nir.Global],
++      entries: collection.Seq[nir.Global],
+       loader: ClassLoader
+   ): ReachabilityAnalysis = {
+     val reachability = new Reach(config, entries, loader)
+diff --git a/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala b/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
+index ecd24ca0..ffffe1cc 100644
+--- a/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
++++ b/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
+@@ -92,7 +92,7 @@ class MinimalRequiredSymbolsTest extends LinkerSpec {
+ 
+     val mode =
+       s"{debugMetadata=$withDebugMetadata, multithreading=$withMultithreading, targetTriple=$withTargetTriple}"
+-    val found = SymbolsCount(result.defns)
++    val found = SymbolsCount(result.defns.toSeq)
+     if (found.total > expected.total) {
+       fail(
+         s"""|

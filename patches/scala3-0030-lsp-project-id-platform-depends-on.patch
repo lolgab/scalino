@@ -1,7 +1,8 @@
 diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
+index 76f21b026e..5e517f6c34 100644
 --- a/language-server/src/dotty/tools/languageserver/Lsp.scala
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
-@@ -132,7 +132,10 @@
+@@ -132,7 +132,10 @@ object Lsp {
      compilerArguments: List[String],
      sourceDirectories: List[String],
      dependencyClasspath: List[String],
@@ -13,7 +14,7 @@ diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language
  
    // -- JSON-RPC envelopes ---------------------------------------------------
  
-@@ -1131,6 +1134,9 @@
+@@ -1131,6 +1134,9 @@ object Lsp {
          var sourceDirectories: List[String] = Nil
          var dependencyClasspath: List[String] = Nil
          var classDirectory: String = null
@@ -23,7 +24,7 @@ diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language
          if (!in.isNextToken('}')) {
            in.rollbackToken()
            var continue = true
-@@ -1140,13 +1146,16 @@
+@@ -1140,13 +1146,16 @@ object Lsp {
                case "sourceDirectories" => sourceDirectories = decodeStringList(in)
                case "dependencyClasspath" => dependencyClasspath = decodeStringList(in)
                case "classDirectory" => classDirectory = in.readString(null)

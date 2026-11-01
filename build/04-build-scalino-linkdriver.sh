@@ -4,42 +4,36 @@
 # like the rest of the toolchain: dotc compiles LinkDriver.scala to NIR, then
 # LinkDriver links itself (run on the JVM, same bootstrap step 03/08 reuse).
 #
-# Uses tools-patched.cp (04a-patch-tools.sh): fixes scala-native's
-# object-file caching for vendored C/S dependencies, which was otherwise
-# effectively always-recompile regardless of whether anything changed --
-# see docs/findings.md "Native-library object-file caching was inert".
+# Links against the locally built, patched tools (build/01a-publish-scala-native.sh):
+# tools_native0.5_3 for the native binary, tools_3 for the JVM bootstrap run.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
 
-[[ -f "$WORK/tools-patched.cp" ]] || { echo "run 04a-patch-tools.sh first" >&2; exit 1; }
-[[ -f "$WORK/tools-patched-jvm.cp" ]] || { echo "run 04a-patch-tools.sh first" >&2; exit 1; }
+[[ -f "$WORK/tools-native.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
+[[ -f "$WORK/tools.cp" ]] || { echo "run 01-fetch-deps.sh first" >&2; exit 1; }
 
-# tools-patched-jvm.cp (04a-patch-tools.sh), NOT the raw tools.cp: LinkDriver
-# is compiled (below) against the *native*-targeted patched classpath
-# (NATIVE_DRIVER_CP), so its bytecode can reference e.g.
-# NativeConfig.withLLVMDirectCodeGen -- but it then actually *runs* here, on
-# a plain JVM, against DRIVER_CP. Those two classpaths must agree on
-# NativeConfig's shape or this throws NoSuchMethodError at runtime for
-# everyone, not just users of that experimental flag.
-DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
+# LinkDriver is compiled (below) against the *native*-targeted tools classpath
+# (NATIVE_DRIVER_CP) but runs here on a plain JVM against DRIVER_CP, so the two
+# must agree on NativeConfig's shape (both come from the same local build).
+DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
 
 # Substitute the published javalib_native0.5_3 jar for the locally-built one
 # with patches/scala-native-0009 (ZipFileSystemProvider) actually applied --
-# see build/01b-build-patched-javalib.sh. This classpath becomes the actual
+# see build/01a-publish-scala-native.sh. This classpath becomes the actual
 # runtime javalib baked into the linked scalino-linkdriver binary itself (not
 # just this build step's own tooling), which is what determines whether the
 # jar classpath entries LinkDriver hands to `Build` at RUNTIME (any real
 # `scalino build`, not just this bootstrap) can be read via NIO's "jar:"
 # FileSystemProvider instead of needing extractJarIfNeeded's workaround.
 TOOLS_PATCHED_JAVALIB_CP="$WORK/tools-patched-javalib.cp"
-LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
+LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  { tr "$CP_SEP" '\n' < "$WORK/tools-patched.cp" | grep -v '/javalib_native0\.5_3-'; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$TOOLS_PATCHED_JAVALIB_CP"
+  { tr "$CP_SEP" '\n' < "$WORK/tools-native.cp" | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$TOOLS_PATCHED_JAVALIB_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
-  cp "$WORK/tools-patched.cp" "$TOOLS_PATCHED_JAVALIB_CP"
-  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01b-build-patched-javalib.sh first, or patches/scala-native-0009 (ZipFileSystemProvider) will NOT take effect and scalino-linkdriver will fall back to needing jar-extraction workarounds. See docs/findings.md."
+  cp "$WORK/tools-native.cp" "$TOOLS_PATCHED_JAVALIB_CP"
+  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01a-publish-scala-native.sh first, or patches/scala-native-0009 (ZipFileSystemProvider) will NOT take effect and scalino-linkdriver will fall back to needing jar-extraction workarounds. See docs/findings.md."
 fi
 
 # Same substitution for nativelib_native0.5_3 -- this bootstrap classpath
@@ -53,14 +47,14 @@ fi
 # classes) -- scalino-linkdriver's own bootstrap build links a full program
 # against javalib+nativelib together, so both need to agree on the same
 # patched pair, not just javalib.
-LOCAL_NATIVELIB_JAR="${SCALINO_NATIVELIB_JAR:-$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/nativelib_native0.5_3.jar}"
+LOCAL_NATIVELIB_JAR="${SCALINO_NATIVELIB_JAR:-$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/nativelib_native0.5_3.jar}"
 if [[ -f "$LOCAL_NATIVELIB_JAR" ]]; then
   TMP_NATIVELIB_SWAP="$(mktemp)"
-  { tr "$CP_SEP" '\n' < "$TOOLS_PATCHED_JAVALIB_CP" | grep -v '/nativelib_native0\.5_3-'; echo "$LOCAL_NATIVELIB_JAR"; } | paste -sd"$CP_SEP" - > "$TMP_NATIVELIB_SWAP"
+  { tr "$CP_SEP" '\n' < "$TOOLS_PATCHED_JAVALIB_CP" | grep -Fxv "$LOCAL_NATIVELIB_JAR"; echo "$LOCAL_NATIVELIB_JAR"; } | paste -sd"$CP_SEP" - > "$TMP_NATIVELIB_SWAP"
   mv "$TMP_NATIVELIB_SWAP" "$TOOLS_PATCHED_JAVALIB_CP"
   echo "  using locally-built, patched nativelib jar: $LOCAL_NATIVELIB_JAR"
 else
-  echo "  WARNING: locally-built nativelib jar not found ($LOCAL_NATIVELIB_JAR) -- run build/01c-build-patched-nativelib.sh first, or nativelib source patches will NOT take effect in scalino-linkdriver's own bootstrap build."
+  echo "  WARNING: locally-built nativelib jar not found ($LOCAL_NATIVELIB_JAR) -- run build/01a-publish-scala-native.sh first, or nativelib source patches will NOT take effect in scalino-linkdriver's own bootstrap build."
 fi
 
 NATIVE_DRIVER_CP="$(to_native_path "$WORK/driver-classes")$CP_SEP$(cat "$TOOLS_PATCHED_JAVALIB_CP")"

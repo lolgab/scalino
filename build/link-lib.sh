@@ -16,9 +16,9 @@ jvm_link_enabled() { [[ -n "${SCALINO_JVM_LINK:-}" && "${SCALINO_JVM_LINK}" != 0
 linkdriver_run() {
   local cp="$1" out="$2" main="$3"; shift 3
   if jvm_link_enabled; then
-    # tools-patched-jvm.cp, not tools.cp: see 04-build-scalino-linkdriver.sh's DRIVER_CP.
+    # tools.cp: see 04-build-scalino-linkdriver.sh's DRIVER_CP.
     local driver_cp
-    driver_cp="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools-patched-jvm.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
+    driver_cp="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
     env ${LINK_ENV[@]+"${LINK_ENV[@]}"} "$JAVA" \
       -Xss64m -XX:MaxRAMPercentage="${SCALINO_LINK_RAM_PERCENT:-80}" \
       -cp "$driver_cp" \
@@ -36,8 +36,8 @@ linkdriver_run() {
 # Prerequisites of the chosen linker, for the scripts' up-front checks.
 link_require() {
   if jvm_link_enabled; then
-    [[ -f "$WORK/tools-patched-jvm.cp" && -d "$WORK/driver-classes" && -f "$DIST/tools-patched-jvm.jar" ]] \
-      || { echo "SCALINO_JVM_LINK needs build/04a + 04 output (tools-patched-jvm.*, driver-classes)" >&2; exit 1; }
+    [[ -f "$WORK/tools.cp" && -d "$WORK/driver-classes" ]] \
+      || { echo "SCALINO_JVM_LINK needs build/01-fetch-deps.sh + 04 output (tools.cp, driver-classes)" >&2; exit 1; }
   else
     [[ -x "$DIST/scalino-linkdriver" ]] || { echo "missing $DIST/scalino-linkdriver -- run build/04-build-scalino-linkdriver.sh first" >&2; exit 1; }
   fi

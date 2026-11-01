@@ -1,5 +1,5 @@
 diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
-index e9595a56..dc93d90b 100644
+index 539d01e178..77ce2d7d3f 100644
 --- a/language-server/src/dotty/tools/languageserver/Lsp.scala
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
 @@ -125,13 +125,10 @@ object Lsp {
@@ -17,7 +17,7 @@ index e9595a56..dc93d90b 100644
  
    // -- JSON-RPC envelopes ---------------------------------------------------
  
-@@ -1066,32 +1063,26 @@ object Lsp {
+@@ -1068,32 +1065,26 @@ object Lsp {
      def nullValue: ProjectConfig = null
      def decodeValue(in: JsonReader, default: ProjectConfig): ProjectConfig =
        if (in.isNextToken('{')) {

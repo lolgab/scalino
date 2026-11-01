@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala b/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala
-index 3fd466c..36f0a7f 100644
+index b043023f3f..72082e02a1 100644
 --- a/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala
 +++ b/compiler/src/dotty/tools/dotc/core/tasty/DottyUnpickler.scala
 @@ -7,7 +7,8 @@ import Contexts.*, SymDenotations.*,  Decorators.*
@@ -12,7 +12,7 @@ index 3fd466c..36f0a7f 100644
  import TreeUnpickler.UnpickleMode
  
  import dotty.tools.tasty.TastyReader
-@@ -83,6 +84,10 @@ class DottyUnpickler(
+@@ -81,6 +82,10 @@ class DottyUnpickler(
    def enter(roots: Set[SymDenotation])(using Context): Unit =
      treeUnpickler.enter(roots)
  
@@ -24,10 +24,10 @@ index 3fd466c..36f0a7f 100644
      posUnpicklerOpt: Option[PositionUnpickler],
      commentUnpicklerOpt: Option[CommentUnpickler],
 diff --git a/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala b/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
-index 514a87a..bfcfa78 100644
+index 30fadcb5f0..ecd86570a5 100644
 --- a/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
 +++ b/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
-@@ -96,6 +96,33 @@ class TreeUnpickler(reader: TastyReader,
+@@ -97,6 +97,33 @@ class TreeUnpickler(reader: TastyReader,
     */
    private var roots: Set[SymDenotation] = uninitialized
  
@@ -61,7 +61,7 @@ index 514a87a..bfcfa78 100644
    /** The root symbols that are defined in this Tasty file. This
     *  is a subset of `roots.map(_.symbol)`.
     */
-@@ -134,6 +161,20 @@ class TreeUnpickler(reader: TastyReader,
+@@ -135,6 +162,20 @@ class TreeUnpickler(reader: TastyReader,
        rdr.indexStats(reader.endAddr)
    }
  
@@ -82,7 +82,7 @@ index 514a87a..bfcfa78 100644
    /** The unpickled trees */
    def unpickle(mode: UnpickleMode)(using Context): List[Tree] = {
      if mode != UnpickleMode.TopLevel then rootOwner = ctx.owner
-@@ -478,7 +519,8 @@ class TreeUnpickler(reader: TastyReader,
+@@ -477,7 +518,8 @@ class TreeUnpickler(reader: TastyReader,
            if unpicklingJava && name == tpnme.Object && (pre.termSymbol eq defn.JavaLangPackageVal) then
              defn.FromJavaObjectType
            else
@@ -92,7 +92,7 @@ index 514a87a..bfcfa78 100644
          case TERMREF =>
            val sname = readName()
            val prefix = readType()
-@@ -486,7 +528,8 @@ class TreeUnpickler(reader: TastyReader,
+@@ -485,7 +527,8 @@ class TreeUnpickler(reader: TastyReader,
              case SignedName(name, sig, target) =>
                TermRef(prefix, name, prefix.member(name).atSignature(sig, target))
              case name =>
@@ -102,7 +102,7 @@ index 514a87a..bfcfa78 100644
            }
          case THIS =>
            ThisType.raw(readType().asInstanceOf[TypeRef])
-@@ -696,13 +739,14 @@ class TreeUnpickler(reader: TastyReader,
+@@ -695,13 +738,14 @@ class TreeUnpickler(reader: TastyReader,
                newSymbol(ctx.owner, name, flags, completer, privateWithin, coord)
          }
        registerSym(start, sym)
@@ -118,7 +118,7 @@ index 514a87a..bfcfa78 100644
            // Enter all members of classes that are not Scala 2 macros.
            //
            // For `StringContext`, enter `s`, `f` and `raw`
-@@ -998,7 +1042,7 @@ class TreeUnpickler(reader: TastyReader,
+@@ -997,7 +1041,7 @@ class TreeUnpickler(reader: TastyReader,
              // be missing from the Tasty file. So we check explicitly for that.
              def isCodefined = roots.contains(companion.denot) == seenRoots.contains(companion)
  
@@ -127,7 +127,7 @@ index 514a87a..bfcfa78 100644
              TypeDef(readTemplate(using localCtx))
            }
            else {
-@@ -1335,8 +1379,10 @@ class TreeUnpickler(reader: TastyReader,
+@@ -1352,8 +1396,10 @@ class TreeUnpickler(reader: TastyReader,
  
        def completeSelect(name: Name, sig: Signature, target: Name): Select =
          val qual = readTree()
@@ -141,7 +141,7 @@ index 514a87a..bfcfa78 100644
              val qualType = qual.tpe.widenIfUnstable
 diff --git a/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
 new file mode 100644
-index 0000000..8eb32a5
+index 0000000000..5187f88f8f
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
 @@ -0,0 +1,135 @@
@@ -280,128 +280,9 @@ index 0000000..8eb32a5
 +      case "toFloat" => Some(java.lang.Float.valueOf(n.floatValue))
 +      case "toDouble" => Some(java.lang.Double.valueOf(n.doubleValue))
 +      case _ => None
-diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 216cfe4..2946bc0 100644
---- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-+++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-@@ -222,7 +222,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-         // value (e.g. `Iterator.slice`'s local `def adjustedBound = ...`
-         // used bare as `adjustedBound min (until - lo)`).
-         case v: LocalDef if v.ddef.termParamss.isEmpty =>
--          interpretTree(v.ddef.rhs)(using v.closureEnv)
-+          // A `return` in a local def exits that def (not the enclosing method).
-+          try interpretTree(v.ddef.rhs)(using v.closureEnv)
-+          catch case LabeledReturn(label, value) if label == v.ddef.symbol => value
-         case v => v
- 
-     // `this` inside a method/constructor body we're interpreting: `env`
-@@ -373,6 +375,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-           val rv = interpretTree(rhs)
-           moduleVars((id.symbol.owner, id.symbol.name.toString)) = rv
-           interpretUnit()
-+        // `field = ...` written unqualified inside an interpreted class's own body.
-+        case id: Ident if id.symbol.is(Mutable) && id.symbol.owner.isClass && env.get(id.symbol.owner).exists(_.isInstanceOf[InterpretedInstance]) =>
-+          val rv = interpretTree(rhs)
-+          env(id.symbol.owner).asInstanceOf[InterpretedInstance].fields(id.symbol.name.toString) = rv
-+          interpretUnit()
-         case _ => unexpectedTree(tree)
- 
-     case Select(qual, name) if isPrimitiveOp(tree.symbol, qual.tpe) =>
-@@ -528,7 +535,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-         // symbol and the spliced code fails to typecheck against it.
-         val withTypeParams = ddef.leadingTypeParams.map(_.symbol).zip(typeArgs).foldLeft(closureEnv)((e, pv) => e.updated(pv._1, pv._2))
-         val callEnv = bindNonErased(params, rawArgs).foldLeft(withTypeParams)((e, pv) => e.updated(pv._1, pv._2))
--        interpretTree(ddef.rhs)(using callEnv)
-+        // A `return` in a local def exits that def (not the enclosing method).
-+        try interpretTree(ddef.rhs)(using callEnv)
-+        catch case LabeledReturn(label, value) if label == ddef.symbol => value
-       else if (env.contains(fn.symbol))
-         // `fn.symbol` is a local `val`/parameter bound to an already-
-         // interpreted function VALUE (not a real method symbol, so none of
-@@ -2870,7 +2879,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-       else NoSymbol
-     args // force before recording the call's type arguments (evaluating args may itself make calls)
-     currentTypeArgs = typeArgs
--    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).getOrElse {
-+    collectionFactory.orElse(interpretQuotesApi(Some(receiver), fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(interpretStdlibIntrinsic(receiver, fn, args)).orElse(hostValueCall(receiver, fn, args)).getOrElse {
-       resolveExternalDefTree(dispatchFn) match
-         case ddef: DefDef if !ddef.rhs.isEmpty => callUserDefDef(Some(receiver), ddef, args, typeArgs)
-         // A nested `object` member, reached through the `val` it compiles to
-@@ -3244,6 +3253,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-       rawArgs.filterNot(_.isEmpty) match
-         case v :: Nil => Some(Some(interpretTree(v)))
-         case _ => None
-+    else if fn.owner == defn.StringClass then
-+      val elem = fn.info.firstParamTypes.headOption.flatMap(_.dealias.argInfos.headOption).map(_.typeSymbol.name.toString).getOrElse("")
-+      HostValueCalls.newString(rawArgs.filterNot(_.isEmpty).map(interpretTree), elem)
-     // `Tuple2`/`Tuple3`/etc (a tuple literal like `(a, b)`, or `Predef`'s
-     // `ArrowAssoc#->` -- itself just `(self, y)`): built as a REAL host
-     // tuple via `scala.Tuple.fromArray` (genuinely general over any arity,
-@@ -3501,7 +3513,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-         if !env0.contains(cls.owner) && System.getenv("SCALINO_OUTER_DIAG") != null then Console.err.println(s"[outerDiag] cls=$cls newType=$newType other=${other.getClass.getSimpleName}")
-         env0
- 
--  private def interpretNewFromTree(fn: Symbol, rawArgs: List[Tree], newType: Type = NoType, existing: InterpretedInstance = null)(using Env): Object =
-+  private def interpretNewFromTree(fn0: Symbol, rawArgs: List[Tree], newType: Type = NoType, existing: InterpretedInstance = null)(using Env): Object =
-+    // A JDK constructor stands for the same-signature constructor of the
-+    // javalib class implementing it (which may be that class's primary one).
-+    val fn = if fn0.is(JavaDefined) then javalibOverlay.map(_.treeFor(fn0)).filter(!_.isEmpty).fold(fn0)(_.symbol) else fn0
-     // A secondary/auxiliary constructor (`def this(...) = this(...)`,
-     // e.g. `scala.util.matching.Regex`'s own `def this(regex: String,
-     // groupNames: String*) = this(Pattern.compile(regex), groupNames*)`):
-@@ -3997,8 +4012,28 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-   /** Local classes met while interpreting blocks, by (possibly re-owned) class symbol. */
-   private val localClassTrees = mutable.Map.empty[Symbol, TypeDef]
- 
-+  /** Bodies of JDK classes from scala-native's javalib TASTy, see `JavalibOverlay`. */
-+  private lazy val javalibOverlay: Option[JavalibOverlay] = JavalibOverlay.fromSettings()
-+
-+  /** `String` and boxed-primitive receivers: see `HostValueCalls`. */
-+  private def hostValueCall(receiver: Object, fn: Symbol, args: List[Object]): Option[Object] =
-+    receiver match
-+      case s: String => HostValueCalls.string(s, fn.name.toString, args)
-+      case _ if args.isEmpty => HostValueCalls.numericConversion(receiver, fn.name.toString)
-+      case _ => None
-+
-+  /** An interpreted instance of a javalib class whose `toString` has a real body. */
-+  private def hasJavalibToString(receiver: Object)(using Context): Boolean = receiver match
-+    case inst: InterpretedInstance if javalibOverlay.exists(_.isShadow(inst.cls)) =>
-+      val m = inst.cls.info.member(nme.toString_).suchThat(_.is(Method)).symbol
-+      m.exists && m.owner != defn.ObjectClass && !resolveExternalDefTree(m).isEmpty
-+    case _ => false
-+
-   private def resolveExternalDefTree(sym: Symbol)(using Context): Tree =
-     if !sym.defTree.isEmpty then sym.defTree
-+    else if javalibOverlay.exists(o => o.isShadow(sym) || (sym.is(JavaDefined) && !o.treeFor(sym).isEmpty)) then
-+      val t = javalibOverlay.get.treeFor(sym)
-+      t
-     else if sym.maybeOwner.exists && localClassTrees.contains(sym.owner) && findDefTree(localClassTrees(sym.owner), sym).isDefined then
-       findDefTree(localClassTrees(sym.owner), sym).get
-     else
-@@ -4252,6 +4287,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-   private def notInterpretable(sym: Symbol): Nothing =
-     val hint =
-       if sym.isDefinedInCurrentRun || !sym.defTree.isEmpty then ""
-+      else if sym.is(JavaDefined) then
-+        // JDK classes have no TASTy of their own: their bodies come from
-+        // javalib's (`JavalibOverlay`), except the host-native `java.lang` core.
-+        if javalibOverlay.isEmpty then " (a JDK method: its body is only available through javalib-tasty.jar, which is not on the classpath)"
-+        else " (a JDK method that javalib's TASTy does not define, or a host-native `java.lang` class such as String/boxes/Math whose methods are handled by `HostValueCalls`)"
-       else " (its definition tree is not retained -- likely defined in a separately-compiled dependency; " +
-            "this own-implementation interpreter does not yet unpickle cross-module TASTy bodies, see docs/findings.md)"
-     throw new StopInterpretation(
-@@ -6842,7 +6882,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
-         Some((c.charValue to end.charValue))
-       case (str: String, "repeat", (n: Integer) :: Nil) => Some(str.repeat(n))
-       case (r, "getClass", Nil) if r != null => Some(r.getClass)
--      case (r, "toString", Nil) => Some(r.toString)
-+      case (r, "toString", Nil) if !hasJavalibToString(r) => Some(r.toString)
-       // `Throwable#getMessage`/`#getCause`: real JDK methods with no
-       // retained Scala source, needed by any interpreted `catch` handler
-       // that inspects the exception it caught (e.g. a curated real
 diff --git a/compiler/src/dotty/tools/dotc/quoted/JavalibOverlay.scala b/compiler/src/dotty/tools/dotc/quoted/JavalibOverlay.scala
 new file mode 100644
-index 0000000..cf22cfb
+index 0000000000..cf22cfb332
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/quoted/JavalibOverlay.scala
 @@ -0,0 +1,210 @@

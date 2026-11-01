@@ -64,20 +64,20 @@ NIR_OUT_MAIN="$SELFHOST_DIR/lsp-nir-out-main"
 NIR_OUT_SHIM="$SELFHOST_DIR/lsp-nir-out-shim"
 LINK_WORK="$SELFHOST_DIR/lsp-link-work"
 
-# See 03-build-scalino-dotc.sh's identical block / build/01b-build-patched-javalib.sh.
+# See 03-build-scalino-dotc.sh's identical block / build/01a-publish-scala-native.sh.
 NATIVELIBS_CP="$SELFHOST_DIR/lsp-nativelibs.cp"
-LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
+LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
   # See build/03-build-scalino-dotc.sh's identical substitution for why the
   # exact-path filter (not just the old "-<version>" suffix pattern) is
-  # needed: 01b-build-patched-javalib.sh may have already rewritten
+  # needed: 01a-publish-scala-native.sh may have already rewritten
   # $WORK/nativelibs.cp to point straight at $LOCAL_JAVALIB_JAR, and listing
   # it twice makes scala-native's linker fail with duplicate symbols.
   { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-' | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
   cp "$WORK/nativelibs.cp" "$NATIVELIBS_CP"
-  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01b-build-patched-javalib.sh first, or patches/scala-native-0003 (URI fix) will NOT take effect. See docs/findings.md."
+  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01a-publish-scala-native.sh first, or patches/scala-native-0003 (URI fix) will NOT take effect. See docs/findings.md."
 fi
 
 echo "== generating self-hosted source file lists (dotc + LSP + presentation-compiler + mtags-shared, and the lsp4j/mtags-interfaces NIR-track shim) =="
@@ -115,7 +115,10 @@ echo "== compiling dotc+nscplugin+language-server+presentation-compiler+mtags-sh
 rm -rf "$NIR_OUT_MAIN"
 mkdir -p "$NIR_OUT_MAIN"
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
+# The compiler sources of Scala 3.10+ are written for -Yexplicit-nulls (scala3/project/Build.scala); the
+# rest of the source set (nscplugin, nir, our patches) is not, hence unsafeNulls for the whole compile.
 "$JAVA" -cp "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/lsp.cp")" dotty.tools.dotc.Main \
+  -Yexplicit-nulls -language:unsafeNulls -language:implicitConversions \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
   -Yretain-trees \

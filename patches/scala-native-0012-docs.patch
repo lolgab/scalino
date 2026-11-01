@@ -1,0 +1,29 @@
+diff --git a/docs/contrib/gc-safepoint-trampoline.md b/docs/contrib/gc-safepoint-trampoline.md
+index 3635d690..99fd876d 100644
+--- a/docs/contrib/gc-safepoint-trampoline.md
++++ b/docs/contrib/gc-safepoint-trampoline.md
+@@ -24,13 +24,19 @@ Scala Native follows the same *idea* on POSIX (with its own `ucontext` + assembl
+ 
+ ### x86_64: red zone, scratch registers and stack alignment
+ 
+-The interrupted code can be a leaf function that keeps live spills in the 128-byte SysV **red zone** below `%rsp`, with any register (`%r10`/`%r11` included) holding a live value. So on x86_64 the redirect does not simply replace the PC:
++The interrupted code can be anywhere a poll sits, including a leaf function that keeps live spills in the 128-byte SysV **red zone** below `%rsp`, with any register (`%r10`/`%r11` included) holding a live value. So on x86_64 the redirect does not simply replace the PC:
+ 
+-- `prepare_redirect` emulates a `call` that **skips the red zone**: it lowers `%rsp` by `128 + 8`, stores the interrupted `%rip` in the new top slot, and then points `%rip` at the trampoline.
+-- The trampoline returns with **`ret $128`**: it pops the interrupted `%rip` and drops the red-zone skip in one instruction, so resuming needs **no scratch register**. `rflags` are saved and restored with `pushfq`/`popfq`.
+-- Before calling C, the trampoline aligns `%rsp` to 16 bytes; `%rbp` carries the unaligned value across the call.
++- `prepare_redirect` emulates a `call` that **skips the red zone**: it lowers `%rsp` by `128 + 8`, stores the interrupted `%rip` in the new top slot, and only then points `%rip` at the trampoline. The trampoline frame therefore never overlaps the red zone.
++- The trampoline returns with **`ret $128`**: it pops the interrupted `%rip` and drops the red-zone skip in one instruction, so resuming needs **no scratch register** (a `jmp *%reg` exit clobbers whichever register it uses) and leaves `rflags` untouched (they are saved and restored with `pushfq`/`popfq`).
++- Before calling C, the trampoline aligns `%rsp` to 16 bytes (the poll can interrupt code at any alignment); `%rbp` carries the unaligned value across the call.
+ 
+-`safepointResumePc` is still recorded, but only the aarch64 trampoline reads it.
++### aarch64: resume through `sigreturn`
++
++The aarch64 trampoline cannot restore registers and then branch to the interrupted PC: there is no register-free indirect branch, and compiled code keeps live values in `x16`, `x17` and `x30` (a `br x16` exit corrupted `x16`), nor does LLVM avoid the 128-byte red zone below `sp` in leaf functions. So:
++
++- `prepare_redirect` copies the whole interrupted machine context (`uc_mcontext`: x0-x30, sp, pc, nzcv, all vector registers) onto the thread's own stack below the red zone and points `sp` at that copy. The copy also keeps the interrupted registers visible to the GC's conservative stack scan.
++- The trampoline only calls `Synchronizer_yield()` and executes `brk`.
++- The `SIGTRAP` handler in `SafepointPollTrampoline.c` (installed by a constructor; a `brk` that is not the trampoline's is passed to the previous handler) copies the saved context over its own signal context and returns, so the kernel's `sigreturn` restores every register exactly. `safepointResumePc` is recorded but unused on aarch64.
+ 
+ Windows uses the **vectored exception** path and still runs `Synchronizer_yield()` from the filter (no `ucontext`); the trampoline header stubs `prepare_redirect` to a no-op there.
+ 

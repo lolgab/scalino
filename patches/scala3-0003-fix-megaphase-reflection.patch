@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala b/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala
-index 871cab52..5190ebbd 100644
+index 871cab52d0..5190ebbdcb 100644
 --- a/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/MegaPhase.scala
 @@ -494,22 +494,36 @@ class MegaPhase(val miniPhases: Array[MiniPhase]) extends Phase {

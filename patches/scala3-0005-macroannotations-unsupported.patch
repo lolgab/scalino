@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/transform/MacroAnnotations.scala b/compiler/src/dotty/tools/dotc/transform/MacroAnnotations.scala
-index af90362e..3c8a8427 100644
+index af90362ee2..3c8a842794 100644
 --- a/compiler/src/dotty/tools/dotc/transform/MacroAnnotations.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/MacroAnnotations.scala
 @@ -13,12 +13,7 @@ import core.MacroClassLoader

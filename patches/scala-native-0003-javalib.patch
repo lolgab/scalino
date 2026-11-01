@@ -1,0 +1,1531 @@
+diff --git a/javalib/src/main/scala/java/lang/Boolean.scala b/javalib/src/main/scala/java/lang/Boolean.scala
+index d4bc1000..84e654c1 100644
+--- a/javalib/src/main/scala/java/lang/Boolean.scala
++++ b/javalib/src/main/scala/java/lang/Boolean.scala
+@@ -1,11 +1,29 @@
+ package java.lang
+ 
+ import java.lang.constant.Constable
++import scala.scalanative.meta.LinktimeInfo
+ 
+-final class Boolean(val _value: scala.Boolean)
++final class Boolean(_rawValue: scala.Boolean)
+     extends Comparable[Boolean]
+     with Constable
+     with java.io.Serializable {
++
++  /** Decodes the underlying value whether `this` is a real, allocated
++   *  `Boolean` object (the common case for explicit `new Boolean(...)`) or a
++   *  SMI-tagged immediate (the common case after autoboxing on 64-bit
++   *  targets, see `scala.scalanative.runtime.SmiBox`). Method resolution for
++   *  a tagged receiver can land here via *static* dispatch (this class is
++   *  `final`, so many calls skip vtable lookup entirely), which doesn't
++   *  inspect the receiver at all - so this accessor has to handle both
++   *  cases itself rather than assume a real field always exists.
++   */
++  @inline def _value: scala.Boolean = {
++    val self = scala.scalanative.runtime.Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeBoolean(self)
++    else _rawValue
++  }
++
+   def booleanValue(): scala.Boolean =
+     _value
+ 
+@@ -54,8 +72,20 @@ private object BooleanConstants {
+ object Boolean {
+   final val TYPE =
+     scala.Predef.classOf[scala.scalanative.runtime.PrimitiveBoolean]
+-  final def TRUE: Boolean = BooleanConstants.TRUE
+-  final def FALSE: Boolean = BooleanConstants.FALSE
++
++  // On 64-bit, TRUE/FALSE are tagged immediates rather than the two real
++  // heap-allocated singletons below, so `Boolean.TRUE`/`FALSE` stay `eq`-
++  // consistent with implicit `true`/`false` autoboxing (both now produce
++  // the same tagged bit pattern). `LinktimeInfo.is32BitPlatform` is a
++  // @resolvedAtLinktime constant, so on 64-bit this is a real link-time
++  // branch - `BooleanConstants` (and its two allocations) is unreachable
++  // and dropped entirely, not merely untaken at runtime.
++  final def TRUE: Boolean =
++    if (LinktimeInfo.is32BitPlatform) BooleanConstants.TRUE
++    else scala.scalanative.runtime.SmiBox.encodeBoolean(true).asInstanceOf[Boolean]
++  final def FALSE: Boolean =
++    if (LinktimeInfo.is32BitPlatform) BooleanConstants.FALSE
++    else scala.scalanative.runtime.SmiBox.encodeBoolean(false).asInstanceOf[Boolean]
+ 
+   @inline def compare(x: scala.Boolean, y: scala.Boolean): scala.Int =
+     if (x == y) 0 else if (x) 1 else -1
+diff --git a/javalib/src/main/scala/java/lang/Byte.scala b/javalib/src/main/scala/java/lang/Byte.scala
+index 2db7340e..d361f40b 100644
+--- a/javalib/src/main/scala/java/lang/Byte.scala
++++ b/javalib/src/main/scala/java/lang/Byte.scala
+@@ -3,14 +3,24 @@ package java.lang
+ import java.lang.constant.Constable
+ 
+ import scalanative.runtime.Intrinsics.{byteToUInt, byteToULong}
++import scala.scalanative.meta.LinktimeInfo
+ 
+-final class Byte(val _value: scala.Byte)
++final class Byte(_rawValue: scala.Byte)
+     extends Number
+     with Comparable[Byte]
+     with Constable {
+   @inline def this(s: String) =
+     this(Byte.parseByte(s))
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline def _value: scala.Byte = {
++    val self = scala.scalanative.runtime.Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeByte(self)
++    else _rawValue
++  }
++
+   @inline override def byteValue(): scala.Byte =
+     _value
+ 
+@@ -30,12 +40,12 @@ final class Byte(val _value: scala.Byte)
+     _value.toDouble
+ 
+   @inline override def equals(that: Any): scala.Boolean =
+-    that match {
++    (this eq that.asInstanceOf[AnyRef]) || (that match {
+       case that: java.lang.Byte =>
+         _value == that._value
+       case _ =>
+         false
+-    }
++    })
+ 
+   @inline override def hashCode(): Int =
+     _value
+@@ -224,14 +234,22 @@ object Byte {
+   import ByteCache.cache
+ 
+   @inline def valueOf(byteValue: scala.Byte): Byte = {
+-    val idx = byteValue - MIN_VALUE
+-    val cached = cache(idx)
+-    if (cached != null) {
+-      cached
++    // On 64-bit, every value tags directly (not just the cache's 256-entry
++    // range) and stays `eq`-consistent with implicit autoboxing of the same
++    // value - see java.lang.Boolean.TRUE/FALSE for why this is a real
++    // link-time branch, not a runtime one.
++    if (LinktimeInfo.is32BitPlatform) {
++      val idx = byteValue - MIN_VALUE
++      val cached = cache(idx)
++      if (cached != null) {
++        cached
++      } else {
++        val newbyte = new Byte(byteValue)
++        cache(idx) = newbyte
++        newbyte
++      }
+     } else {
+-      val newbyte = new Byte(byteValue)
+-      cache(idx) = newbyte
+-      newbyte
++      scala.scalanative.runtime.SmiBox.encodeByte(byteValue).asInstanceOf[Byte]
+     }
+   }
+ 
+diff --git a/javalib/src/main/scala/java/lang/Character.scala b/javalib/src/main/scala/java/lang/Character.scala
+index 88f142c7..213e6bac 100644
+--- a/javalib/src/main/scala/java/lang/Character.scala
++++ b/javalib/src/main/scala/java/lang/Character.scala
+@@ -4,21 +4,32 @@ import java.lang.constant.Constable
+ import java.util.Arrays
+ 
+ import scala.scalanative.runtime.LLVMIntrinsics
++import scala.scalanative.meta.LinktimeInfo
+ 
+-class Character(val _value: scala.Char)
++class Character(_rawValue: scala.Char)
+     extends java.io.Serializable
+     with Comparable[Character]
+     with Constable {
++
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline def _value: scala.Char = {
++    val self = scala.scalanative.runtime.Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeChar(self)
++    else _rawValue
++  }
++
+   def charValue(): scala.Char =
+     _value
+ 
+   @inline override def equals(that: Any): scala.Boolean =
+-    that match {
++    (this eq that.asInstanceOf[AnyRef]) || (that match {
+       case that: Character =>
+         _value == that._value
+       case _ =>
+         false
+-    }
++    })
+ 
+   @inline override def compareTo(that: Character): Int =
+     Character.compare(_value, that._value)
+@@ -452,18 +463,26 @@ object Character {
+   import CharacterCache.cache
+ 
+   def valueOf(charValue: scala.Char): Character = {
+-    if (charValue > 127) {
+-      new Character(charValue)
+-    } else {
+-      val idx = charValue.toInt
+-      val cached = cache(idx)
+-      if (cached != null) {
+-        cached
++    // On 64-bit, every value tags directly (not just the cache's 0..127
++    // range) and stays `eq`-consistent with implicit autoboxing of the same
++    // value - see java.lang.Boolean.TRUE/FALSE for why this is a real
++    // link-time branch, not a runtime one.
++    if (LinktimeInfo.is32BitPlatform) {
++      if (charValue > 127) {
++        new Character(charValue)
+       } else {
+-        val newchar = new Character(charValue)
+-        cache(idx) = newchar
+-        newchar
++        val idx = charValue.toInt
++        val cached = cache(idx)
++        if (cached != null) {
++          cached
++        } else {
++          val newchar = new Character(charValue)
++          cache(idx) = newchar
++          newchar
++        }
+       }
++    } else {
++      scala.scalanative.runtime.SmiBox.encodeChar(charValue).asInstanceOf[Character]
+     }
+   }
+ 
+diff --git a/javalib/src/main/scala/java/lang/Float.scala b/javalib/src/main/scala/java/lang/Float.scala
+index 27536564..0ca833f1 100644
+--- a/javalib/src/main/scala/java/lang/Float.scala
++++ b/javalib/src/main/scala/java/lang/Float.scala
+@@ -8,7 +8,7 @@ import scalanative.libc
+ import scalanative.runtime.Intrinsics
+ import scalanative.runtime.ieee754tostring.ryu.{RyuFloat, RyuRoundingMode}
+ 
+-final class Float(val _value: scala.Float)
++final class Float(_rawValue: scala.Float)
+     extends Number
+     with Comparable[Float]
+     with Constable
+@@ -19,6 +19,15 @@ final class Float(val _value: scala.Float)
+   @inline def this(s: String) =
+     this(Float.parseFloat(s))
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline def _value: scala.Float = {
++    val self = scala.scalanative.runtime.Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeFloat(self)
++    else _rawValue
++  }
++
+   @inline override def byteValue(): scala.Byte =
+     _value.toByte
+ 
+@@ -38,7 +47,7 @@ final class Float(val _value: scala.Float)
+     _value.toDouble
+ 
+   @inline override def equals(that: Any): scala.Boolean =
+-    that match {
++    (this eq that.asInstanceOf[AnyRef]) || (that match {
+       case that: Float =>
+         // As floats with different NaNs are considered equal,
+         // use floatToIntBits instead of floatToRawIntBits
+@@ -48,7 +57,7 @@ final class Float(val _value: scala.Float)
+ 
+       case _ =>
+         false
+-    }
++    })
+ 
+   @inline override def hashCode(): Int =
+     Float.hashCode(_value)
+diff --git a/javalib/src/main/scala/java/lang/Integer.scala b/javalib/src/main/scala/java/lang/Integer.scala
+index e13616e1..267f45c6 100644
+--- a/javalib/src/main/scala/java/lang/Integer.scala
++++ b/javalib/src/main/scala/java/lang/Integer.scala
+@@ -5,8 +5,9 @@ import java.{util => ju}
+ 
+ import scalanative.runtime.Intrinsics.{divUInt, intToULong, remUInt}
+ import scalanative.runtime.LLVMIntrinsics
++import scala.scalanative.meta.LinktimeInfo
+ 
+-final class Integer(val _value: scala.Int)
++final class Integer(_rawValue: scala.Int)
+     extends Number
+     with Comparable[Integer]
+     with Constable
+@@ -14,6 +15,15 @@ final class Integer(val _value: scala.Int)
+   @inline def this(s: String) =
+     this(Integer.parseInt(s))
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline def _value: scala.Int = {
++    val self = scala.scalanative.runtime.Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeInt(self)
++    else _rawValue
++  }
++
+   @inline override def byteValue(): scala.Byte =
+     _value.toByte
+ 
+@@ -33,12 +43,12 @@ final class Integer(val _value: scala.Int)
+     _value.toDouble
+ 
+   @inline override def equals(that: Any): scala.Boolean =
+-    that match {
++    (this eq that.asInstanceOf[AnyRef]) || (that match {
+       case that: Integer =>
+         _value == that._value
+       case _ =>
+         false
+-    }
++    })
+ 
+   @inline override def hashCode(): scala.Int =
+     _value
+@@ -510,18 +520,26 @@ object Integer {
+   import IntegerCache.cache
+ 
+   @inline def valueOf(intValue: scala.Int): Integer = {
+-    if (intValue.toByte.toInt != intValue) {
+-      new Integer(intValue)
+-    } else {
+-      val idx = intValue + 128
+-      val cached = cache(idx)
+-      if (cached != null) {
+-        cached
++    // On 64-bit, every value tags directly (not just the cache's -128..127
++    // range) and stays `eq`-consistent with implicit autoboxing of the same
++    // value - see java.lang.Boolean.TRUE/FALSE for why this is a real
++    // link-time branch, not a runtime one.
++    if (LinktimeInfo.is32BitPlatform) {
++      if (intValue.toByte.toInt != intValue) {
++        new Integer(intValue)
+       } else {
+-        val newint = new Integer(intValue)
+-        cache(idx) = newint
+-        newint
++        val idx = intValue + 128
++        val cached = cache(idx)
++        if (cached != null) {
++          cached
++        } else {
++          val newint = new Integer(intValue)
++          cache(idx) = newint
++          newint
++        }
+       }
++    } else {
++      scala.scalanative.runtime.SmiBox.encodeInt(intValue).asInstanceOf[Integer]
+     }
+   }
+ 
+diff --git a/javalib/src/main/scala/java/lang/Short.scala b/javalib/src/main/scala/java/lang/Short.scala
+index 92c83ed6..3c29720e 100644
+--- a/javalib/src/main/scala/java/lang/Short.scala
++++ b/javalib/src/main/scala/java/lang/Short.scala
+@@ -4,14 +4,24 @@ import java.lang.constant.Constable
+ 
+ import scalanative.runtime.Intrinsics.{shortToUInt, shortToULong}
+ import scalanative.runtime.LLVMIntrinsics
++import scala.scalanative.meta.LinktimeInfo
+ 
+-final class Short(val _value: scala.Short)
++final class Short(_rawValue: scala.Short)
+     extends Number
+     with Comparable[Short]
+     with Constable {
+   @inline def this(s: String) =
+     this(Short.parseShort(s))
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline def _value: scala.Short = {
++    val self = scala.scalanative.runtime.Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeShort(self)
++    else _rawValue
++  }
++
+   @inline override def byteValue(): scala.Byte =
+     _value.toByte
+ 
+@@ -31,12 +41,12 @@ final class Short(val _value: scala.Short)
+     _value.toDouble
+ 
+   @inline override def equals(that: Any): scala.Boolean =
+-    that match {
++    (this eq that.asInstanceOf[AnyRef]) || (that match {
+       case that: java.lang.Short =>
+         _value == that._value
+       case _ =>
+         false
+-    }
++    })
+ 
+   @inline override def hashCode(): scala.Int =
+     _value
+@@ -231,18 +241,26 @@ object Short {
+   private val cache = new Array[java.lang.Short](256)
+ 
+   @inline def valueOf(shortValue: scala.Short): Short = {
+-    if (shortValue.toByte.toShort != shortValue) {
+-      new Short(shortValue)
+-    } else {
+-      val idx = shortValue + 128
+-      val cached = cache(idx)
+-      if (cached != null) {
+-        cached
++    // On 64-bit, every value tags directly (not just the cache's -128..127
++    // range) and stays `eq`-consistent with implicit autoboxing of the same
++    // value - see java.lang.Boolean.TRUE/FALSE for why this is a real
++    // link-time branch, not a runtime one.
++    if (LinktimeInfo.is32BitPlatform) {
++      if (shortValue.toByte.toShort != shortValue) {
++        new Short(shortValue)
+       } else {
+-        val newshort = new Short(shortValue)
+-        cache(idx) = newshort
+-        newshort
++        val idx = shortValue + 128
++        val cached = cache(idx)
++        if (cached != null) {
++          cached
++        } else {
++          val newshort = new Short(shortValue)
++          cache(idx) = newshort
++          newshort
++        }
+       }
++    } else {
++      scala.scalanative.runtime.SmiBox.encodeShort(shortValue).asInstanceOf[Short]
+     }
+   }
+ 
+diff --git a/javalib/src/main/scala/java/lang/System.scala b/javalib/src/main/scala/java/lang/System.scala
+index 5b85c58d..81ae6fef 100644
+--- a/javalib/src/main/scala/java/lang/System.scala
++++ b/javalib/src/main/scala/java/lang/System.scala
+@@ -39,8 +39,11 @@ object System {
+     Runtime.getRuntime().exit(status)
+ 
+   def identityHashCode(x: Object): scala.Int =
+-    java.lang.Long
+-      .hashCode(Intrinsics.castRawPtrToLong(Intrinsics.castObjectToRawPtr(x)))
++    {
++      val ptr = Intrinsics.castObjectToRawPtr(x)
++      scala.scalanative.runtime.GC.noteIdentityHash(ptr)
++      java.lang.Long.hashCode(Intrinsics.castRawPtrToLong(ptr))
++    }
+ 
+   def lineSeparator(): String = {
+     if (isWindows) "\r\n"
+diff --git a/javalib/src/main/scala/java/lang/impl/PosixThread.scala b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
+index 7d6428ca..95020847 100644
+--- a/javalib/src/main/scala/java/lang/impl/PosixThread.scala
++++ b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
+@@ -504,10 +504,16 @@ private[lang] object PosixThread extends NativeThread.Companion {
+       pthread_attr_init(attrs)
+       val stackSize = stackalloc[CSize]()
+       pthread_attr_getstacksize(attrs, stackSize)
+-      (!stackSize).toLong
++      val osDefault = (!stackSize).toLong
++      // musl's default thread stack is 128K, glibc's 8M. Programs written for
++      // glibc (deep recursion on pool threads, GC marking) overflow the former,
++      // so a binary linked against an unmodified musl gets glibc's size.
++      if (isLinux) Math.max(osDefault, LinuxMinDefaultStackSize) else osDefault
+     }
+   }
+ 
++  private final val LinuxMinDefaultStackSize = 8L * 1024 * 1024
++
+   // PosixThread class state
+   @alwaysinline private def LockOffset = 0
+   @alwaysinline private def ConditionsOffset = pthread_mutex_t_size.toInt
+diff --git a/javalib/src/main/scala/java/nio/file/Files.scala b/javalib/src/main/scala/java/nio/file/Files.scala
+index 5eff5d9e..6fe74dde 100644
+--- a/javalib/src/main/scala/java/nio/file/Files.scala
++++ b/javalib/src/main/scala/java/nio/file/Files.scala
+@@ -369,14 +369,40 @@ object Files {
+           throw new DirectoryNotEmptyException(target.toString)
+       } else createDirectory(target, Array.empty)
+     } else if (!isWindows) {
+-      // Scala Native Issue #4382
+-      // Devos, ensure preconditions described at top of method endure.
+-      unixCopyFile(
+-        source,
+-        target,
+-        options,
+-        attrs.asInstanceOf[PosixFileAttributes].permissions()
+-      )
++      // `!isWindows` must stay the sole condition of this branch --
++      // scala-native rejects mixing a link-time constant with a runtime
++      // condition in the same `if` ("Mixing link-time and runtime
++      // conditions is not allowed"), so the provider check below is a
++      // nested, ordinary `if`, not `&&`-ed into this one.
++      if (
++        source.getFileSystem().provider().getScheme() == "file" &&
++        target.getFileSystem().provider().getScheme() == "file"
++      ) {
++        // Scala Native Issue #4382
++        // Devos, ensure preconditions described at top of method endure.
++        unixCopyFile(
++          source,
++          target,
++          options,
++          attrs.asInstanceOf[PosixFileAttributes].permissions()
++        )
++      } else {
++        // Either path isn't on the default "file" provider (e.g. "jar:") --
++        // unixCopyFile's raw POSIX open()/read()/write() calls take
++        // source.toAbsolutePath().toString() and hand it straight to
++        // fcntl.open(), which only makes sense for a real OS path. For a
++        // non-default-provider source (a zip entry, say), that open() call
++        // fails, and the failure is silently swallowed a few lines down in
++        // unixCopyFile's own `catch { case _: IOException => unlink(target) }`
++        // (there to clean up a partially-copied target on a genuine I/O
++        // error) -- so instead of a clear error, copy() would just silently
++        // produce a zero-byte-then-deleted target and return as if nothing
++        // were wrong. Go through the provider-generic stream copy instead,
++        // same fallback already used on Windows.
++        val in = newInputStream(source, Array.empty)
++        try copy(in, target, options.filter(_ == REPLACE_EXISTING))
++        finally in.close()
++      }
+     } else { // Windows
+       val in = newInputStream(source, Array.empty)
+       try copy(in, target, options.filter(_ == REPLACE_EXISTING))
+@@ -1007,14 +1033,24 @@ object Files {
+      * "./".
+      */
+ 
+-    val dirString =
+-      if (dir.equals(emptyPath)) "./"
+-      else dir.toString()
+-
+-    if (!isWindows)
+-      posixList(dir, dirString) // see comment re: args at top of that method
+-    else {
+-      Arrays.stream[Path](FileHelpers.list(dirString, (n, _) => dir.resolve(n)))
++    if (dir.getFileSystem().provider().getScheme() != "file") {
++      // Non-default providers (e.g. "jar:") have no real OS directory to
++      // opendir()/FindFirstFile() -- go through the provider's own
++      // newDirectoryStream instead of the POSIX/Windows fast path below.
++      val ds = newDirectoryStream(dir)
++      StreamSupport
++        .stream[Path](ds.spliterator(), false)
++        .onClose(() => ds.close())
++    } else {
++      val dirString =
++        if (dir.equals(emptyPath)) "./"
++        else dir.toString()
++
++      if (!isWindows)
++        posixList(dir, dirString) // see comment re: args at top of that method
++      else {
++        Arrays.stream[Path](FileHelpers.list(dirString, (n, _) => dir.resolve(n)))
++      }
+     }
+   }
+ 
+@@ -1259,6 +1295,24 @@ object Files {
+ 
+     if (pathSize == 0L) { // SN Issue #I4384, part 1.
+       Array.empty[Byte]
++    } else if (path.getFileSystem().provider().getScheme() != "file") {
++      // Non-default providers (e.g. "jar:") have no real OS file to open()
++      // directly -- go through the provider's own byte channel instead of
++      // the POSIX/Windows fast path below.
++      val in = newInputStream(path, Array.empty)
++      try {
++        val len = pathSize.toInt
++        val bytes = new Array[Byte](len)
++        var offset = 0
++        var read = 0
++        while ({
++          read = in.read(bytes, offset, len - offset);
++          read != -1 && offset + read < len
++        }) {
++          offset += read
++        }
++        bytes
++      } finally in.close()
+     } else {
+       val len = pathSize.toInt
+       val bytes = scala.scalanative.runtime.ByteArray.alloc(len)
+diff --git a/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala b/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
+index fed7d4cb..060f1cac 100644
+--- a/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
++++ b/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
+@@ -15,6 +15,7 @@ import java.util.{LinkedList, List, Map, ServiceLoader, Set}
+ import scala.scalanative.meta.LinktimeInfo.isWindows
+ import scala.scalanative.nio.fs.unix.UnixFileSystemProvider
+ import scala.scalanative.nio.fs.windows.WindowsFileSystemProvider
++import scala.scalanative.nio.fs.zip.ZipFileSystemProvider
+ 
+ abstract class FileSystemProvider protected () {
+ 
+@@ -147,6 +148,7 @@ object FileSystemProvider {
+       else new UnixFileSystemProvider()
+ 
+     list.add(defaultProvider)
++    list.add(new ZipFileSystemProvider())
+     ServiceLoader.load(classOf[FileSystemProvider]).forEach(list.add(_))
+ 
+     list
+diff --git a/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala b/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala
+index 754e9105..b0083b70 100644
+--- a/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala
++++ b/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala
+@@ -815,10 +815,20 @@ object CompletableFuture {
+     }
+ 
+     override def isReleasable(): Boolean = {
+-      if (Thread.interrupted()) interrupted = true
+-      (interrupted && interruptible) ||
+-        (deadline != 0L && (nanos <= 0L || { nanos = deadline - System.nanoTime(); nanos <= 0L })) ||
+-        thread == null
++      if (thread == null) true
++      else {
++        if (Thread.interrupted()) interrupted = true
++        if (interrupted && interruptible) {
++          thread = null
++          true
++        } else if (
++          deadline != 0L &&
++          (nanos <= 0L || { nanos = deadline - System.nanoTime(); nanos <= 0L })
++        ) {
++          thread = null
++          true
++        } else false
++      }
+     }
+ 
+     override def block(): Boolean = {
+diff --git a/javalib/src/main/scala/java/util/zip/Deflater.scala b/javalib/src/main/scala/java/util/zip/Deflater.scala
+index c6b06fc3..35ff9775 100644
+--- a/javalib/src/main/scala/java/util/zip/Deflater.scala
++++ b/javalib/src/main/scala/java/util/zip/Deflater.scala
+@@ -63,6 +63,9 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
+     } else {
+       stream.nextOut = buf.at(off)
+     }
++    if (inputBuffer != null && inputBuffer.length > 0)
++      stream.nextIn =
++        inputBuffer.at(inOff + (stream.totalIn.toLong - inTotalAtSet).toInt)
+     val err = zlib.deflate(stream, flushParam)
+ 
+     if (err == zlib.Z_MEM_ERROR) {
+@@ -152,6 +155,12 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
+   def setInput(buf: Array[Byte]): Unit =
+     setInput(buf, 0, buf.length)
+ 
++  // The z_stream lives off-heap, so a moving GC cannot update the raw
++  // `nextIn` pointer into the input array between calls: remember the array
++  // and re-derive the pointer from it before every call into zlib.
++  private var inOff: Int = 0
++  private var inTotalAtSet: Long = 0L
++
+   def setInput(buf: Array[Byte], off: Int, nbytes: Int): Unit =
+     if (stream == null) {
+       throw new IllegalStateException()
+@@ -166,6 +175,8 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
+         }
+       }
+       inputBuffer = buf
++      inOff = off
++      inTotalAtSet = stream.totalIn.toLong
+       if (buf.length == 0) {
+         stream.nextIn = Deflater.empty.at(off)
+       } else {
+diff --git a/javalib/src/main/scala/java/util/zip/Inflater.scala b/javalib/src/main/scala/java/util/zip/Inflater.scala
+index 0d07fe32..2e3c57dc 100644
+--- a/javalib/src/main/scala/java/util/zip/Inflater.scala
++++ b/javalib/src/main/scala/java/util/zip/Inflater.scala
+@@ -139,12 +139,22 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
+   def setInput(buf: Array[Byte]): Unit =
+     setInput(buf, 0, buf.length)
+ 
++  // The z_stream lives off-heap, so a moving GC cannot update the raw
++  // `nextIn` pointer into the input array between calls: remember the array
++  // and re-derive the pointer from it before every call into zlib.
++  private var inBuf: Array[Byte] = null
++  private var inOff: Int = 0
++  private var inTotalAtSet: Long = 0L
++
+   def setInput(buf: Array[Byte], off: Int, nbytes: Int): Unit =
+     if (stream == null) {
+       throw new NullPointerException()
+     } else if (off <= buf.length && nbytes >= 0 && off >= 0 && buf.length - off >= nbytes) {
+       inRead = 0
+       inLength = nbytes
++      inBuf = buf
++      inOff = off
++      inTotalAtSet = stream.totalIn.toLong
+       if (buf.length == 0) {
+         stream.nextIn = Inflater.empty.at(off)
+       } else {
+@@ -164,6 +174,9 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
+     } else {
+       stream.nextOut = buf.at(off)
+     }
++    if (inBuf != null && inBuf.length > 0)
++      stream.nextIn =
++        inBuf.at(inOff + (stream.totalIn.toLong - inTotalAtSet).toInt)
+     val err = zlib.inflate(stream, zlib.Z_SYNC_FLUSH)
+ 
+     if (err != zlib.Z_OK) {
+diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala
+new file mode 100644
+index 00000000..1587013d
+--- /dev/null
++++ b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala
+@@ -0,0 +1,153 @@
++package scala.scalanative.nio.fs.zip
++
++import java.io.{ByteArrayOutputStream, File}
++import java.lang.Iterable
++import java.nio.file.attribute.UserPrincipalLookupService
++import java.nio.file.spi.FileSystemProvider
++import java.nio.file.{
++  FileStore, FileSystem, NoSuchFileException, Path, PathMatcher,
++  PathMatcherImpl, WatchService
++}
++import java.util.zip.{ZipEntry, ZipFile}
++import java.{util => ju}
++
++import scala.collection.mutable
++
++/** A read-only view of a single jar/zip file as a [[FileSystem]], backed by
++ *  [[java.util.zip.ZipFile]] (already a real, tested Scala Native javalib
++ *  port -- see ZipFileSystemProvider for why this makes the rest of the
++ *  provider small). Directory entries need not be physically present in the
++ *  archive (most real-world jars omit them); every intermediate directory
++ *  implied by a file entry's path is synthesized from that entry's name.
++ */
++final class ZipFileSystem private[zip] (
++    fsProvider: FileSystemProvider,
++    private[zip] val jarPath: String
++) extends FileSystem {
++  private val zipFile = new ZipFile(new File(jarPath))
++
++  @volatile private var closed = false
++
++  // Directory entry names (no leading/trailing "/", "" = archive root) to
++  // their direct children's simple names, sorted for deterministic listing.
++  private val childrenIndex: Map[String, Vector[String]] = {
++    val children =
++      mutable.Map.empty[String, mutable.LinkedHashSet[String]]
++
++    def addChild(parent: String, simpleName: String): Unit =
++      children
++        .getOrElseUpdate(parent, mutable.LinkedHashSet.empty[String])
++        .add(simpleName)
++
++    def registerDirsOf(name: String): Unit = {
++      var idx = name.indexOf('/')
++      while (idx >= 0) {
++        val dir = name.substring(0, idx)
++        val dirSlash = dir.lastIndexOf('/')
++        val dirParent = if (dirSlash < 0) "" else dir.substring(0, dirSlash)
++        val dirSimple = if (dirSlash < 0) dir else dir.substring(dirSlash + 1)
++        addChild(dirParent, dirSimple)
++        idx = name.indexOf('/', idx + 1)
++      }
++    }
++
++    val en = zipFile.entries()
++    while (en.hasMoreElements()) {
++      val raw = en.nextElement().getName()
++      val name = if (raw.endsWith("/")) raw.substring(0, raw.length - 1) else raw
++      if (name.nonEmpty) {
++        val slash = name.lastIndexOf('/')
++        val parent = if (slash < 0) "" else name.substring(0, slash)
++        val simple = if (slash < 0) name else name.substring(slash + 1)
++        addChild(parent, simple)
++        registerDirsOf(name)
++      }
++    }
++
++    children.view.mapValues(_.toVector.sorted).toMap
++  }
++
++  private[zip] def isDir(normalizedEntryPath: String): Boolean =
++    normalizedEntryPath.isEmpty || childrenIndex.contains(normalizedEntryPath)
++
++  private[zip] def exists(normalizedEntryPath: String): Boolean =
++    isDir(normalizedEntryPath) ||
++      zipFile.getEntry(normalizedEntryPath) != null
++
++  private[zip] def entryOf(normalizedEntryPath: String): ZipEntry =
++    zipFile.getEntry(normalizedEntryPath)
++
++  private[zip] def childrenOf(dir: String): Vector[String] =
++    childrenIndex.getOrElse(dir, Vector.empty)
++
++  private[zip] def readEntryBytes(normalizedEntryPath: String): Array[Byte] = {
++    val entry = entryOf(normalizedEntryPath)
++    if (entry == null)
++      throw new NoSuchFileException(normalizedEntryPath)
++    val in = zipFile.getInputStream(entry)
++    try {
++      val initialSize = Math.max(32L, entry.getSize()).min(Int.MaxValue).toInt
++      val out = new ByteArrayOutputStream(initialSize)
++      val buf = new Array[Byte](8192)
++      var n = in.read(buf)
++      while (n != -1) {
++        out.write(buf, 0, n)
++        n = in.read(buf)
++      }
++      out.toByteArray()
++    } finally in.close()
++  }
++
++  override def provider(): FileSystemProvider = fsProvider
++
++  override def close(): Unit =
++    if (!closed) {
++      closed = true
++      zipFile.close()
++      ZipFileSystemProvider.unregister(this)
++    }
++
++  override def getFileStores(): Iterable[FileStore] =
++    new ju.LinkedList[FileStore]()
++
++  override def getUserPrincipalLookupService(): UserPrincipalLookupService =
++    throw new UnsupportedOperationException()
++
++  override def getPath(first: String, more: Array[String]): Path = {
++    if (more.length == 0) new ZipPath(this, first)
++    else {
++      val sb = new StringBuilder(first)
++      more.foreach { element =>
++        if (element.length > 0) {
++          if (sb.length() > 0) sb.append('/')
++          sb.append(element)
++        }
++      }
++      new ZipPath(this, sb.toString())
++    }
++  }
++
++  override def getPathMatcher(syntaxAndPattern: String): PathMatcher =
++    PathMatcherImpl(syntaxAndPattern)
++
++  override def getRootDirectories(): Iterable[Path] = {
++    val list = new ju.LinkedList[Path]()
++    list.add(new ZipPath(this, "/"))
++    list
++  }
++
++  override def getSeparator(): String = "/"
++
++  override def isOpen(): Boolean = !closed
++
++  override def isReadOnly(): Boolean = true
++
++  override def newWatchService(): WatchService =
++    throw new UnsupportedOperationException()
++
++  override def supportedFileAttributeViews(): ju.Set[String] = {
++    val set = new ju.HashSet[String]()
++    set.add("basic")
++    set
++  }
++}
+diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystemProvider.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystemProvider.scala
+new file mode 100644
+index 00000000..b4404057
+--- /dev/null
++++ b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystemProvider.scala
+@@ -0,0 +1,392 @@
++package scala.scalanative.nio.fs.zip
++
++import java.io.File
++import java.net.URI
++import java.nio.ByteBuffer
++import java.nio.channels.{
++  ClosedChannelException, NonWritableChannelException, SeekableByteChannel
++}
++import java.nio.file._
++import java.nio.file.attribute._
++import java.nio.file.spi.FileSystemProvider
++import java.util.concurrent.ConcurrentHashMap
++import java.util.{Map => JMap, Set => JSet}
++
++/** Minimal, read-only "jar:" FileSystemProvider.
++ *
++ *  Scope, deliberately: enough to make `java.nio.file.FileSystems.newFileSystem
++ *  (URI("jar:file:/x.jar"), _)` / `Files.walk` / `Files.readAllBytes` work
++ *  against a jar's entries -- the exact surface `scala.scalanative.io.
++ *  VirtualDirectory.jar` (see util/src/main/scala/scala/scalanative/io/
++ *  VirtualDirectory.scala) needs, and the gap scala-native's own `tools`
++ *  project comment and linker (ClassLoader.fromDisk -> VirtualDirectory$.jar)
++ *  hit as `ProviderNotFoundException`. Not implemented: writing into a jar,
++ *  symbolic links, `getPath(URI)` beyond the plain "jar:file:...!/entry" form.
++ *  Reading is delegated entirely to `java.util.zip.ZipFile`, which is a real,
++ *  tested Scala Native javalib port already -- this class is just NIO
++ *  plumbing (Path/FileSystem/Provider) around it.
++ */
++class ZipFileSystemProvider extends FileSystemProvider {
++  import ZipFileSystemProvider._
++
++  override def getScheme(): String = "jar"
++
++  override def newFileSystem(uri: URI, env: JMap[String, _]): FileSystem = {
++    // Deliberately does NOT enforce real zipfs's usual "one filesystem per
++    // path, second open throws FileSystemAlreadyExistsException" rule.
++    // scala-native's own linker (VirtualDirectory.jar, opened for the whole
++    // link's duration to read .nir classpath entries) and its native-library
++    // unpacker (NativeLib/IO.unzip, opened per compile) can both legitimately
++    // want the SAME physical jar open at once -- e.g. a nativelib jar is both
++    // a classpath entry and a bundle of C sources to unpack. Since this
++    // provider is read-only (no writes to conflict), each open is just an
++    // independent `java.util.zip.ZipFile` (its own RandomAccessFile handle)
++    // over the same bytes -- safe to allow concurrently, unlike a writable
++    // zipfs where JDK's exclusivity rule actually prevents real corruption.
++    val jarPath = jarPathOf(uri)
++    val fs = new ZipFileSystem(this, jarPath)
++    registry.put(keyOf(jarPath), fs)
++    fs
++  }
++
++  override def getFileSystem(uri: URI): FileSystem = {
++    // Best-effort only: returns whichever open filesystem for this path was
++    // last created (or registered again on close-of-an-older-one, see
++    // `unregister`), not "the" filesystem -- there may be several
++    // simultaneously open. Only relied on by `getPath`, not by any real
++    // caller in this codebase (VirtualDirectory.jar/IO.unzip both work
++    // entirely off the FileSystem `newFileSystem` itself returns).
++    val jarPath = jarPathOf(uri)
++    registry.get(keyOf(jarPath)) match {
++      case null => throw new FileSystemNotFoundException(jarPath)
++      case fs   => fs
++    }
++  }
++
++  override def getPath(uri: URI): Path = {
++    val jarPath = jarPathOf(uri)
++    val entry = entryPathOf(uri)
++    val fs = getFileSystem(uri).asInstanceOf[ZipFileSystem]
++    fs.getPath(entry, Array.empty)
++  }
++
++  override def newFileSystem(path: Path, env: JMap[String, _]): FileSystem =
++    newFileSystem(URI.create(s"jar:${path.toUri()}"), env)
++
++  override def newByteChannel(
++      path: Path,
++      options: JSet[_ <: OpenOption],
++      attrs: Array[FileAttribute[_]]
++  ): SeekableByteChannel = {
++    val writeRequested = {
++      val it = options.iterator()
++      var found = false
++      while (it.hasNext() && !found) {
++        it.next() match {
++          case StandardOpenOption.WRITE | StandardOpenOption.APPEND |
++              StandardOpenOption.CREATE | StandardOpenOption.CREATE_NEW |
++              StandardOpenOption.DELETE_ON_CLOSE =>
++            found = true
++          case _ => ()
++        }
++      }
++      found
++    }
++    if (writeRequested) throw new ReadOnlyFileSystemException()
++
++    val zp = asZipPath(path)
++    val norm = zp.normalizedEntryPath
++    if (zp.zfs.isDir(norm))
++      throw new java.io.IOException(s"Is a directory: $path")
++    if (!zp.zfs.exists(norm)) throw new NoSuchFileException(path.toString())
++
++    new InMemoryByteChannel(zp.zfs.readEntryBytes(norm))
++  }
++
++  override def newDirectoryStream(
++      dir: Path,
++      filter: DirectoryStream.Filter[_ >: Path]
++  ): DirectoryStream[Path] = {
++    val zp = asZipPath(dir)
++    val norm = zp.normalizedEntryPath
++    if (!zp.zfs.isDir(norm)) throw new NotDirectoryException(dir.toString())
++
++    val children = new java.util.ArrayList[Path]()
++    zp.zfs.childrenOf(norm).foreach(name => children.add(zp.resolveChild(name)))
++    new DirectoryStreamImpl[Path](children.stream(), filter)
++  }
++
++  override def createDirectory(
++      dir: Path,
++      attrs: Array[FileAttribute[_]]
++  ): Unit = throw new ReadOnlyFileSystemException()
++
++  override def delete(path: Path): Unit =
++    throw new ReadOnlyFileSystemException()
++
++  override def copy(source: Path, target: Path, options: Array[CopyOption]): Unit =
++    throw new ReadOnlyFileSystemException()
++
++  override def move(source: Path, target: Path, options: Array[CopyOption]): Unit =
++    throw new ReadOnlyFileSystemException()
++
++  override def isSameFile(path: Path, path2: Path): Boolean =
++    (path, path2) match {
++      case (a: ZipPath, b: ZipPath) =>
++        a.zfs == b.zfs && a.normalizedEntryPath == b.normalizedEntryPath
++      case _ => false
++    }
++
++  override def isHidden(path: Path): Boolean = {
++    val zp = asZipPath(path)
++    val name = zp.getFileName()
++    name != null && name.toString.startsWith(".")
++  }
++
++  override def checkAccess(path: Path, modes: Array[AccessMode]): Unit = {
++    val zp = asZipPath(path)
++    val norm = zp.normalizedEntryPath
++    if (!zp.zfs.exists(norm)) throw new NoSuchFileException(path.toString())
++    if (modes.contains(AccessMode.WRITE) || modes.contains(AccessMode.EXECUTE))
++      throw new AccessDeniedException(path.toString())
++  }
++
++  override def getFileAttributeView[V <: FileAttributeView](
++      path: Path,
++      tpe: Class[V],
++      options: Array[LinkOption]
++  ): V = {
++    val zp = asZipPath(path)
++    if (tpe == classOf[BasicFileAttributeView]) {
++      val view = new BasicFileAttributeView {
++        override def name(): String = "basic"
++        override def readAttributes(): BasicFileAttributes =
++          attributesOf(zp)
++        override def setTimes(
++            lastModifiedTime: FileTime,
++            lastAccessTime: FileTime,
++            createTime: FileTime
++        ): Unit = throw new ReadOnlyFileSystemException()
++        // The FileAttributeView default routes getAttribute()/asMap through
++        // an empty map -- Files.getAttribute("basic:size", ...) (which
++        // Files.size()/readAllBytes() depend on) goes through exactly this,
++        // not readAttributes(), so it must be overridden too.
++        override def asMap: JMap[String, Object] = attributesMapOf(zp)
++      }
++      view.asInstanceOf[V]
++    } else if (tpe == classOf[PosixFileAttributeView]) {
++      // Files.copy() (used by IO.unzip's copyRecursive, in turn used to
++      // unpack native-library jars for the C compile step) unconditionally
++      // reads PosixFileAttributes on non-Windows -- returning null here (as
++      // an unsupported view) surfaces as a bare NullPointerException deep in
++      // Files.readAttributes, not a clean UnsupportedOperationException, so
++      // this must be a real, if synthetic (jar entries have no real POSIX
++      // metadata), PosixFileAttributeView.
++      val view = new PosixFileAttributeView {
++        override def name(): String = "posix"
++        override def readAttributes(): PosixFileAttributes =
++          posixAttributesOf(zp)
++        override def setTimes(
++            lastModifiedTime: FileTime,
++            lastAccessTime: FileTime,
++            createTime: FileTime
++        ): Unit = throw new ReadOnlyFileSystemException()
++        override def setPermissions(
++            perms: JSet[PosixFilePermission]
++        ): Unit = throw new ReadOnlyFileSystemException()
++        override def setGroup(group: GroupPrincipal): Unit =
++          throw new ReadOnlyFileSystemException()
++        override def getOwner(): UserPrincipal = syntheticPrincipal
++        override def setOwner(owner: UserPrincipal): Unit =
++          throw new ReadOnlyFileSystemException()
++        override def asMap: JMap[String, Object] = attributesMapOf(zp)
++      }
++      view.asInstanceOf[V]
++    } else null.asInstanceOf[V]
++  }
++
++  override def readAttributes[A <: BasicFileAttributes](
++      path: Path,
++      tpe: Class[A],
++      options: Array[LinkOption]
++  ): A = {
++    val zp = asZipPath(path)
++    if (tpe == classOf[BasicFileAttributes]) attributesOf(zp).asInstanceOf[A]
++    else if (tpe == classOf[PosixFileAttributes])
++      posixAttributesOf(zp).asInstanceOf[A]
++    else throw new UnsupportedOperationException(tpe.getName())
++  }
++
++  override def readAttributes(
++      path: Path,
++      attributes: String,
++      options: Array[LinkOption]
++  ): JMap[String, Object] = attributesMapOf(asZipPath(path))
++
++  private def attributesMapOf(zp: ZipPath): JMap[String, Object] = {
++    val attrs = attributesOf(zp)
++    val map = new java.util.HashMap[String, Object]()
++    map.put("isDirectory", Boolean.box(attrs.isDirectory()))
++    map.put("isRegularFile", Boolean.box(attrs.isRegularFile()))
++    map.put("isSymbolicLink", Boolean.box(attrs.isSymbolicLink()))
++    map.put("isOther", Boolean.box(attrs.isOther()))
++    map.put("size", Long.box(attrs.size()))
++    map.put("lastModifiedTime", attrs.lastModifiedTime())
++    map.put("lastAccessTime", attrs.lastAccessTime())
++    map.put("creationTime", attrs.creationTime())
++    map.put("fileKey", attrs.fileKey())
++    map
++  }
++
++  override def setAttribute(
++      path: Path,
++      attribute: String,
++      value: Object,
++      options: Array[LinkOption]
++  ): Unit = throw new ReadOnlyFileSystemException()
++
++  private def attributesOf(zp: ZipPath): BasicFileAttributes = {
++    val norm = zp.normalizedEntryPath
++    val zfs = zp.zfs
++    if (!zfs.exists(norm)) throw new NoSuchFileException(zp.toString())
++    val isDir = zfs.isDir(norm)
++    val entry = zfs.entryOf(norm)
++    val mtime = FileTime.fromMillis(if (entry != null) entry.getTime() else 0L)
++    val entrySize = if (isDir || entry == null) 0L else entry.getSize()
++
++    new BasicFileAttributes {
++      override def creationTime(): FileTime = mtime
++      override def fileKey(): Object = norm
++      override def isDirectory(): Boolean = isDir
++      override def isOther(): Boolean = false
++      override def isRegularFile(): Boolean = !isDir
++      override def isSymbolicLink(): Boolean = false
++      override def lastAccessTime(): FileTime = mtime
++      override def lastModifiedTime(): FileTime = mtime
++      override def size(): Long = entrySize
++    }
++  }
++
++  private def posixAttributesOf(zp: ZipPath): PosixFileAttributes = {
++    val norm = zp.normalizedEntryPath
++    val zfs = zp.zfs
++    if (!zfs.exists(norm)) throw new NoSuchFileException(zp.toString())
++    val isDir = zfs.isDir(norm)
++    val entry = zfs.entryOf(norm)
++    val mtime = FileTime.fromMillis(if (entry != null) entry.getTime() else 0L)
++    val entrySize = if (isDir || entry == null) 0L else entry.getSize()
++    // Jar entries carry no real POSIX metadata -- a fixed, read-only mode
++    // (world-readable, +x on directories for traversal) is enough for
++    // IO.unzip's copyRecursive to extract entries correctly; nothing in this
++    // provider's real callers inspects permissions beyond that.
++    val perms = PosixFilePermissions.fromString(
++      if (isDir) "r-xr-xr-x" else "r--r--r--"
++    )
++
++    new PosixFileAttributes {
++      override def creationTime(): FileTime = mtime
++      override def fileKey(): Object = norm
++      override def isDirectory(): Boolean = isDir
++      override def isOther(): Boolean = false
++      override def isRegularFile(): Boolean = !isDir
++      override def isSymbolicLink(): Boolean = false
++      override def lastAccessTime(): FileTime = mtime
++      override def lastModifiedTime(): FileTime = mtime
++      override def size(): Long = entrySize
++      override def group(): GroupPrincipal = syntheticPrincipal
++      override def owner(): UserPrincipal = syntheticPrincipal
++      override def permissions(): JSet[PosixFilePermission] = perms
++    }
++  }
++
++  private val syntheticPrincipal: UserPrincipal & GroupPrincipal =
++    new UserPrincipal with GroupPrincipal {
++      override def getName(): String = "nobody"
++    }
++
++  private def asZipPath(path: Path): ZipPath = path match {
++    case zp: ZipPath => zp
++    case _           => throw new ProviderMismatchException()
++  }
++}
++
++object ZipFileSystemProvider {
++  private val registry = new ConcurrentHashMap[String, ZipFileSystem]()
++
++  private[zip] def unregister(fs: ZipFileSystem): Unit =
++    registry.remove(keyOf(fs.jarPath), fs)
++
++  /** Extract the underlying jar's local file path from a "jar:file:...[!/entry]"
++   *  URI. Deliberately string-based rather than relying on java.net.URI's
++   *  opaque-vs-hierarchical parsing of the nested "file:" URI, which
++   *  "jar:file:/x.jar" (single leading slash, no authority) sits right at the
++   *  edge of.
++   */
++  private def jarPathOf(uri: URI): String = {
++    val s = uri.toString
++    if (!s.startsWith("jar:"))
++      throw new IllegalArgumentException(s"Not a jar: URI: $uri")
++    val rest = s.substring(4)
++    val bang = rest.indexOf("!/")
++    val fileUriStr = if (bang >= 0) rest.substring(0, bang) else rest
++    if (!fileUriStr.startsWith("file:"))
++      throw new IllegalArgumentException(s"Unsupported nested scheme: $uri")
++    new File(new URI(fileUriStr)).getPath()
++  }
++
++  private def entryPathOf(uri: URI): String = {
++    val s = uri.toString
++    val bang = s.indexOf("!/")
++    if (bang < 0) "/" else s.substring(bang + 1)
++  }
++
++  private def keyOf(jarPath: String): String =
++    new File(jarPath).getAbsolutePath()
++
++  /** A fully in-memory, read-only SeekableByteChannel over a jar entry's
++   *  decompressed bytes. `java.util.zip.ZipFile#getInputStream` is not
++   *  seekable, and archive entries read by this provider (compiled .nir/
++   *  .class files) are small, so eager, whole-entry buffering keeps this
++   *  provider simple instead of layering a seek emulation atop Inflater.
++   */
++  private final class InMemoryByteChannel(data: Array[Byte])
++      extends SeekableByteChannel {
++    private var pos: Int = 0
++    private var open: Boolean = true
++
++    override def isOpen(): Boolean = open
++    override def close(): Unit = open = false
++
++    private def ensureOpen(): Unit =
++      if (!open) throw new ClosedChannelException()
++
++    override def read(dst: ByteBuffer): Int = {
++      ensureOpen()
++      if (pos >= data.length) -1
++      else {
++        val n = math.min(dst.remaining(), data.length - pos)
++        dst.put(data, pos, n)
++        pos += n
++        n
++      }
++    }
++
++    override def write(src: ByteBuffer): Int =
++      throw new NonWritableChannelException()
++
++    override def position(): Long = { ensureOpen(); pos.toLong }
++
++    override def position(newPosition: Long): SeekableByteChannel = {
++      ensureOpen()
++      if (newPosition < 0 || newPosition > Int.MaxValue)
++        throw new IllegalArgumentException(newPosition.toString)
++      pos = newPosition.toInt
++      this
++    }
++
++    override def size(): Long = { ensureOpen(); data.length.toLong }
++
++    override def truncate(size: Long): SeekableByteChannel =
++      throw new NonWritableChannelException()
++  }
++}
+diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipPath.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipPath.scala
+new file mode 100644
+index 00000000..2fb46bce
+--- /dev/null
++++ b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipPath.scala
+@@ -0,0 +1,273 @@
++package scala.scalanative.nio.fs.zip
++
++import java.io.File
++import java.net.URI
++import java.nio.file._
++import java.util.Iterator
++
++// Minimal read-only Path implementation for entries inside a jar:// / zip://
++// filesystem. Path semantics (root "/", separator "/", "." / ".." handling)
++// mirror scala.scalanative.nio.fs.unix.UnixPath exactly -- the only real
++// differences are toUri()/toFile()/toRealPath(), which point at the entry's
++// virtual location inside the archive rather than a real OS path.
++final class ZipPath private[zip] (
++    private[zip] val zfs: ZipFileSystem,
++    rawPath: String
++) extends Path {
++  import ZipPath._
++
++  private[zip] lazy val path: String = removeRedundantSlashes(rawPath)
++
++  private lazy val offsets =
++    if (path.isEmpty()) Array(-1, 0)
++    else if (path == "/") Array(0)
++    else {
++      var i = 0
++      var count = 1
++      while ({
++        count += 1
++        i = path.indexOf('/', i + 1)
++        i != -1
++      }) ()
++      val result = new Array[Int](count)
++      i = if (path.charAt(0) == '/') 0 else -1
++      var j = 0
++      while ({
++        result(j) = i
++        i = path.indexOf('/', i + 1)
++        j += 1
++        i != -1
++      }) ()
++      result(count - 1) = path.length
++      result
++    }
++
++  private lazy val _isAbsolute = rawPath.startsWith("/")
++
++  private lazy val root =
++    if (isAbsolute()) new ZipPath(zfs, "/") else null
++
++  private lazy val fileName =
++    if (path == "/") null
++    else if (path.isEmpty()) this
++    else new ZipPath(zfs, path.split("/").last)
++
++  private lazy val parent = {
++    val nameCount = getNameCount()
++    if (nameCount == 0 || (nameCount == 1 && !isAbsolute())) null
++    else if (isAbsolute())
++      new ZipPath(zfs, "/" + subpath(0, nameCount - 1).toString)
++    else subpath(0, nameCount - 1)
++  }
++
++  private lazy val normalizedPath = new ZipPath(zfs, normalized(this))
++
++  private lazy val absPath =
++    if (path.startsWith("/")) this else new ZipPath(zfs, "/" + path)
++
++  /** Entry name as used by java.util.zip.ZipFile: no leading or trailing
++   *  "/", "" for the archive root.
++   */
++  private[zip] lazy val normalizedEntryPath: String = {
++    val n = normalizedPath.path
++    val noLeading = if (n.startsWith("/")) n.substring(1) else n
++    if (noLeading.endsWith("/")) noLeading.substring(0, noLeading.length - 1)
++    else noLeading
++  }
++
++  private[zip] def resolveChild(name: String): ZipPath =
++    new ZipPath(zfs, path + (if (path.endsWith("/")) "" else "/") + name)
++
++  override def getFileSystem(): FileSystem = zfs
++
++  override def isAbsolute(): Boolean = _isAbsolute
++
++  override def getRoot(): Path = root
++
++  override def getFileName(): Path = fileName
++
++  override def getParent(): Path = parent
++
++  override def getNameCount(): Int = offsets.size - 1
++
++  @inline private def getNameString(index: Int): String = {
++    val nameCount = getNameCount()
++    if (index < 0 || nameCount == 0 || index >= nameCount)
++      throw new IllegalArgumentException
++    else {
++      if (path.isEmpty()) null
++      else path.substring(offsets(index) + 1, offsets(index + 1))
++    }
++  }
++
++  override def getName(index: Int): Path = getNameString(index) match {
++    case null => this
++    case n    => new ZipPath(zfs, n)
++  }
++
++  override def subpath(beginIndex: Int, endIndex: Int): Path =
++    new ZipPath(zfs, (beginIndex until endIndex).map(getName).mkString("/"))
++
++  override def startsWith(other: Path): Boolean =
++    if (zfs.provider() == other.getFileSystem().provider()) {
++      val otherLength = other.getNameCount()
++      val thisLength = getNameCount()
++
++      if (otherLength > thisLength) false
++      else if (isAbsolute() ^ other.isAbsolute()) false
++      else (0 until otherLength).forall(i => getName(i) == other.getName(i))
++    } else false
++
++  override def startsWith(other: String): Boolean =
++    startsWith(new ZipPath(zfs, other))
++
++  override def endsWith(other: Path): Boolean =
++    if (zfs.provider() == other.getFileSystem().provider()) {
++      val otherLength = other.getNameCount()
++      val thisLength = getNameCount()
++      if (otherLength > thisLength) false
++      else if (!other.isAbsolute()) {
++        (0 until otherLength).forall(i =>
++          getName(thisLength - 1 - i) == other.getName(otherLength - 1 - i)
++        )
++      } else if (isAbsolute()) this == other
++      else false
++    } else false
++
++  override def endsWith(other: String): Boolean =
++    endsWith(new ZipPath(zfs, other))
++
++  override def normalize(): Path = normalizedPath
++
++  override def resolve(other: Path): Path =
++    if (other.isAbsolute() || path.isEmpty()) other
++    else if (other.toString.isEmpty()) this
++    else new ZipPath(zfs, path + "/" + other.toString())
++
++  override def resolve(other: String): Path =
++    resolve(new ZipPath(zfs, other))
++
++  override def resolveSibling(other: Path): Path = {
++    val p = getParent()
++    if (p == null) other else p.resolve(other)
++  }
++
++  override def resolveSibling(other: String): Path =
++    resolveSibling(new ZipPath(zfs, other))
++
++  override def relativize(other: Path): Path = {
++    if (isAbsolute() ^ other.isAbsolute()) {
++      throw new IllegalArgumentException("'other' is different type of Path")
++    } else {
++      val normThis = new ZipPath(zfs, ZipPath.normalized(this))
++      if (normThis.toString.isEmpty()) other
++      else if (other.startsWith(normThis))
++        other.subpath(getNameCount(), other.getNameCount())
++      else if (normThis.getParent() == null)
++        new ZipPath(zfs, "../" + other.toString())
++      else {
++        val next = normThis.getParent().relativize(other).toString()
++        if (next.isEmpty()) new ZipPath(zfs, "..")
++        else new ZipPath(zfs, "../" + next)
++      }
++    }
++  }
++
++  override def toAbsolutePath(): Path = absPath
++
++  // No symlinks in a zip archive; a real path is just the normalized,
++  // absolute one.
++  override def toRealPath(options: Array[LinkOption]): Path = {
++    val p = normalizedPath.toAbsolutePath().asInstanceOf[ZipPath]
++    if (zfs.exists(p.normalizedEntryPath)) p
++    else throw new NoSuchFileException(p.path)
++  }
++
++  def register(
++      watcher: WatchService,
++      events: Array[WatchEvent.Kind[_]]
++  ): WatchKey =
++    register(watcher, events, Array.empty)
++
++  def register(
++      watcher: WatchService,
++      events: Array[WatchEvent.Kind[_]],
++      modifiers: Array[WatchEvent.Modifier]
++  ): WatchKey =
++    throw new ProviderMismatchException
++
++  override def toFile(): File = new File(zfs.jarPath + "!" + path)
++
++  override def toUri(): URI =
++    URI.create(s"jar:${new File(zfs.jarPath).toURI()}!${absPath.toString}")
++
++  override def iterator(): Iterator[Path] =
++    new Iterator[Path] {
++      private var i: Int = 0
++      override def remove(): Unit = throw new UnsupportedOperationException()
++      override def hasNext(): Boolean = i < getNameCount()
++      override def next(): Path =
++        if (hasNext()) { val n = getName(i); i += 1; n }
++        else throw new NoSuchElementException()
++    }
++
++  override def compareTo(other: Path): Int =
++    if (zfs.provider() == other.getFileSystem().provider())
++      this.toString().compareTo(other.toString)
++    else throw new ClassCastException()
++
++  override def equals(obj: Any): Boolean =
++    obj match {
++      case other: ZipPath => this.zfs == other.zfs && this.path == other.path
++      case _              => false
++    }
++
++  override def hashCode(): Int = zfs.## * 31 + path.##
++
++  override def toString(): String = path
++}
++
++private object ZipPath {
++  def normalized(path: ZipPath): String = {
++    if (path.path.length < 2) return path.path
++    val absolute = path.path.startsWith("/")
++    val components =
++      (0 until path.offsets.size - 1)
++        .map(path.getNameString)
++        .foldLeft(List.empty[String]) {
++          case (acc, "..") =>
++            if (acc.isEmpty && absolute) Nil
++            else if (acc.isEmpty) List("..")
++            else if (acc.last == "..") acc :+ ".."
++            else acc.tail
++          case (acc, ".") => acc
++          case (acc, "")  => acc
++          case (acc, seg) => seg :: acc
++        }
++        .reverse
++    if (absolute) components.mkString("/", "/", "")
++    else components.mkString("", "/", "")
++  }
++
++  def removeRedundantSlashes(str: String): String =
++    if (str.length < 2) str
++    else {
++      str.indexOf("//") match {
++        case -1 =>
++          if (str.endsWith("/")) str.substring(0, str.length - 1) else str
++        case idx =>
++          val buffer: StringBuffer = new StringBuffer(str)
++          var previous = '/'
++          var i = idx + 1
++          while (i < buffer.length()) {
++            val current = buffer.charAt(i)
++            if (previous == '/' && current == '/') buffer.deleteCharAt(i)
++            else { previous = current; i += 1 }
++          }
++          val result = buffer.toString
++          if (result.length > 1 && result.endsWith("/"))
++            result.substring(0, result.length - 1)
++          else result
++      }
++    }
++}

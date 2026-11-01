@@ -63,15 +63,15 @@ jobs:
 
       - uses: ./.github/actions/memory-watchdog
 
-      # The patched javalib/nativelib (01b/01c) take ~8 min to build on macOS
-      # and only change with the scala-native patches, so keep what they
-      # publish to ~/.ivy2/local.
+      # Scala Native, built from source with our patches (01a), takes ~8 min on
+      # macOS and only changes with the patches and the pinned commit, so keep
+      # what it publishes to ~/.ivy2/local.
       - name: Cache patched scala-native libs
         id: sn-cache
         uses: actions/cache@v4
         with:
           path: ~/.ivy2/local/org.scala-native
-          key: scalino-sn-published-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('patches/scala-native-*.patch', 'versions.env', 'build/01b-build-patched-javalib.sh', 'build/01c-build-patched-nativelib.sh') }}
+          key: scalino-sn-published-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('patches/scala-native-*.patch', 'versions.env', 'build/01a-publish-scala-native.sh') }}
 
       - name: Build toolchain (core)
         shell: bash

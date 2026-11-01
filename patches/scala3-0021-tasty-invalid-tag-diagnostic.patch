@@ -1,8 +1,8 @@
 diff --git a/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala b/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
-index 98a9de45..514a87a0 100644
+index 16cc83bc13..30fadcb5f0 100644
 --- a/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
 +++ b/compiler/src/dotty/tools/dotc/core/tasty/TreeUnpickler.scala
-@@ -509,6 +509,25 @@ class TreeUnpickler(reader: TastyReader,
+@@ -508,6 +508,25 @@ class TreeUnpickler(reader: TastyReader,
            if isBestEffortTasty then new PreviousErrorType
            else throw new Error(s"Illegal ERRORtype in non Best Effort TASTy file")
          case _ =>

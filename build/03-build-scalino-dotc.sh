@@ -12,7 +12,7 @@
 # what was, until this cutover, a separate opt-in experiment at
 # build/selfhost/build-dotc.sh, now removed).
 #
-# Prereqs: 00b-setup-vendor.sh, 01-fetch-deps.sh, 01b-build-patched-javalib.sh,
+# Prereqs: 00b-setup-vendor.sh, 01-fetch-deps.sh, 01a-publish-scala-native.sh,
 # 02-build-java-base.sh, 02b-gen-megaphase-overrides.sh,
 # 04-build-scalino-linkdriver.sh (dotc's own link step below runs LinkDriver
 # directly on the JVM, the same way 04's own second step links LinkDriver
@@ -39,14 +39,14 @@ LINK_WORK="$SELFHOST_DIR/link-work"
 
 # Substitute the published javalib_native0.5_3 jar for the locally-built one
 # with patches/scala-native-0003 (UnixPath/WindowsPath#toUri missing "//"
-# authority) actually applied -- see build/01b-build-patched-javalib.sh.
+# authority) actually applied -- see build/01a-publish-scala-native.sh.
 # Scoped to a copy of nativelibs.cp under $SELFHOST_DIR; $WORK/nativelibs.cp
 # itself is left untouched (still what 06-package.sh vendors for user-code
 # compilation, unaffected by which jar scalino-dotc's own build used).
 NATIVELIBS_CP="$SELFHOST_DIR/nativelibs.cp"
-LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
+LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  # -F/-x, not the old -v '/javalib_native0\.5_3-' regex: 01b-build-patched-javalib.sh
+  # -F/-x, not the old -v '/javalib_native0\.5_3-' regex: 01a-publish-scala-native.sh
   # now rewrites $WORK/nativelibs.cp in place to already point straight at
   # $LOCAL_JAVALIB_JAR (its filename has no "-<version>" suffix, so that old
   # pattern no longer matches it there) -- appending it again unconditionally
@@ -60,7 +60,7 @@ if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
   cp "$WORK/nativelibs.cp" "$NATIVELIBS_CP"
-  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01b-build-patched-javalib.sh first, or patches/scala-native-0003 (URI fix) will NOT take effect. See docs/findings.md."
+  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01a-publish-scala-native.sh first, or patches/scala-native-0003 (URI fix) will NOT take effect. See docs/findings.md."
 fi
 
 echo "== generating self-hosted source file list =="
@@ -71,7 +71,10 @@ echo "== compiling dotc+nscplugin to NIR (bootstrap JVM dotc, real nscplugin jar
 rm -rf "$NIR_OUT"
 mkdir -p "$NIR_OUT"
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
+# The compiler sources of Scala 3.10+ are written for -Yexplicit-nulls (scala3/project/Build.scala); the
+# rest of the source set (nscplugin, nir, our patches) is not, hence unsafeNulls for the whole compile.
 "$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+  -Yexplicit-nulls -language:unsafeNulls -language:implicitConversions \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
   -Yretain-trees \

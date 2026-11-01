@@ -1,5 +1,5 @@
 diff --git a/compiler/src/dotty/tools/dotc/transform/Splicer.scala b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
-index 507c1811..057bf108 100644
+index 507c1811cb..057bf108d8 100644
 --- a/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 +++ b/compiler/src/dotty/tools/dotc/transform/Splicer.scala
 @@ -3,6 +3,7 @@ package transform

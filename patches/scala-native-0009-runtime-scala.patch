@@ -1,0 +1,1543 @@
+diff --git a/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala b/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
+index be8f9763..2e354ec7 100644
+--- a/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
++++ b/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
+@@ -68,6 +68,16 @@ object LinktimeInfo {
+   )
+   def isMultithreadingEnabled: Boolean = resolved
+ 
++  @resolvedAtLinktime(
++    "scala.scalanative.meta.linktimeinfo.isCompactHeaders"
++  )
++  def isCompactHeaders: Boolean = resolved
++
++  @resolvedAtLinktime(
++    "scala.scalanative.meta.linktimeinfo.isCompactByteArrays"
++  )
++  def isCompactByteArrays: Boolean = resolved
++
+   // Referenced in nscplugin and codegen
+   @resolvedAtLinktime(
+     "scala.scalanative.meta.linktimeinfo.contendedPaddingWidth"
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
+index 4f630f49..b51ccaae 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
+@@ -32,7 +32,7 @@ import scalanative.unsigned._
+ import scalanative.annotation.alwaysinline
+ import scala.scalanative.memory.SafeZone
+ import scala.scalanative.runtime.Intrinsics._
+-import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
++import scala.scalanative.meta.LinktimeInfo.{isCompactHeaders, isMultithreadingEnabled}
+ 
+ sealed abstract class Array[T]
+     extends java.io.Serializable
+@@ -224,7 +224,8 @@ object BooleanArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[BooleanArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 1)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 1)
+     array
+   }
+ 
+@@ -295,7 +296,8 @@ object CharArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[CharArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 2)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 2)
+     array
+   }
+ 
+@@ -324,7 +326,7 @@ final class ByteArray private () extends Array[Byte] {
+ 
+   @inline def atRawUnsafe(i: Int): RawPtr = {
+     val rawptr = castObjectToRawPtr(this)
+-    elemRawPtr(rawptr, MemoryLayout.Array.ValuesOffset + 1 * i)
++    elemRawPtr(rawptr, MemoryLayout.Array.ByteValuesOffset + 1 * i)
+   }
+ 
+   @inline def apply(i: Int): Byte = loadByte(atRaw(i))
+@@ -336,8 +338,8 @@ final class ByteArray private () extends Array[Byte] {
+     val arr     = GC.alloc_array(arrcls, castIntToRawSizeUnsigned(length), castIntToRawSize(1))
+     val src     = castObjectToRawPtr(this)
+     ffi.memcpy(
+-      elemRawPtr(arr, MemoryLayout.Array.ValuesOffset),
+-      elemRawPtr(src, MemoryLayout.Array.ValuesOffset),
++      elemRawPtr(arr, MemoryLayout.Array.ByteValuesOffset),
++      elemRawPtr(src, MemoryLayout.Array.ByteValuesOffset),
+       castIntToRawSizeUnsigned(1 * length)
+     )
+     val array = castRawPtrToObject(arr).asInstanceOf[ByteArray]
+@@ -362,11 +364,12 @@ object ByteArray {
+       throw new NegativeArraySizeException
+     }
+     val arrcls  = classOf[ByteArray]
+-    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.ValuesOffset + 1 * length)
++    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.ByteValuesOffset + 1 * length)
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[ByteArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 1)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 1)
+     array
+   }
+ 
+@@ -437,7 +440,8 @@ object ShortArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[ShortArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 2)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 2)
+     array
+   }
+ 
+@@ -508,7 +512,8 @@ object IntArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[IntArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 4)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 4)
+     array
+   }
+ 
+@@ -579,7 +584,8 @@ object LongArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[LongArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 8)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 8)
+     array
+   }
+ 
+@@ -650,7 +656,8 @@ object FloatArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[FloatArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 4)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 4)
+     array
+   }
+ 
+@@ -721,7 +728,8 @@ object DoubleArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[DoubleArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 8)
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), 8)
+     array
+   }
+ 
+@@ -792,7 +800,8 @@ object ObjectArray {
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[ObjectArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), castRawSizeToInt(Intrinsics.sizeOf[RawPtr]))
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), castRawSizeToInt(Intrinsics.sizeOf[RawPtr]))
+     array
+   }
+ 
+@@ -812,7 +821,7 @@ object ObjectArray {
+ final class BlobArray private () extends Array[Byte] {
+   @alwaysinline private def limitPtr: RawPtr = {
+     val rawptr = castObjectToRawPtr(this)
+-    elemRawPtr(rawptr, MemoryLayout.Array.StrideOffset)
++    elemRawPtr(rawptr, MemoryLayout.Array.BlobLimitOffset)
+   }
+   /** Maximal number of elements to scan by the garbage collector (best effort) */
+   @inline def scannableLimit: Int = -loadInt(limitPtr)
+@@ -841,7 +850,7 @@ final class BlobArray private () extends Array[Byte] {
+ 
+   @inline def atRawUnsafe(i: Int): RawPtr = {
+     val rawptr = castObjectToRawPtr(this)
+-    elemRawPtr(rawptr, MemoryLayout.Array.ValuesOffset + 1 * i)
++    elemRawPtr(rawptr, MemoryLayout.Array.BlobValuesOffset + 1 * i)
+   }
+ 
+   @inline def apply(i: Int): Byte = loadByte(atRaw(i))
+@@ -853,8 +862,8 @@ final class BlobArray private () extends Array[Byte] {
+     val arr     = GC.alloc_array(arrcls, castIntToRawSizeUnsigned(length), castIntToRawSize(1))
+     val src     = castObjectToRawPtr(this)
+     ffi.memcpy(
+-      elemRawPtr(arr, MemoryLayout.Array.ValuesOffset),
+-      elemRawPtr(src, MemoryLayout.Array.ValuesOffset),
++      elemRawPtr(arr, MemoryLayout.Array.BlobValuesOffset),
++      elemRawPtr(src, MemoryLayout.Array.BlobValuesOffset),
+       castIntToRawSizeUnsigned(1 * length)
+     )
+     val array = castRawPtrToObject(arr).asInstanceOf[BlobArray]
+@@ -881,7 +890,7 @@ object BlobArray {
+       throw new NegativeArraySizeException
+     }
+     val arrcls  = classOf[BlobArray]
+-    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.ValuesOffset + 1 * length)
++    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.BlobValuesOffset + 1 * length)
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[BlobArray]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
+index 9e06318a..8b72b9b7 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
+@@ -32,7 +32,7 @@ import scalanative.unsigned._
+ import scalanative.annotation.alwaysinline
+ import scala.scalanative.memory.SafeZone
+ import scala.scalanative.runtime.Intrinsics._
+-import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
++import scala.scalanative.meta.LinktimeInfo.{isCompactHeaders, isMultithreadingEnabled}
+ 
+ sealed abstract class Array[T]
+     extends java.io.Serializable
+@@ -179,6 +179,7 @@ object Array {
+ % for T, sizeT in types.items():
+ %{
+    Repr = 'Byte' if T == 'Blob' else T
++   ValuesOff = 'BlobValuesOffset' if T == 'Blob' else ('ByteValuesOffset' if T == 'Byte' else 'ValuesOffset')
+ }%
+ 
+ % if T == 'Blob':
+@@ -188,7 +189,7 @@ final class ${T}Array private () extends Array[${Repr}] {
+ % if T == 'Blob':
+   @alwaysinline private def limitPtr: RawPtr = {
+     val rawptr = castObjectToRawPtr(this)
+-    elemRawPtr(rawptr, MemoryLayout.Array.StrideOffset)
++    elemRawPtr(rawptr, MemoryLayout.Array.BlobLimitOffset)
+   }
+   /** Maximal number of elements to scan by the garbage collector (best effort) */
+   @inline def scannableLimit: Int = -loadInt(limitPtr)
+@@ -218,7 +219,7 @@ final class ${T}Array private () extends Array[${Repr}] {
+ 
+   @inline def atRawUnsafe(i: Int): RawPtr = {
+     val rawptr = castObjectToRawPtr(this)
+-    elemRawPtr(rawptr, MemoryLayout.Array.ValuesOffset + ${sizeT} * i)
++    elemRawPtr(rawptr, MemoryLayout.Array.${ValuesOff} + ${sizeT} * i)
+   }
+ 
+   @inline def apply(i: Int): ${Repr} = load${Repr}(atRaw(i))
+@@ -230,8 +231,8 @@ final class ${T}Array private () extends Array[${Repr}] {
+     val arr     = GC.alloc_array(arrcls, castIntToRawSizeUnsigned(length), castIntToRawSize(${sizeT}))
+     val src     = castObjectToRawPtr(this)
+     ffi.memcpy(
+-      elemRawPtr(arr, MemoryLayout.Array.ValuesOffset),
+-      elemRawPtr(src, MemoryLayout.Array.ValuesOffset),
++      elemRawPtr(arr, MemoryLayout.Array.${ValuesOff}),
++      elemRawPtr(src, MemoryLayout.Array.${ValuesOff}),
+       castIntToRawSizeUnsigned(${sizeT} * length)
+     )
+     val array = castRawPtrToObject(arr).asInstanceOf[${T}Array]
+@@ -262,14 +263,15 @@ object ${T}Array {
+       throw new NegativeArraySizeException
+     }
+     val arrcls  = classOf[${T}Array]
+-    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.ValuesOffset + ${sizeT} * length)
++    val arrsize = castIntToRawSizeUnsigned(MemoryLayout.Array.${ValuesOff} + ${sizeT} * length)
+     val arr = zone.allocImpl(castObjectToRawPtr(arrcls), arrsize)
+     val array = castRawPtrToObject(arr).asInstanceOf[${T}Array]
+     storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
+   % if T == 'Blob':
+     array.setScannableLimitUnsafe(length)
+   % else:
+-    storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), ${sizeT})
++    if (!isCompactHeaders)
++      storeInt(elemRawPtr(arr, MemoryLayout.Array.StrideOffset), ${sizeT})
+   % end
+     array
+   }
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
+index 587c5896..99484f3f 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
+@@ -26,7 +26,12 @@ private[runtime] object Backtrace {
+       preferredImageBase: Long = 0L
+   )
+ 
+-  private val dwarfInfo: Option[DwarfInfo] = processFile()
++  // A failure to read debug info must never fail this module's initializer:
++  // a module whose initializer threw stays "initializing" forever, so every
++  // later stack trace in the process would block on it instead of printing.
++  private val dwarfInfo: Option[DwarfInfo] =
++    try processFile()
++    catch { case _: Exception => None }
+ 
+   case class Position(linkageName: CString, filename: String, line: Int)
+   object Position {
+@@ -197,8 +202,38 @@ private[runtime] object Backtrace {
+   private final val ELF_MAGIC = 0x7f454c46
+   private final val MZ_MAGIC = 0x5a4d
+ 
++  /** argv[0] is only a usable path when it contains a '/'. A program started
++   *  through $PATH gets just its bare name, which would otherwise be looked up
++   *  relative to the current directory. */
++  private def executablePath(): String = {
++    // (link-time and runtime conditions can't be mixed in one expression)
++    if (LinktimeInfo.isLinux) {
++      if (new File("/proc/self/exe").exists()) "/proc/self/exe"
++      else argv0Path()
++    } else argv0Path()
++  }
++
++  private def argv0Path(): String = {
++    val argv0 = ExecInfo.filename
++    if (argv0.contains("/")) argv0
++    else {
++      val path = System.getenv("PATH")
++      val found =
++        if (path == null) None
++        else
++          path
++            .split(File.pathSeparator)
++            .iterator
++            .filter(_.nonEmpty)
++            .map(new File(_, argv0))
++            .find(f => f.isFile() && f.canExecute())
++      found.fold(argv0)(_.getPath())
++    }
++  }
++
+   private def processFile(): Option[DwarfInfo] = {
+-    implicit val bf: BinaryFile = new BinaryFile(new File(ExecInfo.filename))
++    val exePath = executablePath()
++    implicit val bf: BinaryFile = new BinaryFile(new File(exePath))
+     val head = bf.position()
+     val magic = bf.readInt()
+     bf.seek(head)
+@@ -214,12 +249,12 @@ private[runtime] object Backtrace {
+                 (dies, strings, isPIE, 0L)
+             }
+             .orElse {
+-              val basename = new File(ExecInfo.filename).getName()
++              val basename = new File(exePath).getName()
+               // dsymutil `foo` will assemble the debug information into `foo.dSYM/Contents/Resources/DWARF/foo`.
+               // Coulnt't find the official source, but at least libbacktrace locate the dSYM file from this location.
+               // https://github.com/ianlancetaylor/libbacktrace/blob/cdb64b688dda93bbbacbc2b1ccf50ce9329d4748/macho.c#L908
+               val dSymPath =
+-                s"${ExecInfo.filename}.dSYM/Contents/Resources/DWARF/${basename}"
++                s"${exePath}.dSYM/Contents/Resources/DWARF/${basename}"
+               if (new File(dSymPath).exists()) {
+                 val dSYMBin: BinaryFile = new BinaryFile(
+                   new File(dSymPath)
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
+index 777fbed1..c3d8e991 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
+@@ -30,6 +30,12 @@ object GC {
+   @name("scalanative_GC_collect")
+   private[runtime] def collect(): Unit = extern
+ 
++  /** An identity hash code (the address) of `obj` is about to be used, a moving
++   *  GC must not move it from now on.
++   */
++  @name("scalanative_GC_note_identity_hash")
++  def noteIdentityHash(obj: RawPtr): Unit = extern
++
+   private[runtime] type WeakReferencesCollectedCallback = CFuncPtr0[Unit]
+   @name("scalanative_GC_set_weak_references_collected_callback")
+   private[runtime] def setWeakReferencesCollectedCallback(
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
+index 681d8691..e88967f4 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
+@@ -1,7 +1,11 @@
+ package scala.scalanative.runtime
+ 
+ import scala.scalanative.annotation.alwaysinline
+-import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
++import scala.scalanative.meta.LinktimeInfo.{
++  isCompactByteArrays,
++  isCompactHeaders,
++  isMultithreadingEnabled
++}
+ import scala.scalanative.runtime.Intrinsics.{castRawSizeToInt, sizeOf}
+ 
+ private[runtime] object MemoryLayout {
+@@ -14,6 +18,22 @@ private[runtime] object MemoryLayout {
+    */
+   @alwaysinline private def PtrSize = castRawSizeToInt(sizeOf[RawPtr])
+   @alwaysinline private def IntSize = 4
++  @alwaysinline private def alignToPtr(offset: Int) =
++    (offset + PtrSize - 1) & -PtrSize
++
++  /** With compact headers the lock lives in the header word instead of a
++   *  separate lock word.
++   */
++  @alwaysinline private def usesLockWord =
++    isMultithreadingEnabled && !isCompactHeaders
++
++  private def requiresLockWord = throw new IllegalStateException(
++    "Field available only in multithreading mode with non compact headers"
++  )
++
++  private def requiresNonCompactHeaders = throw new IllegalStateException(
++    "Field not available with compact headers"
++  )
+ 
+   private def requiresEnabledMulithreading = throw new IllegalStateException(
+     "Field available only in multithreading mode"
+@@ -22,16 +42,19 @@ private[runtime] object MemoryLayout {
+   object Rtti {
+     @alwaysinline def ClassOffset = 0
+     @alwaysinline def LockWordOffset =
+-      if (isMultithreadingEnabled) PtrSize
+-      else requiresEnabledMulithreading
++      if (usesLockWord) PtrSize
++      else requiresLockWord
+     @alwaysinline def IdOffset =
+-      if (isMultithreadingEnabled) LockWordOffset + PtrSize
++      if (usesLockWord) LockWordOffset + PtrSize
++      else if (isCompactHeaders) IntSize
+       else PtrSize
+ 
+     @deprecated("No longer used", since = "0.5.6") @alwaysinline
+     def TraitIdOffset = -1
+     @alwaysinline def InterfacesCountOffset = IdOffset + IntSize
+-    @alwaysinline def InterfacesOffset = InterfacesCountOffset + IntSize
++    @alwaysinline def InterfacesOffset =
++      if (isCompactHeaders) alignToPtr(InterfacesCountOffset + IntSize)
++      else InterfacesCountOffset + IntSize
+     @alwaysinline def NameOffset = InterfacesOffset + PtrSize
+ 
+     @deprecated("Not a part of Rtti layout", since = "0.5.6") @alwaysinline
+@@ -54,23 +77,46 @@ private[runtime] object MemoryLayout {
+   object Object {
+     @alwaysinline def RttiOffset = 0
+     @alwaysinline def LockWordOffset =
+-      if (isMultithreadingEnabled) PtrSize
+-      else requiresEnabledMulithreading
++      if (usesLockWord) PtrSize
++      else requiresLockWord
+     @alwaysinline def FieldsOffset =
+-      if (isMultithreadingEnabled) LockWordOffset + PtrSize
++      if (usesLockWord) LockWordOffset + PtrSize
++      else if (isCompactHeaders) IntSize
+       else PtrSize
+   }
+ 
+   object Array {
+     @alwaysinline def RttiOffset = 0
+     @alwaysinline def LockWordOffset =
+-      if (isMultithreadingEnabled) PtrSize
+-      else requiresEnabledMulithreading
++      if (usesLockWord) PtrSize
++      else requiresLockWord
+     @alwaysinline def LengthOffset =
+-      if (isMultithreadingEnabled) LockWordOffset + PtrSize
++      if (usesLockWord) LockWordOffset + PtrSize
++      else if (isCompactHeaders) IntSize
+       else PtrSize
+-    @alwaysinline def StrideOffset = LengthOffset + IntSize
+-    @alwaysinline def ValuesOffset = StrideOffset + IntSize
++    // With compact headers stride is stored in rtti
++    @alwaysinline def StrideOffset =
++      if (isCompactHeaders) requiresNonCompactHeaders
++      else LengthOffset + IntSize
++    @alwaysinline def ValuesOffset =
++      if (isCompactHeaders) LengthOffset + IntSize
++      else StrideOffset + IntSize
++
++    // Scannable limit of the BlobArray, stored in the stride slot of the
++    // regular header. With compact headers its elements are kept 16 bytes
++    // from the object start to keep the regular alignment guarantees.
++    @alwaysinline def BlobLimitOffset =
++      if (isCompactHeaders) LengthOffset + IntSize
++      else StrideOffset
++    // ByteArray elements stay at the regular offset unless compact byte arrays
++    // are enabled, third party code (jsoniter-scala) depends on it.
++    @alwaysinline def ByteValuesOffset =
++      if (isCompactHeaders && !isCompactByteArrays)
++        (if (isMultithreadingEnabled) 3 else 2) * PtrSize
++      else ValuesOffset
++    @alwaysinline def BlobValuesOffset =
++      if (isCompactHeaders) 2 * PtrSize
++      else ValuesOffset
+   }
+ 
+ }
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
+index cdacae75..95a4c63b 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
+@@ -8,7 +8,11 @@ import scala.annotation.nowarn
+ 
+ import scala.scalanative.annotation.alwaysinline
+ import scala.scalanative.concurrent.NativeExecutionContext
+-import scala.scalanative.meta.LinktimeInfo.{isMultithreadingEnabled, isWindows}
++import scala.scalanative.meta.LinktimeInfo.{
++  isCompactHeaders,
++  isMultithreadingEnabled,
++  isWindows
++}
+ import scala.scalanative.runtime.GC.{ThreadRoutineArg, ThreadStartRoutine}
+ import scala.scalanative.runtime.Intrinsics._
+ import scala.scalanative.runtime.ffi.stdatomic.atomic_thread_fence
+@@ -331,6 +335,8 @@ object NativeThread {
+         nativeThread.state = NativeThread.State.Terminated
+         thread.notifyAll()
+       }
++      // After the last lock of the thread, gives back its thin lock owner id
++      if (isCompactHeaders) monitor.ThreadSlots.releaseCurrent()
+       StackOverflowGuards.close()
+     }
+     null
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
+index 227a0464..41d1cbf9 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
+@@ -1,6 +1,9 @@
+ package scala.scalanative.runtime
+ 
+-import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
++import scala.scalanative.meta.LinktimeInfo.{
++  isCompactHeaders,
++  isMultithreadingEnabled
++}
+ import scala.scalanative.runtime.Intrinsics._
+ import scala.scalanative.runtime._
+ import scala.scalanative.unsigned._
+@@ -11,7 +14,9 @@ private[runtime] class _Object {
+     this eq that
+ 
+   @inline def __hashCode(): scala.Int = {
+-    val addr = castRawPtrToLong(castObjectToRawPtr(this))
++    val ptr = castObjectToRawPtr(this)
++    GC.noteIdentityHash(ptr)
++    val addr = castRawPtrToLong(ptr)
+     addr.toInt ^ (addr >> 32).toInt
+   }
+ 
+@@ -20,8 +25,30 @@ private[runtime] class _Object {
+ 
+   @inline def __getClass(): _Class[_] = {
+     val ptr = castObjectToRawPtr(this)
+-    val rtti = loadRawPtr(ptr)
+-    castRawPtrToObject(rtti).asInstanceOf[_Class[_]]
++    val bits = castRawPtrToLong(ptr)
++    if ((bits & 1L) != 0L) {
++      // SMI-tagged immediate (see nir.Type.Smi): no header to load an RTTI
++      // pointer from - the discriminant alone determines the boxed class.
++      val discriminant = ((bits >>> 1L) & 0x1FL).toInt
++      (discriminant match {
++        case 0 => classOf[java.lang.Boolean]
++        case 1 => classOf[java.lang.Byte]
++        case 2 => classOf[java.lang.Short]
++        case 3 => classOf[java.lang.Character]
++        case 4 => classOf[java.lang.Integer]
++        case 5 => classOf[java.lang.Float]
++        case 6 => classOf[scala.scalanative.unsigned.UByte]
++        case 7 => classOf[scala.scalanative.unsigned.UShort]
++        case 8 => classOf[scala.scalanative.unsigned.UInt]
++        case other =>
++          throw new IllegalStateException(
++            s"Unknown SMI discriminant $other in tagged pointer"
++          )
++      }).asInstanceOf[_Class[_]]
++    } else {
++      val rtti = loadHeaderRtti(ptr)
++      castRawPtrToObject(rtti).asInstanceOf[_Class[_]]
++    }
+   }
+ 
+   @inline def __notify(): Unit = if (isMultithreadingEnabled) {
+@@ -53,7 +80,10 @@ private[runtime] class _Object {
+         GC.alloc(cls.asInstanceOf[Class[_]], castIntToRawSizeUnsigned(size))
+       val src = castObjectToRawPtr(this)
+       ffi.memcpy(clone, src, Intrinsics.castIntToRawSize(size))
+-      if (isMultithreadingEnabled) {
++      if (isCompactHeaders) {
++        // Reset object monitor, it is stored in the upper bits of the header
++        storeInt(clone, loadInt(clone) & 0xffff)
++      } else if (isMultithreadingEnabled) {
+         // Reset object monitor
+         storeRawSize(
+           elemRawPtr(clone, MemoryLayout.Array.LockWordOffset),
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala b/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
+new file mode 100644
+index 00000000..a3fdcc22
+--- /dev/null
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
+@@ -0,0 +1,135 @@
++package scala.scalanative.runtime
++
++import scala.scalanative.runtime.Intrinsics._
++
++/** Runtime-side counterpart of the compiler's SMI-style tagged-pointer
++ *  boxing scheme (see `nir.Type.Smi` in the `nir` module for the bit-layout
++ *  single source of truth; it can't be shared by reference with this module
++ *  since `nir`/`tools` are compiler-side Scala/JVM code and this module is
++ *  compiled *into* the target program - the encoding is mirrored here by
++ *  value instead).
++ *
++ *  Word layout (64-bit, MSB-first):
++ *  {{{
++ *  bit 63      : tag           1 = tagged immediate, 0 = real pointer
++ *  bits 58-62  : discriminant  5 bits, 9 of 32 values used currently
++ *  bits 0-57   : payload       stored unshifted/right-justified
++ *  }}}
++ */
++object SmiBox {
++  private final val TagBit = 63
++  private final val DiscriminantShift = TagBit - 5 // 58
++  private final val DiscriminantMask = 0x1FL
++  private final val TagMask = 1L << TagBit
++
++  // Mirrors nir.Type.Smi's discriminant assignment - compiler-side and
++  // runtime-side can't share the constant by reference (see class doc), so
++  // this ordering must be kept in sync with nir.Type.Smi by hand.
++  private final val BooleanDiscriminant = 0
++  private final val ByteDiscriminant = 1
++  private final val ShortDiscriminant = 2
++  private final val CharDiscriminant = 3
++  private final val IntDiscriminant = 4
++  private final val FloatDiscriminant = 5
++  private final val UByteDiscriminant = 6
++  private final val UShortDiscriminant = 7
++  private final val UIntDiscriminant = 8
++
++  @inline def isTagged(obj: RawPtr): Boolean =
++    (castRawPtrToLong(obj) & TagMask) != 0L
++
++  @inline def discriminant(obj: RawPtr): Int =
++    ((castRawPtrToLong(obj) >>> DiscriminantShift) & DiscriminantMask).toInt
++
++  // Per-type payload decoders. Used directly by the 6 box classes' own
++  // `_value` accessors (java.lang.{Boolean,Byte,Short,Character,Integer,
++  // Float}), so that a method resolved via *static* (non-virtual) dispatch
++  // in `codegen.Lower` - which doesn't inspect the receiver at all - still
++  // works correctly when handed a tagged `this`: the field access inside
++  // the method body decodes the tag itself instead of assuming a real,
++  // allocated object. The payload sits unshifted in the low bits, so
++  // decoding a fixed-width primitive is just a truncating cast - no shift.
++  @inline def decodeBoolean(obj: RawPtr): scala.Boolean =
++    (castRawPtrToLong(obj) & 0x1L) != 0L
++  @inline def decodeByte(obj: RawPtr): scala.Byte = castRawPtrToLong(obj).toByte
++  @inline def decodeShort(obj: RawPtr): scala.Short = castRawPtrToLong(obj).toShort
++  @inline def decodeChar(obj: RawPtr): scala.Char =
++    (castRawPtrToLong(obj) & 0xFFFFL).toChar
++  @inline def decodeInt(obj: RawPtr): scala.Int = castRawPtrToLong(obj).toInt
++  @inline def decodeFloat(obj: RawPtr): scala.Float =
++    java.lang.Float.intBitsToFloat(castRawPtrToLong(obj).toInt)
++  // Unsigned types: the payload holds the raw bit pattern (produced by a
++  // zero-extend-then-mask on encode, see nir.Type.Smi/
++  // codegen.Lower.genSmiBoxOp) - mask to the field's own bit width instead
++  // of relying on sign, matching decodeChar's shape (a plain `.toByte`/
++  // `.toShort` truncation alone would sign-extend on the *next* read, since
++  // these decode to scala.Byte/scala.Short which are themselves signed).
++  @inline def decodeUByte(obj: RawPtr): scala.Byte =
++    (castRawPtrToLong(obj) & 0xFFL).toByte
++  @inline def decodeUShort(obj: RawPtr): scala.Short =
++    (castRawPtrToLong(obj) & 0xFFFFL).toShort
++  @inline def decodeUInt(obj: RawPtr): scala.Int =
++    (castRawPtrToLong(obj) & 0xFFFFFFFFL).toInt
++
++  // Encode direction: given a primitive value, construct the tagged AnyRef
++  // bit pattern directly - the mirror image of `codegen.Lower`'s
++  // `genSmiBoxOp` (see that method for the compiler-side version of this
++  // exact formula). Used by the 5 cache-backed `valueOf` methods
++  // (java.lang.{Boolean,Byte,Short,Character,Integer} - Float has no JLS-
++  // mandated cache, Long is out of scope for SMI entirely) on 64-bit, so an
++  // *explicit* `Integer.valueOf(x)`-style call gets the same zero-allocation,
++  // tagged-identity treatment as implicit autoboxing already does.
++  //
++  // `payloadMask` clears any bits the widened payload has above its own
++  // type width (in particular, sign-extension from a negative Byte/Short/
++  // Int) - those bits would otherwise collide with the discriminant/tag
++  // bits living above the payload region now that the payload isn't
++  // shifted out of their way.
++  @inline private def encode(discriminant: Int, payload: Long, payloadMask: Long): AnyRef = {
++    val encoded =
++      (payload & payloadMask) | (discriminant.toLong << DiscriminantShift) | TagMask
++    castRawPtrToObject(castLongToRawPtr(encoded))
++  }
++
++  @inline def encodeBoolean(value: scala.Boolean): AnyRef =
++    encode(BooleanDiscriminant, if (value) 1L else 0L, 0x1L)
++  @inline def encodeByte(value: scala.Byte): AnyRef =
++    encode(ByteDiscriminant, value.toLong, 0xFFL) // toLong sign-extends, mask strips it
++  @inline def encodeShort(value: scala.Short): AnyRef =
++    encode(ShortDiscriminant, value.toLong, 0xFFFFL)
++  @inline def encodeChar(value: scala.Char): AnyRef =
++    encode(CharDiscriminant, value.toLong & 0xFFFFL, 0xFFFFL) // zero-extend: Char is unsigned
++  @inline def encodeInt(value: scala.Int): AnyRef =
++    encode(IntDiscriminant, value.toLong, 0xFFFFFFFFL)
++  // UByte/UShort/UInt: no JLS-style valueOf cache exists for these (they're
++  // Scala Native's own types, not java.lang wrappers), so these encoders
++  // aren't currently called from a valueOf-style entry point the way the 5
++  // java.lang.X ones above are - added for symmetry with `decodeUX` and in
++  // case a future caching/construction path wants them.
++  @inline def encodeUByte(value: scala.Byte): AnyRef =
++    encode(UByteDiscriminant, value.toLong & 0xFFL, 0xFFL)
++  @inline def encodeUShort(value: scala.Short): AnyRef =
++    encode(UShortDiscriminant, value.toLong & 0xFFFFL, 0xFFFFL)
++  @inline def encodeUInt(value: scala.Int): AnyRef =
++    encode(UIntDiscriminant, value.toLong & 0xFFFFFFFFL, 0xFFFFFFFFL)
++}
++
++/** Runtime-side counterpart of the compiler's `PtrTag` low-3-bit pointer
++ *  tagging (see `nir.Type.PtrTag` for the bit-layout single source of
++ *  truth; mirrored here by value, same reasoning as `SmiBox`). Orthogonal
++ *  to `SmiBox` above - see `nir.Type.PtrTag`'s doc comment for why the two
++ *  schemes never collide.
++ */
++object PtrBox {
++  private final val Mask = 0x7L
++  private final val PtrDiscriminant = 1L
++
++  @inline def isTagged(obj: RawPtr): Boolean =
++    (castRawPtrToLong(obj) & Mask) == PtrDiscriminant
++
++  @inline def decodeRawPtr(obj: RawPtr): RawPtr =
++    castLongToRawPtr(castRawPtrToLong(obj) & ~Mask)
++
++  @inline def encode(rawptr: RawPtr): AnyRef =
++    castRawPtrToObject(castLongToRawPtr(castRawPtrToLong(rawptr) | PtrDiscriminant))
++}
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala b/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala
+index 62c59eb3..3248df1c 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala
+@@ -57,6 +57,26 @@ object ffi {
+         desired: RawPtr
+     ): CBool = extern
+ 
++    @name("scalanative_atomic_compare_exchange_strong_int")
++    private[runtime] def atomic_compare_exchange_int(
++        ptr: RawPtr,
++        expected: RawPtr,
++        desired: Int
++    ): CBool = extern
++
++    @name("scalanative_atomic_load_explicit_int")
++    private[runtime] def atomic_load_int(
++        ptr: RawPtr,
++        memoryOrder: memory_order
++    ): Int = extern
++
++    @name("scalanative_atomic_store_explicit_int")
++    private[runtime] def atomic_store_int(
++        ptr: RawPtr,
++        v: Int,
++        memoryOrder: memory_order
++    ): Unit = extern
++
+     @name("scalanative_atomic_load_explicit_llong")
+     private[runtime] def atomic_load_llong(
+         ptr: RawPtr,
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
+index 8e7bc9cc..27121b0f 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
+@@ -4,7 +4,10 @@ package monitor
+ import scala.annotation.tailrec
+ 
+ import scala.scalanative.annotation.alwaysinline
+-import scala.scalanative.meta.LinktimeInfo.{is32BitPlatform => is32bit}
++import scala.scalanative.meta.LinktimeInfo.{
++  is32BitPlatform => is32bit,
++  isCompactHeaders
++}
+ import scala.scalanative.runtime.Intrinsics._
+ import scala.scalanative.runtime.VirtualThread
+ import scala.scalanative.runtime.ffi._
+@@ -18,7 +21,9 @@ import LockWord._
+  *  access from multiple threads is inflated in ObjectMonitor
+  *
+  *  @param lockWordRef
+- *    Pointer to LockWord, internal field of every object header
++ *    Pointer to LockWord, internal field of every object header. With compact
++ *    headers it is the pointer to the object header, which stores the lock in
++ *    its upper 16 bits.
+  */
+ @inline
+ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+@@ -59,7 +64,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+ 
+     val threadId = getThreadId(thread)
+ 
+-    if (!tryLock(threadId))
++    if (isSlotlessThread(threadId) || !tryLock(threadId))
+       enterMonitor(thread, threadId) // slow-path
+   }
+ 
+@@ -69,11 +74,16 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+     val native = NativeThread.currentNativeThread
+     val current = lockWord
+     if (current.isInflated) current.getObjectMonitor.enter(thread)
+-    else {
++    else if (isSlotlessThread(threadId)) {
++      // Never owns a thin monitor, the lock of the object needs to be inflated
++      if (!current.isUnlocked || !tryLock(threadId)) {
++        waitingOnMonitorEnter(lockAndInflate(thread, threadId))
++      } else inflate(thread)
++    } else {
+       if (native != null && threadId == current.threadId) {
+         if (current.recursionCount < ThinMonitorMaxRecursion) {
+           // No need for atomic operation since we already obtain the lock
+-          storeRawPtr(lockWordRef, current.withIncreasedRecursion)
++          storeLockWord(current.withIncreasedRecursion)
+         } else {
+           // inflate counts the earlier entries; add this one
+           inflate(thread).enter(thread)
+@@ -89,15 +99,11 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+     val threadId = getThreadId(thread)
+     val current = lockWord
+     val lockedOnce = lockedWithThreadId(threadId)
+-    if (current == lockedOnce)
+-      atomic_store_intptr(
+-        lockWordRef,
+-        castIntToRawPtr(0),
+-        memory_order_release
+-      )
++    if (!isSlotlessThread(threadId) && current == lockedOnce)
++      storeLockWord(castIntToRawPtr(0))
+     else if (current.isUnlocked) () // can happen only on the main thread
+     else if (current.isInflated) current.getObjectMonitor.exit(thread)
+-    else storeRawPtr(lockWordRef, current.withDecresedRecursion)
++    else storeLockWord(current.withDecresedRecursion)
+   }
+ 
+   @alwaysinline def isLockedBy(thread: Thread): Boolean = {
+@@ -107,7 +113,22 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+   }
+ 
+   @alwaysinline private def lockWord: LockWord =
+-    atomic_load_intptr(lockWordRef, memory_order_acquire)
++    if (isCompactHeaders)
++      castIntToRawPtr(atomic_load_int(lockWordRef, memory_order_acquire) >>> 16)
++    else atomic_load_intptr(lockWordRef, memory_order_acquire)
++
++  /** Stores the lock word, with compact headers keeping the class id bits.
++   *  Needs to be used only by the owner of the lock.
++   */
++  @alwaysinline private def storeLockWord(value: RawPtr): Unit =
++    if (isCompactHeaders) {
++      val header = atomic_load_int(lockWordRef, memory_order_acquire)
++      atomic_store_int(
++        lockWordRef,
++        (header & 0xffff) | (castRawPtrToInt(value) << 16),
++        memory_order_release
++      )
++    } else atomic_store_intptr(lockWordRef, value, memory_order_release)
+ 
+   @inline private def getObjectMonitor() = {
+     val current = lockWord
+@@ -132,7 +153,20 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+     if (is32bit) castIntToRawPtr(castRawPtrToInt(threadId) << ThreadIdOffset)
+     else castLongToRawPtr(castRawPtrToLong(threadId) << ThreadIdOffset)
+ 
++  /** Threads which don't fit in the owner field of the compact lock word, they
++   *  use the biggest id only to inflate the lock, never to hold a thin one.
++   */
++  @alwaysinline private def isSlotlessThread(threadId: ThreadId): Boolean =
++    isCompactHeaders && castRawPtrToLong(threadId) == LockWord.ThreadIdMax
++
+   @alwaysinline private def getThreadId(thread: Thread): ThreadId = {
++    if (isCompactHeaders) {
++      // Owner ids are leased to live threads, see thread_slots.c. Virtual
++      // threads share their carrier's native thread, they never get one.
++      if (thread.isInstanceOf[VirtualThread])
++        return castLongToRawPtr(LockWord.ThreadIdMax)
++      return castLongToRawPtr(ThreadSlots.current().toLong)
++    }
+     val addr = castObjectToRawPtr(thread)
+     if (is32bit) castIntToRawPtr(castRawPtrToInt(addr) & LockWord32.ThreadIdMax)
+     else castLongToRawPtr(castRawPtrToLong(addr) & LockWord.ThreadIdMax)
+@@ -156,14 +190,28 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+ 
+   @inline
+   private def tryLock(threadId: ThreadId) = {
+-    val expected = stackalloc[RawPtr]()
+-    // ThreadId set to 0, recursion set to 0
+-    storeRawSize(expected, castIntToRawSize(0))
+-    atomic_compare_exchange_intptr(
+-      lockWordRef,
+-      expected,
+-      lockedWithThreadId(threadId)
+-    )
++    if (isCompactHeaders) {
++      val header = atomic_load_int(lockWordRef, memory_order_acquire)
++      if ((header >>> 16) != 0) false
++      else {
++        val expected = stackalloc[Int]()
++        storeInt(expected, header)
++        atomic_compare_exchange_int(
++          lockWordRef,
++          expected,
++          header | (castRawPtrToInt(lockedWithThreadId(threadId)) << 16)
++        )
++      }
++    } else {
++      val expected = stackalloc[RawPtr]()
++      // ThreadId set to 0, recursion set to 0
++      storeRawSize(expected, castIntToRawSize(0))
++      atomic_compare_exchange_intptr(
++        lockWordRef,
++        expected,
++        lockedWithThreadId(threadId)
++      )
++    }
+   }
+ 
+   // Monitor is currently locked by other thread. Wait until getting over ownership
+@@ -172,6 +220,14 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+       thread: Thread,
+       threadId: ThreadId
+   ): Unit = {
++    // Cached once per call, not re-read on every backoff iteration: this
++    // thread's own native-thread pointer can't change mid-loop, but each
++    // `NativeThread.currentNativeThread` read is a Darwin TLV lookup
++    // (tlv_get_addr) -- under thin-lock contention (the common case, since
++    // every synchronized/identity-hash access goes through here before a
++    // monitor is ever inflated) re-fetching it every backoff was measured as
++    // a double-digit-percent chunk of total runtime in profiling.
++    lazy val nativeThread = NativeThread.currentNativeThread
+     @tailrec @alwaysinline def waitForOwnership(
+         yields: Int,
+         backoffNanos: Int
+@@ -186,7 +242,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+               Thread.`yield`()
+               waitForOwnership(yields, backoffNanos)
+             case _ =>
+-              val native = NativeThread.currentNativeThread
++              val native = nativeThread
+               if (native != null) native.sleepNanos(backoffNanos)
+               else Thread.`yield`()
+               waitForOwnership(
+@@ -217,7 +273,14 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+     // Since pointers are always aligned we can safely override N=sizeof(Word) right-most bits
+     val monitorAddress = castObjectToRawPtr(objectMonitor)
+     val inflated =
+-      if (is32bit) {
++      if (isCompactHeaders) {
++        // The lock word has no room for the address, use the table index
++        val index = MonitorTable.register(
++          castRawPtrToObject(lockWordRef),
++          objectMonitor
++        )
++        castIntToRawPtr((index << 1) | LockType.Inflated)
++      } else if (is32bit) {
+         val lockMark = (LockType.Inflated: Int) << LockTypeOffset
+         val addr = castRawPtrToInt(monitorAddress)
+         castIntToRawPtr(lockMark | addr)
+@@ -226,7 +289,8 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+         val addr = castRawPtrToLong(monitorAddress)
+         castLongToRawPtr(lockMark | addr)
+       }
+-    atomic_store_intptr(lockWordRef, inflated, memory_order_release)
++    if (isCompactHeaders) storeLockWord(inflated)
++    else atomic_store_intptr(lockWordRef, inflated, memory_order_release)
+     atomic_thread_fence(memory_order_seq_cst)
+ 
+     objectMonitor
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
+new file mode 100644
+index 00000000..1a11d5ef
+--- /dev/null
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
+@@ -0,0 +1,108 @@
++package scala.scalanative.runtime
++package monitor
++
++import java.lang.ref.WeakReference
++
++import scala.scalanative.annotation.alwaysinline
++import scala.scalanative.meta.LinktimeInfo.{
++  isCompactHeaders,
++  isMultithreadingEnabled
++}
++import scala.scalanative.runtime.Intrinsics._
++import scala.scalanative.runtime.ffi.stdatomic._
++import scala.scalanative.runtime.ffi.stdatomic.memory_order._
++import scala.scalanative.unsafe.{stackalloc => _, _}
++
++/** Table of inflated monitors, used only with compact object headers.
++ *
++ *  The header of an object has no room for a reference to its ObjectMonitor, so
++ *  an inflated lock word stores an index in this table. The table keeps the
++ *  monitors alive, objects are referenced only weakly: a slot of a collected
++ *  object is reused by later inflations. The monitor itself never references
++ *  its owner object, so it can't keep it alive.
++ */
++private[runtime] object MonitorTable {
++  // Indexes need to fit in the 15 bits of the inflated lock word
++  @alwaysinline def Capacity = 1 << 15
++
++  private var monitors: scala.Array[ObjectMonitor] = _
++  private var owners: scala.Array[WeakReference[AnyRef]] = _
++  private var cursor = 0
++  // Spin lock guarding the allocation of the slots, stored off-heap
++  private var lockCell: RawPtr = _
++
++  /** Needs to be called before any monitor is inflated, from the single
++   *  threaded part of the runtime initialization.
++   */
++  private[runtime] def init(): Unit =
++    if (isCompactHeaders && isMultithreadingEnabled) {
++      if (monitors == null) {
++        lockCell = ffi.malloc(castIntToRawSize(4))
++        storeInt(lockCell, 0)
++        owners = new scala.Array[WeakReference[AnyRef]](Capacity)
++        monitors = new scala.Array[ObjectMonitor](Capacity)
++        exhausted = new OutOfMemoryError(
++          "Too many inflated monitors, limit with compact object headers is " + Capacity
++        )
++      }
++    }
++
++  @alwaysinline def get(index: Int): ObjectMonitor = monitors(index)
++
++  private def lock(): Unit = {
++    val expected = stackalloc[Int]()
++    var acquired = false
++    while (!acquired) {
++      storeInt(expected, 0)
++      acquired = atomic_compare_exchange_int(lockCell, expected, 1)
++      if (!acquired) NativeThread.onSpinWait()
++    }
++  }
++
++  private def unlock(): Unit =
++    atomic_store_int(lockCell, 0, memory_order_release)
++
++  /** Thrown when the table is full. Preallocated: building a new throwable
++   *  synchronizes on it, which can inflate its lock and register in this very
++   *  table, failing again until the stack overflows.
++   */
++  private var exhausted: OutOfMemoryError = _
++
++  /** Registers the monitor of `owner` and returns its index */
++  private[monitor] def register(owner: AnyRef, monitor: ObjectMonitor): Int = {
++    // Allocate outside of the lock, GC can't suspend threads waiting for it
++    val ref = new WeakReference[AnyRef](owner)
++    var idx = tryRegister(ref, monitor)
++    if (idx < 0) {
++      // Slots of collected objects are only reusable once their references are
++      // cleared
++      System.gc()
++      idx = tryRegister(ref, monitor)
++    }
++    if (idx < 0) throw exhausted
++    idx
++  }
++
++  /** Index of the claimed slot, -1 if all of them belong to live objects */
++  private def tryRegister(
++      ref: WeakReference[AnyRef],
++      monitor: ObjectMonitor
++  ): Int = {
++    lock()
++    try {
++      var tries = 0
++      var idx = cursor
++      while (tries < Capacity) {
++        if (monitors(idx) == null || owners(idx).get() == null) {
++          monitors(idx) = monitor
++          owners(idx) = ref
++          cursor = (idx + 1) & (Capacity - 1)
++          return idx
++        }
++        idx = (idx + 1) & (Capacity - 1)
++        tries += 1
++      }
++      -1
++    } finally unlock()
++  }
++}
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
+new file mode 100644
+index 00000000..836d051d
+--- /dev/null
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
+@@ -0,0 +1,16 @@
++package scala.scalanative.runtime
++package monitor
++
++import scala.scalanative.unsafe._
++
++/** Leases of the owner ids of thin locks, see thread_slots.c. Extern, so the
++ *  lock path never needs a module to be loaded.
++ */
++@extern
++private[runtime] object ThreadSlots {
++  @name("scalanative_monitor_thread_slot")
++  def current(): CInt = extern
++
++  @name("scalanative_monitor_release_thread_slot")
++  def releaseCurrent(): Unit = extern
++}
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
+index d90efc16..00cdee46 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
+@@ -1,7 +1,10 @@
+ package scala.scalanative.runtime
+ 
+ import scala.scalanative.annotation.alwaysinline
+-import scala.scalanative.meta.LinktimeInfo.{is32BitPlatform => is32bit}
++import scala.scalanative.meta.LinktimeInfo.{
++  is32BitPlatform => is32bit,
++  isCompactHeaders
++}
+ import scala.scalanative.runtime.Intrinsics._
+ 
+ package object monitor {
+@@ -34,15 +37,29 @@ package object monitor {
+    * |     ObjectMonitor ref        |   1    |
+    *
+    */
++  /* With compact headers (64bit only) the header of every object is a single
++   * 32bit word, [lock:16 | class id:16]. The 16bit lock keeps the same shape,
++   * but is limited to threads with a small id (see BasicMonitor.getThreadId)
++   * and the inflated monitor is referenced by an index in the MonitorTable:
++   *
++   * Thin monitor
++   * |------10bit-------|---5bit----|--1bit--|
++   * | threadID (owner) | recursion |   0    |
++   *
++   * Inflated monitor
++   * |------15bit-------------------|--1bit--|
++   * |     MonitorTable index       |   1    |
++   */
+   private[runtime] object LockWord {
+     // For information why we use `def` instead of `val` see comments in the runtime/MemoryLayout
+     @alwaysinline def RecursionOffset = 1
+-    @alwaysinline def RecursionBits = 7
++    // With compact headers the lock word has 16 bits, see CompactLockWord
++    @alwaysinline def RecursionBits = if (isCompactHeaders) 5 else 7
+     @alwaysinline def ThinMonitorMaxRecursion = (1 << RecursionBits) - 1
+     @alwaysinline def RecursionMask = ThinMonitorMaxRecursion << RecursionOffset
+ 
+-    @alwaysinline def ThreadIdOffset = 8
+-    @alwaysinline def ThreadIdBits = 56
++    @alwaysinline def ThreadIdOffset = if (isCompactHeaders) 6 else 8
++    @alwaysinline def ThreadIdBits = if (isCompactHeaders) 10 else 56
+     @alwaysinline def ThreadIdMax = (1L << ThreadIdBits) - 1
+     @alwaysinline def ThreadIdMask = ThreadIdMax << ThreadIdOffset
+ 
+@@ -132,11 +149,16 @@ package object monitor {
+     // Inflated monitor ops
+     @alwaysinline def getObjectMonitor: ObjectMonitor = {
+       // assert(isInflated, "LockWord was not inflated")
+-      val addr =
+-        if (is32bit) castIntToRawPtr((intValue & LockWord32.ObjectMonitorMask))
+-        else castLongToRawPtr(longValue & LockWord.ObjectMonitorMask)
+-
+-      castRawPtrToObject(addr).asInstanceOf[ObjectMonitor]
++      if (isCompactHeaders)
++        MonitorTable.get(longValue.toInt >>> 1)
++      else {
++        val addr =
++          if (is32bit)
++            castIntToRawPtr((intValue & LockWord32.ObjectMonitorMask))
++          else castLongToRawPtr(longValue & LockWord.ObjectMonitorMask)
++
++        castRawPtrToObject(addr).asInstanceOf[ObjectMonitor]
++      }
+     }
+   }
+ 
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
+index f0fb015e..98dff528 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
+@@ -5,7 +5,10 @@ import java.{lang => jl}
+ 
+ import scala.annotation.nowarn
+ 
+-import scala.scalanative.meta.LinktimeInfo.isMultithreadingEnabled
++import scala.scalanative.meta.LinktimeInfo.{
++  isCompactHeaders,
++  isMultithreadingEnabled
++}
+ import scalanative.annotation.alwaysinline
+ import scalanative.runtime.Intrinsics._
+ import scalanative.runtime.ffi.stdatomic.{atomic_thread_fence, memory_order}
+@@ -38,17 +41,40 @@ package object runtime {
+       getMonitor(obj).exit(obj)
+     }
+ 
++  /** Is `obj`'s bit pattern a tagged immediate (bit 0 set) rather than a
++   *  real, aligned heap pointer? Safe to call unconditionally on every
++   *  platform/object: real pointers are always aligned (bit 0 clear, see
++   *  `nir.Type.Smi`'s alignment audit), so this is trivially `false` for
++   *  every ordinary object and on 32-bit (where tagging never happens).
++   */
++  @alwaysinline
++  private def isSmiTagged(obj: _Object): Boolean =
++    (castRawPtrToLong(castObjectToRawPtr(obj)) & 1L) != 0L
++
+   /** Get monitor for given object. */
+   @alwaysinline
+   def getMonitor(obj: _Object) = {
+-    if (isMultithreadingEnabled)
++    if (isSmiTagged(obj))
++      // A tagged immediate (Boolean/Byte/Short/Char/Int/Float/UByte/UShort/
++      // UInt boxed via tagged-pointer boxing, see nir.Type.Smi) has no
++      // header and no lock word of its own - `synchronized(taggedValue)` /
++      // `.wait()`/`.notify()` on one is unsupported, not silently
++      // coarsened onto a shared sentinel monitor.
++      throw new RuntimeException(
++        "Monitor operations (synchronized/wait/notify) are not supported " +
++          "on SMI-tagged boxed primitives"
++      )
++    else if (isMultithreadingEnabled && isCompactHeaders) {
++      // The lock is stored in the header word itself
++      new BasicMonitor(castObjectToRawPtr(obj))
++    } else if (isMultithreadingEnabled) {
+       new BasicMonitor(
+         elemRawPtr(
+           castObjectToRawPtr(obj),
+           castIntToRawSize(MemoryLayout.Object.LockWordOffset)
+         )
+       )
+-    else
++    } else
+       throw new IllegalStateException(
+         "Monitors unavilable in single threaded mode"
+       )
+@@ -77,6 +103,7 @@ package object runtime {
+       stackSize = 0 /* detect */
+     )
+     StackOverflowGuards.setup(isMainThread = true)
++    monitor.MonitorTable.init()
+ 
+     OutOfMemory.preallocateFallback()
+ 
+@@ -155,8 +182,18 @@ package object runtime {
+     catch {
+       case ex: jl.Throwable =>
+         val threadName = "\"" + thread.getName() + "\""
++        // Say what was thrown, and what was being handled: the class name
++        // alone hides the real error. Each step is guarded, the exceptions
++        // may themselves be what is failing to print.
++        def describe(t: jl.Throwable): String =
++          try {
++            val msg = t.getMessage()
++            if (msg == null) t.getClass().getName()
++            else s"${t.getClass().getName()}: $msg"
++          } catch { case _: jl.Throwable => "<unprintable exception>" }
+         System.err.println(
+-          s"\nException: ${ex.getClass().getName()} thrown from the UncaughtExceptionHandler in thread ${threadName}"
++          s"\nException: ${describe(ex)} thrown from the UncaughtExceptionHandler in thread ${threadName}" +
++            s" while handling ${describe(throwable)}"
+         )
+     }
+   }
+@@ -293,6 +330,17 @@ package object runtime {
+     else
+       waitForModuleInitializationSingleThreaded(moduleSlot, cls)
+ 
++  /** Does the module slot value hold an object of class `cls`? The class (or
++   *  its id with compact headers) is the first field of the object header.
++   */
++  @alwaysinline private def moduleHasClass(
++      moduleRef: RawPtr,
++      cls: Class[_]
++  ): Boolean =
++    if (isCompactHeaders)
++      (Intrinsics.loadInt(moduleRef) & 0xffff) == cls.asInstanceOf[_Class[_]].id
++    else Intrinsics.loadObject(moduleRef) eq cls
++
+   private def waitForModuleInitializationMultithreaded(
+       moduleSlot: unsafe.Ptr[AnyRef],
+       cls: Class[_]
+@@ -316,11 +364,10 @@ package object runtime {
+         cls.wait()
+       } else {
+         // Assumes Class[?] is always 1st filed in the object header
+-        val rtti = Intrinsics.loadObject(moduleRef)
+-        if (rtti eq cls)
++        if (moduleHasClass(moduleRef, cls))
+           return Intrinsics.castRawPtrToObject(moduleRef) // happy-path
+ 
+-        if (rtti eq classOf[ExceptionInInitializerError]) {
++        if (moduleHasClass(moduleRef, classOf[ExceptionInInitializerError])) {
+           val ex: ExceptionInInitializerError = Intrinsics
+             .castRawPtrToObject(moduleRef)
+             .asInstanceOf[ExceptionInInitializerError]
+@@ -344,9 +391,9 @@ package object runtime {
+         moduleSlot.rawptr,
+         ffi.stdatomic.memory_order.memory_order_acquire
+       )
+-      val rtti = Intrinsics.loadObject(moduleRef)
+-      if (rtti eq cls) return Intrinsics.castRawPtrToObject(moduleRef)
+-      if (rtti eq classOf[ExceptionInInitializerError]) {
++      if (moduleHasClass(moduleRef, cls))
++        return Intrinsics.castRawPtrToObject(moduleRef)
++      if (moduleHasClass(moduleRef, classOf[ExceptionInInitializerError])) {
+         val ex = Intrinsics
+           .castRawPtrToObject(moduleRef)
+           .asInstanceOf[ExceptionInInitializerError]
+@@ -360,6 +407,23 @@ package object runtime {
+     ???
+   }
+ 
++  /** Class id -> rtti table, used to decode compact object headers. */
++  @extern private[runtime] object RttiTable {
++    @name("scalanative_rtti_table")
++    var table: RawPtr = extern
++  }
++
++  /** Reads the class of a real (non-tagged, non-null) object, whatever its header encoding is */
++  @alwaysinline private[runtime] def loadHeaderRtti(obj: RawPtr): RawPtr =
++    if (meta.LinktimeInfo.isCompactHeaders)
++      loadRawPtr(
++        elemRawPtr(
++          RttiTable.table,
++          castLongToRawSize((loadInt(obj).toLong & 0xffffL) * 8L)
++        )
++      )
++    else loadRawPtr(obj)
++
+   @extern private[runtime] object StackOverflowGuards {
+     @name("scalanative_StackOverflowGuards_size")
+     def size: Int = extern
+diff --git a/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala b/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
+index e77bb9ae..4910e50f 100644
+--- a/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
++++ b/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
+@@ -10,8 +10,21 @@ import scala.scalanative.runtime._
+ import scala.scalanative.unsigned._
+ 
+ final class Ptr[T] private[scalanative] (
+-    private[scalanative] val rawptr: RawPtr
++    _rawptr: RawPtr
+ ) {
++  // Not just a `val`: `this` may be a `PtrTag`-tagged immediate reached via
++  // static dispatch (see `runtime.PtrBox`/`nir.Type.PtrTag`), same reasoning
++  // as `java.lang.Integer._value`. Every access - inside this class and via
++  // the `private[scalanative]` visibility used elsewhere in this codebase
++  // (Tag.scala, CStruct.scala, CArray.scala, Boxes.scala, ...) - goes
++  // through this check instead of trusting `_rawptr` is real memory.
++  private[scalanative] def rawptr: RawPtr = {
++    val self = Intrinsics.castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.PtrBox.isTagged(self))
++      scala.scalanative.runtime.PtrBox.decodeRawPtr(self)
++    else _rawptr
++  }
++
+   @alwaysinline override def hashCode: Int =
+     java.lang.Long.hashCode(toLong)
+ 
+diff --git a/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala b/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala
+index 31fa1050..5b1dd3b5 100644
+--- a/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala
++++ b/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala
+@@ -1,15 +1,28 @@
+ package scala.scalanative
+ package unsigned
+ 
+-import scalanative.runtime.Intrinsics.{castIntToRawSizeUnsigned, unsignedOf}
++import scalanative.runtime.Intrinsics.{
++  castIntToRawSizeUnsigned,
++  castObjectToRawPtr,
++  unsignedOf
++}
+ 
+ /** `UByte`, a 8-bit unsigned integer. */
+ final class UByte private[scalanative] (
+-    private[scalanative] val underlyingValue: Byte
++    private[scalanative] val _rawValue: Byte
+ ) extends scala.math.ScalaNumber
+     with java.io.Serializable
+     with Comparable[UByte] {
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline private[scalanative] def underlyingValue: Byte = {
++    val self = castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeUByte(self)
++    else _rawValue
++  }
++
+   @inline final def toByte: Byte = underlyingValue
+   @inline final def toShort: Short = toInt.toShort
+   @inline final def toChar: Char = toInt.toChar
+@@ -315,14 +328,25 @@ object UByte {
+   implicit def ubyte2ulong(x: UByte): ULong = x.toULong
+ 
+   @inline def valueOf(byteValue: scala.Byte): UByte = {
+-    import UByteCache.cache
+-    val idx = byteValue - scala.Byte.MinValue
+-    val cached = cache(idx)
+-    if (cached ne null) cached
+-    else {
+-      val newBox = new UByte(byteValue)
+-      cache(idx) = newBox
+-      newBox
++    // On 64-bit, tag directly (zero allocation, and `eq`-consistent with
++    // implicit autoboxing of the same value) instead of consulting the
++    // cache - see java.lang.Boolean.TRUE/FALSE for why this is a real
++    // link-time branch, not a runtime one, so the cache array itself is
++    // dead-code-eliminated on 64-bit rather than merely unused.
++    if (scala.scalanative.meta.LinktimeInfo.is32BitPlatform) {
++      import UByteCache.cache
++      val idx = byteValue - scala.Byte.MinValue
++      val cached = cache(idx)
++      if (cached ne null) cached
++      else {
++        val newBox = new UByte(byteValue)
++        cache(idx) = newBox
++        newBox
++      }
++    } else {
++      scala.scalanative.runtime.SmiBox
++        .encodeUByte(byteValue)
++        .asInstanceOf[UByte]
+     }
+   }
+ }
+diff --git a/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala b/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala
+index 8b9315be..2744f2b1 100644
+--- a/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala
++++ b/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala
+@@ -4,17 +4,26 @@ package unsigned
+ import java.lang.{Integer => JInteger}
+ 
+ import scalanative.runtime.Intrinsics.{
+-  castIntToRawSizeUnsigned, divUInt, remUInt, uintToDouble, uintToFloat,
+-  unsignedOf
++  castIntToRawSizeUnsigned, castObjectToRawPtr, divUInt, remUInt,
++  uintToDouble, uintToFloat, unsignedOf
+ }
+ 
+ /** `UInt`, a 32-bit unsigned integer. */
+ final class UInt private[scalanative] (
+-    private[scalanative] val underlyingValue: Int
++    private[scalanative] val _rawValue: Int
+ ) extends scala.math.ScalaNumber
+     with java.io.Serializable
+     with Comparable[UInt] {
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline private[scalanative] def underlyingValue: Int = {
++    val self = castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeUInt(self)
++    else _rawValue
++  }
++
+   @inline final def toByte: Byte = underlyingValue.toByte
+   @inline final def toShort: Short = underlyingValue.toShort
+   @inline final def toChar: Char = underlyingValue.toChar
+@@ -333,19 +342,24 @@ object UInt {
+   implicit def uint2ulong(x: UInt): ULong = x.toULong
+ 
+   @inline def valueOf(intValue: scala.Int): UInt = {
+-    import UIntCache.cache
+-    val byteValue = intValue.toByte
+-    if (byteValue.toInt != intValue) {
+-      new UInt(intValue)
+-    } else {
+-      val idx = intValue + 128
+-      val cached = cache(idx)
+-      if (cached ne null) cached
+-      else {
+-        val newBox = new UInt(intValue)
+-        cache(idx) = newBox
+-        newBox
++    // See UByte.valueOf for why this is a real link-time branch.
++    if (scala.scalanative.meta.LinktimeInfo.is32BitPlatform) {
++      import UIntCache.cache
++      val byteValue = intValue.toByte
++      if (byteValue.toInt != intValue) {
++        new UInt(intValue)
++      } else {
++        val idx = intValue + 128
++        val cached = cache(idx)
++        if (cached ne null) cached
++        else {
++          val newBox = new UInt(intValue)
++          cache(idx) = newBox
++          newBox
++        }
+       }
++    } else {
++      scala.scalanative.runtime.SmiBox.encodeUInt(intValue).asInstanceOf[UInt]
+     }
+   }
+ 
+diff --git a/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala b/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala
+index 68712025..e1e49899 100644
+--- a/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala
++++ b/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala
+@@ -1,15 +1,28 @@
+ package scala.scalanative
+ package unsigned
+ 
+-import scalanative.runtime.Intrinsics.{castIntToRawSize, unsignedOf}
++import scalanative.runtime.Intrinsics.{
++  castIntToRawSize,
++  castObjectToRawPtr,
++  unsignedOf
++}
+ 
+ /** `UShort`, a 16-bit unsigned integer. */
+ final class UShort private[scalanative] (
+-    private[scalanative] val underlyingValue: Short
++    private[scalanative] val _rawValue: Short
+ ) extends scala.math.ScalaNumber
+     with java.io.Serializable
+     with Comparable[UShort] {
+ 
++  /** See `java.lang.Boolean._value` for why this can't just be a `val`:
++   *  `this` may be a SMI-tagged immediate reached via static dispatch. */
++  @inline private[scalanative] def underlyingValue: Short = {
++    val self = castObjectToRawPtr(this)
++    if (scala.scalanative.runtime.SmiBox.isTagged(self))
++      scala.scalanative.runtime.SmiBox.decodeUShort(self)
++    else _rawValue
++  }
++
+   @inline final def toByte: Byte = underlyingValue.toByte
+   @inline final def toShort: Short = underlyingValue
+   @inline final def toChar: Char = underlyingValue.toChar
+@@ -316,19 +329,26 @@ object UShort {
+   implicit def ubyte2ulong(x: UShort): ULong = x.toULong
+ 
+   @inline def valueOf(shortValue: scala.Short): UShort = {
+-    import UShortCache.cache
+-    val byteValue = shortValue.toByte
+-    if (byteValue.toLong != shortValue) {
+-      new UShort(shortValue)
+-    } else {
+-      val idx = byteValue + 128
+-      val cached = cache(idx)
+-      if (cached ne null) cached
+-      else {
+-        val newBox = new UShort(shortValue)
+-        cache(idx) = newBox
+-        newBox
++    // See UByte.valueOf for why this is a real link-time branch.
++    if (scala.scalanative.meta.LinktimeInfo.is32BitPlatform) {
++      import UShortCache.cache
++      val byteValue = shortValue.toByte
++      if (byteValue.toLong != shortValue) {
++        new UShort(shortValue)
++      } else {
++        val idx = byteValue + 128
++        val cached = cache(idx)
++        if (cached ne null) cached
++        else {
++          val newBox = new UShort(shortValue)
++          cache(idx) = newBox
++          newBox
++        }
+       }
++    } else {
++      scala.scalanative.runtime.SmiBox
++        .encodeUShort(shortValue)
++        .asInstanceOf[UShort]
+     }
+   }
+ }

@@ -1,5 +1,5 @@
 diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
-index 83c753e4..a1435f2d 100644
+index 91f201b723..1837e8454f 100644
 --- a/language-server/src/dotty/tools/languageserver/Lsp.scala
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
 @@ -43,11 +43,19 @@ object Lsp {
@@ -57,7 +57,7 @@ index 83c753e4..a1435f2d 100644
  
    // -- .dotty-ide.json (replaces config.ProjectConfig + Jackson) -----------
  
-@@ -528,6 +555,78 @@ object Lsp {
+@@ -530,6 +557,78 @@ object Lsp {
      def encodeValue(x: WorkspaceSymbolParams, out: JsonWriter): Unit = ???
    }
  
@@ -136,7 +136,7 @@ index 83c753e4..a1435f2d 100644
    // -- Outgoing codecs (encode only) ---------------------------------------
  
    given completionOptionsCodec: JsonValueCodec[CompletionOptions] = new JsonValueCodec[CompletionOptions] {
-@@ -551,6 +650,28 @@ object Lsp {
+@@ -553,6 +652,28 @@ object Lsp {
      }
    }
  
@@ -165,7 +165,7 @@ index 83c753e4..a1435f2d 100644
    given serverCapabilitiesCodec: JsonValueCodec[ServerCapabilities] = new JsonValueCodec[ServerCapabilities] {
      def nullValue: ServerCapabilities = null
      def decodeValue(in: JsonReader, default: ServerCapabilities): ServerCapabilities = ???
-@@ -567,6 +688,11 @@ object Lsp {
+@@ -569,6 +690,11 @@ object Lsp {
        out.writeNonEscapedAsciiKey("implementationProvider"); out.writeVal(x.implementationProvider)
        out.writeNonEscapedAsciiKey("completionProvider"); completionOptionsCodec.encodeValue(x.completionProvider, out)
        out.writeNonEscapedAsciiKey("signatureHelpProvider"); signatureHelpOptionsCodec.encodeValue(x.signatureHelpProvider, out)
@@ -177,7 +177,7 @@ index 83c753e4..a1435f2d 100644
        out.writeObjectEnd()
      }
    }
-@@ -766,6 +892,61 @@ object Lsp {
+@@ -768,6 +894,61 @@ object Lsp {
      }
    }
  
@@ -239,7 +239,7 @@ index 83c753e4..a1435f2d 100644
    // -- Locations/SymbolInformation lists carry their own top-level codec
    //    (used directly as a request's whole `result`) --------------------
  
-@@ -799,6 +980,36 @@ object Lsp {
+@@ -801,6 +982,36 @@ object Lsp {
      }
    }
  
@@ -276,35 +276,3 @@ index 83c753e4..a1435f2d 100644
    private def encodeStringList(xs: List[String], out: JsonWriter): Unit = {
      out.writeArrayStart()
      xs.foreach(out.writeVal(_))
-diff --git a/language-server/src/dotty/tools/languageserver/Main.scala b/language-server/src/dotty/tools/languageserver/Main.scala
-index 2add0c01..a1550950 100644
---- a/language-server/src/dotty/tools/languageserver/Main.scala
-+++ b/language-server/src/dotty/tools/languageserver/Main.scala
-@@ -160,6 +160,27 @@ object Main {
-           case "textDocument/signatureHelp" =>
-             val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
-             sendResult(env.idRaw, writeToArray(server.signatureHelp(params)))
-+          case "textDocument/typeDefinition" =>
-+            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
-+            sendResult(env.idRaw, writeToArray(server.typeDefinition(params))(using locationListCodec))
-+          case "textDocument/prepareRename" =>
-+            val params = readFromArray(env.paramsRaw)(using textDocumentPositionParamsCodec)
-+            server.prepareRename(params) match {
-+              case Some(range) => sendResult(env.idRaw, writeToArray(range))
-+              case None => sendResult(env.idRaw, "null".getBytes("UTF-8"))
-+            }
-+          case "textDocument/selectionRange" =>
-+            val params = readFromArray(env.paramsRaw)(using selectionRangeParamsCodec)
-+            sendResult(env.idRaw, writeToArray(server.selectionRange(params))(using selectionRangeListCodec))
-+          case "textDocument/inlayHint" =>
-+            val params = readFromArray(env.paramsRaw)(using inlayHintParamsCodec)
-+            sendResult(env.idRaw, writeToArray(server.inlayHint(params))(using inlayHintListCodec))
-+          case "textDocument/semanticTokens/full" =>
-+            val params = readFromArray(env.paramsRaw)(using documentSymbolParamsCodec)
-+            sendResult(env.idRaw, writeToArray(server.semanticTokens(params)))
-+          case "textDocument/codeAction" =>
-+            val params = readFromArray(env.paramsRaw)(using codeActionParamsCodec)
-+            sendResult(env.idRaw, writeToArray(server.codeAction(params))(using codeActionListCodec))
-           case "$/cancelRequest" => () // no cancellation support -- see docs/findings.md
-           case other =>
-             Log(s"<- $other UNSUPPORTED")

@@ -1,6 +1,6 @@
 diff --git a/language-server/src/dotty/tools/languageserver/DottyClient.scala b/language-server/src/dotty/tools/languageserver/DottyClient.scala
 deleted file mode 100644
-index c0b7c3c1..00000000
+index c0b7c3c155..0000000000
 --- a/language-server/src/dotty/tools/languageserver/DottyClient.scala
 +++ /dev/null
 @@ -1,6 +0,0 @@
@@ -13,7 +13,7 @@ index c0b7c3c1..00000000
 \ No newline at end of file
 diff --git a/language-server/src/dotty/tools/languageserver/Lsp.scala b/language-server/src/dotty/tools/languageserver/Lsp.scala
 new file mode 100644
-index 00000000..13f93fea
+index 0000000000..91f201b723
 --- /dev/null
 +++ b/language-server/src/dotty/tools/languageserver/Lsp.scala
 @@ -0,0 +1,956 @@
@@ -975,7 +975,7 @@ index 00000000..13f93fea
 +}
 diff --git a/language-server/src/dotty/tools/languageserver/config/ProjectConfig.java b/language-server/src/dotty/tools/languageserver/config/ProjectConfig.java
 deleted file mode 100644
-index e1f55554..00000000
+index e1f55554dc..0000000000
 --- a/language-server/src/dotty/tools/languageserver/config/ProjectConfig.java
 +++ /dev/null
 @@ -1,33 +0,0 @@

@@ -70,7 +70,7 @@ NIR_NATIVE_JARS=(
 )
 NIR_NATIVE_CP=""
 for artifact in "${NIR_NATIVE_JARS[@]}"; do
-  jar="$(cs fetch --intransitive "$artifact" --classpath | tr -d '\r')"
+  jar="$(cs fetch -r ivy2Local --intransitive "$artifact" --classpath | tr -d '\r')"
   NIR_NATIVE_CP="${NIR_NATIVE_CP:+$NIR_NATIVE_CP$CP_SEP}$jar"
 done
 
@@ -78,11 +78,11 @@ PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 
 # Substitute the published javalib_native0.5_3 jar for the locally-built one
 # with any patches/scala-native-000* actually applied -- see
-# build/01b-build-patched-javalib.sh and 03-build-scalino-dotc.sh's identical
+# build/01a-publish-scala-native.sh and 03-build-scalino-dotc.sh's identical
 # substitution. Without this, scalino itself (not just scalino-dotc) links
 # against the unpatched upstream javalib.
 NATIVELIBS_CP="$WORK/scalino-src/nativelibs.cp"
-LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}-SNAPSHOT/jars/javalib_native0.5_3.jar"
+LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
   # -F/-x too, not just the old -v '/javalib_native0\.5_3-' regex: see
   # 03-build-scalino-dotc.sh's identical substitution for why -- 01b already
@@ -97,7 +97,7 @@ if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
   cp "$WORK/nativelibs.cp" "$NATIVELIBS_CP"
-  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01b-build-patched-javalib.sh first, or scala-native patches will NOT take effect in scalino itself."
+  echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01a-publish-scala-native.sh first, or scala-native patches will NOT take effect in scalino itself."
 fi
 
 COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_NATIVE_CP"
