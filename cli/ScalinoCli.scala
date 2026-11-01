@@ -497,7 +497,11 @@ object ScalinoCli:
     jsEsVersion: Option[String] = None,
     jsAvoidClasses: Option[Boolean] = None,
     jsAvoidLetsAndConsts: Option[Boolean] = None,
-    jsAllowBigIntsForLongs: Option[Boolean] = None
+    jsAllowBigIntsForLongs: Option[Boolean] = None,
+    // absolute output directory of `//> using jsClientOut`: write the client there instead of embedding it
+    jsClientOut: Option[String] = None,
+    jsModuleSplitStyle: Option[String] = None,
+    jsSmallModulePackages: List[String] = Nil
   )
 
   /** A path from a `//> using` line: relative to the declaring file, or, when nothing is there, to the
@@ -527,8 +531,8 @@ object ScalinoCli:
     "nativeMode", "nativeGc", "nativeLto", "nativeClang", "nativeClangPP", "nativeClangPp",
     "nativeLinking", "nativeCompile", "nativeCCompile", "nativeCppCompile", "nativePrune", "nativeTarget",
     "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot", "nativePkgConfig",
-    "platform", "platforms", "target.platform", "jsModuleKind", "jsMode", "jsEmitSourceMaps", "jsClient", "shared",
-    "jsNoOpt", "jsCheckIr", "jsHeader", "jsEsVersionStr", "jsAvoidClasses", "jsAvoidLetsAndConsts", "jsAllowBigIntsForLongs",
+    "platform", "platforms", "target.platform", "jsModuleKind", "jsMode", "jsEmitSourceMaps", "jsClient", "jsClientOut", "shared",
+    "jsNoOpt", "jsCheckIr", "jsHeader", "jsEsVersionStr", "jsModuleSplitStyleStr", "jsSmallModuleForPackage", "jsAvoidClasses", "jsAvoidLetsAndConsts", "jsAllowBigIntsForLongs",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -609,11 +613,14 @@ object ScalinoCli:
     var jsMode = Option.empty[String]
     var jsSourceMaps = Option.empty[Boolean]
     var jsClients = List.empty[String]
+    var jsClientOut = Option.empty[String]
     var shared = List.empty[String]
     var jsNoOpt = Option.empty[Boolean]
     var jsCheckIr = Option.empty[Boolean]
     var jsHeader = Option.empty[String]
     var jsEsVersion = Option.empty[String]
+    var jsModuleSplitStyle = Option.empty[String]
+    var jsSmallModulePackages = List.empty[String]
     var jsAvoidClasses = Option.empty[Boolean]
     var jsAvoidLetsAndConsts = Option.empty[Boolean]
     var jsAllowBigIntsForLongs = Option.empty[Boolean]
@@ -671,6 +678,8 @@ object ScalinoCli:
         directiveBool(line, "jsCheckIr").foreach(v => jsCheckIr = Some(v))
         directiveValues(line, "jsHeader").foreach(_.headOption.foreach(v => jsHeader = Some(v)))
         directiveValues(line, "jsEsVersionStr").foreach(_.headOption.foreach(v => jsEsVersion = Some(v)))
+        directiveValues(line, "jsModuleSplitStyleStr").foreach(_.headOption.foreach(v => jsModuleSplitStyle = Some(v)))
+        directiveValues(line, "jsSmallModuleForPackage").foreach(vs => jsSmallModulePackages = jsSmallModulePackages ++ vs)
         directiveBool(line, "jsAvoidClasses").foreach(v => jsAvoidClasses = Some(v))
         directiveBool(line, "jsAvoidLetsAndConsts").foreach(v => jsAvoidLetsAndConsts = Some(v))
         directiveBool(line, "jsAllowBigIntsForLongs").foreach(v => jsAllowBigIntsForLongs = Some(v))
@@ -678,6 +687,7 @@ object ScalinoCli:
         directiveValues(line, "jsMode").foreach(_.headOption.foreach(v => jsMode = Some(v)))
         directiveBool(line, "jsEmitSourceMaps").foreach(v => jsSourceMaps = Some(v))
         directiveValues(line, "jsClient").foreach(vs => jsClients = jsClients ++ vs.map(v => directivePath(src, v).toString))
+        directiveValues(line, "jsClientOut").foreach(_.headOption.foreach(v => jsClientOut = Some(src.toAbsolutePath.getParent.resolve(v).normalize().toString)))
         directiveValues(line, "shared").foreach(vs => shared = shared ++ vs.map(v => directivePath(src, v).toString))
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
@@ -698,7 +708,7 @@ object ScalinoCli:
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
       nativeTargetTriples, nativeSysroots, nativePkgConfig,
       platform, jsModuleKind, jsMode, jsSourceMaps, jsClients.distinct, shared.distinct,
-      jsNoOpt, jsCheckIr, jsHeader, jsEsVersion, jsAvoidClasses, jsAvoidLetsAndConsts, jsAllowBigIntsForLongs
+      jsNoOpt, jsCheckIr, jsHeader, jsEsVersion, jsAvoidClasses, jsAvoidLetsAndConsts, jsAllowBigIntsForLongs, jsClientOut, jsModuleSplitStyle, jsSmallModulePackages.distinct
     )
 
   /** scala-cli's dependency formats (only `org::name::version` is advertised in
@@ -2623,7 +2633,8 @@ object ScalinoCli:
   case class JsOpts(
     moduleKind: String = "none", mode: String = "fast", sourceMaps: Boolean = false, checkIr: Boolean = false,
     header: Option[String] = None, esVersion: Option[String] = None, avoidClasses: Boolean = false,
-    avoidLetsAndConsts: Boolean = false, bigIntsForLongs: Boolean = false)
+    avoidLetsAndConsts: Boolean = false, bigIntsForLongs: Boolean = false,
+    splitStyle: String = "fewest", smallModulePackages: List[String] = Nil)
 
   def platformName(v: String): String = v.toLowerCase match
     case "native" | "scala-native" | "scalanative" => "native"
@@ -2656,6 +2667,16 @@ object ScalinoCli:
       case Some("dev" | "fast" | "fastlinkjs" | "fastopt") => "fast"
       case Some("release" | "full" | "fulllinkjs" | "fullopt") => "full"
       case Some(other) => fail(s"unknown js mode '$other' (expected dev/fastLinkJS or release/fullLinkJS)")
+    val packages = (o.cliJsSmallModulePackages ++ d.jsSmallModulePackages).distinct
+    // scala-cli: the style names are fewestmodules, smallestmodules, smallmodulesfor; packages alone imply the last
+    val split = o.cliJsModuleSplitStyle.orElse(d.jsModuleSplitStyle).map(_.toLowerCase) match
+      case None => if packages.nonEmpty then "smallfor" else "fewest"
+      case Some("fewestmodules" | "fewest") => "fewest"
+      case Some("smallestmodules" | "smallest") => "smallest"
+      case Some("smallmodulesfor" | "smallfor") => "smallfor"
+      case Some(other) => fail(s"unknown js module split style '$other' (expected fewestmodules, smallestmodules or smallmodulesfor)")
+    if split == "smallfor" && packages.isEmpty then fail("--js-module-split-style smallmodulesfor needs --js-small-module-for-package")
+    if split != "fewest" && kind != "esmodule" then fail("a js module split style needs --js-module-kind esmodule")
     JsOpts(
       kind,
       if o.cliJsNoOpt || d.jsNoOpt.contains(true) then "fast" else mode,
@@ -2665,7 +2686,8 @@ object ScalinoCli:
       o.cliJsEsVersion.orElse(d.jsEsVersion).map(_.toLowerCase),
       o.cliJsAvoidClasses || d.jsAvoidClasses.contains(true),
       o.cliJsAvoidLetsAndConsts || d.jsAvoidLetsAndConsts.contains(true),
-      o.cliJsAllowBigInts || d.jsAllowBigIntsForLongs.contains(true))
+      o.cliJsAllowBigInts || d.jsAllowBigIntsForLongs.contains(true),
+      split, packages)
 
   /** Compiles with `-scalajs`, finds the entry point, links with scalino-jslink. Returns the main class
    *  and the linked JavaScript file. */
@@ -2679,7 +2701,8 @@ object ScalinoCli:
     logLevel: String,
     incremental: Boolean,
     js: JsOpts,
-    watch: Boolean = false
+    watch: Boolean = false,
+    outDirOverride: Option[Path] = None
   ): (String, Path) =
     val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental, js = true)
     val jslink = s"$dist/scalino-jslink"
@@ -2691,9 +2714,10 @@ object ScalinoCli:
         case Nil => fail("no entry point found (looked for a static `main(Array[String])`) -- pass --main-class")
         case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one")
     }
-    val outDir = Paths.get(".scalino-build").resolve(mainClass).resolve("js")
+    val outDir = outDirOverride.getOrElse(Paths.get(".scalino-build").resolve(mainClass).resolve("js"))
     System.err.println(Color.gray(s"Linking project (Scala.js ${BuildInfo.scalaJsVersion}, ${if js.mode == "full" then "release" else "dev"})"))
-    (mainClass, linkJs(mainClass, outDir, compiledDir.toString :: extraClasspath.split(CP_SEP).filter(_.nonEmpty).toList, progArgs, logLevel, js, watch))
+    // a directory the user named may hold other files: never wipe it
+    (mainClass, linkJs(mainClass, outDir, compiledDir.toString :: extraClasspath.split(CP_SEP).filter(_.nonEmpty).toList, progArgs, logLevel, js, watch, wipe = outDirOverride.isEmpty))
 
   /** The `-w` counterpart of `runCaptureStdout(jslink ...)`: one `scalino-jslink --long-running` process
    *  reused across rebuilds (its analysis, optimizer and IR caches stay warm), respawned when its argv
@@ -2726,9 +2750,12 @@ object ScalinoCli:
       jsLongRunningLinker = None
       (1, "")
 
+  /** The files (entry, split modules, source maps) the last `linkJs` wrote. */
+  private var lastLinkedJsFiles: List[String] = Nil
+
   /** Runs scalino-jslink over `classpath` (entry point `mainClass`) into a fresh `outDir`; returns the JavaScript file. */
-  def linkJs(mainClass: String, outDir: Path, classpath: List[String], progArgs: List[String], logLevel: String, js: JsOpts, watch: Boolean = false): Path =
-    deleteRecursively(outDir)
+  def linkJs(mainClass: String, outDir: Path, classpath: List[String], progArgs: List[String], logLevel: String, js: JsOpts, watch: Boolean = false, wipe: Boolean = true): Path =
+    if wipe then deleteRecursively(outDir)
     Files.createDirectories(outDir)
     val cmd =
       List(s"$dist/scalino-jslink", "--out", outDir.toString, "--main", mainClass, "--module-kind", js.moduleKind, "--mode", js.mode, "--log", logLevel) ++
@@ -2736,6 +2763,8 @@ object ScalinoCli:
       (if js.sourceMaps then Nil else List("--no-source-maps")) ++
       (if js.checkIr then List("--check-ir") else Nil) ++
       js.header.toList.flatMap(h => List("--header", h)) ++
+      (if js.splitStyle == "fewest" then Nil else List("--module-split-style", js.splitStyle)) ++
+      js.smallModulePackages.flatMap(p => List("--small-module-for-package", p)) ++
       js.esVersion.toList.flatMap(v => List("--es-version", v)) ++
       (if js.avoidClasses then List("--avoid-classes") else Nil) ++
       (if js.avoidLetsAndConsts then List("--avoid-lets-and-consts") else Nil) ++
@@ -2744,6 +2773,7 @@ object ScalinoCli:
     val (linkExit, linkOut) = if watch then linkJsIncremental(cmd) else runCaptureStdout(cmd)
     if linkExit != 0 then fail("linking failed")
     val modules = linkOut.linesIterator.map(_.trim).filter(_.startsWith("module: ")).map(_.stripPrefix("module: ")).toList
+    lastLinkedJsFiles = linkOut.linesIterator.map(_.trim).filter(_.startsWith("file: ")).map(_.stripPrefix("file: ")).toList
     modules match
       case List(m) => outDir.resolve(m)
       case _ => fail(s"expected one linked JavaScript module, scalino-jslink reported ${modules.size}")
@@ -2773,12 +2803,32 @@ object ScalinoCli:
     Files.write(out, text.getBytes("UTF-8"))
     if Files.exists(map) then Files.copy(map, out.resolveSibling(mapName), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
 
+  /** `jsClientOut`: the linker wrote the client straight into `outDir` (each file through a temp name and a
+   *  rename, so a server hosting the directory never sees a half-written one). This records what it wrote in
+   *  `manifest.json` and removes files the previous manifest listed that this build no longer produces.
+   *  Anything else in the directory is left alone. */
+  def writeJsClientManifest(jsFile: Path, outDir: Path): Unit =
+    val manifestFile = outDir.resolve("manifest.json")
+    val entry = jsFile.getFileName.toString
+    val written = (entry :: lastLinkedJsFiles).distinct.filter(n => Files.exists(outDir.resolve(n))).sorted
+    if Files.exists(manifestFile) then
+      """"path"\s*:\s*"([^"]+)"""".r.findAllMatchIn(readFile(manifestFile)).map(_.group(1)).filterNot(written.contains).foreach { old =>
+        val f = outDir.resolve(old).normalize
+        if f.startsWith(outDir.normalize) then Files.deleteIfExists(f)
+      }
+    val entries = written.map(n => s"""    {"path": "$n", "size": ${Files.size(outDir.resolve(n))}}""")
+    val manifest = s"""{\n  "entry": "$entry",\n  "files": [\n${entries.mkString(",\n")}\n  ]\n}\n"""
+    val tmp = outDir.resolve("manifest.json.tmp")
+    Files.write(tmp, manifest.getBytes("UTF-8"))
+    Files.move(tmp, manifestFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    System.err.println(Color.gray(s"Wrote JS client to $outDir"))
+
   /** `//> using jsClient ../client`: the directory is a Scala.js project (its own `//> using` lines, its
    *  own entry point, plus the `//> using shared` sources of the project declaring it) built into a browser script and embedded in the server binary as the resource
    *  `/client/main.js` (+ `/client/main.js.map`). Linked as a classic script (`nomodule`) unless the client
    *  says otherwise, and optimized when the server is being packaged. Returns the resource directory to put
    *  on the server's class path. */
-  def buildJsClient(dir: String, shared: List[String], o: RunOpts, forPackage: Boolean): Path =
+  def buildJsClient(dir: String, shared: List[String], o: RunOpts, forPackage: Boolean, out: Option[String] = None): Option[Path] =
     val clientDir = Paths.get(dir)
     if !Files.isDirectory(clientDir) then fail(s"jsClient: '$dir' is not a directory")
     val (sources, _) = partitionSources(forPlatform(expandSources(clientDir :: shared.map(Paths.get(_))), "js"))
@@ -2793,11 +2843,18 @@ object ScalinoCli:
       val classpath = (List(resolveJsDeps((jsBaseDeps ++ d.deps).distinct, depsCache, repos)) ++ d.jars ++ d.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
       val compileOnly = resolveDeps(d.compileOnlyDeps.distinct, depsCache, repos)
       val jsOpts = resolveJsOpts(d, o, defaultMode = if forPackage then "release" else "dev")
-      val (_, jsFile) = buildJs(sources, Nil, d.mainClass, classpath, d.options ++ o.cliOptions, compileOnly, o.logLevel, !o.noIncremental, jsOpts, o.watch)
-      val resources = Paths.get(".scalino-build", "_client", "resources")
-      deleteRecursively(resources)
-      copyJs(jsFile, resources.resolve("client").resolve("main.js"))
-      resources.toAbsolutePath
+      val outDir = out.map(Paths.get(_))
+      val (_, jsFile) = buildJs(sources, Nil, d.mainClass, classpath, d.options ++ o.cliOptions, compileOnly, o.logLevel, !o.noIncremental, jsOpts, o.watch, outDirOverride = outDir)
+      outDir match
+        case Some(dir) =>
+          writeJsClientManifest(jsFile, dir)
+          None
+        case None =>
+          if jsOpts.splitStyle != "fewest" then fail("a jsClient with a module split style is many files: set --js-client-out (or //> using jsClientOut) to write them to a directory")
+          val resources = Paths.get(".scalino-build", "_client", "resources")
+          deleteRecursively(resources)
+          copyJs(jsFile, resources.resolve("client").resolve("main.js"))
+          Some(resources.toAbsolutePath)
     finally jsPlatform = saved
 
   def buildJsAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts, directives: Directives): Int =
@@ -2817,6 +2874,7 @@ object ScalinoCli:
         val (_, jsFile) = link(o.progArgs)
         runProgram(jsRuntimeCommand() :+ jsFile.toString, o.watch)
       case "package" =>
+        if jsOpts.splitStyle != "fewest" then fail("package writes one file: a js module split style is not supported here (use a jsClient with --js-client-out)")
         val (mainClass, jsFile) = link(Nil)
         val ext = jsFile.getFileName.toString.substring(jsFile.getFileName.toString.lastIndexOf('.'))
         val out = Paths.get(o.out.getOrElse(mainClass.substring(mainClass.lastIndexOf('.') + 1) + ext))
@@ -3214,9 +3272,13 @@ object ScalinoCli:
        |  --js                      build for Scala.js, `//> using platform js`
        |  --platform scala-js|scala-native   same as --js / --native
        |  --js-mode dev|release     fastLinkJS (default), or fullLinkJS: optimizer + minifier
+       |  --js-client-out <dir>     write a `jsClient` (all linked files + manifest.json) to <dir> instead of embedding it
        |  --js-module-kind <kind>   commonjs/common, esmodule/es (writes .mjs) or nomodule/none (default)
        |  --js-emit-source-maps     emit source maps (off by default)
        |  --js-no-opt               no optimizer, even with --js-mode release
+       |  --js-module-split-style fewestmodules|smallestmodules|smallmodulesfor   (esmodule only; many files,
+       |                            needs --js-client-out for a client)
+       |  --js-small-module-for-package <pkg>   small modules for a package and its subpackages (repeatable)
        |  --js-check-ir  --js-header <text>  --js-es-version <es2015...es2021>
        |  --js-avoid-classes  --js-avoid-lets-and-consts  --js-allow-big-ints-for-longs
        |  --js-runtime node|deno|bun  what `run` and `test` execute the program with
@@ -3273,7 +3335,8 @@ object ScalinoCli:
        |  //> using platform js                (Scala.js instead of Scala Native)
        |  //> using jsMode release             (dev|release)
        |  //> using jsModuleKind esmodule      (commonjs|esmodule|nomodule)
-       |  //> using jsEmitSourceMaps true       (also jsNoOpt, jsCheckIr, jsHeader, jsEsVersionStr, jsAvoidClasses,
+       |  //> using jsEmitSourceMaps true       (also jsNoOpt, jsCheckIr, jsHeader, jsEsVersionStr, jsModuleSplitStyleStr,
+       |                                             jsSmallModuleForPackage, jsAvoidClasses,
        |                                             jsAvoidLetsAndConsts, jsAllowBigIntsForLongs)
        |  //> using target.platform scala-js     (this file is only compiled for that platform)
        |""".stripMargin
@@ -3541,11 +3604,14 @@ object ScalinoCli:
     cliPlatform: Option[String] = None,
     cliJsModuleKind: Option[String] = None,
     cliJsMode: Option[String] = None,
+    cliJsClientOut: Option[String] = None,
     cliJsSourceMaps: Option[Boolean] = None,
     cliJsNoOpt: Boolean = false,
     cliJsCheckIr: Boolean = false,
     cliJsHeader: Option[String] = None,
     cliJsEsVersion: Option[String] = None,
+    cliJsModuleSplitStyle: Option[String] = None,
+    cliJsSmallModulePackages: List[String] = Nil,
     cliJsAvoidClasses: Boolean = false,
     cliJsAvoidLetsAndConsts: Boolean = false,
     cliJsAllowBigInts: Boolean = false,
@@ -3590,6 +3656,7 @@ object ScalinoCli:
         case "--native" => o = o.copy(cliPlatform = Some("native"))
         case "--platform" => o = o.copy(cliPlatform = Some(args(i + 1))); i += 1
         case "--js-mode" => o = o.copy(cliJsMode = Some(args(i + 1))); i += 1
+        case "--js-client-out" => o = o.copy(cliJsClientOut = Some(args(i + 1))); i += 1
         case "--js-module-kind" => o = o.copy(cliJsModuleKind = Some(args(i + 1))); i += 1
         case "--js-emit-source-maps" => o = o.copy(cliJsSourceMaps = Some(true))
         case f if f.startsWith("--js-emit-source-maps=") =>
@@ -3606,7 +3673,9 @@ object ScalinoCli:
         case "--js-runtime" => o = o.copy(cliJsRuntime = Some(args(i + 1))); i += 1
         case "--js-version" =>
           die("--js-version is not supported -- this toolchain only ever targets the one pinned Scala.js version it was built for")
-        case f @ ("--js-dom" | "--js-emit-wasm" | "--js-module-split-style" | "--js-small-module-for-package" | "--js-es-module-import-map" | "--js-source-maps-path") =>
+        case "--js-module-split-style" => o = o.copy(cliJsModuleSplitStyle = Some(args(i + 1))); i += 1
+        case "--js-small-module-for-package" => o = o.copy(cliJsSmallModulePackages = o.cliJsSmallModulePackages :+ args(i + 1)); i += 1
+        case f @ ("--js-dom" | "--js-emit-wasm" | "--js-es-module-import-map" | "--js-source-maps-path") =>
           die(s"$f is not supported")
         case "--native-version" =>
           die("--native-version is not supported -- this toolchain only ever targets the one pinned scala-native version it was built for")
@@ -3697,7 +3766,7 @@ object ScalinoCli:
     if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives)
     if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
     // `compile` only type-checks the server: it doesn't need the bundle.
-    val clientResources = if mode == "compile" then Nil else directives.jsClients.map(buildJsClient(_, directives.shared, o, forPackage = mode == "package"))
+    val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, forPackage = mode == "package", out = o.cliJsClientOut.orElse(directives.jsClientOut)))
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
@@ -3858,7 +3927,7 @@ object ScalinoCli:
       }
       if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
       // Same as `run`: the client is built (dev mode unless --js-mode says otherwise) and embedded, so tests can read /client/main.js.
-      val clientResources = directives.jsClients.map(buildJsClient(_, directives.shared, o, forPackage = false))
+      val clientResources = directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, forPackage = false, out = o.cliJsClientOut.orElse(directives.jsClientOut)))
       val repos = (directives.repositories ++ o.cliRepositories).distinct
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)
@@ -4094,6 +4163,7 @@ object ScalinoCli:
   private val completionJsModes = "dev fast fastLinkJS release full fullLinkJS"
   private val completionPlatforms = "scala-js scala-native js native"
   private val completionJsRuntimes = "node deno bun"
+  private val completionJsSplitStyles = "fewestmodules smallestmodules smallmodulesfor"
   private val completionJsEsVersions = "es5_1 es2015 es2016 es2017 es2018 es2019 es2020 es2021"
   private def completionTriples: String = Sysroot.Supported.mkString(" ")
   private val completionOptions =
@@ -4104,7 +4174,7 @@ object ScalinoCli:
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
-    "--js --native --platform --js-mode --js-module-kind --js-emit-source-maps --js-no-opt --js-check-ir --js-header --js-es-version " +
+    "--js --native --platform --js-mode --js-client-out --js-module-kind --js-emit-source-maps --js-no-opt --js-check-ir --js-header --js-es-version --js-module-split-style --js-small-module-for-package " +
     "--js-avoid-classes --js-avoid-lets-and-consts --js-allow-big-ints-for-longs --js-runtime " +
     "--formats --package-name --package-version -h --help"
 
@@ -4140,6 +4210,7 @@ object ScalinoCli:
        |    --platform) COMPREPLY=($$(compgen -W "$completionPlatforms" -- "$$cur")); return ;;
        |    --js-runtime) COMPREPLY=($$(compgen -W "$completionJsRuntimes" -- "$$cur")); return ;;
        |    --js-es-version) COMPREPLY=($$(compgen -W "$completionJsEsVersions" -- "$$cur")); return ;;
+       |    --js-module-split-style) COMPREPLY=($$(compgen -W "$completionJsSplitStyles" -- "$$cur")); return ;;
        |    --js-header) return ;;
        |    --format|--formats) COMPREPLY=($$(compgen -W "binary tar deb rpm docker brew" -- "$$cur")); return ;;
        |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
@@ -4196,6 +4267,7 @@ object ScalinoCli:
        |    --platform) _values 'platform' $completionPlatforms; return ;;
        |    --js-runtime) _values 'runtime' $completionJsRuntimes; return ;;
        |    --js-es-version) _values 'ECMAScript version' $completionJsEsVersions; return ;;
+       |    --js-module-split-style) _values 'split style' $completionJsSplitStyles; return ;;
        |    --js-header) return ;;
        |    --format|--formats) _values 'format' binary tar deb rpm docker brew; return ;;
        |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
@@ -4245,6 +4317,7 @@ object ScalinoCli:
        |complete -c scalino -l platform -x -a "$completionPlatforms"
        |complete -c scalino -l js-runtime -x -a "$completionJsRuntimes"
        |complete -c scalino -l js-es-version -x -a "$completionJsEsVersions"
+       |complete -c scalino -l js-module-split-style -x -a "$completionJsSplitStyles"
        |complete -c scalino -l js-header -x
        |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"

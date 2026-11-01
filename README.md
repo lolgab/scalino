@@ -200,6 +200,22 @@ A Scala Native server can embed a Scala.js frontend:
 resource `/client/main.js`; `scalino package` links it in release mode. See
 [`examples/client-server`](examples/client-server).
 
+To host the client yourself (FreeUnit's `share` action, nginx, a CDN) instead
+of embedding it, add `//> using jsClientOut ../client-dist` or pass
+`--js-client-out <dir>`. The Scala.js linker writes straight into that
+directory (each file through a temp name and a rename, so a server hosting it
+never sees a half-written file) and records the entry point, file names and
+sizes in `manifest.json`; nothing is embedded in the binary. Other files in the
+directory are left alone: only files a previous manifest listed and the new
+build no longer produces are removed.
+
+For a client split into many ES modules use scala-cli's options,
+`--js-module-kind esmodule --js-module-split-style smallestmodules` (also
+`fewestmodules`, `smallmodulesfor` with `--js-small-module-for-package <pkg>`;
+directives `jsModuleSplitStyleStr` and `jsSmallModuleForPackage`). A split client is
+many files, so it needs `jsClientOut`; it cannot be embedded. The manifest lists
+every module.
+
 ## Editor support
 
 `scalino-lsp` gives your editor completion, hover, signature help,

@@ -153,4 +153,28 @@ class ClientSuite extends munit.FunSuite:
 SCALA
 out="$("$SCALINO" test server 2>&1)"; expect "$out" "1 passed, 0 failed"
 
+echo "== jsClientOut / --js-client-out writes the client to a directory instead of embedding it"
+cd "$WORK/cs"
+mkdir -p "$WORK/cs-out" && echo keep > "$WORK/cs-out/other.css"
+echo stale > "$WORK/cs-out/old.js"
+printf '{"entry":"main.js","files":[{"path":"old.js","size":5}]}' > "$WORK/cs-out/manifest.json"
+"$SCALINO" package server -q --js-client-out "$WORK/cs-out" -o app-noembed >/dev/null
+[[ "$(cat "$WORK/cs-out/other.css")" == keep ]] || fail "an unrelated file in the client output dir was touched"
+[[ ! -e "$WORK/cs-out/old.js" ]] || fail "a file the previous manifest listed was not removed"
+[[ -s "$WORK/cs-out/main.js" ]] || fail "main.js missing in the client output dir"
+expect "$(cat "$WORK/cs-out/manifest.json")" '"entry": "main.js"'
+expect "$(cat "$WORK/cs-out/manifest.json")" '"path": "main.js"'
+node -e 'global.document = { getElementById: () => ({ set innerHTML(v) { console.log("DOM <- " + v) } }) }; require(process.argv[1])' "$WORK/cs-out/main.js" > dom2.log
+expect "$(cat dom2.log)" "<h1>Hello, Scala.js!</h1><p>2, 4, 6</p>"
+[[ "$(wc -c < app-noembed)" -lt "$(wc -c < app)" ]] || fail "the bundle is still embedded in the binary"
+
+echo "== --js-module-split-style smallestmodules writes many modules, listed in the manifest"
+"$SCALINO" package server -q --js-client-out "$WORK/cs-split" --js-module-kind esmodule --js-module-split-style smallestmodules -o app-split >/dev/null
+expect "$(cat "$WORK/cs-split/manifest.json")" '"entry": "main.mjs"'
+[[ "$(ls "$WORK/cs-split"/*.mjs | wc -l)" -gt 1 ]] || fail "expected several modules in the split output"
+for f in "$WORK/cs-split"/*.mjs; do expect "$(cat "$WORK/cs-split/manifest.json")" "\"path\": \"$(basename "$f")\""; done
+node --input-type=module -e 'globalThis.document = { getElementById: () => ({ set innerHTML(v) { console.log("DOM <- " + v) } }) }; await import(process.argv[1])' "$WORK/cs-split/main.mjs" > dom3.log
+expect "$(cat dom3.log)" "<h1>Hello, Scala.js!</h1><p>2, 4, 6</p>"
+if "$SCALINO" package server -q --js-module-split-style smallestmodules --js-module-kind esmodule -o app-bad >/dev/null 2>&1; then fail "a split jsClient must not be embedded"; fi
+
 echo "OK: Scala.js smoke tests passed"

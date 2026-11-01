@@ -62,6 +62,7 @@ object JsLink:
   private val Usage =
     """usage: scalino-jslink --out DIR [--main CLASS | --main-noargs CLASS | --module-initializer CLASS.method]...
       |                      [--main-arg ARG]... [--module-kind esmodule|commonjs|none] [--mode fast|full] [--source-maps|--no-source-maps]
+      |                      [--module-split-style fewest|smallest|smallfor] [--small-module-for-package PKG]...
       |                      [--check-ir] [--pretty-print] [--log quiet|info|verbose] CLASSPATH_ENTRY...
       |       scalino-jslink --find-mains CLASSPATH_ENTRY...
       |       scalino-jslink --class-table CLASSPATH_ENTRY...""".stripMargin
@@ -74,6 +75,8 @@ object JsLink:
       inits: List[List[String] => ModuleInitializer] = Nil,
       mainArgs: List[String] = Nil,
       moduleKind: ModuleKind = ModuleKind.NoModule,
+      splitStyle: String = "fewest",
+      smallModulePackages: List[String] = Nil,
       full: Boolean = false,
       sourceMaps: Boolean = true,
       checkIR: Boolean = false,
@@ -107,6 +110,10 @@ object JsLink:
         case "none" | "nomodule" => ModuleKind.NoModule
         case _ => fail(s"unknown module kind: $v")
       parse(t, o.copy(moduleKind = k))
+    case "--module-split-style" :: v :: t =>
+      if v != "fewest" && v != "smallest" && v != "smallfor" then fail(s"unknown module split style: $v")
+      parse(t, o.copy(splitStyle = v))
+    case "--small-module-for-package" :: v :: t => parse(t, o.copy(smallModulePackages = o.smallModulePackages :+ v))
     case "--mode" :: v :: t =>
       if v != "fast" && v != "full" then fail(s"unknown mode: $v")
       parse(t, o.copy(full = v == "full"))
@@ -230,6 +237,12 @@ object JsLink:
 
     val config = StandardConfig()
       .withModuleKind(o.moduleKind)
+      .withModuleSplitStyle(o.splitStyle match
+        case "smallest" => ModuleSplitStyle.SmallestModules
+        case "smallfor" =>
+          if o.smallModulePackages.isEmpty then fail("--module-split-style smallfor needs --small-module-for-package")
+          ModuleSplitStyle.SmallModulesFor(o.smallModulePackages)
+        case _ => ModuleSplitStyle.FewestModules)
       .withOptimizer(o.full)
       .withMinify(o.full)
       .withClosureCompilerIfAvailable(false)
@@ -282,6 +295,8 @@ object JsLink:
           val tmp = out.resolve(name + ".tmp")
           Files.write(tmp, mem.content(name).get)
           Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
+        // every file written (a split link has many), then the entry module
+        for name <- mem.fileNames().sorted do println(s"file: $name")
         for m <- result.publicModules do println(s"module: ${m.jsFileName}")
         true
       catch
