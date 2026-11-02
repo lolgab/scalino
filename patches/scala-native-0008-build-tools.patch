@@ -620,7 +620,7 @@ index 1adf331f..f8ff6cd2 100644
    }
  
    /** Looks at all the object files to see if one is newer than the output
-@@ -457,6 +517,32 @@ private[scalanative] object LLVM {
+@@ -457,6 +517,35 @@ private[scalanative] object LLVM {
        case None     => Seq("-Wno-override-module")
      }
  
@@ -644,7 +644,10 @@ index 1adf331f..f8ff6cd2 100644
 +        // a profile of a slightly different build is expected, not an error
 +        "-Wno-profile-instr-unprofiled",
 +        "-Wno-profile-instr-out-of-date",
-+        "-Wno-profile-instr-missing"
++        "-Wno-profile-instr-missing",
++        // "function control flow change detected (hash mismatch)" is reported
++        // by the backend, under -Wbackend-plugin, once per stale function
++        "-Wno-backend-plugin"
 +      )
 +    }
 +    gen ++ use
