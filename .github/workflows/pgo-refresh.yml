@@ -31,7 +31,7 @@ jobs:
         name: ${{ fromJSON(inputs.names) }}
     env:
       SCALANATIVE_LINK_THREADS: '1'
-      SCALINO_LINK_RAM_PERCENT: '55'
+      SCALINO_LINK_RAM_PERCENT: '40'
       SCALINO_LINK_MODE: release-fast
       SCALINO_JVM_LINK: '1'
       # the base build must not use the profiles that are being replaced
@@ -67,6 +67,12 @@ jobs:
           SKIP_FINAL: '1'
           LSP_RUNS: ${{ inputs.lsp_runs }}
         run: ./build/pgo/pgo-${{ matrix.name }}.sh
+
+      - name: Memory log
+        if: always()
+        run: |
+          tail -40 "$RUNNER_TEMP/mem.log" || true
+          sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -10 || true
 
       - name: Link logs
         if: always()
