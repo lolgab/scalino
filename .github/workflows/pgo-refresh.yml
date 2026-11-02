@@ -31,7 +31,9 @@ jobs:
         name: ${{ fromJSON(inputs.names) }}
     env:
       SCALANATIVE_LINK_THREADS: '1'
-      SCALINO_LINK_RAM_PERCENT: '40'
+      # runners are killed in the final clang/lld link of instrumented dotc/lsp
+      # binaries; the idle link JVM keeps its heap, so leave it little
+      SCALINO_LINK_RAM_PERCENT: '30'
       SCALINO_LINK_MODE: release-fast
       SCALINO_JVM_LINK: '1'
       # the base build must not use the profiles that are being replaced
