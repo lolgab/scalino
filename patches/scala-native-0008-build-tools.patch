@@ -1,5 +1,5 @@
 diff --git a/tools/src/main/scala/scala/scalanative/build/Build.scala b/tools/src/main/scala/scala/scalanative/build/Build.scala
-index 8eb17b0c..6b3e3979 100644
+index 8eb17b0c..7ba000f0 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Build.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Build.scala
 @@ -156,7 +156,7 @@ object Build {
@@ -20,7 +20,46 @@ index 8eb17b0c..6b3e3979 100644
              )
            )
          }
-@@ -318,13 +318,40 @@ object Build {
+@@ -256,15 +256,37 @@ object Build {
+     // - build configuration
+     // - class paths' mtime
+     // - the output native binary ('s mtime)
++    // - the link-time environment variables that change the generated code
+     // Since the NIR code is shipped in jars, we should be able to detect the changes in NIRs.
+     // One thing we miss is, we cannot detect changes in c libraries somewhere in `/usr/lib`.
+     (
+       config,
+       config.classPath.map(getLastModifiedChild(_)),
+-      getLastModified(config.artifactPath)
++      getLastModified(config.artifactPath),
++      linkEnv
+     ).hashCode()
+   }
+ 
++  /** The environment variables read by the optimizer and the code generator
++   *  (escape analysis, stack allocation, allocation-oriented inlining, PGO) that
++   *  change what is generated. Without them in the checksum, relinking with a
++   *  different setting is skipped as "no changes". Variables that only print
++   *  diagnostics are left out.
++   */
++  private val linkEnvNames = Seq(
++    "SCALANATIVE_STACK_OBJECTS",
++    "SCALANATIVE_STACK_INCLUDE",
++    "SCALANATIVE_STACK_EXCLUDE",
++    "SCALANATIVE_STACK_HASH",
++    "SCALANATIVE_STACK_POISON",
++    "SCALANATIVE_INLINE_ALLOC",
++    "SCALANATIVE_SITE_PROFILE",
++    "SCALANATIVE_PGO_HOT_FACTOR",
++    "SCALANATIVE_EA_X"
++  )
++  private def linkEnv: Seq[(String, Option[String])] =
++    linkEnvNames.map(n => n -> sys.env.get(n))
++
+   /** Finds and compiles native libaries.
+    *
+    *  @param config
+@@ -318,13 +340,40 @@ object Build {
  
    private[scalanative] final val userConfigHashFile = "userConfigHash"
  
@@ -65,7 +104,7 @@ index 8eb17b0c..6b3e3979 100644
        content = config.compilerConfig.##.toString()
      )
  
-@@ -334,10 +361,33 @@ object Build {
+@@ -334,10 +383,33 @@ object Build {
      // Fatal errors, e.g. StackOverflowErrors are not propagated by Futures
      // Use a helper promise to get notified about the underlying problem
      val promise = Promise[T]()
@@ -421,7 +460,7 @@ index fbf4be30..c9cc2d47 100644
          }
  
 diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
-index 1adf331f..f8ff6cd2 100644
+index 1adf331f..507db3b1 100644
 --- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
 @@ -1,11 +1,10 @@
