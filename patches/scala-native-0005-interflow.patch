@@ -64,10 +64,10 @@ index 6c95d25d..c5582e65 100644
        case (Ieq, nir.Val.Virtual(l), nir.Val.Virtual(r))
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
 new file mode 100644
-index 00000000..c2f2be23
+index 00000000..30a3c9ca
 --- /dev/null
 +++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
-@@ -0,0 +1,1496 @@
+@@ -0,0 +1,1505 @@
 +package scala.scalanative
 +package interflow
 +
@@ -505,6 +505,7 @@ index 00000000..c2f2be23
 +  private val specEnabled = !exps.contains("nospec")
 +  // mutation testing aid: re-introduces a fixed soundness bug (see summarize)
 +  private val mutateDeepFix = exps.contains("mutate-deepfix")
++  private val mutateCollapsedExt = exps.contains("mutate-collapsedext")
 +  private val MaxSpecs = 150000
 +  private val MaxSpecSize = 2500
 +  private var specCount = 0
@@ -1405,6 +1406,14 @@ index 00000000..c2f2be23
 +            // contents of a collapsed node are the node itself
 +            if ((f & ContentsGlobal) != 0 && (f & Collapsed) != 0 && (f & Global) == 0) {
 +              flags(i) |= Global
++              changed = true
++            }
++            // ... so a collapsed node that is (or aliases) caller memory is its
++            // own content, even when it has no content node to propagate to
++            // (a callee that stores one parameter into another is modelled as
++            // union + collapse): everything in it is reachable from the caller
++            if ((f & Collapsed) != 0 && (f & (ExtRoot | Ext)) != 0 && (f & Ext) == 0 && !mutateCollapsedExt) {
++              flags(i) |= Ext
 +              changed = true
 +            }
 +            if (fmap(i) != null) {

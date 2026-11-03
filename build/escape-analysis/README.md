@@ -12,6 +12,14 @@ build/escape-analysis/dev-link.sh <tag>     # compile the analysis sources, link
 build/escape-analysis/bench-dotc.sh $EA_WORK/<tag>/dotty.tools.dotc.Main
 ```
 
+A small program (a regression test, a reduced miscompile) links in seconds against the same overlay:
+
+```sh
+scalino compile Main.scala --native-mode release-fast      # produces .scalino-build/_scratch/classes
+build/escape-analysis/dev-link-app.sh .scalino-build/_scratch/classes Main /tmp/out [release-full]
+EXTRA_CP=<dependency NIR jars> ...                          # e.g. the .scalino-build/deps-cache/*.cp of the project
+```
+
 `EA_WORK` defaults to `.build-work/ea-dev`. Do **not** use `vendor/sn-sbt`: it is
 out of sync with `vendor/scala-native`.
 
@@ -33,7 +41,7 @@ Link-time environment variables read by the analysis (all optional):
 | `SCALANATIVE_ESCAPE_STATS=1` | analysis time breakdown and counters |
 | `SCALANATIVE_INLINE_STATS=1` | outcome of the allocation-oriented inlining decisions |
 | `SCALANATIVE_SITE_PROFILE=<file>` | instrument every allocation site with a hit counter, write the site table to `<file>` |
-| `SCALANATIVE_EA_X=a,b` | experiments: `nospec` (no specialization), `monitor`, `matcherror`, `throwcap` (the last three are **unsound**, measurement only), `mutate-deepfix` (re-introduces a fixed soundness bug, see below) |
+| `SCALANATIVE_EA_X=a,b` | experiments: `nospec` (no specialization), `monitor`, `matcherror`, `throwcap` (the last three are **unsound**, measurement only), `mutate-deepfix` / `mutate-collapsedext` (re-introduce fixed soundness bugs, see below) |
 
 ## Measuring allocations
 
@@ -68,6 +76,14 @@ callee that leaks the *contents* of a parameter was not reflected in the
 caller's summary when the caller never loaded those fields itself) and the
 program then prints a different sum. When adding an analysis feature, add a
 mutant like that and make sure the example catches it.
+
+`tests/escape-analysis/run.sh [scalino]` is the regression test for a second bug of
+that kind: a callee that stores one parameter into another is modelled as union +
+collapse of the two argument nodes, and a collapsed node that is caller memory
+(`ExtRoot`) never received `Ext`, so the stored object looked local and was stack
+allocated (the wes `Envelope` in `PulseRegisters.$init$`). It links with the stack
+transform off / on / on+poison, and with `SCALANATIVE_EA_X=mutate-collapsedext`, which
+must make the output differ or crash.
 
 Differential test of a compiler binary built with the analysis against a known
 good one, over Scala 3's own `tests/pos` programs:

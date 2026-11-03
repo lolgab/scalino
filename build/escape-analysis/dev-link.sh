@@ -29,7 +29,7 @@ if [[ -z "${SKIP_COMPILE:-}" ]]; then
   "$JAVA" -Xss64m -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
     -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")" -d "$OV" \
     $V/interflow/EscapeAnalysis.scala $V/interflow/Inline.scala $V/codegen/Lower.scala \
-    $V/checker/Check.scala $V/build/ScalaNative.scala
+    $V/checker/Check.scala $V/build/ScalaNative.scala $V/build/Build.scala
 fi
 NLCP=$(cat "$WORK/selfhost/nativelibs.cp")
 if [[ -n "${PROF:-}" ]]; then
