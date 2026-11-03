@@ -1,0 +1,17 @@
+diff --git a/compiler/src/dotty/tools/dotc/transform/PickleQuotes.scala b/compiler/src/dotty/tools/dotc/transform/PickleQuotes.scala
+index fdfdcd5f..98064d89 100644
+--- a/compiler/src/dotty/tools/dotc/transform/PickleQuotes.scala
++++ b/compiler/src/dotty/tools/dotc/transform/PickleQuotes.scala
+@@ -303,7 +303,11 @@ object PickleQuotes {
+     def pickleAsTasty() = {
+       val body1 =
+         if body.isType then body
+-        else Inlined(Inlines.inlineCallTrace(ctx.owner, quote.sourcePos), Nil, body)
++        else
++          // The quote may sit in code inlined from another file (`"a" -> '{ ... }`
++          // goes through the inline `ArrowAssoc.->` of Predef): then ctx.source is
++          // that file's, not the quote's, which inlineCallTrace asserts to be equal.
++          Inlined(Inlines.inlineCallTrace(ctx.owner, quote.sourcePos)(using ctx.withSource(quote.source)), Nil, body)
+       val pickleQuote = PickledQuotes.pickleQuote(body1)
+       val pickledQuoteStrings = pickleQuote match
+         case x :: Nil => Literal(Constant(x))
