@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Reproduces the exact source-file list scalino-dotc is self-hosted from --
-# used by build/03-build-scalino-dotc.sh (the real pipeline, since the
-# 2026-09-07 GraalVM-native-image-to-Scala-Native cutover; see
-# docs/findings.md's "Self-hosting" arc for the full history of why each
-# excluded file is excluded). Kept as its own script so the exact file set
-# is reproducible without re-deriving it from scratch.
+# Reproduces the source-file list scalino-dotc is self-hosted from, used by
+# build/03-build-scalino-dotc.sh. See docs/findings.md "Self-hosting" for why each excluded
+# file is excluded.
 #
 # Usage: build/selfhost/gen-file-list.sh > /tmp/reduced-file-list.txt
 set -euo pipefail
@@ -43,26 +40,18 @@ find "$ROOT/.build-work/generated/scalajs-ir-src" -name "*.scala"
 # (nscplugin's NirPrimitives extends CompilerCompat.NirPrimitivesBase, which builds on the renamed
 # backend/ScalaPrimitives.scala picked up by the plain `find` above.)
 
-# The Blocker-A-era generated MiniPhase override table (build/02b-gen-megaphase-overrides.sh).
+# The generated MiniPhase override table (build/02b-gen-megaphase-overrides.sh).
 echo "$ROOT/.build-work/generated/MiniPhaseOverrides.scala"
 
-# tasty-core's real source (org.scala-lang:tasty-core_3 has no Scala Native
-# cross-build either -- confirmed via cs fetch -- but its source lives
-# right here in the same vendor/scala3 checkout, as its own sbt project,
-# not physically inside compiler/src).
+# tasty-core's source (no Scala Native cross-build) lives in vendor/scala3 as its own sbt project.
 find "$ROOT/vendor/scala3/tasty/src" -name "*.scala"
 
-# scala3-interfaces' real source, ported from Java to Scala (see
-# patches/scala3-0006 -- Scala Native's own dotc has no Java-to-NIR path at
-# all, so every .java file needed porting regardless of any external
-# dependency).
+# scala3-interfaces' source, ported from Java to Scala (patches/scala3-0006): Scala Native's dotc
+# has no Java-to-NIR path.
 find "$ROOT/vendor/scala3/interfaces/src" -name "*.scala"
 
-# scala-native's own nscplugin (the real NIR-generation backend) + its
-# nir/util source dependencies (dependsOnSource in scala-native's own
-# project/Build.scala, not separately published artifacts). See
-# patches/scala-native-0002 for the small fixups needed (symExtensions'
-# moved location, no backend.jvm.GenBCode to runsBefore, no java.util.Locale).
+# scala-native's nscplugin (the NIR backend) + its nir/util sources (dependsOnSource in
+# scala-native's Build.scala, not published artifacts). Fixups: patches/scala-native-0002.
 find "$ROOT/vendor/scala-native/nscplugin/src/main/scala-3" -name "*.scala"
 # The compiler-version-specific sources (CompilerCompat) live in scala-between_<from>_<to> /
 # scala-since_<from> directories next to scala-3: take the ones that cover SCALA_VERSION.
@@ -82,25 +71,15 @@ PY
 find "$ROOT/vendor/scala-native/nir/src/main/scala" -name "*.scala"
 find "$ROOT/vendor/scala-native/util/src/main/scala" -name "*.scala"
 
-# Hand-written stub of scala-native's own sbt-buildinfo-generated
-# scala.scalanative.nir.ScalaNativeBuildInfo (normally produced by the
-# sbt-buildinfo plugin at scala-native's own build time, referenced by
-# nir/src's own Versions.scala but never checked into vendor/scala-native's
-# source). Keep in sync with versions.env if SCALA_NATIVE_VERSION/
-# SCALA_VERSION ever change.
+# Hand-written stub of scala.scalanative.nir.ScalaNativeBuildInfo, which scala-native's
+# sbt-buildinfo generates at its own build time (referenced by nir/src's Versions.scala, not
+# checked in). Keep in sync with SCALA_NATIVE_VERSION/SCALA_VERSION in versions.env.
 echo "$ROOT/build/selfhost/ScalaNativeBuildInfo.scala"
 
-# NOTE (not a .scala file, so not part of THIS list): after linking the
-# self-hosted binary, copy build/selfhost/compiler.properties into the NIR
-# output directory (at its root, i.e. `<out>/compiler.properties`) and pass
-# `--embed-resources` to scalino-linkdriver. Without it,
-# dotty.tools.dotc.config.Properties#versionNumberString silently returns ""
-# at runtime (its own `/compiler.properties` classpath resource, normally
-# bundled inside the published scala3-compiler jar, is never available when
-# compiling from source) -- which breaks nscplugin's own
-# AdaptLazyVals.compilerUsesVarHandles version sniff (`ScalaVersion.parse("")`
-# succeeds as `AnyScalaVersion`, not a parse failure, so the intended
-# `.orElse` fallback never triggers) and silently skips rewriting real
-# VarHandle-based lazy vals (Scala 3.8+) into their Scala-Native-compatible
-# form. See docs/findings.md's "Wiring in the real backend" section for the
-# full root-cause writeup and verification.
+# Not a .scala file, so not in this list: after linking, copy build/selfhost/compiler.properties
+# to `<out>/compiler.properties` in the NIR output and pass `--embed-resources` to
+# scalino-linkdriver. Otherwise dotty.tools.dotc.config.Properties#versionNumberString returns ""
+# at runtime, and nscplugin's AdaptLazyVals.compilerUsesVarHandles sniff
+# (`ScalaVersion.parse("")` succeeds as AnyScalaVersion, so the `.orElse` fallback never fires)
+# silently skips rewriting VarHandle-based lazy vals (Scala 3.8+). See docs/findings.md
+# "Wiring in the real backend".

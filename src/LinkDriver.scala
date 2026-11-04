@@ -3,11 +3,8 @@ import scala.scalanative.util.Scope
 import java.nio.file.{Path, Paths}
 
 object LinkDriver:
-  /** `Logger.default` (used unconditionally before) always prints debug/trace
-   *  (raw clang invocations, full NativeConfig dumps) to stderr, with no way
-   *  to dial it down -- scalino now passes its own resolved log level as an
-   *  optional 6th arg ("quiet"|"info"|"verbose", default "info") so `-v`/`-q`
-   *  actually affect the link step, not just scalino's own output. */
+  /** `Logger.default` always prints debug/trace (clang invocations, NativeConfig dumps), so scalino
+   *  passes its log level as an optional 6th arg ("quiet"|"info"|"verbose", default "info"). */
   def loggerFor(level: String): Logger = level match
     case "quiet" => Logger.apply(_ => (), _ => (), _ => (), _ => (), msg => System.err.println(s"[error] $msg"))
     case "verbose" => Logger.default
@@ -19,10 +16,9 @@ object LinkDriver:
       msg => System.err.println(s"[error] $msg")
     )
 
-  /** Everything past the 6 required positional args (cp, workDir, mainClass,
-   *  clang, clang++, logLevel) is flag-style, one flag per `//> using
-   *  native*`/`--native-*` option resolved by ScalinoCli's own NativeOpts --
-   *  see cli/ScalinoCli.scala's buildBinary for the argv this is parsing. */
+  /** Everything past the positional args (cp, workDir, mainClass, clang, clang++, logLevel) is a
+   *  flag, one per `//> using native*`/`--native-*` option resolved by ScalinoCli's NativeOpts
+   *  (see buildBinary in cli/ScalinoCli.scala for the argv). */
   case class Opts(
     mode: Option[String] = None,
     gc: Option[String] = None,
@@ -167,10 +163,8 @@ object LinkDriver:
       if args.nonEmpty then System.err.println(s"scalino-linkdriver: expected at least 5 arguments, got ${args.length}")
       System.err.println(Usage)
       sys.exit(2)
-    // File.pathSeparator, not a hardcoded ":" -- confirmed via Windows CI:
-    // a hardcoded ":" shatters a real Windows path at its own drive-letter
-    // colon ("C:\..."), producing garbage entries and "Discovered 0 classes"
-    // no matter how correct each individual path string already is.
+    // File.pathSeparator, not ":": a hardcoded ":" splits Windows paths at the drive letter
+    // ("C:\..."), giving garbage entries and "Discovered 0 classes".
     val cp = args(0).split(java.io.File.pathSeparator).toSeq.map(s => Paths.get(s))
     val workDir = Paths.get(args(1))
     val mainClass = args(2)
@@ -211,26 +205,13 @@ object LinkDriver:
       .withCompilerConfig(
         _.withClang(Paths.get(args(3)))
           .withClangPP(Paths.get(args(4)))
-          // `NativeConfig.empty` leaves these at `Seq.empty` -- real
-          // scala-cli/sbt-scala-native wire in `Discover`'s defaults
-          // (`/opt/homebrew/lib` etc. on macOS) so system libs a native
-          // dependency needs (e.g. `@link("crypto")` from http4s-crypto)
-          // are actually findable; without this, linking anything that
-          // needs a Homebrew-installed system lib fails with "library
-          // 'x' not found" even though the same project links fine
-          // under real scala-cli on the same machine. User-supplied
-          // `--linking`/`--compile` (from `//> using nativeLinking`/
-          // `nativeCompile`) are appended on top, not substituted in
-          // place of, these defaults.
+          // `NativeConfig.empty` has no lib/include dirs: add `Discover`'s defaults (e.g.
+          // /opt/homebrew/lib) so system libs like `@link("crypto")` are found. User-supplied
+          // `--linking`/`--compile` are appended to them.
           .withLinkingOptions(Discover.linkingOptions() ++ opts.linking)
           .withCompileOptions(Discover.compileOptions() ++ opts.compile)
-          // SCALINO_HEAP_HISTOGRAM gates the whole live-heap-histogram GC
-          // debug feature (patches/scala-native-0041, on top of the feature
-          // itself from patches/scala-native-0005) at C compile time --
-          // undefined by default, since the always-linked-in histogramTable
-          // (~7.5MB static table) and Histogram_dump code otherwise bloat
-          // every binary regardless of whether SCALANATIVE_HEAP_HISTOGRAM_FILE
-          // is ever set at runtime.
+          // SCALINO_HEAP_HISTOGRAM compiles in the live-heap-histogram GC debug feature
+          // (patches/scala-native-0005, 0041); off by default as its ~7.5MB table bloats every binary.
           .withCOptions(opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
           .withCppOptions(opts.cppCompile)
           .withMode(mode)
@@ -390,42 +371,29 @@ object LinkDriver:
       if opts.targetTriples.isEmpty then List(config) else opts.targetTriples.distinct.map(forTriple)
 
     if opts.longRunning then
-      // Same protocol as scala-js-cli's `--longRunning` (scala-js-cli#64):
-      // one Scope, one process, kept alive across every relink so the
-      // patched scala.scalanative.linker.ClassPath's persistent NIR parse
-      // cache (patches/scala-native-0047) actually survives between builds
-      // -- a fresh Scope per build would tear down and reopen every jar's
-      // NIO FileSystem, and a fresh ClassLoader.fromDisk call still hits the
-      // same cached ClassPath.Impl either way (it's keyed process-globally,
-      // not by Scope), but reusing one Scope avoids paying jar-FileSystem
-      // open/close on every iteration for no reason.
+      // Same protocol as scala-js-cli's `--longRunning` (scala-js-cli#64): one Scope and process
+      // across relinks, so the NIR parse cache (patches/scala-native-0047) survives and jar
+      // FileSystems aren't reopened on every build.
       val stdin = new java.io.BufferedReader(new java.io.InputStreamReader(System.in))
       Scope.apply[Unit] { (s: Scope) =>
         given Scope = s
         var continue = true
         while continue do
-          // A build failure (bad source, missing symbol, C compile error...)
-          // is reported on the protocol (SCALINO_LINKING_FAILED) instead of
-          // propagating. The caller (ScalinoCli.linkIncremental) then closes
-          // our stdin, which ends this loop, and spawns a fresh process on
-          // the next link -- failed builds can leave process-global caches
-          // in a half-updated state, so the process isn't reused.
+          // A failed build is reported as SCALINO_LINKING_FAILED. The caller (linkIncremental) then
+          // closes stdin and spawns a fresh process, since failed builds can leave global caches
+          // half-updated.
           try
             for c <- configs do
               val outPath = Build.buildCachedAwait(c)
               logger.debug(s"LINKED: $outPath")
-            // Sentinel printed only after a successful link, mirroring
-            // scala-js-cli's SCALA_JS_LINKING_DONE -- the caller (ScalinoCli,
-            // in watch mode) blocks reading stdout for this exact line
-            // before treating the rebuild as finished.
+            // Mirrors scala-js-cli's SCALA_JS_LINKING_DONE; watch mode waits for this line.
             println("SCALINO_LINKING_DONE")
           catch
             case e: Exception =>
               System.err.println(s"scalino-linkdriver: ${e.getMessage}")
               println("SCALINO_LINKING_FAILED")
           System.out.flush()
-          // Blocks here until the caller writes a line to trigger the next
-          // relink, or closes stdin to end the process gracefully.
+          // A line on stdin triggers the next relink; EOF ends the process.
           continue = stdin.readLine() != null
       }
     else

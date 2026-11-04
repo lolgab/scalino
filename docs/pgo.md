@@ -1,10 +1,10 @@
 # Profile guided optimization
 
-Release builds of the performance critical binaries — `scalino-linkdriver`,
-`scalino-dotc` and `scalino-lsp` — are profile guided. Measured on the native
-`scalino-dotc` compiling the Scala Native tools sources (macOS arm64,
-`release-fast`): **about 11–13% faster** than the same build without PGO, also
-on a workload the profile was not trained on. About two thirds of that comes
+Release builds of `scalino-linkdriver`, `scalino-dotc` and `scalino-lsp` use
+profile-guided optimization. Measured on the native `scalino-dotc` compiling the
+Scala Native tools sources (macOS arm64, `release-fast`): about 11–13% faster
+than the same build without PGO, also on a workload the profile was not trained
+on. About two thirds of that comes
 from LLVM's own IR-level PGO, one third from Interflow (the NIR optimizer)
 using the same profile.
 
@@ -25,8 +25,8 @@ for `linkdriver`, `dotc`, `lsp`). `build/04` (linkdriver), `build/03` (dotc) and
 
 `SCALANATIVE_PGO_STATS=1` prints how many inlining decisions the profile changed.
 
-A PGO link that fails is retried without PGO (build/03, 08) or the plain binary
-is kept (build/04): a profile can never break a release.
+If a PGO link fails, build/03 and 08 retry without PGO and build/04 keeps the
+plain binary.
 
 ### What Interflow does with the profile
 
@@ -75,8 +75,8 @@ The IR differs from the direct codegen's, so the JVM link has its own profiles,
 `pgo/<name>.jvm.{llvm,interflow}.gz` (`pgo_key` in `build/pgo/pgo-lib.sh`), taken
 by the same `build/pgo/pgo-<name>.sh` scripts with `SCALINO_JVM_LINK=1`.
 The `Refresh PGO profiles` workflow (`workflow_dispatch`) does that on a CI runner
--- with the toolchain, clang and `SCALANATIVE_LINK_THREADS` of the release build,
-so the CFG hashes match -- and opens a PR with the new files. It refreshes
+with the toolchain, clang and `SCALANATIVE_LINK_THREADS` of the release build,
+so the CFG hashes match, and opens a PR with the new files. It refreshes
 `pgo/linkdriver.*.gz` too (natively linked, direct codegen; `names` input selects). Until they are
 committed a JVM release link simply has no PGO. scalino-linkdriver is always
 linked natively and keeps its direct-codegen profile.
@@ -93,7 +93,7 @@ git add pgo && git commit
 Needs `llvm-profdata` on `PATH` (Homebrew/apt LLVM) and the instrumented
 binaries are linked with the compiler-rt profile runtime of `$CLANG`. Stale
 profiles are harmless: a function whose CFG changed just loses its profile
-(LLVM) and an unknown function is treated as unknown (Interflow). Refresh after
+(LLVM), and Interflow treats it as unknown. Refresh after
 changes that move a lot of code, or when a release's PGO speedup regresses
 (`build/pgo/bench-dotc.sh <dotc A> <dotc B>`).
 
@@ -123,10 +123,10 @@ mangled symbol names, so one profile serves all targets. It is collected on
 macOS arm64; on other targets the functions whose IR differs (platform specific
 code) simply do not match and are optimized as before.
 
-## Gotchas found on the way
+## Gotchas
 
-* `SCALANATIVE_INLINE_STATS=1` builds a string per inlining decision — far too
-  slow for dotc; use `SCALANATIVE_PGO_STATS`.
+* `SCALANATIVE_INLINE_STATS=1` builds a string per inlining decision, which is
+  far too slow for dotc; use `SCALANATIVE_PGO_STATS`.
 * Native link pool threads now get 64MB stacks (patch `scala-native-0081`,
   `SCALANATIVE_LINK_STACK_MB`), like the JVM driver's `-Xss64m`; with the OS
   default (512KB on macOS) the escape analysis recursion overflowed on dotc-sized

@@ -1,12 +1,9 @@
 package java.util.logging
 
-/** Minimal shim covering exactly the 2 `log` overloads presentation-compiler/
- *  mtags-shared call (`CompilerSearchVisitor.scala`, `CompilerAccess.scala`,
- *  `PackageIndex.scala`) -- `java.util.logging` has no Scala Native
- *  cross-build/javalib port. Writes to stderr rather than no-op, so these
- *  genuine error/warning logs (compiler crashes, classpath scan failures)
- *  stay visible for debugging this prototype, matching this project's own
- *  stderr-logging convention (see Main.scala's `Log`).
+/** Minimal shim for the 2 `log` overloads presentation-compiler/mtags-shared call
+ *  (`CompilerSearchVisitor`, `CompilerAccess`, `PackageIndex`), as `java.util.logging` has no
+ *  Scala Native port. Writes to stderr so compiler crashes and classpath scan failures stay
+ *  visible (see Main.scala's `Log`).
  */
 final class Logger private (name: String) {
   def log(level: Level, msg: String): Unit =

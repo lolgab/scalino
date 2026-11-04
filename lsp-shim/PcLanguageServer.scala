@@ -29,28 +29,20 @@ import scala.scalanative.unsafe.{extern, CInt}
   def scalanative_gc_set_evac_default(enabled: CInt): Unit = extern
 }
 
-/** Thin LSP layer over `scala3-presentation-compiler` (Metals' PC engine),
- *  reusing `Main.scala`'s existing JSON-RPC transport and `Lsp.scala`'s
- *  existing jsoniter-scala wire model -- no lsp4j, no Gson, no reflection,
- *  the same "no reflection anywhere" design the old (now removed)
- *  `DottyLanguageServer` backend used. Real lsp4j/mtags-interfaces/
- *  mtags-shared types are satisfied by the in-tree shim at `lsp-shim/` (not
- *  real jars).
+/** Thin LSP layer over `scala3-presentation-compiler` (Metals' PC engine), reusing `Main.scala`'s
+ *  JSON-RPC transport and `Lsp.scala`'s jsoniter-scala wire model: no lsp4j, Gson or reflection.
+ *  The lsp4j/mtags types the PC expects are satisfied by the in-tree shim at `lsp-shim/`.
  *
- *  Scope: completion/hover/definition/typeDefinition/references/rename/
- *  prepareRename/documentHighlight/signatureHelp/selectionRange/inlayHint/
- *  semanticTokens/codeAction + didOpen/didChange/didClose diagnostics.
- *  presentation-compiler has no documentSymbol/workspaceSymbol/implementation
- *  equivalent (those come from Metals' own BSP-driven indexer, not the PC
- *  itself) -- `Main.scala`'s dispatch just doesn't wire those methods.
+ *  Supports completion, hover, definition, typeDefinition, references, rename, prepareRename,
+ *  documentHighlight, signatureHelp, selectionRange, inlayHint, semanticTokens, codeAction and
+ *  didOpen/didChange/didClose diagnostics. documentSymbol, workspaceSymbol and implementation
+ *  come from Metals' BSP-driven indexer, not the PC, so `Main.scala` doesn't wire them.
  */
 class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Unit) { thisServer =>
 
-  /** One entry per project in `.scalino-build/scalino-lsp.json` (e.g. an
-   *  app's main and test scopes, later one per platform). Each owns its own
-   *  presentation compiler, built lazily on the first request for one of its
-   *  files -- a second PC is a second symbol table, so a project nobody
-   *  touches costs nothing. */
+  /** One entry per project in `.scalino-build/scalino-lsp.json` (e.g. an app's main and test
+   *  scopes). Each owns a presentation compiler, built lazily on the first request for one of its
+   *  files, so an untouched project costs nothing. */
   private final class Project(
       val id: String,
       val config: ProjectConfig,
@@ -68,17 +60,16 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   /** Empty until the config is loaded; never empty afterwards. */
   private var projects: List[Project] = Nil
   private var warmupError: Throwable = null
-  /** Set when the workspace has no `.scalino-build/scalino-lsp.json`, i.e. it
-   *  never ran `scalino setup-ide`. Not an error: the server stays idle and
-   *  answers every request with an empty result, so a project that doesn't
-   *  use scalino doesn't get a toast per request. */
+  /** Set when the workspace has no `.scalino-build/scalino-lsp.json` (`scalino setup-ide` never
+   *  ran). Not an error: the server answers every request with an empty result, so no toast per
+   *  request in projects that don't use scalino. */
   @volatile private var unconfigured = false
 
   /** Serialized request body; empty result when the workspace is unconfigured. */
   private def guarded[A](empty: => A)(body: => A): A =
     thisServer.synchronized {
-      // A request racing the warmup thread must learn whether the workspace
-      // is configured before deciding (requirePc waits for the same signal).
+      // A request racing the warmup thread must wait to learn whether the workspace is configured
+      // (requirePc waits for the same signal).
       val deadline = System.currentTimeMillis() + 180000
       while (projects.isEmpty && warmupError == null && !unconfigured && System.currentTimeMillis() < deadline)
         thisServer.wait(deadline - System.currentTimeMillis())
@@ -86,12 +77,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }
   private val buffers: mutable.Map[URI, String] = mutable.Map.empty
 
-  /** `didChange` used to recompile+publish synchronously on every keystroke:
-   *  typing a few chars queued up that many full compiles behind the LSP's
-   *  single lock, so diagnostics shown mid-burst lagged several keystrokes
-   *  behind (stale errors for seconds after the fix was already typed), even
-   *  though any *individual* compile is fast. Debounce so only the text from
-   *  the last edit in a burst gets compiled. */
+  /** Debounces `didChange`: a compile per keystroke queued up behind the LSP's single lock and
+   *  made diagnostics lag. Only the text from the last edit in a burst is compiled. */
   private val diagnosticsDebounceMillis = 250L
   private val diagnosticsScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r => {
     val t = new Thread(r, "pc-diagnostics-debounce")
@@ -101,8 +88,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private val bufferVersions: mutable.Map[URI, Long] = mutable.Map.empty
   private val pendingDiagnostics: mutable.Map[URI, java.util.concurrent.ScheduledFuture[?]] = mutable.Map.empty
 
-  /** Same on-disk config the old `DottyLanguageServer` backend used to read
-   *  (`scalino setup-ide`'s output). */
+  /** `scalino setup-ide`'s output. */
   private def loadConfig(clientRootUri: String): List[ProjectConfig] = {
     val IDE_CONFIG_FILE = ".scalino-build/scalino-lsp.json"
     // Some clients (e.g. neovim with no detected root) send `rootUri: null`.
@@ -116,8 +102,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     readFromArray(Files.readAllBytes(configFile.toPath))(using projectConfigListCodec)
   }
 
-  /** Per-kind inlay hint toggles, named like Metals' `inlayHints.*.enable`
-   *  settings. All on by default. */
+  /** Per-kind inlay hint toggles, named like Metals' `inlayHints.*.enable` settings. */
   private val InlayHintSettingKeys = List(
     "inferredTypes", "typeParameters", "implicitArguments", "implicitConversions",
     "byNameParameters", "namedParameters", "hintsInPatternMatch")
@@ -172,8 +157,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
         thisServer.synchronized {
           projects = loaded
           thisServer.notifyAll()
-          // Warm the first project (its PC is what a client's first request
-          // most likely needs); the rest are built on demand.
+          // Warm the first project, the likeliest target of the first request; the rest are built on demand.
           ensurePc(loaded.head)
           ()
         }
@@ -203,13 +187,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     InitializeResult(capabilities)
   }
 
-  /** The config's `sourceDirectories` are the parents of every project
-   *  source (`setup-ide` collects them from the expanded file list, which
-   *  skips hidden/build dirs). dotc's `-sourcepath` scan is recursive though,
-   *  so handing it a dir like the project root also pulls in `.metals/`,
-   *  `.scalino-build/.../sources/` (the stdlib's own sources, ->
-   *  "duplicate source version import" errors) etc. List each dir's direct
-   *  children instead; the PC accepts individual source files as entries. */
+  /** dotc's `-sourcepath` scan is recursive, so passing a source dir like the project root also
+   *  pulls in `.metals/` and `.scalino-build/.../sources/` (the stdlib's sources, giving
+   *  "duplicate source version import" errors). List each dir's direct children instead; the PC
+   *  accepts individual source files as entries. */
   private def sourceFilesIn(dirs: Seq[Path]): Seq[Path] =
     dirs.flatMap { d =>
       Option(d.toFile.listFiles()).toSeq.flatten
@@ -235,12 +216,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }
   }
 
-  /** The project a document belongs to: the one listing the file's parent
-   *  directory, else the one with the deepest source directory above it
-   *  (a file created since `setup-ide` ran), else the project with the
-   *  largest classpath (documents with no project of their own, such as
-   *  dependency sources opened from a jar -- the broadest classpath is the
-   *  one most likely to resolve their imports). */
+  /** The project a document belongs to: the one listing the file's parent directory, else the one
+   *  with the deepest source directory above it (a file created since `setup-ide`), else the one
+   *  with the largest classpath (e.g. dependency sources opened from a jar: likeliest to resolve
+   *  their imports). */
   private def projectFor(uri: URI): Project = {
     val ps = projects
     val parent: Option[Path] =
@@ -265,12 +244,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
         buildTargetIdentifier = project.id,
         classpath = cfg.dependencyClasspath.distinct.map(Paths.get(_)),
         options = cfg.compilerArguments.distinct :+ "-color:never",
-        // Without this, sourcePathMode defaults to DISABLED and sourcePath
-        // below is plumbed through but never used: the InteractiveDriver
-        // only ever typechecks files the editor explicitly opens
-        // (didOpen/didChange), so a symbol defined in a sibling source file
-        // that hasn't been opened yet fails to resolve -- looks exactly
-        // like "not all files in the source dirs get compiled".
+        // Without this, sourcePathMode is DISABLED and sourcePath is ignored: symbols in sibling
+        // files that haven't been opened fail to resolve.
         config = scala.meta.internal.pc.PresentationCompilerConfigImpl(
           _sourcePathMode = scala.meta.pc.SourcePathMode.FULL
         ),
@@ -282,14 +257,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     project.pc
   }
 
-  /** Every `complete` call makes the PC build a throwaway `InteractiveDriver`
-   *  (see `RawScalaPresentationCompiler.complete`), a few MB of garbage per
-   *  call. Scala Native's Immix heap fragments under that churn and its RSS
-   *  only ever grows, reaching GBs in a long editing session. Recycling the
-   *  PC (fresh driver; the old one becomes garbage together with its symbol
-   *  table and caches) bounds it: when the server has been idle for
-   *  `pcRecycleIdleMillis` after `pcRecycleMinCompletions` completions, or
-   *  hard-capped at `pcRecycleMaxCompletions` regardless of idleness. */
+  /** Every `complete` call builds a throwaway `InteractiveDriver` (a few MB of garbage), which
+   *  fragments Scala Native's Immix heap until RSS reaches GBs. Recycling the PC bounds it: after
+   *  `pcRecycleMinCompletions` completions once idle for `pcRecycleIdleMillis`, or at
+   *  `pcRecycleMaxCompletions` regardless. */
   private val pcRecycleIdleMillis = 15000L
   private val pcRecycleMinCompletions = 50
   private val pcRecycleMaxCompletions = 400
@@ -297,9 +268,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private def recyclePc(project: Project): Unit = {
     if (project.factory == null || project.pc == null) return
     val fresh = project.factory()
-    // Warm the new driver with the project's open buffers so the next request
-    // doesn't pay for typechecking them from scratch (results are discarded;
-    // diagnostics for unchanged text are already published).
+    // Warm the new driver with the project's open buffers so the next request doesn't typecheck
+    // them from scratch (results are discarded).
     buffers.foreach { case (uri, text) =>
       if (projectFor(uri) eq project)
         try fresh.didChange(CompilerVirtualFileParams(uri, text))
@@ -307,8 +277,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }
     project.pc = fresh
     project.completionsSincePc = 0
-    // Let the GC (evacuating, when enabled) reclaim the old PC's heap now
-    // rather than at the next allocation-triggered cycle.
+    // Reclaim the old PC's heap now rather than at the next allocation-triggered cycle.
     System.gc()
   }
 
@@ -326,12 +295,9 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }
   }
 
-  /** Warmup (classpath resolution + PC construction) runs on a daemon thread
-   *  started from `initialize()` -- requests that land before it finishes
-   *  (e.g. an editor's first definition request right after startup) block
-   *  here instead of failing outright. 30s was too tight: observed real PC
-   *  warmup (classpath scanning over ~20+ real jars) taking anywhere from
-   *  ~1s (warm page cache) to several minutes (cold). */
+  /** Warmup (classpath resolution + PC construction) runs on a daemon thread started from
+   *  `initialize()`; requests arriving before it finishes block here instead of failing. The
+   *  deadline is generous: warmup took from ~1s (warm page cache) to several minutes (cold). */
   private def requirePc(uri: URI): RawScalaPresentationCompiler = thisServer.synchronized {
     val deadline = System.currentTimeMillis() + 180000
     while (projects.isEmpty && warmupError == null && System.currentTimeMillis() < deadline)
@@ -342,11 +308,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     ensurePc(projectFor(uri))
   }
 
-  /** Convert an `Lsp.Position` (line/character) to a raw text offset --
-   *  presentation-compiler's `OffsetParams` always wants a plain `Int`
-   *  offset, computed from whatever full text the client last sent (no
-   *  driver/SourceFile needed, unlike `DottyLanguageServer.sourcePosition`
-   *  -- this is pure text math). */
+  /** Converts an `Lsp.Position` to the plain `Int` offset `OffsetParams` wants, from the full text
+   *  the client last sent. */
   private def positionToOffset(text: String, pos: Position): Int = {
     var idx = 0
     var line = 0
@@ -436,9 +399,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private def toTextEdit(e: l.TextEdit): TextEdit =
     TextEdit(toRange(e.getRange()), e.getNewText())
 
-  /** Real lsp4j types markup-ish fields as `Either<String, MarkupContent>`
-   *  (or similar) since a raw string is also a valid MarkupContent -- unwrap
-   *  either branch into a plain `MarkupContent`. */
+  /** lsp4j types markup fields as `Either<String, MarkupContent>`; unwrap either branch into a
+   *  `MarkupContent`. */
   private def eitherToMarkupContent(e: JEither[String, l.MarkupContent]): MarkupContent =
     if (e == null) MarkupContent("plaintext", "")
     else if (e.isLeft()) MarkupContent("plaintext", e.getLeft())
@@ -464,26 +426,17 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     bufferVersions(uri) = version
     pendingDiagnostics.remove(uri).foreach(_.cancel(false))
     val task: Runnable = () => thisServer.synchronized {
-      // Drop this compile if a newer edit landed while we were waiting --
-      // that edit's own scheduled task will publish for the latest text.
+      // Drop this compile if a newer edit landed: its own task publishes for the latest text.
       if (bufferVersions.get(uri).contains(version)) publishDiagnosticsFor(uri, document.uri)
     }
     pendingDiagnostics(uri) =
       diagnosticsScheduler.schedule(task, diagnosticsDebounceMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
   }
 
-  /** dotc's raw diagnostic `code` is just `ErrorMessageID.errorNumber`'s bare
-   *  digits (e.g. "50") -- shown by VS Code as `source(code)`, i.e.
-   *  "presentation compiler(50)", which tells a user nothing on its own.
-   *  Reformat to dotc's own `E###` convention (matches dotc's CLI output,
-   *  e.g. `-- [E007] Type Mismatch Error:`) and, since every such ID has a
-   *  real published page at
-   *  https://docs.scala-lang.org/scala3/reference/error-codes/E###.html
-   *  (confirmed live for E050), attach it as `codeDescription` so a client
-   *  that supports it (VS Code does) renders the code as a clickable link
-   *  straight to the explanation. `-1` (`NoExplanationID`, real Metals'
-   *  own special case for "no doc page exists") and anything non-numeric
-   *  are left with no code/link at all rather than a broken one. */
+  /** dotc's raw diagnostic `code` is the bare `ErrorMessageID.errorNumber` (e.g. "50"). Reformat
+   *  it to dotc's `E###` convention and attach
+   *  https://docs.scala-lang.org/scala3/reference/error-codes/E###.html as `codeDescription`.
+   *  `-1` (`NoExplanationID`, as in Metals) and non-numeric codes get no code/link. */
   private def formatDiagnosticCode(rawCode: String): Option[(String, String)] =
     rawCode.toIntOption.filter(_ >= 0).map { n =>
       val padded = "E%03d".format(n)
@@ -547,17 +500,12 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     result.locations().asScala.map(toLocation).toList
   }
 
-  /** References of the symbol at `pos`, split into those in `uri` itself and
-   *  those in other files. presentation-compiler only ever searches the one
-   *  file it is handed (Metals drives it from its own index, which this
-   *  server doesn't have), so the rest is done here the way Metals does it:
-   *  resolve the symbol(s) at the cursor to semanticdb names, then ask for
-   *  that name in every other source of the connected projects (those
-   *  related through `dependsOn`, in either direction: a rename in `main`
-   *  must reach `test`, and a use in `test` must find the `main` definition),
-   *  each asked of the compiler of the project owning that file. Files whose
-   *  text doesn't mention the identifier are skipped without typechecking
-   *  them. File-local symbols never leave their file. */
+  /** References of the symbol at `pos`, split into those in `uri` itself and those in other files.
+   *  The PC only searches the file it is handed (Metals drives it from an index we lack), so as in
+   *  Metals: resolve the symbol(s) at the cursor to semanticdb names, then ask the owning project's
+   *  compiler for that name in every other source of the connected projects (related through
+   *  `dependsOn` in either direction: a rename in `main` must reach `test` and vice versa). Files
+   *  not mentioning the identifier are skipped untypechecked. File-local symbols stay in their file. */
   private def workspaceReferences(uri: URI, pos: Position, includeDeclaration: Boolean): (List[Location], List[Location]) = {
     val text = textOf(uri)
     val offset = positionToOffset(text, pos)
@@ -610,11 +558,9 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     here ++ others
   }
 
-  /** For the file the rename was requested in, the PC's own rename is
-   *  preferred (it knows about backticks, named arguments, ...), but it only
-   *  handles file-local symbols and answers nothing for the rest, so then
-   *  that file's references stand in for it. Every other file's occurrences
-   *  come from `workspaceReferences`. */
+  /** In the requested file the PC's own rename is preferred (it knows about backticks, named
+   *  arguments, ...), but it only handles file-local symbols, so otherwise that file's references
+   *  stand in. Other files' occurrences come from `workspaceReferences`. */
   def rename(params: RenameParams): WorkspaceEdit = guarded(WorkspaceEdit(Map.empty)) {
     val uri = pcUri(params.textDocument.uri)
     val pcEdits = requirePc(uri).rename(offsetParams(uri, params.position), params.newName).asScala.map(toTextEdit).toList
@@ -663,10 +609,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     )
   }
 
-  // presentation-compiler has no documentSymbol/workspace-symbol/implementation
-  // equivalent -- those come from Metals' own BSP-driven indexer, not the PC
-  // itself (see this class's doc comment above). Stubbed empty so Main.scala's
-  // shared ServerBackend dispatch doesn't need a PC-specific branch for them.
+  // The PC has no documentSymbol/workspaceSymbol/implementation (see the class doc); stubbed empty
+  // so Main.scala's shared ServerBackend dispatch needs no PC-specific branch.
   def documentSymbol(params: DocumentSymbolParams): List[SymbolInformation] = Nil
   def symbol(params: WorkspaceSymbolParams): List[SymbolInformation] = Nil
   def implementation(params: TextDocumentPositionParams): List[Location] = Nil
@@ -706,10 +650,8 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
       namedParameters = on("namedParameters"),
       hintsInPatternMatch = on("hintsInPatternMatch"),
       closingLabels = false)
-    // presentation-compiler folds each child of the requested range separately
-    // and the children overlap (a call and its own arguments), so one hint --
-    // `[Int, Int]`, `(using ...)` -- can come back once per enclosing tree;
-    // editors render each copy. Identical position + text + kind is one hint.
+    // The PC folds each child of the range separately and children overlap (a call and its
+    // arguments), so one hint can come back once per enclosing tree. Dedupe on position + text + kind.
     val rawHints = requirePc(uri).inlayHints(hintsParams).asScala.toList
     def hintLabel(h: l.InlayHint): String = Option(h.getLabel()) match {
       case None => ""
@@ -721,16 +663,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
       (p.getLine(), p.getCharacter(), hintLabel(h), Option(h.getKind()).map(_.getValue()))
     }.map { h =>
       val pos = h.getPosition()
-      // Real lsp4j 1.0.0 types `label` as `Either<String, List<InlayHintLabelPart>>` --
-      // presentation-compiler really does build the `List` shape for composite
-      // (e.g. multi-part inferred-type) hints (`InlayHints.makeInlayHint`,
-      // mtags-shared), so unlike the other Either-typed fields in this file
-      // (which PC only ever sets to `Left`), this one needs its Right branch
-      // handled for real: flatten each part's plain text -- this minimal wire
-      // model has no per-part hover-link shape to preserve, only a display
-      // string. `tooltip` is never actually set by any call site (confirmed
-      // via a full grep of presentation-compiler+mtags-shared), so
-      // `eitherToString`'s generic Left/Right handling is enough there.
+      // `label` is `Either<String, List<InlayHintLabelPart>>` and the PC builds the `List` shape for
+      // composite hints (`InlayHints.makeInlayHint`), so unlike the other Either fields (always
+      // `Left`) the Right branch matters: flatten the parts' text, as the wire model has no
+      // per-part links. `tooltip` is never set by the PC, so `eitherToString` suffices there.
       val label = Option(h.getLabel()) match {
         case None => ""
         case Some(e) if e.isLeft() => e.getLeft()
@@ -746,16 +682,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     }.toList
   }
 
-  /** LSP's semantic-tokens wire format is a flat, *relative*-encoded array:
-   *  each token is 5 ints `(deltaLine, deltaStartChar, length, tokenType,
-   *  tokenModifiersBitmask)`, delta-encoded against the previous token's
-   *  start (`deltaStartChar` is relative to the previous token's start
-   *  column ONLY when on the same line, otherwise absolute) -- see the LSP
-   *  spec's "SemanticTokens" section. `RawScalaPresentationCompiler.Node`
-   *  gives raw text offsets, not line/character, so this does one forward
-   *  scan over the buffer converting each node's start offset to
-   *  line/character (nodes are sorted by position first since the encoding
-   *  requires monotonically increasing positions). */
+  /** Encodes nodes in LSP's relative semantic-tokens format: 5 ints per token
+   *  `(deltaLine, deltaStartChar, length, tokenType, tokenModifiersBitmask)`, where `deltaStartChar`
+   *  is relative to the previous token only on the same line, else absolute. Nodes carry raw
+   *  offsets, so they are sorted and converted to line/character in one forward scan. */
   def semanticTokens(params: DocumentSymbolParams): Lsp.SemanticTokens = guarded(Lsp.SemanticTokens(Nil)) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)
@@ -784,18 +714,10 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     Lsp.SemanticTokens(data.result())
   }
 
-  /** Only the code actions presentation-compiler can compute from just a
-   *  cursor/selection (no extra user-chosen payload) are wired here --
-   *  `ConvertToNamedArguments`/`ConvertToNamedLambdaParameters` need a set of
-   *  argument indices the user picked, which this minimal client model has
-   *  no UI to collect, so they're deliberately left unwired rather than
-   *  guessed at (e.g. "convert all arguments", which wouldn't match what a
-   *  real editor's own argument-picking UI would send). Each provider is
-   *  tried independently and just contributes nothing if it doesn't apply at
-   *  this position -- there's no separate "is this applicable here" query on
-   *  `RawScalaPresentationCompiler`, only "try it and see what edits (if
-   *  any) come back", so a thrown exception is treated the same as an empty
-   *  result. */
+  /** Only code actions computable from just a cursor/selection are wired.
+   *  `ConvertToNamedArguments`/`ConvertToNamedLambdaParameters` need user-picked argument indices,
+   *  which this client model can't collect. Each provider is tried independently (there is no
+   *  applicability query on `RawScalaPresentationCompiler`), and an exception counts as no edits. */
   def codeAction(params: CodeActionParams): List[Lsp.CodeAction] = guarded(Nil) {
     val uri = pcUri(params.textDocument.uri)
     val text = textOf(uri)

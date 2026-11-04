@@ -1,49 +1,25 @@
 #!/usr/bin/env bash
-# Builds scalino-lsp: dotc + scala3-presentation-compiler (Metals' own PC
-# engine) + a thin glue layer, all compiled to NIR and linked into a real
-# Scala Native executable -- self-hosted, no JVM/GraalVM in the resulting
-# binary.
+# Builds scalino-lsp: dotc + scala3-presentation-compiler (Metals' PC engine) + a thin glue
+# layer, compiled to NIR and linked into a Scala Native executable (no JVM).
 #
-# Until 2026-09-13 this shipped dotty's own narrow pre-Metals
-# DottyLanguageServer backend instead (still self-hosted, but a much
-# smaller feature surface than Metals' own PC engine gives -- no
-# extract-method/inlay-hints/richer completions/etc). That backend has been
-# removed entirely (patches/scala3-0017-lsp-pc-backend-switch.patch deletes
-# DottyLanguageServer.scala/Memory.scala from vendor/scala3 and rewrites
-# Main.scala's dispatch to call presentation-compiler-backed
-# `PcLanguageServer` directly) -- see docs/findings.md's "Self-hosting
-# scalino-lsp" section for the DottyLanguageServer-era history, and
-# `~/.claude/plans/lovely-jumping-anchor.md` for the presentation-compiler
-# cutover's design record.
+# Until 2026-09-13 this shipped dotty's DottyLanguageServer instead; patches/scala3-0017 removed
+# it and routes Main.scala to the presentation-compiler-backed `PcLanguageServer` (history in
+# docs/findings.md "Self-hosting scalino-lsp").
 #
-# presentation-compiler's own ~140 files (across presentation-compiler/ +
-# its mtags-shared dependency) need zero edits -- the only blocker is that
-# they're written against org.eclipse.lsp4j.* and org.scalameta:mtags-interfaces'
-# scala.meta.pc.*, neither of which have a Scala Native build or any Java
-# bytecode->NIR path in this toolchain. Fixed with a Scala-source shim under
-# those exact package names (lsp-shim/lsp4j, lsp-shim/mtags-interfaces).
+# presentation-compiler (~140 files, plus mtags-shared) is used unmodified. It is written against
+# org.eclipse.lsp4j.* and scala.meta.pc.* (mtags-interfaces), which have no Scala Native build,
+# so Scala-source shims under those names live in lsp-shim/lsp4j and lsp-shim/mtags-interfaces.
 #
-# TWO-INVOCATION COMPILE: dotc's "auto-application" leniency for parenless
-# no-arg method calls (`params.text` instead of `params.text()`) only
-# applies when the called symbol is genuinely JavaDefined -- real lsp4j/
-# mtags-interfaces classfiles get it automatically, but a fresh Scala port
-# compiled jointly with presentation-compiler's real (unmodifiable) source,
-# which calls the same methods both ways, does not. Fix: compile
-# presentation-compiler+mtags-shared+the glue against the REAL lsp4j/
-# jsonrpc/coursier-interface jars and mtags-interfaces javac'd from its real
-# sources jar (invocation 1 below -- matching how Metals' own sbt build
-# actually depends on these), while lsp-shim/lsp4j+lsp-shim/mtags-interfaces
-# compile SEPARATELY, standalone, to produce the actual NIR definitions the
-# linker needs for those same symbolic names (invocation 2) -- mirrors the
-# existing nativelibs.cp precompiled-NIR-plus-fresh-compile pattern used
-# elsewhere in this build.
+# TWO-INVOCATION COMPILE: dotc only auto-applies parenless calls to no-arg methods
+# (`params.text` for `params.text()`) on genuinely Java-defined symbols, and the shim, compiled
+# jointly with PC sources that call the methods both ways, isn't. So invocation 1 compiles
+# presentation-compiler+mtags-shared+glue against the REAL lsp4j/jsonrpc/coursier-interface jars
+# and mtags-interfaces javac'd from its sources jar (as Metals' sbt build does), and invocation 2
+# compiles the shims standalone to produce the NIR the linker needs for those same names.
 #
-# Prereqs: same as build/03-build-scalino-dotc.sh (compiler.cp/tools.cp/
-# nativelibs.cp/nscplugin.cp/nscplugin.jar.txt/lsp.cp via 01-fetch-deps.sh,
-# dist/scalino-linkdriver + driver-classes via 04-build-scalino-linkdriver.sh,
-# dist/scalino via 07-build-scalino.sh), plus network access for `cs fetch`
-# (real lsp4j/jsonrpc/coursier-interface jars + mtags-interfaces' sources
-# jar) and a JDK javac (build/00-env.sh's $JAVAC).
+# Prereqs: as for 03-build-scalino-dotc.sh (01-fetch-deps.sh manifests, dist/scalino-linkdriver
+# and driver-classes from 04, dist/scalino from 07), plus network for `cs fetch` and a JDK javac
+# ($JAVAC from 00-env.sh).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -64,15 +40,11 @@ NIR_OUT_MAIN="$SELFHOST_DIR/lsp-nir-out-main"
 NIR_OUT_SHIM="$SELFHOST_DIR/lsp-nir-out-shim"
 LINK_WORK="$SELFHOST_DIR/lsp-link-work"
 
-# See 03-build-scalino-dotc.sh's identical block / build/01a-publish-scala-native.sh.
+# See 03-build-scalino-dotc.sh / 01a-publish-scala-native.sh.
 NATIVELIBS_CP="$SELFHOST_DIR/lsp-nativelibs.cp"
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  # See build/03-build-scalino-dotc.sh's identical substitution for why the
-  # exact-path filter (not just the old "-<version>" suffix pattern) is
-  # needed: 01a-publish-scala-native.sh may have already rewritten
-  # $WORK/nativelibs.cp to point straight at $LOCAL_JAVALIB_JAR, and listing
-  # it twice makes scala-native's linker fail with duplicate symbols.
+  # Exact-path filter: see 03-build-scalino-dotc.sh (a duplicate jar entry breaks the link).
   { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-' | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
@@ -86,23 +58,20 @@ echo "  $(wc -l < "$FILE_LIST" | tr -d ' ') files (main invocation)"
 {
   find "$ROOT/lsp-shim/lsp4j" -name "*.scala"
   find "$ROOT/lsp-shim/mtags-interfaces" -name "*.scala"
-  # Real deps with no Scala Native cross-build, needed only by mtags-shared/
-  # presentation-compiler (not by presentation-compiler's public API surface
-  # itself) -- real jars satisfy invocation 1's typecheck (java.util.logging
-  # comes from the real JDK automatically; coursierapi from PC_REAL_JARS_CP's
-  # io.get-coursier:interface jar), these produce the actual NIR.
+  # Real deps with no Scala Native cross-build, needed by mtags-shared/presentation-compiler:
+  # the real jars satisfy invocation 1's typecheck, these produce the NIR.
   find "$ROOT/lsp-shim/java-util-logging" -name "*.scala"
   find "$ROOT/lsp-shim/coursierapi" -name "*.scala"
 } | to_native_path_list > "$SHIM_FILE_LIST"
 echo "  $(wc -l < "$SHIM_FILE_LIST" | tr -d ' ') files (shim NIR-track invocation)"
 
-echo "== fetching real lsp4j/jsonrpc/coursier-interface jars (classpath-only -- presentation-compiler+mtags-shared compile against these for typechecking, matching Metals' own sbt build; never compiled from source or shipped as NIR) =="
+echo "== fetching real lsp4j/jsonrpc/coursier-interface jars (classpath-only: typechecking against them keeps Java auto-application working; never shipped as NIR) =="
 PC_REAL_JARS_CP="$(cs fetch --classpath \
   org.eclipse.lsp4j:org.eclipse.lsp4j:1.0.0 \
   org.eclipse.lsp4j:org.eclipse.lsp4j.jsonrpc:1.0.0 \
   io.get-coursier:interface:1.0.18 | tr -d '\r')"
 
-echo "== fetching+javac-ing mtags-interfaces' real sources jar (classpath-only -- same reasoning as the lsp4j jars above; javac gets real Java-defined classfiles' auto-application leniency, which a Scala port compiled jointly with presentation-compiler would not) =="
+echo "== fetching+javac-ing mtags-interfaces' real sources jar (classpath-only, like the lsp4j jars above) =="
 MTAGS_IFACE_SRC_JAR="$(cs fetch --classifier sources --intransitive org.scalameta:mtags-interfaces:1.6.7 | tr -d '\r')"
 MTAGS_IFACE_SRC_DIR="$SELFHOST_DIR/mtags-interfaces-src"
 MTAGS_IFACE_CLASSES_DIR="$SELFHOST_DIR/mtags-interfaces-classes"
@@ -126,12 +95,10 @@ NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
   -d "$NIR_OUT_MAIN" \
   "@$FILE_LIST"
 
-# See 03-build-scalino-dotc.sh / docs/findings.md "Wiring in the real
-# backend" for why this is needed (nscplugin's VarHandle-vs-pre-3.8
-# lazy-val version sniff).
+# See 03-build-scalino-dotc.sh (nscplugin's VarHandle-vs-pre-3.8 lazy-val version sniff).
 cp "$ROOT/build/selfhost/compiler.properties" "$NIR_OUT_MAIN/compiler.properties"
 
-echo "== compiling lsp-shim/lsp4j+lsp-shim/mtags-interfaces to NIR (invocation 2: standalone, no real jars -- these ARE the real NIR definitions invocation 1's symbolic org.eclipse.lsp4j.*/scala.meta.pc.* calls resolve against at link time) =="
+echo "== compiling lsp-shim/lsp4j+lsp-shim/mtags-interfaces to NIR (invocation 2: standalone; supplies the NIR definitions for the org.eclipse.lsp4j.*/scala.meta.pc.* symbols) =="
 rm -rf "$NIR_OUT_SHIM"
 mkdir -p "$NIR_OUT_SHIM"
 "$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
@@ -143,8 +110,7 @@ mkdir -p "$NIR_OUT_SHIM"
   "@$SHIM_FILE_LIST"
 
 echo "== fetching link-only Scala-Native cross-build jars (jsoniter-scala-core, java.time/Locale polyfills) =="
-# Same reasoning/pinning-fragility notes as build/03-build-scalino-dotc.sh's
-# identical block: --intransitive, fetched ONE ARTIFACT PER cs INVOCATION.
+# --intransitive, one artifact per `cs fetch`: see 03-build-scalino-dotc.sh.
 LSP_NATIVE_JARS=(
   "com.github.plokhotnyuk.jsoniter-scala:jsoniter-scala-core_native0.5_3:2.37.3"
   "io.github.cquiroz:scala-java-time_native0.5_3:2.6.0"
@@ -163,10 +129,9 @@ source ./pgo/pgo-lib.sh
 # The link classpath is kept for build/pgo/pgo-lsp.sh, which relinks it.
 LSP_LINK_CP="$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP"
 printf '%s' "$LSP_LINK_CP" > "$SELFHOST_DIR/lsp-link.cp"
-# Native scalino-linkdriver (04b-fetch-scalino-linkdriver.sh), not LinkDriver
-# on a JVM -- see 03-build-scalino-dotc.sh's identical link step.
-# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
-# heap badly (interflow's garbage); without it the link runs out of heap.
+# Native scalino-linkdriver (04b), not LinkDriver on a JVM; see 03-build-scalino-dotc.sh.
+# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), for this command only: linking dotc-sized programs
+# fragments the Immix heap badly and otherwise runs out of heap.
 LINK_EXTRA=()
 lsp_link() {
   rm -rf "$LINK_WORK"
@@ -195,12 +160,8 @@ BUILT="$LINK_WORK/dotty.tools.languageserver.Main"
 [[ -f "$BUILT" ]] || { echo "link did not produce $BUILT" >&2; exit 1; }
 rm -f "$DIST/scalino-lsp" # new inode, see 04-build-scalino-linkdriver.sh
 cp "$BUILT" "$DIST/scalino-lsp"
-# On macOS/arm64, the linker's own ad-hoc signature on this particular
-# binary is sometimes rejected by the kernel at exec time (observed: exec
-# fails silently, SIGKILL, 0 CPU time used, lldb can't even attach --
-# classic AMFI code-signature rejection, NOT a runtime crash in our code).
-# Re-signing ad-hoc ourselves after the copy reliably fixes it. Harmless
-# no-op on Linux (command doesn't exist there, hence the guard).
+# macOS/arm64: the linker's ad-hoc signature is sometimes rejected at exec time (silent SIGKILL,
+# AMFI, not a runtime crash). Re-signing after the copy fixes it. No-op on Linux (guarded).
 if command -v codesign >/dev/null 2>&1; then
   codesign -s - -f "$DIST/scalino-lsp"
 fi

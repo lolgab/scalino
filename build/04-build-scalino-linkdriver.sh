@@ -18,14 +18,10 @@ source ./00-env.sh
 # must agree on NativeConfig's shape (both come from the same local build).
 DRIVER_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/tools.cp")$CP_SEP$(to_native_path "$WORK/driver-classes")"
 
-# Substitute the published javalib_native0.5_3 jar for the locally-built one
-# with patches/scala-native-0009 (ZipFileSystemProvider) actually applied --
-# see build/01a-publish-scala-native.sh. This classpath becomes the actual
-# runtime javalib baked into the linked scalino-linkdriver binary itself (not
-# just this build step's own tooling), which is what determines whether the
-# jar classpath entries LinkDriver hands to `Build` at RUNTIME (any real
-# `scalino build`, not just this bootstrap) can be read via NIO's "jar:"
-# FileSystemProvider instead of needing extractJarIfNeeded's workaround.
+# Substitute the locally-built javalib jar (patches/scala-native-0009, ZipFileSystemProvider; see
+# 01a). It becomes the javalib baked into the linked scalino-linkdriver, so jar classpath
+# entries handed to `Build` at runtime are read via NIO's "jar:" FileSystemProvider instead of
+# needing extractJarIfNeeded's workaround.
 TOOLS_PATCHED_JAVALIB_CP="$WORK/tools-patched-javalib.cp"
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
@@ -36,17 +32,10 @@ else
   echo "  WARNING: locally-built javalib jar not found ($LOCAL_JAVALIB_JAR) -- run build/01a-publish-scala-native.sh first, or patches/scala-native-0009 (ZipFileSystemProvider) will NOT take effect and scalino-linkdriver will fall back to needing jar-extraction workarounds. See docs/findings.md."
 fi
 
-# Same substitution for nativelib_native0.5_3 -- this bootstrap classpath
-# (tools-patched.cp, via tools-native.cp/01-fetch-deps.sh) is a completely
-# separate lineage from $WORK/nativelibs.cp (the one build/01c-build-patched-
-# nativelib.sh substitutes in place), so 01c's own patched jar never reached
-# scalino-linkdriver's own build until this swap was added. Harmless before
-# nativelib gained new symbols an end user's javalib/nativelib could fail to
-# resolve at NIR-link time (e.g. runtime.SmiBox$, added for SMI-style
-# tagged-pointer boxing and referenced directly from javalib's boxed-primitive
-# classes) -- scalino-linkdriver's own bootstrap build links a full program
-# against javalib+nativelib together, so both need to agree on the same
-# patched pair, not just javalib.
+# Same substitution for nativelib_native0.5_3. This bootstrap classpath (tools-native.cp) is a
+# separate lineage from $WORK/nativelibs.cp (patched in place by 01c), and javalib and nativelib
+# must agree on the patched pair (e.g. runtime.SmiBox$, which javalib's boxed-primitive classes
+# reference) for the bootstrap build to link.
 LOCAL_NATIVELIB_JAR="${SCALINO_NATIVELIB_JAR:-$HOME/.ivy2/local/org.scala-native/nativelib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/nativelib_native0.5_3.jar}"
 if [[ -f "$LOCAL_NATIVELIB_JAR" ]]; then
   TMP_NATIVELIB_SWAP="$(mktemp)"
@@ -74,22 +63,15 @@ LINK_WORK="${SCALINO_LINK_WORK:-$WORK/driver-link}"
 rm -rf "$LINK_WORK"
 mkdir -p "$LINK_WORK"
 
-# NativeConfig's direct LLVM-C codegen backend is now ON BY DEFAULT (see
-# tools-patched), which means the tools_3 link step invoked below -- linking
-# scalino-linkdriver itself, not just a later `scalino build` -- pulls in the
-# @extern LLVM-C bindings (tools/native/.../codegen/llvm/direct/LLVMCApi.scala)
-# and needs libLLVM at link time, unconditionally. This is no longer optional:
-# without it, the LinkDriver step below fails with cryptic
-# "undefined reference to LLVMFunctionType" linker errors.
+# NativeConfig's direct LLVM-C codegen backend is on by default, so the tools_3 link step below
+# (even linking scalino-linkdriver itself) pulls in the @extern LLVM-C bindings
+# (LLVMCApi.scala) and needs libLLVM unconditionally; without it the link fails with
+# "undefined reference to LLVMFunctionType".
 #
-# Statically linked, not dynamically: the released scalino-linkdriver binary
-# must run on end-user machines (curl-installed) that have no libLLVM at all
-# (e.g. bare Fedora -- see docs/findings.md "static LLVM link"). Per-component
-# archives (libLLVMCore.a, libLLVMSupport.a, ...) have no same-named .so/.dylib
-# counterpart -- only the combined libLLVM does -- so plain "-lLLVMCore" etc.
-# always resolves to the static archive on both Linux and macOS; no
-# -Wl,-Bstatic tricks needed. `llvm-config --link-static` gives us those
-# per-component -l flags instead of the one combined "-lLLVM".
+# Linked statically: the released binary runs on machines with no libLLVM (e.g. bare Fedora; see
+# docs/findings.md "static LLVM link"). Per-component archives (libLLVMCore.a, ...) have no
+# same-named .so/.dylib, so "-lLLVMCore" always resolves to the archive on Linux and macOS;
+# `llvm-config --link-static` supplies those flags instead of the combined "-lLLVM".
 LLVM_DIRECT_CODEGEN_LINKING_OPTS=()
 if command -v llvm-config >/dev/null 2>&1; then
   LLVM_CONFIG_VERSION="$(llvm-config --version 2>/dev/null || true)"
@@ -97,12 +79,8 @@ if command -v llvm-config >/dev/null 2>&1; then
   LLVM_CONFIG_LIBDIR="$(llvm-config --libdir 2>/dev/null || true)"
   if [[ "${LLVM_CONFIG_MAJOR:-0}" =~ ^[0-9]+$ ]] && (( LLVM_CONFIG_MAJOR >= 13 )) \
       && [[ -n "$LLVM_CONFIG_LIBDIR" && -d "$LLVM_CONFIG_LIBDIR" ]]; then
-    # "all" includes optional components (e.g. Polly/PollyISL) that some
-    # distros' llvm-config reports as available even though the matching
-    # .a isn't actually installed (Ubuntu's llvm-dev doesn't ship libPolly*,
-    # that's a separate libpolly-<ver>-dev package) -- filter those -lFoo
-    # flags down to ones whose libFoo.a actually exists in LLVM_CONFIG_LIBDIR,
-    # instead of failing the link over components we don't use anyway.
+    # "all" includes optional components (e.g. Polly) that llvm-config lists although the .a is not
+    # installed (Ubuntu's llvm-dev has no libPolly*): keep only -lFoo with an existing libFoo.a.
     LLVM_STATIC_LIBS_ALL=($(llvm-config --link-static --libs all 2>/dev/null))
     LLVM_STATIC_LIBS=()
     for lib in "${LLVM_STATIC_LIBS_ALL[@]}"; do
@@ -114,28 +92,12 @@ if command -v llvm-config >/dev/null 2>&1; then
         echo "  skipping $lib: no lib${lib#-l}.a in $LLVM_CONFIG_LIBDIR (component not actually installed)" >&2
       fi
     done
-    # llvm-config --system-libs doesn't report these two, but the archives
-    # need them once actually resolved at (our) link time rather than
-    # deferred to a shared lib's own dependency chain: (1) the C++ runtime --
-    # dynamically linking the combined libLLVM.so/.dylib worked without one
-    # because THAT link carried its own libc++/libstdc++ dependency,
-    # transparently satisfied at load time; raw .a archives have no such
-    # thing, their std::__1::... references become our problem directly.
-    # (2) zstd -- LLVM_ENABLE_ZSTD is on in both Homebrew's and Ubuntu's LLVM
-    # builds, but llvm-config's system-libs output omits it regardless
-    # (longstanding llvm-config limitation, not distro-specific). Unlike
-    # libc++/libstdc++ (ubiquitous system libs, fine to leave dynamic --
-    # every Linux/macOS has them, same as Rust's own rustc does), zstd is
-    # exactly the kind of not-guaranteed-present dependency this whole change
-    # is meant to eliminate, so it must be forced static too. It isn't
-    # LLVM's own archive (no per-component .a to exploit the "no same-named
-    # dylib" trick with) -- Homebrew/apt both ship libzstd.a *and*
-    # libzstd.dylib/.so side by side, so plain "-lzstd" silently prefers the
-    # dynamic one. Resolve its real static archive path via pkg-config
-    # (ships a .pc file on both Homebrew and Debian/Ubuntu's libzstd-dev) and
-    # pass that path directly instead of "-lzstd" -- passing a linker a full
-    # path to a .a, instead of "-l" + "-L", always forces static regardless
-    # of platform, with no -Wl,-Bstatic/-Bdynamic (GNU-ld-only) needed.
+    # llvm-config --system-libs omits two things the archives need: (1) the C++ runtime (the
+    # combined libLLVM.so carried its own dependency; raw .a archives don't), left dynamic since
+    # it is ubiquitous; (2) zstd (LLVM_ENABLE_ZSTD is on in Homebrew and Ubuntu builds), which must
+    # be static since it may be absent on end-user machines. Both Homebrew and apt ship libzstd.a
+    # next to the dylib/.so, so plain -lzstd picks the dynamic one; resolve the .a path via
+    # pkg-config and pass it directly, which forces static on every platform.
     ZSTD_STATIC=""
     if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libzstd 2>/dev/null; then
       ZSTD_LIBDIR="$(pkg-config --variable=libdir libzstd 2>/dev/null || true)"
@@ -145,17 +107,9 @@ if command -v llvm-config >/dev/null 2>&1; then
       echo "  WARNING: no static libzstd.a found via pkg-config -- falling back to dynamic -lzstd, which reintroduces a runtime dependency (install e.g. 'libzstd-dev' on Debian/Ubuntu, or 'zstd' via Homebrew)." >&2
       ZSTD_STATIC="-lzstd"
     fi
-    # terminfo: libLLVMSupport.a's Process::FileDescriptorHasColors calls
-    # set_curterm/setupterm/tigetnum/del_curterm directly. llvm-config
-    # --system-libs doesn't report this dependency either (same
-    # longstanding limitation as zstd above) -- on Linux it's normally
-    # pulled in transitively through ncurses/readline's own link chain,
-    # but a raw static-archive link has no such transitive path and
-    # leaves these undefined. Not needed on macOS: Apple's libc++/libSystem
-    # link closure already resolves them there. Probe candidate lib names
-    # (distros vary: tinfo vs the bundled-into-ncurses fallback) with a
-    # throwaway link instead of hardcoding one, since the -dev package that
-    # ships the linkable .so (not just the runtime .so.N) differs by distro.
+    # terminfo: libLLVMSupport.a calls set_curterm/setupterm/tigetnum/del_curterm directly, and
+    # llvm-config --system-libs omits it. Linux only (macOS resolves it via libSystem). Probe
+    # candidate libs with a throwaway link since the -dev package providing the .so varies.
     TERMINFO_LIB=""
     if [[ "$(uname -s)" != "Darwin" ]]; then
       for cand in tinfo ncursesw ncurses curses; do
@@ -173,19 +127,11 @@ if command -v llvm-config >/dev/null 2>&1; then
     LLVM_SYSTEM_LIBS+=($(llvm-config --system-libs 2>/dev/null))
     if [[ "${#LLVM_STATIC_LIBS[@]}" -gt 0 ]]; then
       LLVM_DIRECT_CODEGEN_LINKING_OPTS=(--linking "-L$LLVM_CONFIG_LIBDIR")
-      # array-guard idiom (not plain "${arr[@]}"): macOS's /bin/bash is stuck
-      # on 3.2, which treats expanding a possibly-empty array as an unbound
-      # variable under `set -u` -- llvm-config --system-libs legitimately
-      # returns nothing on some LLVM builds (e.g. Homebrew's).
+      # Array-guard idiom: macOS's bash 3.2 treats expanding an empty array as unbound under
+      # `set -u`, and llvm-config --system-libs returns nothing on some builds (e.g. Homebrew's).
       #
-      # LLVM_STATIC_LIBS listed *twice*: LLVM's component archives reference
-      # each other circularly (e.g. libLLVMX86CodeGen.a's GlobalISel code
-      # needs a vtable that only gets pulled in from libLLVMCodeGen.a), and
-      # unlike GNU ld's --start-group/--end-group, Apple's ld64 (and a plain
-      # single-pass ld in general) resolves archives in one left-to-right
-      # pass -- a symbol needed by an earlier archive but defined only in a
-      # later one is otherwise left undefined. Repeating the list is the
-      # standard portable workaround (no --start-group equivalent on ld64).
+      # LLVM_STATIC_LIBS is listed twice: the component archives reference each other circularly
+      # and ld64 resolves archives in a single left-to-right pass (no --start-group equivalent).
       for f in "${LLVM_STATIC_LIBS[@]}" "${LLVM_STATIC_LIBS[@]}" ${LLVM_SYSTEM_LIBS[@]+"${LLVM_SYSTEM_LIBS[@]}"}; do
         LLVM_DIRECT_CODEGEN_LINKING_OPTS+=(--linking "$f")
       done

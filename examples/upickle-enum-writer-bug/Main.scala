@@ -1,22 +1,15 @@
 import domain.*
 
-// Still-open gap, NOT wired into CI (still failing) -- see docs/findings.md
-// item 10's "still-open gap" section for the full writeup. `domain/*.scala`
-// here are `~/scala/ape`'s real files, copied verbatim (that's where this
-// was originally found) -- no db/http/porcupine/cats-effect involved, this
-// is purely about `derives ReadWriter` on a `enum` with more than one case.
+// Still-open gap, not wired into CI (fails); see docs/findings.md item 10 "still-open gap".
+// `domain/*.scala` are `~/scala/ape`'s real files, copied verbatim; no db/http/porcupine/
+// cats-effect involved, only `derives ReadWriter` on an `enum` with more than one case.
 //
-// Every enum here serializes ONLY its ordinal-0 (first-declared) case
-// correctly; every other case throws `scala.MatchError: null` inside
-// `upickle.core.Types$TaggedWriter.write0`. Confirmed NOT related to
-// default parameters, nested case classes, or field position/count in
-// `BuildingInput` (the shape that originally surfaced this) -- those were
-// red herrings. Confirmed NOT an owner-chain/hygiene bug (unlike the
-// separate, already-tracked `x.addOne`/`LambdaLift` gap) via `SCALINO_INTERP
-// _DEBUG`-traced `[spliceOwner]`/`[newVal]` prints showing consistent
-// symbol identity across all per-case vals. Confirmed NOT a general
-// Scala Native local-implicit-lazy-val-in-a-Block codegen bug via a
-// hand-written control that works correctly with the same shape.
+// Every enum here serializes only its ordinal-0 case correctly; every other case throws
+// `scala.MatchError: null` in `upickle.core.Types$TaggedWriter.write0`. Ruled out: default
+// parameters, nested case classes, field position/count in `BuildingInput`; an owner-chain/
+// hygiene bug (SCALINO_INTERP_DEBUG `[spliceOwner]`/`[newVal]` traces show consistent symbol
+// identity); a general Scala Native local-implicit-lazy-val-in-a-Block codegen bug (a
+// hand-written control with the same shape works).
 object Main:
   def main(args: Array[String]): Unit =
     def tryWrite[T: upickle.default.Writer](name: String, v: T): Unit =

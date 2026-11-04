@@ -23,8 +23,8 @@ The patches are split by area, with disjoint file sets, so they are independent 
 
 ## Bumping `SCALA_NATIVE_REF`
 
-Replaying 80-odd stacked patches one by one re-resolves the same conflicts again and again whenever upstream
-moves code, so do one merge instead:
+Replaying 80-odd stacked patches one by one re-resolves the same conflicts every time upstream moves code, so
+do one merge instead:
 
 1. Clone Scala Native (full history). Make a branch `base` at the old upstream commit and apply the series
    to it, one commit; make `new-base` at the new upstream commit.
@@ -37,7 +37,7 @@ moves code, so do one merge instead:
 5. Bump `SCALA_NATIVE_REF`/`SCALA_NATIVE_VERSION` (`project/ScalaNativeBuildInfo.scala`'s `baseVersion`) in
    `versions.env`, and the values in `build/selfhost/ScalaNativeBuildInfo.scala`.
 
-Check each patched area against upstream before keeping it: upstream has already absorbed several of ours
+Check each patched area against upstream before keeping it. Upstream has already absorbed several of our changes
 (the x86_64 trampoline red-zone fix, `Path.toUri`, `Arrays.fill`, the growth-deferral constants, the
 `Files` probes, interior-pointer conservative marking, ...).
 

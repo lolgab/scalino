@@ -49,10 +49,8 @@ object Sysroot:
   def resolve(triples: List[String], explicit: List[String]): List[String] =
     val explicitTriples = explicit.map(_.takeWhile(_ != '=')).toSet
     val found = triples.filterNot(explicitTriples).flatMap { t =>
-      // An explicit `--native-target-triple` always links against scalino's
-      // sysroot, the host's own triple and macOS-on-a-Mac included, so a build
-      // gives the same result on every machine (no "works on my Mac, breaks on
-      // Linux CI").
+      // An explicit `--native-target-triple` always links against scalino's sysroot, even for the
+      // host's own triple, so builds are identical on every machine.
       find(t) match
         case Some(dir) => Some(s"$t=$dir")
         case None if Supported.contains(t) =>

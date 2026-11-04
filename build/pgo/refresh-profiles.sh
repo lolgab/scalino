@@ -11,6 +11,6 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 want=("$@"); [[ ${#want[@]} -gt 0 ]] || want=(linkdriver dotc lsp)
 for n in "${want[@]}"; do
-  echo "######## $n"
+  echo "== $n"
   ./pgo-"$n".sh
 done

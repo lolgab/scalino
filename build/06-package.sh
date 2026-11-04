@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Vendors every jar bin/scalino-bootstrap and scalino need at runtime into dist/lib and
-# rewrites the classpath manifests (compiler.cp, nativelibs.cp,
-# nscplugin.jar.txt) to hold dist-relative paths ("lib/foo.jar") instead of
-# absolute coursier-cache paths -- so dist/ can be tarred up and copied to
-# another machine and still work. bin/scalino-bootstrap and cli/ScalinoCli.scala resolve those
-# relative entries against their own dist/ root at runtime.
+# rewrites the classpath manifests (compiler.cp, nativelibs.cp, nscplugin.jar.txt) to
+# dist-relative paths ("lib/foo.jar") so dist/ can be copied to another machine.
+# bin/scalino-bootstrap and cli/ScalinoCli.scala resolve them against their dist/ root.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -43,25 +41,16 @@ cs fetch \
   --classpath | tr -d '\r' > "$WORK/jslibs.cp"
 vendor_cp "$WORK/jslibs.cp" "$DIST/jslibs.cp"
 
-# Vendors each nativelib's matching sources jar (built from vendor/scala-
-# native+patches for javalib/nativelib by 01b/01c, fetched upstream as-is
-# for the rest by 01-fetch-deps.sh) as a sibling of its main jar in dist/lib
-# -- the exact "<jar>-sources.jar" sibling layout scalino-dotc's
-# sourceFromSourcesJar (patches/scala3-0014) looks for, so scalino-lsp's
-# go-to-definition into any of these resolves into the REAL code the
-# compiler just linked against, not a best-effort runtime fetch that (for
-# javalib/nativelib specifically) could only ever find unpatched upstream
-# source, or nothing at all for a "-SNAPSHOT" this project never publishes
-# anywhere fetchable.
+# Vendors each nativelib's sources jar next to its main jar in dist/lib, as
+# "<jar>-sources.jar" (the layout scalino-dotc's sourceFromSourcesJar, patches/scala3-0014,
+# looks for), so scalino-lsp's go-to-definition lands in the code actually linked against
+# (javalib/nativelib are built from vendor/scala-native + patches by 01b/01c; the rest come
+# from 01-fetch-deps.sh).
 #
-# Matched by name, not order: a sources jar's basename with "-sources.jar"
-# swapped for ".jar" must equal some already-vendored main jar's basename
-# (true both for coursier's own "<artifact>-<version>-sources.jar" alongside
-# "<artifact>-<version>.jar", and for 01b/01c's locally-published
-# "<artifact>-sources.jar" alongside their unversioned "<artifact>.jar"
-# substitution) -- so an entry with no matching main jar in dist/lib (e.g.
-# a lib that got excluded on this platform, like windowslib off-Windows)
-# is silently skipped instead of vendored as dead weight.
+# Matched by name: a sources jar's basename with "-sources.jar" swapped for ".jar" must equal an
+# already-vendored main jar's basename (coursier's "<artifact>-<version>" naming and the local
+# builds' unversioned "<artifact>"). Entries with no match (e.g. windowslib off-Windows) are
+# skipped.
 vendor_sources() {
   local src="$1"
   [[ -f "$src" ]] || return 0
@@ -94,15 +83,10 @@ PLUGIN_BASE="$(basename "$PLUGIN_JAR")"
 cp -p "$PLUGIN_JAR" "$DIST/lib/$PLUGIN_BASE"
 echo "lib/$PLUGIN_BASE" > "$DIST/nscplugin.jar.txt"
 
-# Bundle coursier's `cs` launcher as scalino-cs, so `//> using dep`
-# resolution (cli/ScalinoCli.scala's resolveDeps/fetchSourcesBestEffort/
-# fetchStdlibSourcesBestEffort) never depends on the end user having `cs` on
-# their own PATH. Renamed so it can't collide with a user's own real `cs`.
-# `command -v cs` here is already the right binary for this machine: 00-env.sh
-# requires it on PATH at build time, and CI installs it per-target-OS/arch
-# (coursier/setup-action, native runners) before build/all.sh ever runs --
-# there's no cross-platform download/pin to manage, just copy what's already
-# resolved.
+# Bundle coursier's `cs` as scalino-cs so `//> using dep` resolution (cli/ScalinoCli.scala's
+# resolveDeps/fetchSourcesBestEffort/fetchStdlibSourcesBestEffort) doesn't depend on the user's
+# PATH; renamed to avoid colliding with a user's own `cs`. The `cs` on PATH is the right binary
+# for this machine (00-env.sh requires it; CI installs it per target).
 cp "$(command -v cs)" "$DIST/scalino-cs"
 chmod +x "$DIST/scalino-cs"
 

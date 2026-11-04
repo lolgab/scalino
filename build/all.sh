@@ -22,13 +22,10 @@ if [[ "$STAGE" == all || "$STAGE" == core ]]; then
 ./02-build-java-base.sh
 ./02a-build-compiler-patched.sh
 ./02b-gen-megaphase-overrides.sh
-# Must run before 03/03b/07/08: they all link against dist/scalino-linkdriver
-# as their own link step.
+# Must run before 03/03b/07/08, which link with dist/scalino-linkdriver.
 ./04-build-scalino-linkdriver.sh
-# Must run here, right after 04 and before 07/08: it writes the
-# dist-relative compiler.cp/nativelibs.cp/nscplugin.jar.txt that 08's smoke
-# test needs -- it drives the real dist/scalino binary through `setup-ide`
-# against a real dist/ layout, exactly like an end user would.
+# Must run right after 04 and before 07/08: it writes the dist-relative manifests that 08's
+# smoke test needs (it drives the real dist/scalino through `setup-ide`).
 ./06-package.sh
 fi
 

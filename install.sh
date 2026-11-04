@@ -3,22 +3,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/lolgab/scalino/main/install.sh | bash
 #
-# Downloads the latest (or $SCALINO_VERSION-pinned) GitHub release tarball for
-# the current OS/arch, verifies its sha256 checksum, unpacks it into a
-# versioned directory under $SCALINO_INSTALL_DIR (default: ~/.local/share/scalino),
-# and symlinks `scalino` and `scalino-lsp` into $SCALINO_BIN_DIR (default:
-# ~/.local/bin) so editor LSP clients find scalino-lsp on PATH with no
-# per-project config. Both resolve their own dist root from their real
-# (symlink-resolved) path at runtime -- see cli/selfexe/*.scala -- so a
-# symlink here is safe and the rest of dist/ (scalino-dotc,
-# scalino-linkdriver, scalino-cs, lib/) never needs to move.
+# Downloads the latest (or $SCALINO_VERSION-pinned) GitHub release tarball for the current
+# OS/arch, verifies its sha256, unpacks it into a versioned directory under $SCALINO_INSTALL_DIR
+# (default: ~/.local/share/scalino) and symlinks `scalino` and `scalino-lsp` into
+# $SCALINO_BIN_DIR (default: ~/.local/bin) so editor LSP clients find scalino-lsp on PATH. Both
+# resolve their dist root from their symlink-resolved path (cli/selfexe/*.scala), so the
+# symlinks are safe.
 #
-# Still required on top of this, on the running machine (not bundled --
-# see docs/findings.md): `clang`/`clang++`, needed for every build, even a
-# zero-dependency Hello World. Dependency resolution for `//> using dep`
-# is self-contained -- scalino bundles its own renamed copy of coursier's
-# `cs` launcher (dist/scalino-cs) so the real `cs`, if any, on the user's
-# own PATH is never touched.
+# Not bundled (see docs/findings.md): `clang`/`clang++`, needed for every build. Dependency
+# resolution uses the bundled dist/scalino-cs, so the user's own `cs` is never touched.
 set -euo pipefail
 
 repo="lolgab/scalino"
@@ -45,8 +38,8 @@ esac
 
 target="${plat}-${plat_arch}"
 
-# Authenticated API calls get a much higher rate limit than anonymous ones --
-# shared CI runner IPs routinely exhaust the anonymous quota (HTTP 403).
+# Authenticated API calls get a much higher rate limit; shared CI runner IPs routinely exhaust
+# the anonymous quota (HTTP 403).
 gh_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
 # GET an api.github.com URL, sending the token (if any); dies with a message
@@ -72,9 +65,8 @@ api_get() {
 }
 
 if [ "$version" != "latest" ]; then
-  # Pinned: the release asset names are fixed by .github/workflows/release.yml
-  # (scalino-<tag>-<target>.tar.gz, <tag> keeps its leading "v"), so
-  # build the URL directly -- no api.github.com call, no rate limit.
+  # Pinned: asset names are fixed by release.yml (scalino-<tag>-<target>.tar.gz, <tag> keeps its
+  # "v"), so build the URL directly and skip api.github.com and its rate limit.
   tag="$version"
   case "$tag" in v*) ;; *) tag="v$tag" ;; esac
   asset_url="https://github.com/$repo/releases/download/$tag/scalino-${tag}-${target}.tar.gz"
@@ -115,10 +107,8 @@ else
   extract_dir="$work/extracted"
   mkdir -p "$extract_dir"
   tar xzf "$tarball" -C "$extract_dir"
-  # The tarball's top-level directory is named after the release
-  # (scalino-<version>-<target>); move whatever single
-  # directory it contains into place under the tag, not that release name,
-  # so re-running with a different $SCALINO_VERSION doesn't collide.
+  # The tarball's top-level dir is named after the release (scalino-<version>-<target>); move it
+  # under the tag instead so re-running with a different $SCALINO_VERSION doesn't collide.
   inner="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d)"
   [ -n "$inner" ] || die "unexpected tarball layout (no top-level directory)"
   mv "$inner" "$dest_dir"
@@ -143,11 +133,9 @@ if ! command -v clang >/dev/null 2>&1; then
   echo "install.sh: warning -- clang not found on PATH. scalino needs clang/clang++ to build anything, even a zero-dependency Hello World."
 fi
 
-# Pre-generated shell completion scripts ship in the tarball at
-# dist/completions/ (see cli/ScalinoCli.scala's `completions` subcommand) --
-# a manual install like this one has no single system-wide completions
-# dir to drop them into, so just point the user at them (brew/apt/dnf/arch/
-# nix installs place these automatically -- see packaging/*).
+# Completion scripts ship in dist/completions/ (cli/ScalinoCli.scala's `completions`). A manual
+# install has no system-wide dir to put them in, so point the user at them; the packaged
+# installs (brew/apt/dnf/arch/nix, see packaging/*) place them automatically.
 echo "install.sh: shell completions are in $dest_dir/completions/ -- e.g. source $dest_dir/completions/scalino.bash from your shell rc, or copy _scalino/scalino.fish to your zsh/fish completions dir"
 
 echo "install.sh: try it: echo '@main def hello(): Unit = println(\"hello\")' > Hello.scala && scalino run Hello.scala"

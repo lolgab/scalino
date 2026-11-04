@@ -2,16 +2,14 @@
 
 [![CI](https://github.com/lolgab/scalino/actions/workflows/ci.yml/badge.svg)](https://github.com/lolgab/scalino/actions/workflows/ci.yml)
 
-Write, build, and run Scala 3 without installing a JVM. `scalino` compiles
-straight to a native executable via Scala Native — no bytecode, no JIT, no
-`java` on your machine at all.
+Build and run Scala 3 without a JVM. `scalino` compiles to a native executable
+through Scala Native, with no bytecode and no `java` on the machine.
 
-Everything you run day to day is native: the compiler, the linker, the
-`scalino` build tool, and the `scalino-lsp` language server are all compiled
-by dotc from their own patched source, targeting Scala Native directly. The
-compiler, linker and language server are profile-guided builds (about 11–14%
-faster than without, see [`docs/pgo.md`](docs/pgo.md)). See
-[`docs/findings.md`](docs/findings.md) for the full story.
+The compiler, the linker, the `scalino` build tool and the `scalino-lsp`
+language server are all native, compiled by dotc from their own patched source.
+The compiler, linker and language server are profile-guided builds, about
+11–14% faster than without ([`docs/pgo.md`](docs/pgo.md)).
+[`docs/findings.md`](docs/findings.md) has the details.
 
 ## Quick start
 
@@ -27,29 +25,26 @@ scalino package Hello.scala -o hello && ./hello
 scalino setup-ide                          # then open the folder in Zed / VS Code / Neovim
 ```
 
-The only other thing you need is `clang` (see [Install](#install)), except for
-Scala.js builds, which need no C toolchain, only `node` to run them.
+You also need `clang` (see [Install](#install)). Scala.js builds need only `node`
+to run them.
 
 ## How it compares
 
-`scalino` is a mini [scala-cli](https://scala-cli.virtuslab.org/), shaped like
-the real one on purpose: same command names, same `//> using` directives, same
-flags where it implements them. `scalino-lsp` stands in for Metals.
+`scalino` is a mini [scala-cli](https://scala-cli.virtuslab.org/) with the same
+command names, `//> using` directives and flags, where implemented.
+`scalino-lsp` stands in for Metals.
 
 The differences:
 
-- **No JVM**, at build time or at run time.
-- **One Scala, one Scala Native and one Scala.js version**: the ones it was
-  built with (`scalino version` prints them). You can't switch versions per
-  project, and there is no JVM target.
-- **Scala.js** (`//> using platform js` or `--js`) builds without a JVM too:
-  `dotc -scalajs`, then `scalino-jslink` (the Scala.js linker compiled to
-  Scala Native), run with `node`; `test` and `setup-ide` work too.
-- **Server and client without a JVM**: a Scala Native server declares
-  `//> using jsClient ../client` (a Scala.js project) and
-  `//> using shared ../shared` (sources compiled into both). `scalino run`
-  builds the client and embeds it in the server binary as the resource
-  `/client/main.js`, linked with fastLinkJS (fullLinkJS in a `release-*` native mode). See
+- No JVM, at build time or at run time.
+- One Scala, one Scala Native and one Scala.js version: the ones it was built
+  with (`scalino version` prints them). Versions can't be switched per project,
+  and there is no JVM target.
+- Scala.js (`//> using platform js` or `--js`) also builds without a JVM:
+  `dotc -scalajs`, then `scalino-jslink` (the Scala.js linker compiled to Scala
+  Native), run with `node`. `test` and `setup-ide` work too.
+- A Scala Native server can embed a Scala.js client, see
+  [Server and client without a JVM](#server-and-client-without-a-jvm) and
   [`examples/client-server`](examples/client-server).
 
 ## Install
@@ -63,13 +58,13 @@ for your OS/arch, verifies its checksum, and installs `scalino` to
 `~/.local/bin`. You can override this with `$SCALINO_INSTALL_DIR`,
 `$SCALINO_BIN_DIR` or `$SCALINO_VERSION`.
 
-**Requirement:** `clang`/`clang++` for Scala Native builds (the default). Every one
-links through clang, even a zero-dependency Hello World. Scala.js builds need no
-C toolchain, only `node` (or `deno`/`bun`) to run them; the Scala.js base
-libraries ship in the tarball, so those build offline too. It's already on macOS via the Xcode Command Line
-Tools; elsewhere, install it with `apt install clang` or similar. Dependency
-resolution doesn't need a separate install: scalino bundles its own renamed copy
-of [coursier](https://get-coursier.io/)'s `cs` launcher (`scalino-cs`).
+**Requirement:** `clang`/`clang++` for Scala Native builds (the default); every
+Scala Native build links through clang. macOS has it with the Xcode Command Line
+Tools; elsewhere use `apt install clang` or similar. Scala.js builds need no C
+toolchain, only `node` (or `deno`/`bun`) to run them, and the Scala.js base
+libraries ship in the tarball, so they build offline. Dependency resolution
+needs no separate install: scalino bundles a renamed copy of
+[coursier](https://get-coursier.io/)'s `cs` launcher (`scalino-cs`).
 
 ### Other ways to install
 
@@ -121,36 +116,32 @@ scalino package examples/Hello.scala -o hello && ./hello
 | `sysroot build` | set up a cross-compilation sysroot ([Cross-compilation](#cross-compilation)) |
 | `clean`, `version`, `completions` | what they say |
 
-- **Sources:** pass files or directories. File order doesn't matter: the entry
-  point (`@main`, `extends App`, `def main`) is found automatically. Files
-  under `test/` or `src/test/scala/` are test scope, following scala-cli's
-  convention.
-- **Directives:** scalino understands the usual `//> using` directives:
-  `dep`, `test.dep`, `scala`, `mainClass`, `options`, `repository`,
-  `resourceDir`, `native*`, and more. Each has an equivalent flag (`--dep`,
-  `-S`, `-O`, `--main-class`, `-w`, `-o`, `-- <args...>`, …). Values go
-  unquoted, as in current scala-cli (quotes are still accepted):
+- **Sources:** pass files or directories. File order doesn't matter; the entry
+  point (`@main`, `extends App`, `def main`) is found automatically. Files under
+  `test/` or `src/test/scala/` are test scope, as in scala-cli.
+- **Directives:** `//> using` directives include `dep`, `test.dep`, `scala`,
+  `mainClass`, `options`, `repository`, `resourceDir` and `native*`. Each has an
+  equivalent flag (`--dep`, `-S`, `-O`, `--main-class`, `-w`, `-o`,
+  `-- <args...>`, ...). Values go unquoted, as in current scala-cli (quotes are
+  still accepted):
 
   ```scala
   //> using dep com.lihaoyi::os-lib::0.11.3
   //> using options -Wunused:all -deprecation
   //> using nativeMode release-fast
   ```
-- **Scala.js:** add `//> using platform js` (or pass `--js`) and the same
-  sources build for Scala.js, with no JVM: `dotc -scalajs`, then
-  `scalino-jslink`. `run` and `test` execute the output with `node`
+- **Scala.js:** add `//> using platform js` (or pass `--js`) to build the same
+  sources for Scala.js. `run` and `test` execute the output with `node`
   (`--js-runtime node|deno|bun`). See [Scala.js](#scalajs).
-- **Debug info:** binaries are built without source-level debug info (DWARF).
-  Opt in with `--native-debug-info` or `//> using nativeDebugInfo true` when
-  you want lldb/gdb or profilers to show Scala sources and lines.
-- **Tests:** the test framework is auto-detected from the classpath, so any
-  framework with a Scala Native port works. `--test-only <glob>` drops the
-  other suites from the link, and `-- <pattern>` is passed through to the
-  framework.
-- **Builds are incremental:** unchanged sources are reused from the last build
+- **Debug info:** binaries have no source-level debug info (DWARF) by default.
+  Pass `--native-debug-info` or `//> using nativeDebugInfo true` to let
+  lldb/gdb and profilers show Scala sources and lines.
+- **Tests:** the framework is detected from the classpath, so any framework with
+  a Scala Native port works. `--test-only <glob>` drops the other suites from
+  the link, and `-- <pattern>` is passed to the framework.
+- **Incremental builds:** unchanged sources are reused from the last build
   (`--no-incremental` turns this off). Resolved classpaths and build output are
   cached in `.scalino-build/`.
-
 - **Post-link hook and run environment:** `--post-link <cmd>` (`//> using postLink <cmd>`)
   runs a command on the linked binary, and `--run-env KEY=VALUE`
   (`//> using runEnv KEY=VALUE`) adds environment variables for the program
@@ -160,9 +151,9 @@ scalino package examples/Hello.scala -o hello && ./hello
 
 ## Wrapping scalino
 
-Tools that build on scalino (a deployment CLI that patches the binary, say)
-don't need their own watch loop: `scalino run -w` already rebuilds, restarts
-and shuts down the program properly. Two generic hooks cover the rest.
+Tools built on scalino (a deployment CLI that patches the binary, say) can use
+`scalino run -w` for rebuilding, restarting and shutting down the program, plus
+two hooks.
 
 | flag | directive | does |
 |---|---|---|
@@ -207,9 +198,9 @@ scalino run -w server --post-link "snunit bundle" --run-env PORT=8080 --run-env 
 
 Scala.js is a second target next to Scala Native, with scala-cli's flags and
 defaults (plain script, no source maps). The compiler is `dotc -scalajs` and
-the linker is `scalino-jslink`, the Scala.js linker compiled to Scala Native,
-so there is no JVM and no C toolchain involved. You only need `node` (or
-`deno`/`bun`) to run the result.
+the linker is `scalino-jslink`, the Scala.js linker compiled to Scala Native, so
+neither a JVM nor a C toolchain is involved. Running the result needs `node` (or
+`deno`/`bun`).
 
 ```sh
 scalino run --js Hello.scala                                  # or //> using platform js
@@ -247,8 +238,9 @@ A Scala Native server can embed a Scala.js frontend:
 ```
 
 `scalino run` builds the client and embeds it in the server binary as the
-resource `/client/main.js`; the client is linked with fastLinkJS, or with fullLinkJS when the server is built
-with a `release-*` `--native-mode` / `nativeMode` (`--js-mode` overrides). See
+resource `/client/main.js`. The client is linked with fastLinkJS, or with
+fullLinkJS when the server is built with a `release-*` `--native-mode` /
+`nativeMode` (`--js-mode` overrides). See
 [`examples/client-server`](examples/client-server).
 
 To host the client yourself (FreeUnit's `share` action, nginx, a CDN) instead
@@ -269,11 +261,11 @@ every module.
 
 ## Editor support
 
-`scalino-lsp` gives your editor completion, hover, signature help,
-go-to-definition / type-definition / implementation, references, rename,
-document and workspace symbols, highlights, inlay hints, semantic tokens,
-selection ranges, code actions, and diagnostics. It's built on dotty's
-presentation compiler and runs without a JVM.
+`scalino-lsp` provides completion, hover, signature help, go-to-definition /
+type-definition / implementation, references, rename, document and workspace
+symbols, highlights, inlay hints, semantic tokens, selection ranges, code
+actions and diagnostics. It is built on dotty's presentation compiler and runs
+without a JVM.
 
 1. Run `scalino setup-ide <sources...>`. This writes
    `.scalino-build/scalino-lsp.json`: one project for the main scope and,
@@ -284,37 +276,37 @@ presentation compiler and runs without a JVM.
    dependencyClasspath}`, so further targets (say a js frontend) are more
    entries, not a new format.
 2. Install the client for your editor (each directory's README has the steps):
-   - **Zed:** [`zed-extension/`](zed-extension/), published in Zed's gallery as "Scalino".
-   - **VS Code:** [`vscode-extension/`](vscode-extension/), installed locally for now (it's not on the Marketplace yet).
-   - **Neovim:** [`neovim-extension/`](neovim-extension/), a `vim.lsp` config. No plugin needed.
+   - Zed: [`zed-extension/`](zed-extension/), in Zed's gallery as "Scalino".
+   - VS Code: [`vscode-extension/`](vscode-extension/), installed locally (not on the Marketplace).
+   - Neovim: [`neovim-extension/`](neovim-extension/), a `vim.lsp` config; no plugin needed.
 
 ## Status
 
-What's verified to work:
+Verified:
 
-- **The core toolchain** (Scala 3 → NIR → native executable), including
-  inline/quote macros. Macros are expanded by a from-scratch TASTy-tree
-  interpreter instead of dotc's usual approach of running bytecode on a JVM.
-  It's tested against macro fixtures taken from upstream's own test suite.
-  Quote-expression and quote-type patterns (`case '{ ... } =>`, `case '[List[t]] =>`) and
-  case-class/`UnApply` deconstruction work.
-- **The LSP**, on hand-written projects, on a real multi-package third-party
+- The core toolchain (Scala 3 → NIR → native executable), including inline and
+  quote macros. A TASTy-tree interpreter written for scalino expands macros,
+  instead of dotc running bytecode on a JVM. It is tested against macro fixtures
+  from upstream's test suite, including quote-expression and quote-type patterns
+  (`case '{ ... } =>`, `case '[List[t]] =>`) and case-class/`UnApply`
+  deconstruction.
+- The LSP, on hand-written projects, on a real multi-package third-party
   project, and end to end in Zed.
 
 Known gaps:
 
-- **Scala.js `package --format`.** Deb/rpm/docker/brew wrapping is Native only.
-- **JUnit-style `@Test` discovery.** Test frameworks have to use
-  `SubclassFingerprint`, which munit, utest, scalatest and zio-test-sbt all do.
-- **Windows** is experimental.
+- Scala.js `package --format`: deb/rpm/docker/brew wrapping is Native only.
+- JUnit-style `@Test` discovery: test frameworks must use `SubclassFingerprint`,
+  as munit, utest, scalatest and zio-test-sbt do.
+- Windows is experimental.
 
-[`docs/findings.md`](docs/findings.md) has the full breakdown of what's
-verified, blocked or still to do.
+[`docs/findings.md`](docs/findings.md) has the full list of verified, blocked
+and pending items.
 
 ## Packaging
 
-`scalino package --format` wraps the native binary for distribution. You don't
-need fpm or dpkg; `.rpm` uses `rpmbuild`, and docker uses `docker`/`podman`:
+`scalino package --format` wraps the native binary for distribution. It needs
+no fpm or dpkg; `.rpm` uses `rpmbuild` and docker uses `docker`/`podman`:
 
 ```sh
 scalino package --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
@@ -331,13 +323,13 @@ scalino package --format brew --release-url https://github.com/me/app/releases/d
 
 The package metadata comes from these directives:
 `//> using packageName|packageVersion|packageDescription|packageMaintainer|packageLicense|packageHomepage|packageDep|packageFile|packageDockerBase|packageDockerImage|packageReleaseUrl`
-(see `scalino package --help`). With [cross-compilation](#cross-compilation),
-one machine can build every target into the same output dir. You can also build
-each OS/arch on its own CI runner. Either way, run `--format brew` last.
+(see `scalino package --help`). With [cross-compilation](#cross-compilation)
+one machine can build every target into the same output dir; you can also build
+each OS/arch on its own CI runner. Run `--format brew` last either way.
 
 ## Cross-compilation
 
-One machine can build binaries for several platforms in a single command:
+One command can build binaries for several platforms:
 
 ```sh
 # missing sysroots are built automatically on first use
@@ -358,14 +350,17 @@ parsed only once.
 | `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | `scalino sysroot build <triple>` (run for you on first use), on a Mac too |
 | `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot build <triple>`, plus `lld` (**experimental**, see below) |
 
-The musl targets are fully static, so one binary runs on every distro.
-Cross links use `ld.lld`; if none is on PATH, scalino downloads one (from the llvm-mingw release,
-cached next to the sysroots; `scalino sysroot lld` fetches it ahead of time).
+The musl targets are fully static, so one binary runs on every distro. Cross
+links use `ld.lld`; if none is on `PATH`, scalino downloads one from the
+llvm-mingw release and caches it next to the sysroots (`scalino sysroot lld`
+fetches it ahead of time).
+
 A sysroot holds the target's libc headers and libraries. `scalino sysroot build
 <triple>` assembles one on your machine from upstream packages, each checked
 against a pinned sha256 (scalino publishes none), and installs it under
 `~/.cache/scalino/sysroots`. `scalino package --native-target-triple` runs it
-automatically for any target without one. It needs only `curl` and `tar`; nothing is compiled.
+for any target without a sysroot. It needs only `curl` and `tar`; nothing is
+compiled.
 
 | target | assembled from |
 |---|---|
@@ -399,12 +394,12 @@ automatically for any target without one. It needs only `curl` and `tar`; nothin
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 
-Passing `--native-target-triple` always links against scalino's sysroot, also
-when the triple is the machine's own (macOS targets on a Mac included, instead
-of the installed SDK): the result doesn't depend on the system's libc, and a
-build that works locally works on any CI. Without it,
-the build is a plain system build, using the machine's own toolchain, SDK, frameworks
-and libraries (`--native-pkg-config` etc.), so on a Mac it can use Apple frameworks.
+`--native-target-triple` always links against scalino's sysroot, even when the
+triple is the machine's own (on a Mac, instead of the installed SDK). The result
+doesn't depend on the system's libc, so a build that works locally works on any
+CI. Without the flag the build is a plain system build using the machine's
+toolchain, SDK, frameworks and libraries (`--native-pkg-config` etc.), so on a
+Mac it can use Apple frameworks.
 
 `run` and `test` always build for the host, because the result has to run on
 this machine.
@@ -460,18 +455,18 @@ builder's libraries, and the target is linked against the sysroot instead.
 `*-linux-musl` binaries are static and run anywhere; `*-linux-gnu` ones are
 dynamic against glibc 2.31 (patchelf them on NixOS).
 
-This fetches every locked jar with `pkgs.fetchurl` and builds offline. Re-run
-`scalino lock` whenever dependencies change. The flake supports x86_64/aarch64
+The flake fetches every locked jar with `pkgs.fetchurl` and builds offline.
+Re-run `scalino lock` whenever dependencies change. It supports x86_64/aarch64
 Linux and macOS.
 
-For editing, `mkScalinoDevShell` gives you a `nix develop` shell with:
+For editing, `mkScalinoDevShell` provides a `nix develop` shell with:
 
 - the same offline cache
 - the locked `-sources.jar`s
 - the pinned stdlib sources shipped in the package
 
-With that, `scalino setup-ide .` and `scalino-lsp` work without network,
-including go-to-definition into libraries:
+In that shell `scalino setup-ide .` and `scalino-lsp` work offline, including
+go-to-definition into libraries:
 
 ```nix
 devShells.${system}.default = scalino.lib.${system}.mkScalinoDevShell {
@@ -505,10 +500,9 @@ bootstrapped from:
 
 ## Releasing
 
-For maintainers: push a `vX.Y.Z` tag, and the
-[release workflow](.github/workflows/release.yml) builds `dist/` for every
-supported platform/arch and publishes a GitHub Release. If one platform fails
-to build, the others still publish.
+Push a `vX.Y.Z` tag. The [release workflow](.github/workflows/release.yml)
+builds `dist/` for every supported platform/arch and publishes a GitHub Release;
+if one platform fails, the others still publish.
 
 ```sh
 git tag vX.Y.Z && git push origin vX.Y.Z

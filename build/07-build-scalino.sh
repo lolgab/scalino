@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Builds scalino: the mini scala-cli-style build tool, self-hosted -- compiled
-# by the very toolchain it wraps (dist/scalino-dotc + dist/scalino-linkdriver),
-# not by any JVM. See cli/ScalinoCli.scala and docs/findings.md "Toward a
+# Builds scalino, the scala-cli-style build tool, self-hosted with dist/scalino-dotc +
+# dist/scalino-linkdriver. See cli/ScalinoCli.scala and docs/findings.md "Toward a
 # build-tool experience without a JVM".
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -20,8 +19,7 @@ SRC_DIR="$WORK/scalino-src"
 rm -rf "$SRC_DIR"
 mkdir -p "$SRC_DIR"
 
-# scala-native's own artifact-naming convention uses just major.minor (see
-# e.g. nativelib_native0.5_3) -- not the full patch version.
+# scala-native artifacts are named with major.minor only (e.g. nativelib_native0.5_3).
 NATIVE_BINARY_VERSION="$(echo "$SCALA_NATIVE_VERSION" | cut -d. -f1,2)"
 
 cat > "$SRC_DIR/BuildInfo.scala" <<EOF
@@ -37,8 +35,7 @@ $(for v in DEBIAN_SNAPSHOT MUSL_DEB_VERSION MUSL_DEV_AMD64_SHA256 MUSL_DEV_ARM64
   )
 EOF
 
-# scalino locates its own dist/ root via a tiny OS-specific native binding
-# (cli/selfexe/*.scala) -- pick the one matching the host we're building on.
+# scalino locates its dist/ root via an OS-specific native binding (cli/selfexe/*.scala).
 case "$(uname -s)" in
   Linux) SELFEXE="$ROOT/cli/selfexe/Linux.scala" ;;
   Darwin) SELFEXE="$ROOT/cli/selfexe/Macos.scala" ;;
@@ -51,19 +48,12 @@ LINK_DIR="$WORK/scalino-link"
 rm -rf "$CLASSES_DIR" "$LINK_DIR"
 mkdir -p "$CLASSES_DIR"
 
-# ScalinoCli.scala's own entry-point/test-discovery scanner needs a real NIR
-# reader (see cli/ScalinoCli.scala's "Entry-point detection" section): on a
-# self-hosted scalino-dotc, the compiled user project's classesDir never gets
-# real JVM .class files (no backend/jvm/ASM in that toolchain at all), only
-# .nir -- so the classfile-based scanner alone can't ever find a main class
-# or test class there. nir_native0.5_3/util_native0.5_3 are scala-native's
-# own NIR data model + binary (de)serializer, published as real Scala Native
-# cross-build artifacts -- --intransitive (one artifact per `cs fetch` call,
-# not one call with both) for the same reason build/08-build-scalino-lsp.sh's
-# LSP_NATIVE_JARS are fetched that way: resolving them together pulls in
-# their own transitive javalib/nativelib/clib copy, which conflicts with
-# nativelibs.cp's pinned $SCALA_NATIVE_VERSION build (duplicate-symbol link
-# errors) -- fetched one at a time, --intransitive correctly suppresses that.
+# ScalinoCli's entry-point/test scanner needs a NIR reader: the self-hosted scalino-dotc emits
+# only .nir (no JVM .class files), so the classfile scanner can't find main/test classes
+# (cli/ScalinoCli.scala "Entry-point detection"). nir_native0.5_3/util_native0.5_3 are fetched
+# one `cs fetch --intransitive` call each, as in 08-build-scalino-lsp.sh (LSP_NATIVE_JARS):
+# together they pull in a second javalib/nativelib/clib copy that conflicts with nativelibs.cp
+# (duplicate-symbol link errors).
 NIR_NATIVE_JARS=(
   "org.scala-native:nir_native0.5_3:$SCALA_NATIVE_VERSION"
   "org.scala-native:util_native0.5_3:$SCALA_NATIVE_VERSION"
@@ -76,23 +66,13 @@ done
 
 PLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 
-# Substitute the published javalib_native0.5_3 jar for the locally-built one
-# with any patches/scala-native-000* actually applied -- see
-# build/01a-publish-scala-native.sh and 03-build-scalino-dotc.sh's identical
-# substitution. Without this, scalino itself (not just scalino-dotc) links
-# against the unpatched upstream javalib.
+# Substitute the locally-built, patched javalib jar (see 01a and 03-build-scalino-dotc.sh);
+# otherwise scalino itself links against the unpatched upstream javalib.
 NATIVELIBS_CP="$WORK/scalino-src/nativelibs.cp"
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  # -F/-x too, not just the old -v '/javalib_native0\.5_3-' regex: see
-  # 03-build-scalino-dotc.sh's identical substitution for why -- 01b already
-  # rewrites $WORK/nativelibs.cp in place to point straight at
-  # $LOCAL_JAVALIB_JAR (whose filename has no "-<version>" suffix, so the old
-  # pattern doesn't match it there), so appending it again unconditionally
-  # duplicated the entry and made scala-native's linker fail with "duplicate
-  # symbol" for every native javalib symbol (z.c, etc). Filtering the exact
-  # local path too makes this idempotent regardless of whether
-  # $WORK/nativelibs.cp already has it.
+  # -F/-x too: see 03-build-scalino-dotc.sh (01b already rewrites $WORK/nativelibs.cp to contain
+  # $LOCAL_JAVALIB_JAR, and a duplicate entry makes the link fail with "duplicate symbol").
   { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-' | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
@@ -111,35 +91,24 @@ COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_
   "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$ROOT/cli/SysrootBuild.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
 LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_NATIVE_CP"
-# --mode release-size: v0.0.1 shipped scala-native's *default* Mode (debug --
-# no --mode flag was passed at all). -Xss64m defensively -- see
-# 03-build-scalino-dotc.sh's identical note (release-fast/-size's own
-# optimizer StackOverflowed there against dotc's large methods; ScalinoCli
-# itself is much smaller, but this is cheap insurance either way).
-# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
-# heap badly (interflow's garbage); without it the link runs out of heap.
+# --mode release-size: v0.0.1 shipped the default debug mode. -Xss64m is cheap insurance; see
+# 03-build-scalino-dotc.sh's note on the optimizer overflowing the stack on dotc's large methods.
+# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), for this command only: linking large programs
+# fragments the Immix heap badly (interflow garbage) and otherwise runs out of heap.
 LINK_ENV=()
 linkdriver_run "$LINK_CP" "$(to_native_path "$LINK_DIR")" ScalinoCli --mode "$([[ "$SCALINO_LINK_MODE" == debug ]] && echo debug || echo release-size)" --multithreading --no-incremental-compilation
 
 cp "$LINK_DIR/ScalinoCli" "$DIST/scalino"
 chmod +x "$DIST/scalino"
-# See 08-build-scalino-lsp.sh's identical guard: on macOS/arm64 the
-# linker's own ad-hoc signature is sometimes rejected by the kernel at
-# exec time (SIGKILL, 0 CPU time used, no crash report -- AMFI
-# code-signature rejection, not a runtime crash). Re-signing ad-hoc
-# ourselves after the copy reliably fixes it. Harmless no-op on Linux.
+# Same guard as 08-build-scalino-lsp.sh: on macOS/arm64 the linker's ad-hoc signature is
+# sometimes rejected at exec time (SIGKILL, AMFI); re-signing after the copy fixes it. No-op on Linux.
 if command -v codesign >/dev/null 2>&1; then
   codesign -s - -f "$DIST/scalino"
 fi
 
-# Shell completion scripts (see cli/ScalinoCli.scala's `completions`
-# subcommand): pre-generated here and shipped in dist/completions/ rather
-# than left for the end user to run themselves, so every packaging format
-# (brew/apt/dnf/arch/nix -- see build/09-package-linux-native.sh and
-# packaging/*) can just install these static files at their own
-# convention's completion path. Generated by the binary we just built, not
-# hand-written, so they can never drift from the option list `main`/
-# `parseRunOpts` actually accept.
+# Shell completion scripts (cli/ScalinoCli.scala's `completions` subcommand), generated by the
+# binary just built so they track its options, and shipped in dist/completions/ for every
+# packaging format (see build/09-package-linux-native.sh and packaging/*).
 mkdir -p "$DIST/completions"
 "$DIST/scalino" completions bash > "$DIST/completions/scalino.bash"
 "$DIST/scalino" completions zsh > "$DIST/completions/_scalino"

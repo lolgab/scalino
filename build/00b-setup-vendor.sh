@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Clones scala/scala3 (at the tag SCALA_VERSION) and scala-native/scala-native (at the upstream main
 # commit SCALA_NATIVE_REF) if not already present and applies every matching patch from patches/,
-# in order. vendor/ is gitignored (full clones are large) -- this script is
-# what "pulls and patches the scala/scala3 [and scala-native] code" from the
-# original project brief actually refers to.
+# in order. vendor/ is gitignored (full clones are large).
 #
 # Patch files are prefixed by which vendored repo they target:
 # patches/scala3-*.patch -> vendor/scala3, patches/scala-native-*.patch ->
@@ -17,10 +15,8 @@ setup_one() {
   local vendor="$ROOT/vendor/$name"
 
   if [[ ! -d "$vendor/.git" ]]; then
-    # -c core.autocrlf=false: our patches/*.patch files have LF line endings
-    # (as committed); on Windows, git's default CRLF checkout conversion
-    # would make the vendored source not match them byte-for-byte and
-    # `git apply` fails with "patch does not apply".
+    # core.autocrlf=false: patches have LF endings; Windows CRLF conversion would make
+    # `git apply` fail with "patch does not apply".
     if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
       # a commit, not a tag: GitHub serves any reachable sha to a shallow fetch
       git -c core.autocrlf=false init -q "$vendor"
@@ -54,12 +50,8 @@ setup_one() {
   fi
   if [[ -n "$(git status --short)" ]]; then
     echo "vendor/$name has local changes already -- resetting before reapplying patches" >&2
-    # `git checkout -q -- .` only restores MODIFIED tracked files -- it
-    # doesn't remove files a previous patch run ADDED or restore files it
-    # DELETED, so re-running this script against an already-patched clone
-    # left those half-applied and every subsequent `git apply` failed with
-    # "already exists"/"No such file or directory". A hard reset + clean
-    # actually gets back to the pristine post-clone state.
+    # `git checkout -- .` doesn't remove files a previous patch run added or restore ones it
+    # deleted, so `git apply` then fails with "already exists"; hard reset + clean does.
     git reset -q --hard HEAD
     git clean -q -fd
   fi

@@ -1,16 +1,9 @@
-// scalino's distribution-packaging half (`scalino package --format ...`): wraps
-// the one native binary scalino already links into the formats Linux/macOS
-// users actually install from -- .deb, .rpm, OCI/Docker image, a release
-// tarball, and a Homebrew formula -- the nfpm/goreleaser/cargo-dist role,
-// as opposed to sbt-native-packager's "generate a launcher script around a
-// classpath" (there is no classpath here, just one executable).
+// `scalino package --format ...`: wraps the one native binary into .deb, .rpm, OCI/Docker image,
+// release tarball and Homebrew formula (the nfpm/goreleaser/cargo-dist role).
 //
-// Everything that can be written in-process is (ar/tar/gzip/md5 for .deb,
-// tar/gzip/sha256 for the tarball, Dockerfile + formula text), so no fpm /
-// dpkg-deb is ever needed. The two formats that genuinely need an external
-// tool shell out to it: .rpm -> `rpmbuild` (the RPM header/cpio payload
-// format is not worth re-implementing, and rpmbuild also computes the
-// shared-library Requires automatically), docker -> `docker`/`podman build`.
+// Everything is written in-process (ar/tar/gzip/md5 for .deb, tar/gzip/sha256 for the tarball,
+// Dockerfile and formula text) except .rpm -> `rpmbuild` (which also computes shared-library
+// Requires) and docker -> `docker`/`podman build`.
 //
 // A package holds the binary for one target: the host's, or the one given with
 // `--native-target-triple` (see `hostFromTriple`; cross targets need a sysroot,
@@ -60,9 +53,7 @@ object Packaging:
           Left("--format binary (a bare native executable) can't be combined with other formats")
         else Right(distinct)
 
-  // ---------------------------------------------------------------------
   // Host / metadata
-  // ---------------------------------------------------------------------
 
   case class Host(os: String, arch: String, libc: String):
     def triple: String = os match
@@ -156,9 +147,7 @@ object Packaging:
       cliReleaseUrl.orElse(one("packageReleaseUrl")).map(_.stripSuffix("/"))
     )
 
-  // ---------------------------------------------------------------------
   // Payload model + archive writers
-  // ---------------------------------------------------------------------
 
   private val Mode755 = 0x1ed
   private val Mode644 = 0x1a4
@@ -305,9 +294,7 @@ object Packaging:
       sb.append(Character.forDigit(byte >> 4, 16)).append(Character.forDigit(byte & 15, 16))
     sb.toString
 
-  // ---------------------------------------------------------------------
   // Filesystem helpers
-  // ---------------------------------------------------------------------
 
   private def deleteTree(f: java.io.File): Unit =
     if f.isDirectory then Option(f.listFiles()).foreach(_.foreach(deleteTree))
@@ -349,9 +336,7 @@ object Packaging:
     if host.libc == "musl" then
       fail(s"--format $fmt targets glibc distributions, but the target is musl (${host.triple})")
 
-  // ---------------------------------------------------------------------
   // Formats
-  // ---------------------------------------------------------------------
 
   private def debArch(arch: String): String = arch match
     case "x86_64" => "amd64"
@@ -570,9 +555,7 @@ object Packaging:
     Files.write(out, formula.getBytes(UTF_8))
     out
 
-  // ---------------------------------------------------------------------
   // Entry point
-  // ---------------------------------------------------------------------
 
   /** Builds every requested format from the already-linked `binary` into
    *  `outDir`. `brew` always runs last (it indexes the tarballs). */
