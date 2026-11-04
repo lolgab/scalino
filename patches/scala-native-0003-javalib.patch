@@ -591,35 +591,6 @@ index fed7d4cb..060f1cac 100644
      ServiceLoader.load(classOf[FileSystemProvider]).forEach(list.add(_))
  
      list
-diff --git a/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala b/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala
-index 754e9105..b0083b70 100644
---- a/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala
-+++ b/javalib/src/main/scala/java/util/concurrent/CompletableFuture.scala
-@@ -815,10 +815,20 @@ object CompletableFuture {
-     }
- 
-     override def isReleasable(): Boolean = {
--      if (Thread.interrupted()) interrupted = true
--      (interrupted && interruptible) ||
--        (deadline != 0L && (nanos <= 0L || { nanos = deadline - System.nanoTime(); nanos <= 0L })) ||
--        thread == null
-+      if (thread == null) true
-+      else {
-+        if (Thread.interrupted()) interrupted = true
-+        if (interrupted && interruptible) {
-+          thread = null
-+          true
-+        } else if (
-+          deadline != 0L &&
-+          (nanos <= 0L || { nanos = deadline - System.nanoTime(); nanos <= 0L })
-+        ) {
-+          thread = null
-+          true
-+        } else false
-+      }
-     }
- 
-     override def block(): Boolean = {
 diff --git a/javalib/src/main/scala/java/util/zip/Deflater.scala b/javalib/src/main/scala/java/util/zip/Deflater.scala
 index c6b06fc3..35ff9775 100644
 --- a/javalib/src/main/scala/java/util/zip/Deflater.scala
