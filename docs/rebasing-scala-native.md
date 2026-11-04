@@ -40,3 +40,12 @@ moves code, so do one merge instead:
 Check each patched area against upstream before keeping it: upstream has already absorbed several of ours
 (the x86_64 trampoline red-zone fix, `Path.toUri`, `Arrays.fill`, the growth-deferral constants, the
 `Files` probes, interior-pointer conservative marking, ...).
+
+## Binary compatibility with libraries built for released Scala Native
+
+The link name of an extern (`@name`) is part of its NIR global, so renaming one that already exists in a
+release breaks every library compiled against that release: "Unknown extern symbol
+scala.scalanative.posix.sys.socket$.socket". Upstream #5123 did this for `socket`, `nanosleep`,
+`clock_gettime`, `sigaltstack` and `setlocale`; `patches/scala-native-0013-posixlib-binary-compat.patch`
+reverts those names. When bumping `SCALA_NATIVE_REF`, diff added `@name` lines on pre-existing externs
+(`git diff <last release> <new ref> -- '*.scala' | grep '^+ *@name'`) and run `tests/native-compat/run.sh`.

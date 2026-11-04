@@ -1,0 +1,65 @@
+posixlib/clib: keep the link names of externs that libraries built with Scala Native 0.5.12 reference
+
+Upstream (#5123, FreeBSD/OpenBSD/NetBSD support) added @name("scalanative_...") to externs that
+already existed: socket, nanosleep, clock_gettime, sigaltstack and setlocale. The link name is part
+of the extern's NIR global (Sig.Extern), so a library compiled against 0.5.12 that calls
+socket.socket references Sig.Extern("socket"), which no longer exists:
+"Unknown extern symbol scala.scalanative.posix.sys.socket$.socket". Keep the 0.5.12 names; the
+scalanative_* C shims stay in the resources, unreferenced.
+
+diff --git a/clib/src/main/scala/scala/scalanative/libc/locale.scala b/clib/src/main/scala/scala/scalanative/libc/locale.scala
+index 4630d36..47ee022 100644
+--- a/clib/src/main/scala/scala/scalanative/libc/locale.scala
++++ b/clib/src/main/scala/scala/scalanative/libc/locale.scala
+@@ -79,7 +79,6 @@ private[scalanative] trait locale {
+ 
+   def localeconv(): Ptr[lconv] = extern
+ 
+-  @name("scalanative_setlocale")
+   def setlocale(category: CInt, locale: CString): CString = extern
+ }
+ 
+diff --git a/posixlib/src/main/scala/scala/scalanative/posix/signal.scala b/posixlib/src/main/scala/scala/scalanative/posix/signal.scala
+index 9bb31c2..a29c16f 100644
+--- a/posixlib/src/main/scala/scala/scalanative/posix/signal.scala
++++ b/posixlib/src/main/scala/scala/scalanative/posix/signal.scala
+@@ -345,7 +345,6 @@ import scala.scalanative.unsafe._
+   def sigaction(sig: CInt, act: Ptr[sigaction], oact: Ptr[sigaction]): CInt =
+     extern
+   def sigaddset(set: Ptr[sigset_t], signo: CInt): CInt = extern
+-  @name("scalanative_sigaltstack")
+   def sigaltstack(ss: Ptr[stack_t], oss: Ptr[stack_t]): CInt = extern
+   def sigdelset(set: Ptr[sigset_t], signo: CInt): CInt = extern
+   def sigemptyset(set: Ptr[sigset_t]): CInt = extern
+diff --git a/posixlib/src/main/scala/scala/scalanative/posix/sys/socket.scala b/posixlib/src/main/scala/scala/scalanative/posix/sys/socket.scala
+index 4cdb863..e0a2701 100644
+--- a/posixlib/src/main/scala/scala/scalanative/posix/sys/socket.scala
++++ b/posixlib/src/main/scala/scala/scalanative/posix/sys/socket.scala
+@@ -380,7 +380,6 @@ object socket {
+   @name("scalanative_sockatmark") // A stub on Win32, see top of file
+   def sockatmark(socket: CInt): CInt = extern
+ 
+-  @name("scalanative_socket")
+   def socket(domain: CInt, tpe: CInt, protocol: CInt): CInt = extern
+ 
+   @name("scalanative_socketpair") // A stub on Win32, see top of file
+diff --git a/posixlib/src/main/scala/scala/scalanative/posix/time.scala b/posixlib/src/main/scala/scala/scalanative/posix/time.scala
+index 387717a..da53962 100644
+--- a/posixlib/src/main/scala/scala/scalanative/posix/time.scala
++++ b/posixlib/src/main/scala/scala/scalanative/posix/time.scala
+@@ -77,7 +77,6 @@ trait time extends libc.time {
+ 
+   def clock(): clock_t = extern
+   def clock_getres(clockid: clockid_t, res: Ptr[timespec]): CInt = extern
+-  @name("scalanative_clock_gettime")
+   def clock_gettime(clockid: clockid_t, tp: Ptr[timespec]): CInt = extern
+ 
+   // No clock_nanosleep on macOS. time.c provides a stub always returning -1.
+@@ -104,7 +103,6 @@ trait time extends libc.time {
+ 
+   def mktime(time: Ptr[tm]): time_t = extern
+ 
+-  @name("scalanative_nanosleep")
+   @blocking
+   def nanosleep(
+       requested: Ptr[timespec],
