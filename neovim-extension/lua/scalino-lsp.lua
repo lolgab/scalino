@@ -1,13 +1,11 @@
--- Neovim wiring for scalino-lsp (scalino's JVM-free Scala LSP -- see
--- ../README.md and ../docs/findings.md "JVM-free language server (LSP)").
+-- Neovim wiring for scalino-lsp (scalino's JVM-free Scala LSP; see ../README.md and
+-- ../docs/findings.md "JVM-free language server (LSP)").
 --
--- Unlike the vscode-extension/ and zed-extension/ directories, this isn't a
--- packaged plugin -- Neovim's own LSP client (vim.lsp, 0.11+) is generic
--- enough that no extension code is needed, just a client config. Source
--- this file from your init.lua, or copy it into your config and adjust.
+-- Not a packaged plugin like vscode-extension/ and zed-extension/: Neovim's LSP client
+-- (vim.lsp, 0.11+) only needs a client config. Source this file from your init.lua, or copy it
+-- into your config and adjust.
 --
--- No auto-download of `scalino-lsp` itself, same as the other two: it isn't
--- published anywhere generic, it's this repo's own dist/ build output
+-- No auto-download of `scalino-lsp`, same as the other two: it is this repo's dist/ build output
 -- (build/08-build-scalino-lsp.sh, or a release tarball).
 
 local M = {}
@@ -43,14 +41,10 @@ local function resolve_cmd(opts)
   return "scalino-lsp"
 end
 
--- scalino-lsp exits itself after SCALINO_LSP_IDLE_TIMEOUT_MINUTES of
--- inactivity (default 30) to avoid piling up hanging processes -- see
--- vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala.
--- That's a clean exit (code 0), which Neovim's client treats as a
--- deliberate stop rather than a crash, so it won't reattach on its own the
--- way it would after a crash-restart. Re-`start` the client for every
--- still-open scala buffer so editing resumes without needing to close and
--- reopen the buffer.
+-- scalino-lsp exits itself after SCALINO_LSP_IDLE_TIMEOUT_MINUTES of inactivity (default 30; see
+-- vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala). Neovim treats that
+-- clean exit (code 0) as a deliberate stop and won't reattach, so re-`start` the client for
+-- every still-open scala buffer.
 local function reattach_open_buffers(cfg)
   vim.schedule(function()
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do

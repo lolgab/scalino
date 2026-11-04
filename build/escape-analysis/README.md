@@ -20,8 +20,8 @@ build/escape-analysis/dev-link-app.sh .scalino-build/_scratch/classes Main /tmp/
 EXTRA_CP=<dependency NIR jars> ...                          # e.g. the .scalino-build/deps-cache/*.cp of the project
 ```
 
-`EA_WORK` defaults to `.build-work/ea-dev`. Do **not** use `vendor/sn-sbt`: it is
-out of sync with `vendor/scala-native`.
+`EA_WORK` defaults to `.build-work/ea-dev`. Do not use `vendor/sn-sbt`: it is out
+of sync with `vendor/scala-native`.
 
 Link-time environment variables read by the analysis (all optional):
 
@@ -29,7 +29,7 @@ Link-time environment variables read by the analysis (all optional):
 | --- | --- |
 | `SCALANATIVE_STACK_OBJECTS=0/1` | force the stack allocation transform off/on (on by default in release modes) |
 | `SCALANATIVE_INLINE_ALLOC=0/1/<n>` | allocation-oriented inlining off/on, `<n>` = maximal callee size |
-| `SCALANATIVE_STACK_POISON=1` | **overwrite the stack objects of a frame when it is left** (see below) |
+| `SCALANATIVE_STACK_POISON=1` | overwrite the stack objects of a frame when it is left (see below) |
 | `SCALANATIVE_STACK_INCLUDE` / `_EXCLUDE=<regex>` | restrict the transform to classes matching / not matching |
 | `SCALANATIVE_STACK_HASH=lo:hi:mod` | keep only the sites whose (function, id) hash mod `mod` is in `[lo,hi)`: bisecting a miscompile |
 | `SCALANATIVE_STACK_VERBOSE=1` | print every converted site (`kind in function #id`) |
@@ -41,7 +41,7 @@ Link-time environment variables read by the analysis (all optional):
 | `SCALANATIVE_ESCAPE_STATS=1` | analysis time breakdown and counters |
 | `SCALANATIVE_INLINE_STATS=1` | outcome of the allocation-oriented inlining decisions |
 | `SCALANATIVE_SITE_PROFILE=<file>` | instrument every allocation site with a hit counter, write the site table to `<file>` |
-| `SCALANATIVE_EA_X=a,b` | experiments: `nospec` (no specialization), `monitor`, `matcherror`, `throwcap` (the last three are **unsound**, measurement only), `mutate-deepfix` / `mutate-collapsedext` (re-introduce fixed soundness bugs, see below) |
+| `SCALANATIVE_EA_X=a,b` | experiments: `nospec` (no specialization), `monitor`, `matcherror`, `throwcap` (the last three are unsound, for measurement only), `mutate-deepfix` / `mutate-collapsedext` (re-introduce fixed soundness bugs, see below) |
 
 ## Measuring allocations
 
@@ -61,8 +61,8 @@ python3 build/escape-analysis/site-report.py /tmp/sites.tsv /tmp/hits.txt 40
 
 ## Validating soundness
 
-A stack object that outlives its frame is silent: the dead stack memory is
-usually intact for a while. **Always validate with `SCALANATIVE_STACK_POISON=1`**,
+A stack object that outlives its frame fails silently: the dead stack memory is
+usually intact for a while. Always validate with `SCALANATIVE_STACK_POISON=1`,
 which makes every function overwrite its stack objects with `0xA5` before it
 returns or throws, so a dangling reference crashes right away:
 
@@ -70,15 +70,15 @@ returns or throws, so a dangling reference crashes right away:
 SCALANATIVE_STACK_POISON=1 ./dist/scalino run examples/escape-analysis/Main.scala --native-mode release-fast   # prints sum=1412
 ```
 
-`examples/escape-analysis` must also *fail* when the analysis is made unsound:
+`examples/escape-analysis` must also fail when the analysis is made unsound:
 `SCALANATIVE_EA_X=mutate-deepfix` re-introduces a real bug found in review (a
 callee that leaks the *contents* of a parameter was not reflected in the
 caller's summary when the caller never loaded those fields itself) and the
-program then prints a different sum. When adding an analysis feature, add a
-mutant like that and make sure the example catches it.
+program then prints a different sum. A new analysis feature needs a mutant like
+that, and the example must catch it.
 
 `tests/escape-analysis/run.sh [scalino]` is the regression test for a second bug of
-that kind: a callee that stores one parameter into another is modelled as union +
+that kind. A callee that stores one parameter into another is modelled as union +
 collapse of the two argument nodes, and a collapsed node that is caller memory
 (`ExtRoot`) never received `Ext`, so the stored object looked local and was stack
 allocated (the wes `Envelope` in `PulseRegisters.$init$`). It links with the stack
@@ -99,8 +99,7 @@ to run, in both binaries.)
 
 ## Bisecting a miscompile
 
-If a binary linked with the analysis misbehaves, find the stack-allocated site
-responsible: relink with `SCALANATIVE_STACK_HASH=0:1:2`, then `1:2:2`, and so on
+To find the stack-allocated site that breaks a binary linked with the analysis, relink with `SCALANATIVE_STACK_HASH=0:1:2`, then `1:2:2`, and so on
 (`0:1:4`, `2:3:4`, ...), keeping the half that still fails; list the remaining
 sites with `SCALANATIVE_STACK_VERBOSE=1 SCALANATIVE_STACK_EXIT=1`, and use
 `SCALANATIVE_ESCAPE_DUMP` / `SCALANATIVE_ESCAPE_TRACE` on the function to see

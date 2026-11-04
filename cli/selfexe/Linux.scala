@@ -1,10 +1,8 @@
 package selfexe
 
-// Resolves the path to the currently running executable on Linux, via the
-// kernel-maintained /proc/self/exe symlink (already fully resolved -- no
-// realpath needed). java.lang.ProcessHandle.current() would be the portable
-// JVM way to do this, but it's unimplemented in scala-native's javalib port
-// (unreachable-symbol link error), hence this hand-rolled POSIX binding.
+// Path of the running executable on Linux, via the /proc/self/exe symlink (already resolved).
+// java.lang.ProcessHandle.current() is unimplemented in scala-native's javalib (unreachable-symbol
+// link error), hence this POSIX binding.
 import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
 

@@ -6,14 +6,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
 
 echo "== dotc compiler classpath =="
-# `| tr -d '\r'` on every `cs fetch --classpath` below: `cs` is a JVM app, and
-# on Windows its stdout line separator is "\r\n" -- a plain `> file` redirect
-# leaves a trailing \r glued to the last classpath entry, invisible to most
-# consumers (java -cp seems to tolerate it) until something reads the file
-# byte-strictly, like `cp` in 06-package.sh's vendor_cp (confirmed via CI:
-# "cp: cannot stat '...util-interface-1.10.7.jar'$'\r'': No such file or
-# directory"). Stripped once here so every downstream consumer of these
-# files gets clean content regardless of how it reads them.
+# `| tr -d '\r'` on every `cs fetch --classpath` below: on Windows cs prints "\r\n", leaving a
+# trailing \r on the last entry that byte-strict readers (cp in 06-package.sh's vendor_cp)
+# choke on ("cannot stat '...jar'$'\r''").
 cs fetch "org.scala-lang:scala3-compiler_3:$SCALA_VERSION" "org.scala-lang:scala3-library_3:$SCALA_VERSION" \
   --classpath | tr -d '\r' > "$WORK/compiler.cp"
 
@@ -26,9 +21,8 @@ cs fetch -r ivy2Local "org.scala-native:nscplugin_$SCALA_VERSION:$SCALA_NATIVE_V
 tr "$CP_SEP" '\n' < "$WORK/nscplugin.cp" | grep "nscplugin_$SCALA_VERSION" > "$WORK/nscplugin.jar.txt"
 
 echo "== scala-native target runtime libs (java.base-for-native, stdlib port, etc) =="
-# NOTE: scalalib_native0.5_3 is an empty/decoy artifact for this version line.
-# The real Scala stdlib port lives in scala3lib_native0.5_3. Do not add
-# scalalib_native0.5_3 here -- see docs/findings.md.
+# scalalib_native0.5_3 is an empty decoy for this version line; the real stdlib port is
+# scala3lib_native0.5_3 (see docs/findings.md).
 cs fetch -r ivy2Local \
   "org.scala-native:nativelib_native0.5_3:$SCALA_NATIVE_VERSION" \
   "org.scala-native:javalib_native0.5_3:$SCALA_NATIVE_VERSION" \
@@ -63,19 +57,12 @@ for cp in nativelibs.cp tools-native.cp; do
 done
 
 echo "== LSP server deps (hand-rolled JSON-RPC + jsoniter-scala, no lsp4j/Gson) =="
-# Previously lsp4j + Gson (reflection-based) -- replaced after discovering a
-# pathology specific to this project's closed-world, AOT-compiled Scala
-# Native binaries: Gson's reflective TypeAdapter construction for a real
-# editor's full-sized `initialize` capabilities payload silently never
-# completes there (works fine under a real JVM with the identical
-# bytes/classes -- see docs/findings.md "JVM-free language server (LSP)").
-# dotty.tools.languageserver now implements the JSON-RPC/LSP wire protocol
-# by hand (Main.scala) with hand-written jsoniter-scala JsonValueCodec
-# instances (no JsonCodecMaker macro derivation: this project's own macro
-# interpreter -- patches/scala3-0001 -- isn't guaranteed to expand arbitrary
-# third-party compile-time macros, and this sidesteps that risk entirely) --
-# compile-time-generated-equivalent, fully reflection-free parsing, both at
-# runtime and in the AOT-compiled binary.
+# Not lsp4j + Gson: Gson's reflective TypeAdapter construction never completes in the
+# AOT-compiled binary on a real editor's `initialize` payload (fine on a JVM; see
+# docs/findings.md "JVM-free language server (LSP)"). dotty.tools.languageserver implements
+# JSON-RPC by hand (Main.scala) with hand-written jsoniter-scala codecs, avoiding
+# JsonCodecMaker, since the macro interpreter (patches/scala3-0001) may not expand arbitrary
+# third-party macros.
 cs fetch "com.github.plokhotnyuk.jsoniter-scala:jsoniter-scala-core_3:2.37.3" \
   --classpath | tr -d '\r' > "$WORK/lsp.cp"
 

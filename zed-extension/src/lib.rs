@@ -1,19 +1,14 @@
-// Zed extension for scalino-lsp (scalino's JVM-free Scala
-// LSP -- see /README.md and /docs/findings.md "JVM-free language server
-// (LSP)"). Defines its own "Scala (scalino)" language/grammar (languages/scala/,
-// copied from https://github.com/scalameta/metals-zed -- see
-// languages/scala/NOTICE), deliberately named differently from metals-zed's
-// own "Scala" language (and scoped to just `.scala`, not
-// `.sbt`/`.sc`/`.mill`) so the two never collide over the same file
-// extensions -- see the longer comment in extension.toml. Registers
-// `scalino-lsp` as the only language server for it.
+// Zed extension for scalino-lsp (scalino's JVM-free Scala LSP; see /README.md and /docs/findings.md
+// "JVM-free language server (LSP)"). Defines its own "Scala (scalino)" language/grammar
+// (languages/scala/, copied from https://github.com/scalameta/metals-zed, see
+// languages/scala/NOTICE), named differently from metals-zed's "Scala" and scoped to `.scala`
+// only (not `.sbt`/`.sc`/`.mill`) so the two never collide; see extension.toml. Registers
+// `scalino-lsp` as its only language server.
 //
-// No DAP support (the worksheet/decompiler modules that would need one were
-// trimmed from the server -- see patches/scala3-0002-trim-language-server.patch)
-// and no auto-download: scalino-lsp isn't published anywhere generic,
-// it's this repo's own dist/ build output (build/08-build-scalino-lsp.sh, or
-// a release tarball). Resolved the same way any other manually-installed
-// LSP binary is in Zed: on PATH (`worktree.which`), or pinned explicitly via
+// No DAP support (the worksheet/decompiler modules that would need one were trimmed from the
+// server, patches/scala3-0002-trim-language-server.patch) and no auto-download: scalino-lsp is
+// this repo's dist/ build output (build/08-build-scalino-lsp.sh, or a release tarball). Resolved
+// like any manually installed LSP binary in Zed: on PATH (`worktree.which`), or via
 // `lsp.scalino-lsp.binary.path` in settings.json.
 
 use zed_extension_api::{self as zed, settings::LspSettings, Result};

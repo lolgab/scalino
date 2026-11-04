@@ -71,13 +71,8 @@ jobs:
         run: ./tests/js/run.sh dist/scalino
 
       - name: Smoke test -- real macro
-        # Known-failing, not a regression: see ci.yml's identical step for
-        # the full explanation (jsoniter-scala's derivation macro hits a
-        # genuine, still-open interpreter gap -- docs/findings.md's
-        # "Remaining work" #1). Without continue-on-error here, this step's
-        # failure skipped every later step in the job (Package included),
-        # so a release build that actually succeeded still shipped zero
-        # assets for every platform.
+        # Known-failing, not a regression: see ci.yml. continue-on-error because a failure here
+        # used to skip every later step (Package included) and ship no assets.
         continue-on-error: true
         shell: bash
         run: ./dist/scalino run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
@@ -102,11 +97,8 @@ jobs:
             assets/*.tar.gz.sha256
           if-no-files-found: error
 
-      # .deb/.rpm are an alternative to the tarball for apt/dnf users --
-      # native package manager install (clang pulled in as a real dependency)
-      # instead of tarball+install.sh. Linux only: fpm's rpm backend shells
-      # out to rpmbuild, which isn't installed/tested on the macOS/Windows
-      # legs here.
+      # .deb/.rpm for apt/dnf users (pulls in clang as a dependency) instead of tarball+install.sh.
+      # Linux only: fpm's rpm backend needs rpmbuild, not installed on the macOS/Windows legs.
       - name: Package .deb/.rpm (Linux only)
         if: runner.os == 'Linux'
         shell: bash
@@ -217,12 +209,8 @@ jobs:
     name: Update packaging metadata (homebrew/arch/nix)
     needs: publish
     runs-on: ubuntu-24.04
-    # Best-effort: build/10-update-package-metadata.sh curls all 4 platform
-    # tarballs from the release it just downloaded/uploaded. If one platform's
-    # build job failed above (they're continue-on-error, see the comment on
-    # the build job), that asset is missing from the release and this script
-    # fails fetching it -- a maintainer then reruns it locally once the
-    # missing platform is fixed. Must not block the release itself.
+    # Best-effort: build/10-update-package-metadata.sh downloads all 4 platform tarballs, so it
+    # fails when a (continue-on-error) build leg produced no asset; rerun it locally then.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

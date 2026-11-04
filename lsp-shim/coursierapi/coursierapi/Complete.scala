@@ -1,13 +1,8 @@
 package coursierapi
 
-/** Stub for real `io.get-coursier:interface`'s `coursierapi.Complete`
- *  (Ammonite/ScalaCli-style `import $ivy"..."` dependency-string
- *  completions) -- no Scala Native cross-build exists for that jar, and
- *  this is a narrow, rarely-triggered completion feature (see
- *  `scala.meta.internal.mtags.CoursierComplete`, this shim's only caller).
- *  Real-network dependency resolution isn't implemented here: `complete()`
- *  always returns an empty result, same as a real lookup that found no
- *  matches -- no functionality loss beyond this one completion trigger.
+/** Stub for `io.get-coursier:interface`'s `coursierapi.Complete` (`import $ivy"..."` dependency
+ *  completions), which has no Scala Native build. `complete()` always returns an empty result;
+ *  `scala.meta.internal.mtags.CoursierComplete` is the only caller.
  */
 final class Complete private () {
   def withScalaVersion(v: String): Complete = this

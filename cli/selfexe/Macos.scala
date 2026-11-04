@@ -1,9 +1,7 @@
 package selfexe
 
-// Resolves the path to the currently running executable on macOS via
-// _NSGetExecutablePath (libSystem, always linked) + realpath to strip any
-// symlinks/relative components. See Linux.scala for why this isn't done
-// through java.lang.ProcessHandle.
+// Path of the running executable on macOS: _NSGetExecutablePath (libSystem) + realpath to strip
+// symlinks. See Linux.scala for why not java.lang.ProcessHandle.
 import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
 

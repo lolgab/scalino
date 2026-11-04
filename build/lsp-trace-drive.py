@@ -1,24 +1,11 @@
 #!/usr/bin/env python3
-"""Drives a comprehensive real-editor-shaped LSP request sequence against a
-dotty.tools.languageserver.Main process launched with the given command --
-a full functional smoke test exercising every endpoint PcLanguageServer
-implements (initialize with a real editor's full capabilities+
-workspaceFolders, didOpen/didChange, hover, definition, completion,
-references, rename, documentSymbol, workspace/symbol) against real dotc
-compilation of build/lsp-trace-fixture.
-
-No longer used to trace reflection config (that whole tracing setup is
-gone): the LSP module used to be lsp4j+Gson (reflection-based), and this
-script's job was tracing reachability config against realistic request
-shapes -- Gson's reflective TypeAdapter construction only worked for types
-actually exercised during a traced run, and a real editor's rich
-`initialize` payload turned out to trigger a pathology specific to this
-project's closed-world AOT-compiled binaries that no amount of extra
-tracing fixed (see docs/findings.md "JVM-free language server (LSP)"). The
-module is now a hand-rolled JSON-RPC/LSP implementation over hand-written
-jsoniter-scala codecs, zero reflection, so there's nothing left to trace --
-this script is kept purely as an end-to-end functional test to run by hand
-after any change to Main.scala/Lsp.scala/PcLanguageServer.scala.
+"""Drives a real-editor-shaped LSP request sequence against a dotty.tools.languageserver.Main
+process launched with the given command: initialize with a real editor's full capabilities and
+workspaceFolders, didOpen/didChange, hover, definition, completion, references, rename,
+documentSymbol and workspace/symbol, against real dotc compilation of build/lsp-trace-fixture.
+An end-to-end functional test to run by hand after changing Main.scala/Lsp.scala/PcLanguageServer.scala
+(it once traced reflection config for the lsp4j+Gson server; see docs/findings.md
+"JVM-free language server (LSP)").
 
 Usage: lsp-trace-drive.py <project-dir> <command...>
 <project-dir> must contain Model.scala, Greeter.scala, Main.scala (see
@@ -156,18 +143,10 @@ def main():
     client = LspClient(proc)
     ok = True
     try:
-        # A real editor's `initialize` carries `clientInfo` and a deeply
-        # nested `capabilities` tree (workspace/*, textDocument/*, window),
-        # each level a distinct lsp4j POJO Gson must reflectively
-        # instantiate/populate on the way in -- a bare `"capabilities": {}`
-        # (this fixture's shape until 2026-09-05) never exercises any of
-        # that, so the reachability trace never registers those types, and
-        # a real client's `initialize` request then dies with
-        # "Type ... was never registered" the moment Gson tries to
-        # deserialize e.g. ClientInfo or CompletionClientCapabilities --
-        # invisible to the client (just a dead connection), only visible in
-        # the server's own stderr. See docs/findings.md "JVM-free language
-        # server (LSP)" for the write-side sibling of this same bug class.
+        # A real editor's `initialize` carries `clientInfo` and a deeply nested `capabilities` tree.
+        # A bare `"capabilities": {}` never exercised it, and a real client's `initialize` died
+        # with "Type ... was never registered" in Gson (invisible to the client, only in the
+        # server's stderr). See docs/findings.md "JVM-free language server (LSP)".
         client_capabilities = {
             "workspace": {
                 "applyEdit": True,
@@ -225,15 +204,9 @@ def main():
                 "foldingRange": {"dynamicRegistration": True, "rangeLimit": 5000, "lineFoldingOnly": True},
             },
             "window": {"workDoneProgress": True},
-            # A real editor's `initialize` (Zed confirmed) also sends these
-            # two top-level capability groups, which this fixture never
-            # exercised until a real Zed launch silently hung for exactly
-            # ~60s then cleanly self-exited (no error printed anywhere --
-            # the read-loop's worker thread pool has a default 60s
-            # keep-alive, and once whatever silently ate the parse failure
-            # never resubmits another read, that's what's left ticking).
-            # Bisected down to these two fields independently reproducing
-            # it; see docs/findings.md "JVM-free language server (LSP)".
+            # Zed's `initialize` also sends these two groups; without them in this fixture a real
+            # Zed launch hung ~60s (the read-loop pool's keep-alive) and then self-exited with no
+            # error. Bisected to these two fields; see docs/findings.md "JVM-free language server (LSP)".
             "general": {"positionEncodings": ["utf-16"]},
             "experimental": {"serverStatusNotification": True, "localDocs": True},
         }

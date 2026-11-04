@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
-# Builds .deb and .rpm packages from dist/ via fpm (gem install fpm), for
-# native apt/dnf installs as an alternative to the tarball+install.sh flow.
-# Linux only -- fpm's rpm backend shells out to rpmbuild, absent on
-# macOS/Windows CI legs, so this script is only invoked for the
-# linux-x86_64/linux-arm64 release targets.
+# Builds .deb and .rpm packages from dist/ via fpm (gem install fpm), as an alternative to the
+# tarball+install.sh flow. Linux only: fpm's rpm backend needs rpmbuild, absent on macOS/Windows
+# CI legs, so only the linux-x86_64/linux-arm64 release targets run it.
 #
-# Layout installed on the target machine (mirrors 06-package.sh's
-# self-contained, relocatable dist/ -- scalino resolves its dist root from
-# its own real path, so the /usr/bin symlinks below are safe and the rest
-# of /usr/lib/scalino/ never needs to move):
+# Layout installed on the target (scalino resolves its dist root from its real path, so the
+# /usr/bin symlinks are safe):
 #   /usr/lib/scalino/{scalino,scalino-dotc,scalino-linkdriver,scalino-jslink,
 #                     scalino-lsp,scalino-cs,jslibs.cp,java.base.jar,compiler.cp,nativelibs.cp,
 #                     nscplugin.jar.txt,lib/,README.md,LICENSE,NOTICE}
@@ -45,10 +41,8 @@ ln -s "/$prefix/scalino" "$staging/usr/bin/scalino"
 ln -s "/$prefix/scalino-lsp" "$staging/usr/bin/scalino-lsp"
 ln -s "/$prefix/scalino-cs" "$staging/usr/bin/scalino-cs"
 
-# Shell completions (pre-generated into dist/completions/ by
-# build/07-build-scalino.sh) -- installed at each shell's own standard
-# system-wide lookup path, so apt/dnf users get them for free with no
-# per-user setup, same as any other native package.
+# Shell completions (generated into dist/completions/ by 07-build-scalino.sh), installed at each
+# shell's standard system-wide path.
 mkdir -p "$staging/usr/share/bash-completion/completions" \
          "$staging/usr/share/zsh/site-functions" \
          "$staging/usr/share/fish/vendor_completions.d"

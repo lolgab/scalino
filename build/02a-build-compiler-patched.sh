@@ -1,33 +1,14 @@
 #!/usr/bin/env bash
-# Compiles the patched vendor/scala3 (+ vendor/scala-native nscplugin/nir/util)
-# self-hosted source set to plain JVM .class files, using the published,
-# unpatched scala3-compiler_3 jar as the executing compiler. Needed only so
-# build/02b-gen-megaphase-overrides.sh's reflection scan can see MiniPhase
-# subclasses this project's own patches add (e.g.
-# transform/CollectEntryPoints.scala, patches/scala3-0006) -- those never
-# exist in the published jar, only in the patched source tree, so scanning
-# the published jar alone (what 02b did on its own, pre-2026-09-13) silently
-# omits them: MegaPhase.defines' generated lookup table then has no entry for
-# them, and any self-hosted binary crashes the first time it actually fuses
-# phases (`MiniPhaseOverrides has no entry for ...`).
+# Compiles the patched vendor/scala3 (+ vendor/scala-native nscplugin/nir/util) self-hosted
+# source set to plain JVM .class files, using the published, unpatched scala3-compiler_3 jar.
+# Needed so 02b's reflection scan sees MiniPhase subclasses added by our patches (e.g.
+# transform/CollectEntryPoints.scala, patches/scala3-0006); scanning the published jar alone
+# omits them and a self-hosted binary crashes when fusing phases
+# (`MiniPhaseOverrides has no entry for ...`).
 #
-# This step exists because build/selfhost/build-dotc.sh, an earlier opt-in
-# GraalVM-native-image-era script, used to do this same reflection-discovery
-# compile (leftover evidence: the now-orphaned, stale-3.8.4-pinned
-# .build-work/compiler-patched.cp / compiler-sources.cp files) but was
-# deleted in the 2026-09-07 self-host cutover (commit 94851ee) without this
-# capability being carried over into the new 02b script. Restored here as
-# its own step so it's easy to find again.
-#
-# Note this is a *plain JVM* compile, not a Scala Native/NIR one: it uses the
-# real published scala3-compiler_3 jar's own already-loaded GenBCode backend
-# to emit real, reflectable .class bytecode (this project's own
-# vendor/scala3 patches Nil out `backendPhases` only in the source *files*
-# being compiled here -- that has zero effect on the already-running compiler
-# process actually doing the compiling). backend/jvm/backend/sjs sources are
-# still excluded from the input (see build/selfhost/gen-file-list.sh's own
-# comment) purely because they'd need a real org.scala-lang.modules:scala-asm
-# dependency to compile as *source*, which nothing here needs.
+# Plain JVM compile, not NIR: the backendPhases patch only affects the compiled sources, not the
+# running compiler. backend/jvm/backend/sjs sources stay excluded (see
+# build/selfhost/gen-file-list.sh) since they'd need scala-asm.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -38,14 +19,9 @@ BOOT_DIR="$WORK/selfhost-bootstrap"
 rm -rf "$BOOT_DIR"
 mkdir -p "$BOOT_DIR"
 
-# selfhost/gen-file-list.sh's own list includes the *output* of 02b
-# (.build-work/generated/MiniPhaseOverrides.scala), which doesn't exist yet
-# at this point in the pipeline (that's the file 02b is about to generate,
-# using classes compiled by *this* script). Swap in an empty stand-in: the
-# real self-hosted NIR build (build/03-build-scalino-dotc.sh) always compiles
-# the real generated one, never this stand-in -- this bootstrap compile only
-# needs MegaPhase.scala's reference to `MiniPhaseOverrides.declaredMethodNames`
-# to type-check, not to contain real data.
+# gen-file-list.sh's list includes 02b's output (MiniPhaseOverrides.scala), which doesn't exist
+# yet. Use an empty stand-in: this compile only needs MegaPhase.scala's reference to
+# `MiniPhaseOverrides.declaredMethodNames` to type-check; 03 compiles the real one.
 DUMMY_OVERRIDES="$BOOT_DIR/MiniPhaseOverridesDummy.scala"
 cat > "$DUMMY_OVERRIDES" <<'EOF'
 package dotty.tools.dotc.transform
@@ -64,11 +40,8 @@ echo "  $(wc -l < "$FILE_LIST" | tr -d ' ') files"
 OUT_CLASSES="$BOOT_DIR/classes"
 mkdir -p "$OUT_CLASSES"
 
-# The classpath the sources are compiled *against* must NOT include the
-# published scala3-compiler_3 jar itself: these sources redefine plenty of
-# its own classes (Compiler.scala, every transform/*.scala file, ...), and
-# having both on the same classpath used for typechecking risks duplicate/
-# shadowed-symbol errors. Only its non-compiler dependencies are needed.
+# Compile against the non-compiler dependencies only: these sources redefine many classes of
+# the published scala3-compiler_3 jar, and having both risks duplicate-symbol errors.
 DEPS_CP="$(tr "$CP_SEP" '\n' < "$WORK/compiler.cp" | grep -v '/scala3-compiler_3-' | paste -sd"$CP_SEP" -)"
 
 echo "== compiling patched dotc+nscplugin source to plain JVM classes (bootstrap, for MiniPhase discovery only) =="

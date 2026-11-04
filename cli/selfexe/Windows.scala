@@ -1,9 +1,7 @@
 package selfexe
 
-// Resolves the path to the currently running executable on Windows via the
-// standard Win32 GetModuleFileNameA (kernel32, always linked). Untested --
-// Windows support in this toolchain is best-effort/experimental. See
-// Linux.scala for why this isn't done through java.lang.ProcessHandle.
+// Path of the running executable on Windows via Win32 GetModuleFileNameA (kernel32). See
+// Linux.scala for why not java.lang.ProcessHandle.
 import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
 

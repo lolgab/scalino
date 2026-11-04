@@ -1,22 +1,14 @@
-// scalino: a mini scala-cli, self-hosted -- this file is itself compiled by
-// dist/scalino-dotc + dist/scalino-linkdriver (see build/07-build-scalino.sh) into
-// a standalone Scala Native binary. No JVM anywhere in this tool or in
-// anything it invokes: it drives dist/scalino-dotc and dist/scalino-linkdriver
-// directly, and shells out to dist/scalino-cs (coursier's own official `cs`
-// launcher, itself a prebuilt GraalVM native-image binary -- bundled and
-// renamed by build/06-package.sh so it never needs to be on the end user's
-// own PATH) for dependency resolution. See docs/findings.md "Toward a
-// build-tool experience without a JVM".
+// scalino: a mini scala-cli, itself compiled by dist/scalino-dotc + dist/scalino-linkdriver
+// (see build/07-build-scalino.sh) into a standalone Scala Native binary. No JVM involved: it
+// drives dist/scalino-dotc and dist/scalino-linkdriver directly and shells out to
+// dist/scalino-cs (coursier's `cs` launcher, bundled by build/06-package.sh) for dependency
+// resolution. See docs/findings.md "Toward a build-tool experience without a JVM".
 //
-// Scope ("mini"): a single `//> using dep`/`//> using scala` directive
-// parser (one dep per line, no version constraints/exclusions), a
-// compiled-classfile entry-point scanner (scala-cli/Mill-style: scan the
-// bytecode scalino-dotc emits for a real `public static void main(String[])`,
-// not a source-text heuristic), and a persistent on-disk cache for both
-// dependency resolution and compile/link output.
-// No multi-Scala-version support (this binary only ever
-// targets the one Scala/scala-native version it was built for -- a
-// `//> using scala` directive that disagrees just gets a warning).
+// "Mini": a `//> using` directive parser (no version constraints/exclusions), an entry-point
+// scanner over the compiled classfiles (a real `public static void main(String[])`, not a
+// source-text heuristic), and an on-disk cache for dependency resolution and compile/link output.
+// Only the one Scala/scala-native version it was built for is supported; a disagreeing
+// `//> using scala` just warns.
 
 import java.io.{ByteArrayOutputStream, InputStream}
 import java.lang.{ProcessBuilder => JProcessBuilder}
@@ -28,42 +20,23 @@ import scala.scalanative.io.VirtualDirectory
 
 object ScalinoCli:
 
-  // `dist` is wherever this binary itself lives, resolved from its own path
-  // (not baked in at build time) so a copied/relocated/extracted-from-a-
-  // release-tarball dist/ still works -- see docs/findings.md "Packaging/
-  // relocatability". Deliberately NOT "two levels up from the binary,
-  // then + /dist": that hardcoded a directory literally named `dist`,
-  // which release.yml's tarball layout (scalino sitting directly next to
-  // lib/, compiler.cp, etc., with no `dist/` wrapper) doesn't have.
-  // selfexe.SelfExe is one of three OS-specific implementations
-  // (cli/selfexe/*.scala); build/07-build-scalino.sh picks the right one for
-  // the host OS at compile time.
+  // `dist` is the directory the binary lives in, resolved at run time so a relocated dist/ or a
+  // release tarball still works (docs/findings.md "Packaging/relocatability"). Not "two levels up,
+  // then /dist": the tarball layout has no `dist/` wrapper.
+  // selfexe.SelfExe is one of three OS-specific implementations (cli/selfexe/*.scala) picked by
+  // build/07-build-scalino.sh.
   val dist: String =
     val exe = selfexe.SelfExe.path()
     Paths.get(exe).toRealPath().getParent.toString
 
-  // Every classpath string this file builds/parses uses the platform's real
-  // path separator (";" on Windows, ":" elsewhere) -- confirmed via CI: a
-  // hardcoded ":" shatters a real Windows path at its own drive-letter
-  // colon ("C:\..."), the same bug found and fixed in src/LinkDriver.scala.
-  // dist/*.cp itself is already written with this same separator (see
-  // build/06-package.sh's vendor_cp), so this just has to match it.
+  // Classpath strings use the platform path separator (";" on Windows): a hardcoded ":" splits
+  // "C:\..." at the drive letter. dist/*.cp is written with the same separator (build/06-package.sh).
   val CP_SEP: String = java.io.File.pathSeparator
 
-  // ---------------------------------------------------------------------
-  // Color output, cargo/scala-cli-style: on by default when the relevant
-  // stream is a real terminal, auto-disabled when it's redirected to a
-  // file/pipe (so scripted/CI usage and `scalino ... | tee log` both stay
-  // plain), and overridable either way via the same conventions cargo and
-  // scala-cli already both respect -- NO_COLOR (https://no-color.org: any
-  // non-empty value, unconditionally off), CLICOLOR_FORCE (BSD/cargo
-  // convention: force color even off a real terminal, e.g. piped into
-  // `less -R`), TERM=dumb, and an explicit `--color always|auto|never`
-  // flag (cargo's own spelling and values), which always wins over both
-  // env vars. `--color` is pulled out of argv once in `main`, before any
-  // subcommand-specific parsing ever sees it -- cargo accepts it anywhere
-  // on the line, not just as the first argument.
-  // ---------------------------------------------------------------------
+  // Color output, cargo/scala-cli-style: on when the stream is a terminal, off when redirected.
+  // Overridable by NO_COLOR (https://no-color.org: any non-empty value turns it off),
+  // CLICOLOR_FORCE, TERM=dumb, and `--color always|auto|never`, which wins over the env vars.
+  // `--color` is pulled out of argv once in `main`, and accepted anywhere on the line like cargo.
 
   enum ColorMode:
     case Always, Never, Auto
@@ -77,10 +50,8 @@ object ScalinoCli:
       case "auto" => ColorMode.Auto
       case other => die(s"invalid --color value: '$other' (expected always, auto, or never)")
 
-  /** Strips a `--color always|auto|never` (or `--color=<value>`) out of
-   *  `args` wherever it appears and sets `colorMode` from it, returning
-   *  `args` with that flag removed so no subcommand's own option parser
-   *  ever has to know about it. A no-op (mode stays Auto) if absent. */
+  /** Strips `--color always|auto|never` (or `--color=<value>`) out of `args`, sets `colorMode`
+   *  from it, and returns the remaining args. Mode stays Auto if absent. */
   def extractColorFlag(args: Array[String]): Array[String] =
     val eqIdx = args.indexWhere(_.startsWith("--color="))
     if eqIdx >= 0 then
@@ -101,12 +72,8 @@ object ScalinoCli:
     private val BOLD_GREEN = "[1;32m"
     private val BOLD_YELLOW = "[1;33m"
 
-    /** Real `isatty(3)` on the given fd (1 = stdout, 2 = stderr) --
-     *  posixlib is already on this toolchain's own default native
-     *  classpath (dist/nativelibs.cp, see build/01-fetch-deps.sh), so this
-     *  links with no extra `//> using dep` anywhere. Defensive try/catch:
-     *  a failed color *decision* should never be why the CLI itself
-     *  crashes. */
+    /** `isatty(3)` on the given fd (1 = stdout, 2 = stderr), from posixlib (already on
+     *  dist/nativelibs.cp). Any failure means no color rather than a crash. */
     private def isTty(fd: Int): Boolean =
       try scala.scalanative.posix.unistd.isatty(fd) != 0
       catch case _: Throwable => false
@@ -132,9 +99,7 @@ object ScalinoCli:
     def error(s: String, stream: java.io.PrintStream = System.err): String = paint(BOLD_RED, s, stream)
     /** Recoverable warnings (unsupported directive, scala-version mismatch). */
     def warn(s: String, stream: java.io.PrintStream = System.err): String = paint(BOLD_YELLOW, s, stream)
-    /** Build/run progress and success ("resolving", "compiling", "wrote
-     *  <path>", ...) -- cargo's own bold green for every such verb, success
-     *  included, not just a distinct "done" color. */
+    /** Build/run progress and success ("resolving", "compiling", "wrote <path>", ...): cargo's bold green. */
     def action(s: String, stream: java.io.PrintStream = System.err): String = paint(BOLD_GREEN, s, stream)
     /** scala-cli's dim gray for its own "Compiling project (...)" progress lines. */
     def gray(s: String, stream: java.io.PrintStream = System.err): String = paint("\u001b[90m", s, stream)
@@ -151,18 +116,14 @@ object ScalinoCli:
     System.err.println(Color.error(s"scalino: $msg"))
     sys.exit(1)
 
-  /** Raised by anything in the compile/link/resolve pipeline that can fail
-   *  and recover on the next rebuild (as opposed to a bad CLI invocation,
-   *  which is a `die` -- always fatal, checked once before the pipeline
-   *  ever runs). In watch mode (`-w`) a BuildFailed is caught and reported
-   *  per-iteration instead of killing the watch loop; outside watch mode
-   *  it's caught once at the top and turned into the same `die` exit. */
+  /** A compile/link/resolve failure that the next rebuild may recover from (unlike a bad CLI
+   *  invocation, which is a fatal `die`). Watch mode (`-w`) reports it per iteration; otherwise
+   *  it is caught at the top and turned into the same `die` exit. */
   case class BuildFailed(msg: String) extends RuntimeException(msg)
   def fail(msg: String): Nothing = throw BuildFailed(msg)
 
-  /** scala-cli prints a bare "Compilation failed" after a failed compile (the
-   *  diagnostics and the "Error compiling project" line already came before
-   *  it) -- not a `scalino:`-prefixed red fatal like every other failure. */
+  /** scala-cli prints a bare "Compilation failed" after a failed compile, not a `scalino:`-prefixed
+   *  red fatal like other failures. */
   val CompilationFailed = "Compilation failed"
 
   def reportBuildFailure(msg: String): Unit =
@@ -190,10 +151,8 @@ object ScalinoCli:
       n = in.read(tmp)
     new String(buf.toByteArray, "UTF-8")
 
-  /** Runs a command with inherited stdio (its own stdout/stderr/stdin pass
-   *  straight through), returning the exit code. Used for every step whose
-   *  output the user should just see directly: cs downloading, scalino-dotc's
-   *  own errors, scalino-linkdriver's build log, and the final program.
+  /** Runs a command with inherited stdio and returns the exit code. For steps whose output the
+   *  user should see directly: cs downloads, linkdriver's build log, the final program.
    */
   def runInherited(cmd: List[String], cwd: Option[Path] = None, extraEnv: Map[String, String] = Map.empty): Int =
     val pb = new JProcessBuilder(cmd.asJava)
@@ -285,9 +244,7 @@ object ScalinoCli:
   def runProgram(cmd: List[String], watch: Boolean, env: Map[String, String] = Map.empty): Int =
     if watch then runManaged(cmd, env) else runInherited(cmd, extraEnv = env)
 
-  /** Runs scalino-dotc with stdout+stderr merged and captured (stdin still
-   *  inherited), so its plain-text diagnostics can be re-rendered
-   *  scala-cli-style by `Diagnostics`. */
+  /** Runs scalino-dotc with stdout+stderr merged and captured, so `Diagnostics` can re-render them. */
   def runCaptureAll(cmd: List[String]): (Int, String) =
     val pb = new JProcessBuilder(cmd.asJava)
     pb.redirectErrorStream(true)
@@ -296,12 +253,10 @@ object ScalinoCli:
     val out = readAll(proc.getInputStream)
     (proc.waitFor(), out)
 
-  /** Re-renders dotc's `-color:never` diagnostics the way scala-cli prints
-   *  them: every line behind a colored `[warn]`/`[error]` tag, the location
-   *  as `./path:line:col` (1-based column), then the message, then the source
-   *  line with its caret -- no `-- [E006] Not Found Error ---` rule, no
-   *  line-number gutter, no "longer explanation" footer, no "N errors found"
-   *  summary. Anything that doesn't look like a diagnostic passes through. */
+  /** Re-renders dotc's `-color:never` diagnostics as scala-cli prints them: a colored `[warn]`/
+   *  `[error]` tag, the location as `./path:line:col` (1-based), the message, then the source line
+   *  with its caret. The `-- [E006] ...` rule, line-number gutter, explanation footer and
+   *  "N errors found" summary are dropped. Other lines pass through. */
   object Diagnostics:
     private final case class Header(isWarning: Boolean, path: String, line: Int, col: Int)
 
@@ -381,14 +336,12 @@ object ScalinoCli:
             rest = rest.tail
       out.toList
 
-  /** scala-cli's progress-line label: `Scala 3.9.0, JVM (27)` there, the
-   *  platform this toolchain actually targets here. */
+  /** scala-cli's progress-line label (`Scala 3.9.0, JVM (27)` there), for the platform targeted here. */
   def buildLabel: String = s"Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}"
   def jsBuildLabel: String = s"Scala ${BuildInfo.scalaVersion}, Scala.js ${BuildInfo.scalaJsVersion}"
 
-  /** Runs a command capturing stdout, with stderr passed straight through
-   *  (matches `cs fetch --classpath`: download progress on stderr, the
-   *  classpath value on stdout). */
+  /** Runs a command capturing stdout, with stderr passed through (`cs fetch --classpath` prints
+   *  progress on stderr and the classpath on stdout). */
   def runCaptureStdout(cmd: List[String]): (Int, String) =
     val pb = new JProcessBuilder(cmd.asJava)
     pb.redirectError(JProcessBuilder.Redirect.INHERIT)
@@ -399,13 +352,9 @@ object ScalinoCli:
     val out = readAll(proc.getInputStream)
     (proc.waitFor(), out.trim)
 
-  /** One already-running `dist/scalino-linkdriver --long-running` process,
-   *  reused across `-w`/`--watch` rebuilds (LinkDriver.scala's stdin/stdout
-   *  protocol, mirroring scala-js-cli#64's `--longRunning`). Kept alive so
-   *  its patched scala.scalanative.linker.ClassPath in-memory NIR parse
-   *  cache (patches/scala-native-0049) actually survives between rebuilds --
-   *  a one-shot (non-watch) build never touches this, and still goes
-   *  through `runInherited` below, spawning and exiting once as before. */
+  /** A running `dist/scalino-linkdriver --long-running` process, reused across `-w` rebuilds
+   *  (LinkDriver.scala's stdin/stdout protocol, as in scala-js-cli#64) so its in-memory NIR parse
+   *  cache (patches/scala-native-0049) survives. One-shot builds use `runInherited` instead. */
   private case class LongRunningLinker(
     argv: List[String],
     proc: Process,
@@ -419,15 +368,10 @@ object ScalinoCli:
     scala.util.Try(d.in.close())
     if !d.proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) then d.proc.destroyForcibly()
 
-  /** Drives `argv` (the same argv `runInherited` would have used, minus the
-   *  trailing `--long-running` this adds itself) through the persistent
-   *  linkdriver process, respawning it if this is the first call, the
-   *  previous process died, or `argv` changed (different classpath, main
-   *  class, or any native flag -- e.g. switching which file is being run
-   *  under `-w`). Streams the driver's stdout straight to our own stdout
-   *  (matching `runInherited`'s inherited-IO look) until the sentinel line
-   *  LinkDriver.scala prints at the end of each relink, and returns 0/1 the
-   *  same way `runInherited`'s exit code would.
+  /** Drives `argv` (what `runInherited` would get, minus the `--long-running` added here) through
+   *  the persistent linkdriver process, respawning it on the first call, after it died, or when
+   *  `argv` changed (classpath, main class, any native flag). Streams its stdout to ours until the
+   *  sentinel line LinkDriver.scala prints after each relink; returns 0/1.
    */
   def linkIncremental(argv: List[String]): Int =
     val (driver, alreadyBuilding) = longRunningLinker match
@@ -436,10 +380,9 @@ object ScalinoCli:
         existing.foreach(terminateLinker)
         val pb = new JProcessBuilder((argv :+ "--long-running").asJava)
         pb.redirectError(JProcessBuilder.Redirect.INHERIT)
-        // This process lives across many relinks, which fragments the Immix
-        // heap (3.9GB -> 2.6GB watch-mode RSS with compaction); one-shot
-        // links exit before it could pay off, so only enable it here. A
-        // value the user already exported wins.
+        // This process lives across many relinks and fragments the Immix heap (watch-mode RSS
+        // 3.9GB -> 2.6GB with compaction); one-shot links exit too soon to benefit. A value the
+        // user already exported wins.
         pb.environment().putIfAbsent("SCALANATIVE_EVAC_ENABLE", "1")
         val proc = pb.start()
         val d = LongRunningLinker(
@@ -451,9 +394,7 @@ object ScalinoCli:
         longRunningLinker = Some(d)
         (d, true)
 
-    // A freshly-spawned process is already linking on its own; an existing
-    // one is blocked waiting on stdin (LinkDriver.scala's `readLine()`) for
-    // exactly this trigger.
+    // A freshly spawned process links on its own; an existing one waits on stdin for this trigger.
     if !alreadyBuilding then
       driver.in.write('\n'.toInt)
       driver.in.flush()
@@ -465,9 +406,8 @@ object ScalinoCli:
 
     if line == "SCALINO_LINKING_DONE" then 0
     else if line == "SCALINO_LINKING_FAILED" then
-      // A failed link may leave the process's process-global caches (NIR
-      // parse cache, previousReach, Interflow state) half-updated, so
-      // don't reuse it: terminate it and let the next link spawn a fresh one.
+      // A failed link may leave process-global caches (NIR parse cache, previousReach, Interflow
+      // state) half-updated: terminate it so the next link spawns a fresh process.
       terminateLinker(driver)
       longRunningLinker = None
       1
@@ -490,13 +430,9 @@ object ScalinoCli:
     if code != 0 || out.isEmpty then fail(s"'$name' not found on PATH")
     out
 
-  // ---------------------------------------------------------------------
-  // Directives: `//> using <key> "value"[, "value2"...]`, one per line,
-  // anywhere in the file. Not a real directive parser (no multi-line `//>
-  // using` blocks, no `-`/`.`-namespaced keys beyond what's listed below),
-  // but covers scala-cli's common single-line quoted-value form, including
-  // its plural aliases (`dep`/`deps`, `option`/`options`).
-  // ---------------------------------------------------------------------
+  // Directives: `//> using <key> "value"[, "value2"...]`, one per line, anywhere in the file.
+  // Single-line form only (no multi-line `//> using` blocks), with plural aliases
+  // (`dep`/`deps`, `option`/`options`).
 
   case class Directives(
     deps: List[String],
@@ -571,10 +507,8 @@ object ScalinoCli:
   private val quotedRe = """"([^"]*)"""".r
   private def usingRe(key: String) = s"""//>\\s*using\\s+${java.util.regex.Pattern.quote(key)}\\b(.*)$$""".r
 
-  /** Every `//> using <key>` this parser actually understands -- kept in
-   *  sync by hand with parseDirectives below, so an unrecognized key (e.g.
-   *  scala-cli's `platform`/`jvm`/`toolkit`/`resourceDir`/`publish.*`) can be
-   *  flagged instead of silently doing nothing. */
+  /** Every `//> using <key>` understood by parseDirectives below (keep in sync by hand), so
+   *  unrecognized keys (e.g. `platform`, `jvm`, `toolkit`, `publish.*`) can be flagged. */
   private val recognizedDirectiveKeys = Set(
     "dep", "deps", "dependency", "dependencies",
     "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies",
@@ -594,19 +528,14 @@ object ScalinoCli:
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
     "packageHomepage", "packageDep", "packageDeps", "packageFile", "packageFiles",
     "packageDockerBase", "packageDockerImage", "packageReleaseUrl"
-    // deliberately NOT "nativeVersion": this toolchain only ever targets the
-    // one pinned scala-native version it was built for (see the "scala"
-    // directive's own version-mismatch warning below for the same reason) --
-    // an unrecognized "nativeVersion" directive falls through to the generic
-    // unsupported-directive warning instead.
+    // Not "nativeVersion": only the one pinned scala-native version is supported (like the "scala"
+    // directive), so it falls through to the unsupported-directive warning.
   )
   private val anyDirectiveKeyRe = """//>\s*using\s+(\S+)""".r
 
-  /** All values on a `//> using <key> ...` line, trying each of `keys` in
-   *  turn (so callers can accept e.g. both `dep` and `deps`). Values are
-   *  either bare (scala-cli's current default: `//> using dep org::name::version`,
-   *  several values separated by whitespace or `, `) or quoted (`"org::name::version"`,
-   *  still accepted). */
+  /** All values on a `//> using <key> ...` line, trying each of `keys` (e.g. `dep` and `deps`).
+   *  Values are bare (`//> using dep org::name::version`, several separated by whitespace or `, `)
+   *  or quoted (`"org::name::version"`). */
   private def directiveValues(line: String, keys: String*): Option[List[String]] =
     keys.iterator.flatMap { k =>
       usingRe(k).findFirstMatchIn(line).map { m =>
@@ -628,9 +557,8 @@ object ScalinoCli:
       if quoted.nonEmpty then quoted else List(rest.trim).filter(_.nonEmpty)
     }
 
-  /** Same as `directiveValues`, for the handful of boolean-valued directives
-   *  (`nativeEmbedResources`/`nativeMultithreading`) -- `//> using nativeMultithreading true`
-   *  (or a bare `//> using nativeMultithreading` with no value, treated as `true`). */
+  /** Like `directiveValues`, for boolean directives (`nativeEmbedResources`/`nativeMultithreading`);
+   *  a bare directive with no value means `true`. */
   private def directiveBool(line: String, keys: String*): Option[Boolean] =
     directiveValues(line, keys*).map(_.headOption.map(_.trim.toLowerCase)).flatMap {
       case Some("false") => Some(false)
@@ -692,13 +620,9 @@ object ScalinoCli:
     var postLink = List.empty[String]
     var runEnv = List.empty[String]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
-    // Directive lines must be a comment-only line, `//>` as its first
-    // non-blank characters -- NOT just "contains `//>` anywhere". An
-    // unanchored scan also matches `//> using ...` mentioned in prose
-    // (scaladoc explaining the directive syntax, a `printUsage` help-text
-    // string literal like `|  //> using dep "..."`, etc.), which isn't a
-    // directive at all -- this repo's own cli/ScalinoCli.scala is full of such
-    // mentions, and scanning "." pulls that file in as a source.
+    // Directive lines must start with `//>` (after whitespace): an unanchored scan also matches
+    // `//> using ...` in prose and help-text literals, and this repo's own cli/ScalinoCli.scala
+    // is full of them.
     for src <- sources; (rawLine, lineIdx) <- readFile(src).linesIterator.zipWithIndex do
       val line = rawLine.trim
       if line.startsWith("//>") then
@@ -787,10 +711,7 @@ object ScalinoCli:
    *   - `org::name:version`  Scala-version cross (sbt `%%`)        -> `org:name_3:version`
    *   - `org:::name:version` full Scala-version cross              -> `org:name_3.9.0:version`
    *   - `org::name::version` platform+Scala cross (sbt `%%%`)      -> `org:name_native<binVer>_3:version`
-   *  (there is no `org:name::version` form -- scala-cli doesn't have a
-   *  "platform-only, not Scala-version" cross suffix, so a lone `::` before
-   *  the version with a single-colon name prefix is treated as malformed
-   *  and passed through unchanged rather than guessed at.)
+   *  There is no `org:name::version` form (as in scala-cli); it is passed through unchanged.
    */
   /** Set by `buildAndMaybeRun` before anything resolves a dependency: true for a Scala.js build, whose
    *  `org::name::version` means `name_sjs1_3` instead of `name_native0.5_3`. */
@@ -814,10 +735,8 @@ object ScalinoCli:
         else s"$org:${name}_native${BuildInfo.nativeBinaryVersion}_3:$version"
       case _ => dep
 
-  /** Filesystem-safe cache key. Short inputs are kept readable (and keep their
-   *  existing cache file names); long ones -- a project with many dependencies
-   *  -- are truncated and suffixed with a digest, since the full name would
-   *  exceed the filesystem's filename limit ("File name too long"). */
+  /** Filesystem-safe cache key. Short inputs stay readable; long ones are truncated and suffixed
+   *  with a digest to stay under the filename limit. */
   def sanitizeKey(s: String): String =
     val sanitized = s.map(c => if c.isLetterOrDigit then c else '_')
     if sanitized.length <= MaxKeyLength then sanitized
@@ -825,12 +744,8 @@ object ScalinoCli:
 
   private val MaxKeyLength = 100
 
-  /** FNV-1a 64-bit, hex-encoded -- for cache keys derived from a *resolved
-   *  classpath* (many absolute paths) rather than a short dep-coordinate
-   *  list: `sanitizeKey` only substitutes characters 1:1, so a classpath's
-   *  worth of them still blows past the filesystem's filename-length limit
-   *  ("File name too long") -- this collapses it to a fixed-size digest
-   *  instead. */
+  /** FNV-1a 64-bit, hex-encoded: collapses a resolved classpath into a fixed-size cache key, which
+   *  `sanitizeKey`'s 1:1 substitution would leave over the filename limit. */
   def hashKey(s: String): String =
     var hash = 0xcbf29ce484222325L
     val prime = 0x100000001b3L
@@ -838,40 +753,17 @@ object ScalinoCli:
       hash = (hash ^ (b & 0xffL)) * prime
     java.lang.Long.toHexString(hash)
 
-  /** A `::name::version` (scala-native cross) dependency's own published
-   *  build pulls its OWN version of scala-native's runtime jars transitively
-   *  (whatever scala-native release it happened to be built against) --
-   *  almost never the exact same patch version as ours. Left alone, both
-   *  end up on the link classpath and clang fails with hundreds of
-   *  duplicate-symbol errors (two copies of the GC, two copies of libc
-   *  shims, ...). We always supply these ourselves (dist/nativelibs.cp), so
-   *  they're excluded here rather than resolved a second time. */
-  /** Root coordinates always added to every `cs fetch`, regardless of what
-   *  the user asked for -- `cs fetch` (unlike a real build tool's own
-   *  dependency management) resolves Maven `provided`-scope dependencies as
-   *  excluded by default, with no CLI flag to change that (confirmed
-   *  against real `cs fetch --help`/`cs resolve --help`: neither exposes a
-   *  scope/configuration override). A dependency listed explicitly as a
-   *  ROOT coordinate, though, always resolves at ITS OWN default scope
-   *  (compile) regardless of what scope it'd have as someone else's
-   *  transitive dependency -- so re-requesting it directly here is enough
-   *  to pull it in.
+  /** A `::name::version` dependency transitively pulls scala-native runtime jars of whatever
+   *  version it was built against, rarely ours; both on the classpath give clang hundreds of
+   *  duplicate-symbol errors. We supply them ourselves (dist/nativelibs.cp), so they're excluded. */
+  /** Root coordinates added to every `cs fetch`. `cs fetch` excludes Maven `provided`-scope
+   *  dependencies with no flag to change that, but a ROOT coordinate resolves at its own default
+   *  scope, so requesting it directly pulls it in.
    *
-   *  `org.typelevel:scalac-compat-annotation_3` is exactly this case: it's
-   *  a `provided`-scope dependency of `org.typelevel::literally` (itself
-   *  pulled in by `http4s-core` and others), needed at MACRO-EXPANSION
-   *  time (an inlined reference to one of its annotation classes shows up
-   *  in the retained tree literally's own macro splices), not at runtime --
-   *  found via `scalino test .` against a real project (`~/scala/ape`)
-   *  using http4s's `uri"..."` literal macro, which failed to even TYPE
-   *  (a generic "undefined: ..." dotc error, unrelated to macro
-   *  interpretation) because the annotation class was simply missing from
-   *  the resolved classpath. Tiny (a handful of annotation-only classes,
-   *  no real behavior) and broadly needed by any typelevel library using
-   *  the same `literally`-based macro pattern, not just this one project --
-   *  same category of "always supply this ourselves" as the scala-native
-   *  runtime libs below, just for a compile-time gap instead of a runtime
-   *  duplicate-symbol one.
+   *  `org.typelevel:scalac-compat-annotation_3` is the case: a `provided` dependency of
+   *  `org.typelevel::literally` (pulled in by `http4s-core` and others), needed at macro-expansion
+   *  time. Without it, http4s's `uri"..."` macro fails to typecheck with a generic "undefined: ..."
+   *  dotc error because its annotation classes are missing from the classpath.
    */
   private def alwaysIncludedArtifacts: List[String] =
     List("org.typelevel:scalac-compat-annotation_3:0.1.4")
@@ -891,27 +783,19 @@ object ScalinoCli:
       "org.scala-lang:scala-library"
     )
 
-  /** Resolves `deps` to a classpath via native `cs fetch --classpath`,
-   *  cached on disk keyed by the sorted dependency list -- `cs` itself does
-   *  its own artifact caching, this just skips invoking it at all (and its
-   *  network round-trip) when we've already resolved this exact dependency
-   *  set before. */
-  /** True if every classpath entry in `cp` still exists on disk -- a cache
-   *  hit whose entries point into `~/.cache`/`~/Library/Caches/Coursier`
-   *  can go stale if that cache is cleared out from under it (by `cs
-   *  cache clear`, a disk-cleanup tool, etc), independently of this
-   *  cache's own key/mtime. Re-resolving in that case beats handing
-   *  scalino-dotc a classpath full of dangling paths and watching it
-   *  report every symbol from those jars as "not found". */
+  /** Resolves `deps` to a classpath via `cs fetch --classpath`, cached on disk keyed by the sorted
+   *  dependency list, which skips invoking `cs` (and its network round-trip) for a known set. */
+  /** True if every classpath entry in `cp` still exists on disk: the coursier cache can be cleared
+   *  (`cs cache clear`, disk cleanup) behind a cache hit, and dotc would then report every symbol
+   *  from those jars as "not found". */
   def cachedClasspathStillValid(cp: String): Boolean =
     cp.split(CP_SEP).filter(_.nonEmpty).forall(e => Files.exists(Paths.get(e)))
 
   def resolveDeps(deps: List[String], cacheDir: Path, repositories: List[String] = Nil): String =
     if deps.isEmpty then ""
     else
-      // scalino.lock.json (see `scalino lock`) wins over everything: when it
-      // covers this dependency set and its artifacts are on disk, no `cs`
-      // process (and no network) is involved at all.
+      // scalino.lock.json (see `scalino lock`) wins: when it covers this set and its artifacts are
+      // on disk, no `cs` process or network is involved.
       lockedClasspath(lockKeyFor(deps, repositories)).getOrElse {
         if !offlineMode && loadLock().nonEmpty then
           System.err.println(Color.warn(
@@ -928,8 +812,8 @@ object ScalinoCli:
         }
       }
 
-  /** The raw `cs fetch --classpath` call behind `resolveDeps` (no caching, no
-   *  lockfile) -- also what `scalino lock` runs to (re)generate the lock. */
+  /** The `cs fetch --classpath` call behind `resolveDeps` (no caching or lockfile); also what
+   *  `scalino lock` runs. */
   private def csFetchClasspath(deps: List[String], repositories: List[String]): String =
     val cs = s"$dist/scalino-cs"
     val coords = deps.map(toCoursierCoord) ::: alwaysIncludedArtifacts
@@ -942,18 +826,13 @@ object ScalinoCli:
       fail(s"dependency resolution failed for: ${deps.mkString(", ")}$hint")
     cp
 
-  // ---------------------------------------------------------------------
   // Offline mode + lockfile, for hermetic builds (Nix, Bazel, air-gapped CI).
   //
-  // `scalino lock` records, per dependency set, the exact jars `cs fetch`
-  // resolved: cache-relative path, source URL and sha256. With a lockfile
-  // present `resolveDeps` builds the classpath straight from it (no coursier
-  // resolution => no POMs needed, transitive versions pinned), and an
-  // external tool can fetch every `{url, sha256}` up front (Nix:
-  // `pkgs.fetchurl` per artifact) and lay the files out at `path` under
-  // $SCALINO_CACHE. `--offline`/SCALINO_OFFLINE=1 additionally forbids any
-  // network use (cs runs with COURSIER_MODE=offline).
-  // ---------------------------------------------------------------------
+  // `scalino lock` records, per dependency set, the jars `cs fetch` resolved: cache-relative path,
+  // source URL and sha256. With a lockfile `resolveDeps` builds the classpath from it (no POMs
+  // needed, transitive versions pinned), and an external tool can fetch every `{url, sha256}`
+  // (Nix: `pkgs.fetchurl`) and lay the files out at `path` under $SCALINO_CACHE.
+  // `--offline`/SCALINO_OFFLINE=1 forbids any network use (cs runs with COURSIER_MODE=offline).
 
   val LockFileName = "scalino.lock.json"
 
@@ -1086,11 +965,8 @@ object ScalinoCli:
       else None // not downloaded yet: fall back to a normal `cs fetch`
     }
 
-  /** The `-sources.jar`s `setup-ide` wants (see `fetchSourcesBestEffort`),
-   *  recorded in the lock so an external fetcher can place them next to the
-   *  classes jars -- that sibling layout is how scalino-lsp finds them.
-   *  Best-effort like its sibling: a dependency tree where `cs` can't find
-   *  every sources jar just yields none for that set. */
+  /** The `-sources.jar`s `setup-ide` wants (see `fetchSourcesBestEffort`), recorded in the lock so
+   *  an external fetcher can place them next to the classes jars, where scalino-lsp looks. Best-effort. */
   private def csFetchSourceJars(deps: List[String], repositories: List[String]): List[String] =
     val repoFlags = repositories.flatMap(r => List("-r", r))
     val (code, out) = runCaptureStdout(
@@ -1273,19 +1149,11 @@ object ScalinoCli:
             case _ => err("expected ',' or '}'")
         b.result()
 
-  /** Best-effort: also fetches `-sources.jar` classifiers for `deps`
-   *  (transitively, so a click into a transitive dependency's symbols works
-   *  too) into the coursier cache, as siblings of the classes jars
-   *  `resolveDeps` already resolved -- that's where scalino-lsp's
-   *  go-to-definition-into-library-sources (patches/scala3-0014) looks for
-   *  them. Never fails the caller: a dependency that doesn't publish
-   *  sources, or a network hiccup, just means go-to-def won't resolve into
-   *  that one library, same as before this existed. Only called from
-   *  `setup-ide` (sources are otherwise dead weight for `run`/`compile`/
-   *  `test`), and only attempted once per dependency set -- a marker file,
-   *  not the classpath cache file itself, since this is a separate network
-   *  round-trip from `resolveDeps`'s own `cs fetch --classpath` and
-   *  shouldn't block or duplicate it. */
+  /** Best-effort: fetches `-sources.jar` classifiers for `deps` (transitively) into the coursier
+   *  cache, as siblings of the classes jars, where go-to-definition into library sources
+   *  (patches/scala3-0014) looks. Never fails the caller; a library without sources just doesn't
+   *  resolve. Only called from `setup-ide`, once per dependency set (tracked by a marker file, as
+   *  it is a separate round-trip from `resolveDeps`). */
   def fetchSourcesBestEffort(deps: List[String], cacheDir: Path, repositories: List[String] = Nil): Unit =
     if deps.nonEmpty then
       try
@@ -1301,21 +1169,11 @@ object ScalinoCli:
           Files.write(marker, Array.emptyByteArray)
       catch case scala.util.control.NonFatal(_) => ()
 
-  /** Same idea as `fetchSourcesBestEffort`, but for the vendored
-   *  scala-library/scala3-library jars themselves (`dist/lib/scala-library-
-   *  $scalaVersion.jar`, `dist/lib/scala3-library_3-$scalaVersion.jar`) --
-   *  those never go through `resolveDeps` at all (`excludedArtifacts`
-   *  deliberately keeps the toolchain's own stdlib jars off the coursier-
-   *  resolved classpath, see that val's comment), so without this, go-to-
-   *  definition into stdlib symbols (`println`, `List`, ...) can never find a
-   *  sources jar no matter how many user dependencies get theirs fetched.
-   *  patches/scala3-0014 looks for `<jar>-sources.jar` as a sibling of the
-   *  jar actually on the classpath, so the fetched jar is placed directly in
-   *  `dist/lib` under that exact name -- same layout already used by the
-   *  vendored `-sources.jar`s for scala-native's own runtime libs. Best-
-   *  effort and marker-gated like its sibling above: never fails the caller,
-   *  and only attempted once per `dist` (the version is fixed for a given
-   *  build, so there's nothing to key on beyond "have we tried").
+  /** Like `fetchSourcesBestEffort`, for the vendored scala-library/scala3-library jars
+   *  (`dist/lib/scala-library-$scalaVersion.jar`, ...), which never go through `resolveDeps`
+   *  (see `excludedArtifacts`). patches/scala3-0014 looks for `<jar>-sources.jar` next to the jar on
+   *  the classpath, so the sources jar is placed in `dist/lib` under that name. Best-effort, and
+   *  marker-gated once per `dist`.
    */
   def fetchStdlibSourcesBestEffort(): Unit =
     try
@@ -1342,19 +1200,10 @@ object ScalinoCli:
         Files.write(marker, Array.emptyByteArray)
     catch case scala.util.control.NonFatal(_) => ()
 
-  // ---------------------------------------------------------------------
-  // Entry-point detection, scala-cli/Mill-style: not a source-text
-  // heuristic, but a scan of the *compiled* .class files for a real
-  // `public static void main(String[])` method. scalino-dotc emits plain
-  // JVM classfiles alongside .nir even though the final artifact is a
-  // native binary, so this needs no reflection/classloading machinery --
-  // just reading the classfile format directly (stable, tiny, and fully
-  // specified, so a hand-rolled parser is cheap and exact). `@main def`,
-  // `extends App`, and a hand-written `def main` inside an object all
-  // lower to exactly this static forwarder shape, so one check covers all
-  // three with no special-casing -- and, unlike a text scan, can't misfire
-  // on a `{`/`}` inside a string/comment or a non-top-level main-like def.
-  // ---------------------------------------------------------------------
+  // Entry-point detection, scala-cli/Mill-style: scan the compiled .class files (scalino-dotc emits
+  // them alongside .nir) for a `public static void main(String[])`, parsing the classfile format
+  // directly. `@main def`, `extends App` and a hand-written `def main` all lower to this static
+  // forwarder shape, and unlike a text scan it can't misfire on braces in strings/comments.
 
   private val classMagic = 0xCAFEBABEL
 
@@ -1366,22 +1215,16 @@ object ScalinoCli:
     def skip(n: Int): Unit = pos += n
     def bytesOf(n: Int): Array[Byte] = { val r = bytes.slice(pos, pos + n); pos += n; r }
 
-  /** Parses just enough of a classfile to answer "does this class declare a
-   *  public static `main(String[]): Unit`, and what's its own name" --
-   *  constant pool (to resolve the this_class name and method
-   *  name/descriptor Utf8s), access flags, and the method table. Field
-   *  bodies/other attributes are skipped, not decoded. */
+  /** Parses just enough of a classfile (constant pool, access flags, method table) to tell
+   *  whether it declares a public static `main(String[]): Unit`, and its name. */
   def scanClassFile(bytes: Array[Byte]): Option[String] =
     try
       val r = ClassReader(bytes)
       if r.u4() != classMagic then return None
       r.skip(4) // minor + major version
       val cpCount = r.u2()
-      // Constant-pool entries are 1-indexed; index 0 is unused. Long/Double
-      // entries (tags 5/6) take up two consecutive indices per the spec.
-      // Only Utf8 (name/descriptor text) and Class (name_index, to resolve
-      // this_class) entries are ever looked up afterwards, so only those
-      // are retained.
+      // Constant-pool entries are 1-indexed; Long/Double (tags 5/6) take two indices. Only Utf8 and
+      // Class entries are looked up afterwards, so only those are retained.
       val utf8 = new Array[String](cpCount)
       val classNameIdx = new Array[Int](cpCount)
       var i = 1
@@ -1431,9 +1274,8 @@ object ScalinoCli:
       else Some(utf8(classNameIdx(thisClassIdx)).replace('/', '.'))
     catch case _: Exception => None
 
-  /** Recursively scans every `.class` file under `classesDir` (scalino-dotc's
-   *  `-d` output) and returns the distinct set of classes declaring a public
-   *  static `main(String[])`, in the order first seen. */
+  /** The distinct classes, in first-seen order, declaring a public static `main(String[])` among the
+   *  `.class` files under `classesDir` (scalino-dotc's `-d` output). */
   def findMainClasses(classesDir: Path): List[String] =
     def walk(dir: Path): List[Path] =
       val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
@@ -1443,46 +1285,27 @@ object ScalinoCli:
       scanClassFile(Files.readAllBytes(f)).foreach(found.+=)
     found.toList
 
-  // ---------------------------------------------------------------------
-  // NIR-based fallback for the entry-point/test-discovery scan above: a
-  // self-hosted scalino-dotc (no backend/jvm/ASM baked in at all -- see
-  // docs/findings.md's self-hosting arc) never writes real .class files
-  // alongside .nir, so `findMainClasses`/`discoverTestClasses`'s classfile
-  // scanner finds nothing there, ever -- not a bug in the scanner, just a
-  // format it was never given. NIR is scala-native's own binary IR, already
-  // produced by every compile regardless of backend, and it's flat and
-  // post-erasure (structurally close to a JVM classfile) rather than
-  // TASTy's pickled tree shape, so this ports the *exact same* heuristic
-  // the classfile scanner uses -- same field names below, same semantics --
-  // just reading `nir.Defn`/`nir.Sig` instead of raw bytecode. Used ONLY
-  // when `classesDir` has no `.class` files at all (see call sites below);
-  // real GraalVM-built scalino-dotc always emits `.class`, so its behavior
-  // is completely unchanged by any of this.
-  // ---------------------------------------------------------------------
+  // NIR fallback for the entry-point/test-discovery scan above: a self-hosted scalino-dotc has no
+  // JVM backend and writes no .class files (docs/findings.md, self-hosting), so the classfile
+  // scanner finds nothing. NIR is flat and post-erasure, close to a classfile, so the same
+  // heuristic is applied to `nir.Defn`/`nir.Sig`. Used only when `classesDir` has no `.class` files.
 
   private def walkNirFiles(dir: Path): List[Path] =
     val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
     entries.flatMap(f => if f.isDirectory then walkNirFiles(f.toPath) else if f.getName.endsWith(".nir") then List(f.toPath) else Nil)
 
-  /** Deserializes one `.nir` file. Same fault-tolerance posture as the
-   *  classfile reader: a stale/corrupt/unreadable file is skipped (empty
-   *  result), not fatal -- one bad file under `classesDir` shouldn't break
-   *  discovery for everything else in it. */
+  /** Deserializes one `.nir` file. A stale/corrupt/unreadable file is skipped (empty result), as
+   *  in the classfile reader. */
   private def readNirDefns(f: Path): Seq[snir.Defn] =
     try
       val dir = VirtualDirectory.local(f.getParent)
       deserializeBinary(dir, Paths.get(f.getFileName.toString))
     catch case _: Exception => Nil
 
-  /** Does this `Defn.Define` declare `main(Array[String]): Unit` with no
-   *  receiver -- i.e. the same "public static `main(String[])`" shape the
-   *  classfile scanner looks for, which is exactly how nscplugin lowers an
-   *  object's `@main def`/`extends App`/hand-written `def main`: a
-   *  synthetic top-level *class* (not the module itself) declaring `main`
-   *  with a plain `(Array[String]) => Unit` signature and no `this`
-   *  parameter (the module's own instance `main` -- two args, `this` first
-   *  -- is a different, uninteresting definition in a separate `.nir`
-   *  file). */
+  /** Does this `Defn.Define` declare `main(Array[String]): Unit` with no receiver, the shape
+   *  nscplugin lowers an object's `@main def`/`extends App`/`def main` to: a synthetic top-level
+   *  *class* (not the module) with a plain `(Array[String]) => Unit` signature and no `this`.
+   *  The module's own instance `main` (`this` first) is a different definition in another file. */
   private def isNirMainDefine(d: snir.Defn.Define): Boolean =
     (d.ty.args match
       case Seq(snir.Type.Array(snir.Type.Ref(snir.Global.Top("java.lang.String"), _, _), _)) => d.ty.ret == snir.Type.Unit
@@ -1493,10 +1316,8 @@ object ScalinoCli:
         case _                         => false
       catch case _: Exception => false)
 
-  /** NIR equivalent of `findMainClasses` -- one real top-level *class*
-   *  (never a module: see `isNirMainDefine`'s doc) per `.nir` file declaring
-   *  a matching `main`, keyed by that class's own name (dollar-free, same
-   *  as the classfile scanner's `this_class`). */
+  /** NIR equivalent of `findMainClasses`: one top-level *class* (never a module, see
+   *  `isNirMainDefine`) per `.nir` file declaring a matching `main`, by its dollar-free name. */
   def findMainClassesNir(classesDir: Path): List[String] =
     val found = scala.collection.mutable.LinkedHashSet.empty[String]
     for f <- walkNirFiles(classesDir) do
@@ -1517,69 +1338,33 @@ object ScalinoCli:
         case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one")
     }
 
-  // ---------------------------------------------------------------------
-  // `scalino test`: bridging sbt's test-interface (`sbt.testing.Framework` et
-  // al -- the same API munit/utest/scalatest/zio-test's *native* ports all
-  // implement, since it's the one interface every scala-native test
-  // framework port targets) into a JVM-free build, with no reflection and
-  // no sbt/ComRunner on either end.
+  // `scalino test`: bridges sbt's test-interface (`sbt.testing.Framework`, which munit, utest,
+  // scalatest and zio-test's native ports implement) without a JVM, reflection or sbt/ComRunner.
+  // sbt-scala-native loads the framework on a JVM classloader for `.fingerprints()` and talks to
+  // that process over a socket per test run; neither is available here. Instead:
   //
-  // Real (JVM) sbt-scala-native drives this from the sbt/JVM side: it loads
-  // the framework's classfile on a JVM classloader just to call
-  // `.fingerprints()` (cheap metadata, not real test execution), and
-  // generates a `TestMain` that talks back to that JVM process over a
-  // socket for every actual test run. None of that is available here --
-  // there's no JVM anywhere in this toolchain's chain, at build time or
-  // runtime. Instead:
+  //   1. Framework discovery: scan the test classpath's jars (structurally, with the classfile
+  //      ancestry walk used for test discovery) for a concrete, public, no-arg-constructible
+  //      class implementing `sbt.testing.Framework`.
+  //   2. Fingerprint probing: `Framework#fingerprints()` (the marker superclass identifying a test
+  //      class, object or plain class) is computed by the framework's own code at run time, and
+  //      we can't run it at build time. So compile+link a throwaway "probe" binary through the
+  //      normal pipeline that instantiates the frameworks and prints their fingerprints, run it
+  //      and parse its output. Cached by framework classes + classpath, so one compile+link per
+  //      project.
+  //   3. Test discovery: scan the compiled test sources (classesDir) for classes whose ancestry
+  //      (superclasses and interfaces, across classesDir and the jars) includes a fingerprint's
+  //      marker superclass and matches `isModule`.
+  //   4. Driver codegen: generate `ScalinoCliTestMain.scala`, which instantiates the frameworks by
+  //      name (`new munit.Framework()`, no reflection) and builds `TaskDef`s from the discovered
+  //      classes, compiled in with the user's sources. Instantiating test objects is then the
+  //      framework's business (native ports use `@EnableReflectiveInstantiation`; the dummy
+  //      `ClassLoader` passed to `Framework#runner` is never invoked).
   //
-  //   1. Framework discovery: scan every class in the resolved test
-  //      classpath's jars (not just a hardcoded list of known frameworks --
-  //      structurally, via the same classfile-ancestry walk used for test
-  //      discovery below) for a concrete, public, no-arg-constructible class
-  //      that implements `sbt.testing.Framework`. This is exactly the same
-  //      check sbt itself does, just done by us via a hand-rolled classfile
-  //      reader instead of a JVM classloader.
-  //   2. Fingerprint probing: `Framework#fingerprints()` returns real
-  //      `Fingerprint` values (which marker superclass/annotation identifies
-  //      a test class, whether it's a Scala object or a plain class) that
-  //      are *computed at runtime* by that framework's own code -- there's
-  //      no way to know them without actually running it, and we have no
-  //      bytecode interpreter to run arbitrary 3rd-party code at build time.
-  //      So: compile+link a throwaway "probe" binary (via the exact same
-  //      scalino-dotc/scalino-linkdriver pipeline as any other build) whose
-  //      only job is to instantiate the discovered framework(s) and print
-  //      their fingerprints, run it, and parse its output. Cached (like
-  //      dependency resolution) keyed by the framework classes + classpath,
-  //      so this only costs a real compile+link once per project.
-  //   3. Test discovery: with real fingerprint data in hand, scan the
-  //      user's *compiled* test sources (classesDir) the same way -- does
-  //      this class's ancestry (superclass chain + interfaces, walked
-  //      transitively across both classesDir and the classpath jars)
-  //      include the fingerprint's marker superclass, and does it look like
-  //      a Scala object or a plain class to match `isModule`.
-  //   4. Driver codegen: generate a small `ScalinoCliTestMain.scala` that
-  //      literally instantiates the framework(s) by name (`new
-  //      munit.Framework()` -- direct, static, no reflection) and builds
-  //      `TaskDef`s from the discovered class names, then compiles it in
-  //      alongside the user's sources for a normal final compile+link. The
-  //      actual test-object instantiation inside a discovered `Task` is the
-  //      framework's own problem at that point (its native port relies on
-  //      scala-native's own `@EnableReflectiveInstantiation` support, not
-  //      the (dummy, unimplemented on scala-native) `ClassLoader` passed to
-  //      `Framework#runner` -- that's supplied only because the API
-  //      requires *some* `ClassLoader` value, never actually invoked).
-  //
-  // Known gaps vs real scala-cli: only `SubclassFingerprint`-based
-  // frameworks are supported (covers munit/utest/scalatest/zio-test-sbt --
-  // every framework this was verified against); `AnnotatedFingerprint`
-  // (JUnit4-style `@Test`-per-method discovery) is not, since JUnit's own
-  // sbt-scala-native support is a separate compiler-plugin-level mechanism,
-  // not a plain Framework probe. No per-test-method selector filtering --
-  // only whole test classes are ever selected (`SuiteSelector`); `--`
-  // arguments are forwarded to the framework's own `Runner` untouched
-  // (munit/utest both accept a `"*NameSubstring*"`-style filter there,
-  // matching real scala-cli's own `-- <pattern>` convention).
-  // ---------------------------------------------------------------------
+  // Gaps vs scala-cli: only `SubclassFingerprint` frameworks (munit/utest/scalatest/zio-test-sbt);
+  // no `AnnotatedFingerprint` (JUnit4 `@Test` discovery, a compiler-plugin mechanism); only whole
+  // classes are selected (`SuiteSelector`). `--` arguments go to the framework's `Runner`
+  // untouched (munit/utest accept a `"*NameSubstring*"` filter, as in scala-cli).
 
   def readAllBytes(in: InputStream): Array[Byte] =
     val buf = new ByteArrayOutputStream()
@@ -1590,12 +1375,9 @@ object ScalinoCli:
       n = in.read(tmp)
     buf.toByteArray
 
-  /** A superset of what `scanClassFile` extracts -- also the superclass/
-   *  interface names (for ancestry walks) and enough field/method info to
-   *  tell a Scala object from a plain class and detect a public no-arg
-   *  constructor. Kept separate from `scanClassFile` (some parsing logic is
-   *  duplicated) rather than refactoring that already-relied-upon function,
-   *  to keep this purely additive. */
+  /** A superset of `scanClassFile`'s result: also the superclass/interface names (for ancestry
+   *  walks) and enough to tell a Scala object from a plain class and detect a public no-arg
+   *  constructor. */
   case class ClassInfo(
     thisClass: String,
     superClass: Option[String],
@@ -1683,17 +1465,10 @@ object ScalinoCli:
       finally zf.close()
     catch case _: Exception => None
 
-  /** NIR equivalent of `analyzeClassFile` -- same `ClassInfo` shape, sourced
-   *  from a `Defn.Class`/`Defn.Module`'s own `parent`/`traits` fields
-   *  directly (no ancestry reconstruction needed at all: unlike bytecode,
-   *  NIR already carries them as real fields, not something to re-derive
-   *  from a constant pool) plus a same-file scan for a public no-arg
-   *  constructor (`isCtor`, `!isPrivate`, and exactly one NIR-level arg --
-   *  the implicit receiver, since NIR method signatures always include
-   *  `this` explicitly, unlike a JVM descriptor). `accessFlags` is left `0`
-   *  (unused by any LOCAL-classesDir caller below; only the jar-based
-   *  `findFrameworkClasses` reads it, and that path stays classfile-only,
-   *  real dependency jars always have `.class`). */
+  /** NIR equivalent of `analyzeClassFile`: the same `ClassInfo`, from a `Defn.Class`/`Defn.Module`'s
+   *  `parent`/`traits` fields plus a same-file scan for a public no-arg constructor (`isCtor`,
+   *  `!isPrivate`, one NIR-level arg: the implicit `this`). `accessFlags` stays `0`: only the
+   *  jar-based `findFrameworkClasses` reads it, and jars always have `.class` files. */
   private def hasPublicNoArgCtorNir(selfTop: snir.Global.Top, defns: Seq[snir.Defn]): Boolean =
     defns.exists {
       case d: snir.Defn.Define =>
@@ -1712,16 +1487,10 @@ object ScalinoCli:
         ClassInfo(m.name.id, m.parent.map(_.id), m.traits.map(_.id).toList, accessFlags = 0, isModule = true, hasPublicNoArgCtorNir(m.name, defns))
     }
 
-  /** Resolves a (dotted) class name to its `ClassInfo`, checking the local
-   *  compiled-output directory first (`.class` if present -- real
-   *  GraalVM-built scalino-dotc always has it; else `.nir`, the only format
-   *  a self-hosted scalino-dotc ever produces), then every jar on the
-   *  classpath in order -- used by `isAssignable`'s ancestry walk, which
-   *  needs to follow a chain that starts in user code and typically ends
-   *  inside a dependency jar (e.g. `MySuite extends munit.FunSuite extends
-   *  munit.Suite`); dependency jars are always real `.class`-bearing JVM
-   *  artifacts regardless of which toolchain built scalino-dotc, so that
-   *  half is untouched. */
+  /** Resolves a dotted class name to its `ClassInfo`: the local output directory first (`.class`,
+   *  else `.nir`), then each classpath jar in order. `isAssignable`'s ancestry walk starts in user
+   *  code and typically ends in a dependency jar (`MySuite extends munit.FunSuite extends
+   *  munit.Suite`). */
   def findClassInfo(name: String, classesDir: Path, jars: List[String]): Option[ClassInfo] =
     val localClass = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".class")
     if Files.exists(localClass) then analyzeClassFile(Files.readAllBytes(localClass))
@@ -1730,11 +1499,9 @@ object ScalinoCli:
       if Files.exists(localNir) then nirClassInfoOf(readNirDefns(localNir))
       else jars.iterator.flatMap(j => readClassFromJar(j, name).iterator).nextOption().flatMap(analyzeClassFile)
 
-  /** Does `startClass`'s ancestry (superclass chain and, at every step,
-   *  every implemented interface -- since Scala traits compile to
-   *  interfaces, and a `SubclassFingerprint`'s marker is very often a trait
-   *  like `munit.Suite`/`utest.TestSuite`) include `target`? A from-scratch,
-   *  classfile-level substitute for the JVM's `Class#isAssignableFrom`. */
+  /** Does `startClass`'s ancestry (superclasses and, at every step, interfaces: Scala traits
+   *  compile to interfaces and markers are often traits like `munit.Suite`) include `target`?
+   *  Classfile-level substitute for `Class#isAssignableFrom`. */
   def isAssignable(startClass: String, target: String, classesDir: Path, jars: List[String]): Boolean =
     isAssignableVia(startClass, target, findClassInfo(_, classesDir, jars))
 
@@ -1751,14 +1518,9 @@ object ScalinoCli:
 
   private val sbtTestingFramework = "sbt.testing.Framework"
 
-  /** Structurally scans every class in `jars` for a concrete (public,
-   *  non-abstract), no-arg-constructible implementor of
-   *  `sbt.testing.Framework` -- no hardcoded per-framework list, so any
-   *  framework with a scala-native port that follows the standard
-   *  sbt-testing-interface contract (munit, utest, scalatest, zio-test-sbt,
-   *  and anything else shaped the same way) is found the same way. Synthetic
-   *  classes (lambdas, anonymous classes, nested `$`-named classes) are
-   *  skipped -- framework entry points are always a plain top-level class. */
+  /** Scans every class in `jars` for a concrete (public, non-abstract), no-arg-constructible
+   *  implementor of `sbt.testing.Framework`, with no per-framework list. Synthetic classes
+   *  (lambdas, anonymous, nested `$`-named) are skipped: entry points are plain top-level classes. */
   def findFrameworkClasses(jars: List[String]): List[String] =
     val found = scala.collection.mutable.LinkedHashSet.empty[String]
     for jar <- jars do
@@ -1782,8 +1544,7 @@ object ScalinoCli:
       catch case _: Exception => ()
     found.toList
 
-  /** A `SubclassFingerprint` a framework reported, as probed from a real
-   *  (compiled+linked+run) instance of it -- see the probe step above. */
+  /** A `SubclassFingerprint` a framework reported, as probed from a real instance (see above). */
   case class SubclassSpec(frameworkFqcn: String, superclassName: String, isModule: Boolean, requireNoArgConstructor: Boolean)
 
   def probeSourceFor(frameworkFqcns: List[String]): String =
@@ -1810,16 +1571,10 @@ object ScalinoCli:
         case _ => Nil // ANN (AnnotatedFingerprint) or an unrecognized line -- not supported, see note above
     }.toList
 
-  /** Compiles+links+runs the probe binary described above and parses its
-   *  output into fingerprint specs, cached on disk keyed by the framework
-   *  classes + resolved test classpath (a real compile+link, so worth
-   *  skipping on repeat runs the same way `resolveDeps` skips re-resolving).
-   *  `userClassesDir` (pass 1's compiled output) is put on the probe's
-   *  classpath too -- not needed for a normal published-dependency
-   *  framework (those are already on `testClasspath`), but harmless, and
-   *  lets a project-local `sbt.testing.Framework` implementation (picked via
-   *  explicit `--test-framework`, since auto-detection only scans jars)
-   *  resolve as well. */
+  /** Compiles, links and runs the probe binary described above and parses its output into
+   *  fingerprint specs, cached on disk by framework classes + resolved test classpath.
+   *  `userClassesDir` (pass 1's output) is also on the probe's classpath so a project-local
+   *  `sbt.testing.Framework` (picked with `--test-framework`; auto-detection only scans jars) resolves. */
   def probeFingerprints(frameworkFqcns: List[String], testClasspath: String, cc: CompileClasspath, userClassesDir: Path, cacheDir: Path, logLevel: String): List[SubclassSpec] =
     Files.createDirectories(cacheDir)
     val key = sanitizeKey(frameworkFqcns.sorted.mkString(",")) + "-" + hashKey(testClasspath)
@@ -1849,17 +1604,12 @@ object ScalinoCli:
 
   case class TestMatch(className: String, isModule: Boolean, frameworkFqcn: String, superclassName: String)
 
-  /** Scans every compiled class under `classesDir` and matches it against
-   *  `specs`, the framework(s)' real fingerprints. A module's reported name
-   *  drops the compiler-generated trailing `$` (its companion object's
-   *  *module class* is what actually carries the ancestry/`MODULE$` field;
-   *  sbt-testing's own convention is that a module fingerprint's
-   *  fullyQualifiedName excludes it). */
+  /** Matches every compiled class under `classesDir` against `specs`, the frameworks' fingerprints.
+   *  A module's reported name drops the trailing `$` (the module class carries the ancestry/`MODULE$`;
+   *  sbt-testing's module fullyQualifiedName excludes it). */
   def discoverTestClasses(classesDir: Path, specs: List[SubclassSpec], jars: List[String]): List[TestMatch] =
-    // Same NIR fallback as `detectMainClass`: only reached when `classesDir`
-    // has no `.class` files at all (a self-hosted scalino-dotc). Every
-    // `.nir` file's single top-level `Defn.Class`/`Defn.Module` is scanned
-    // the same way a `.class` file would be -- see `nirClassInfoOf`.
+    // Same NIR fallback as `detectMainClass`, when `classesDir` has no `.class` files: scan each
+    // `.nir` file's top-level `Defn.Class`/`Defn.Module` (see `nirClassInfoOf`).
     val localInfos: List[ClassInfo] =
       if walkClassFiles(classesDir).nonEmpty then
         walkClassFiles(classesDir).flatMap(f => analyzeClassFile(Files.readAllBytes(f)))
@@ -1882,14 +1632,10 @@ object ScalinoCli:
           .foreach(s => found(reportedName) = TestMatch(reportedName, isModuleClass, s.frameworkFqcn, s.superclassName))
     found.values.toList
 
-  /** Generates `ScalinoCliTestMain.scala`: one real (statically instantiated, no
-   *  reflection) `Framework` per distinct `frameworkFqcn` among `matches`,
-   *  a `TaskDef` per discovered test class (looking its real `Fingerprint`
-   *  back up from that framework's own `fingerprints()` at run time, by the
-   *  same (superclassName, isModule) pair used to discover it), and a
-   *  synchronous drain-loop `Task.execute` runner with a plain pass/fail/
-   *  error/skipped tally -- see the design note above for why this can be
-   *  this simple (no ComRunner protocol, no JVM classloader tricks). */
+  /** Generates `ScalinoCliTestMain.scala`: a statically instantiated `Framework` per distinct
+   *  `frameworkFqcn` among `matches`, a `TaskDef` per test class (its `Fingerprint` looked up at run
+   *  time from the framework's `fingerprints()` by the (superclassName, isModule) pair used to
+   *  discover it), and a synchronous `Task.execute` drain loop tallying pass/fail/error/skipped. */
   def generateTestMain(matches: List[TestMatch]): String =
     val byFramework = matches.groupBy(_.frameworkFqcn).toList
     val groups = byFramework.zipWithIndex.map { case ((fqcn, ms), idx) =>
@@ -1960,17 +1706,11 @@ object ScalinoCli:
        |    if failed > 0 || errored > 0 then sys.exit(1)
        |""".stripMargin
 
-  // ---------------------------------------------------------------------
-  // Source expansion: a directory argument (e.g. `scalino run .`) means "every
-  // .scala file under here", scala-cli-style -- skipping hidden dirs and
-  // this tool's own build-output dirs.
-  // ---------------------------------------------------------------------
+  // Source expansion: a directory argument (`scalino run .`) means every .scala file under it,
+  // scala-cli-style, skipping hidden dirs and this tool's build-output dirs.
 
-  // "vendor" excluded because vendor/scala3 is a full gitignored dotty
-  // checkout (~18k .scala files) -- sweeping it into IDE/run/compile source
-  // scanning made `scalino setup-ide .` (and any other directory-arg command)
-  // hang for minutes walking+directive-parsing files that aren't this
-  // project's own sources.
+  // "vendor" is excluded: vendor/scala3 is a gitignored dotty checkout (~18k .scala files) that made
+  // directory-arg commands hang for minutes.
   private val skipDirNames = Set(".scalino-build", "target", "out", "vendor")
 
   def collectScalaFiles(dir: Path): List[Path] =
@@ -1984,11 +1724,8 @@ object ScalinoCli:
       else Nil
     }
 
-  /** Translates a scala-cli-style glob (`*` within a path segment, `**`
-   *  across segments, `?` a single char) to an anchored regex -- hand-rolled
-   *  rather than `java.nio.file.FileSystem#getPathMatcher("glob:...")`,
-   *  since that relies on JDK-internal glob-to-regex machinery whose support
-   *  in this toolchain's from-scratch javalib port is unverified. */
+  /** Translates a scala-cli-style glob (`*` within a path segment, `**` across segments, `?` one
+   *  char) to an anchored regex; `getPathMatcher("glob:...")` is unverified in this javalib port. */
   private def globToRegex(glob: String): scala.util.matching.Regex =
     val sb = new StringBuilder("^")
     var i = 0
@@ -2004,16 +1741,10 @@ object ScalinoCli:
     sb.append("$")
     sb.toString.r
 
-  /** `//> using file`/`files` (extra source files, resolved relative to the
-   *  directory of the source that declares them -- mainly useful when a
-   *  single explicit source file needs a sibling not otherwise on the
-   *  command line) and `//> using exclude` (glob, matched against each
-   *  collected source's path relative to the current working directory,
-   *  scala-cli-style) applied over the directory-expanded source set. Only
-   *  scans directives declared by sources already in `base` -- an `exclude`
-   *  or `file` inside a `file`-referenced source is not itself expanded a
-   *  second time, matching scala-cli's own one-level (not transitive)
-   *  behavior for this directive. */
+  /** Applies `//> using file`/`files` (extra sources, relative to the declaring source's directory)
+   *  and `//> using exclude` (glob against each source's path relative to the cwd) over the
+   *  directory-expanded set. Only directives of sources already in `base` count; as in scala-cli,
+   *  a `file`-referenced source's own directives are not expanded again. */
   private def applyFileAndExcludeDirectives(base: List[Path]): List[Path] =
     def directiveValuesOf(src: Path, keys: String*): List[String] =
       if !Files.exists(src) then Nil
@@ -2044,10 +1775,8 @@ object ScalinoCli:
     val base = paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p)).distinct
     applyFileAndExcludeDirectives(base)
 
-  /** `--watching`/`--watching-path`: extra paths polled for mtime changes
-   *  alongside the real sources, same recursive dir-walk as
-   *  `collectScalaFiles` but keeping every file (not just `.scala`) --
-   *  these are meant for arbitrary resources a build might depend on. */
+  /** `--watching`/`--watching-path`: extra paths polled for mtime changes, walked like
+   *  `collectScalaFiles` but keeping every file (they are arbitrary resources). */
   def expandWatchPaths(paths: List[Path]): List[Path] =
     def collectAll(dir: Path): List[Path] =
       val entries = Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil).sortBy(_.getName)
@@ -2059,21 +1788,13 @@ object ScalinoCli:
       }
     paths.flatMap(p => if Files.isDirectory(p) then collectAll(p) else List(p))
 
-  // ---------------------------------------------------------------------
-  // Compilation scopes, scala-cli-style: every source is "main" scope
-  // except one that has a path segment literally named "test" -- covers
-  // both a flat top-level `test/` folder and the sbt-style nested
-  // `src/test/scala/...` layout. `run`/`compile` only build the main
-  // scope (test sources typically reference a test framework like munit
-  // that's declared via `//> using test.dep`, not a plain `dep`, and so
-  // isn't even on the main scope's classpath -- compiling them in would
-  // just fail). `scalino test` (handleTest, below) compiles both scopes
-  // together instead, since test sources depend on main scope.
-  // ---------------------------------------------------------------------
+  // Compilation scopes, scala-cli-style: a source is "main" unless it has a path segment named
+  // "test" (a top-level `test/` folder or sbt-style `src/test/scala/...`). `run`/`compile` build
+  // only main: test sources use frameworks declared via `//> using test.dep`, which aren't on its
+  // classpath. `scalino test` (handleTest) compiles both scopes together.
 
-  // Anything under an sbt-style `src/main/` is main scope even when a package
-  // directory further down is called `test` (`src/main/scala/app/test/Foo.scala`
-  // is `package app.test`, not a test source).
+  // Anything under `src/main/` is main scope even if a package directory is called `test`
+  // (`src/main/scala/app/test/Foo.scala` is `package app.test`).
   def isTestSource(p: Path): Boolean =
     val segments = p.iterator().asScala.map(_.toString).toList
     val underSrcMain = segments.zip(segments.drop(1)).contains(("src", "main"))
@@ -2082,11 +1803,7 @@ object ScalinoCli:
   def partitionSources(sources: List[Path]): (List[Path], List[Path]) =
     sources.partition(s => !isTestSource(s))
 
-  // ---------------------------------------------------------------------
-  // Compile + link, mirroring bin/scalino-bootstrap but with directive-resolved deps
-  // folded into the classpath, and driven straight from this process
-  // instead of shelling out to a shell script.
-  // ---------------------------------------------------------------------
+  // Compile + link, mirroring bin/scalino-bootstrap with directive-resolved deps on the classpath.
 
   def readListFile(name: String): String = readFile(Paths.get(s"$dist/$name")).trim
 
@@ -2094,24 +1811,14 @@ object ScalinoCli:
   // (e.g. "lib/foo.jar") so dist/ stays relocatable -- resolve to absolute.
   def resolveCp(raw: String): String = raw.split(CP_SEP).map(e => s"$dist/$e").mkString(CP_SEP)
 
-  /** Compiles `sources`, then detects (or takes, if `explicitMainClass` is
-   *  set) the entry point from the *compiled* classfiles -- see
-   *  `detectMainClass` -- links, and copies the resulting binary to
-   *  `outFor(mainClass)`. Compilation always targets a single
-   *  mainClass-independent scratch dir (never mainClass-keyed, so nothing
-   *  is lost by not knowing the entry point's name up front, and it
-   *  sidesteps the chicken-and-egg problem of needing a compiled classfile
-   *  to name a directory the compiler is about to compile into) -- but,
-   *  since `compileToClasses` below is now incremental, that dir persists
-   *  across builds rather than being wiped every time. Only linking (whose
-   *  C-object cache genuinely benefits from a stable, persistent path) is
-   *  keyed by the resolved mainClass.
-   *  Returns the resolved mainClass. */
-  /** javaBase/pluginJar/compileCp for a scalino-dotc invocation -- shared by
-   *  `buildBinary` (compile/run) and `handleSetupIde` (`setup-ide`) so the
-   *  IDE server type-checks against the exact same classpath/flags a real
-   *  build would use. `nativelibsCp` is returned undropped (see below) since
-   *  `buildBinary` also needs it, unmodified, for linking. */
+  /** Compiles `sources`, detects the entry point from the compiled classfiles (or takes
+   *  `explicitMainClass`, see `detectMainClass`), links, and copies the binary to
+   *  `outFor(mainClass)`. Compilation targets one persistent mainClass-independent dir (the entry
+   *  point isn't known until compiled; `compileToClasses` is incremental); only linking, whose
+   *  C-object cache wants a stable path, is keyed by mainClass. Returns the resolved mainClass. */
+  /** javaBase/pluginJar/compileCp for a scalino-dotc invocation, shared by `buildBinary` and
+   *  `handleSetupIde` so the IDE type-checks against the same classpath/flags as a build.
+   *  `nativelibsCp` is returned undropped since `buildBinary` needs it unmodified for linking. */
   case class CompileClasspath(javaBase: String, pluginJar: String, compileCp: String, nativelibsCp: String)
 
   /** `-Xmacro-settings:javalibTasty=dist/lib/javalib-tasty.jar` (build/01b-build-patched-javalib.sh):
@@ -2129,35 +1836,18 @@ object ScalinoCli:
     val compilerCp = resolveCp(readListFile("compiler.cp"))
     val nativelibsCp = resolveCp(readListFile("nativelibs.cp"))
     val pluginJar = s"$dist/" + readListFile("nscplugin.jar.txt")
-    // dist/lib/scalalib-retained.jar (build/03b-build-scalalib-retained.sh):
-    // the same scala-library source nativelibsCp's plain jar has, recompiled
-    // with dotc instead of scalac -- real TASTy, so our own-implementation
-    // macro interpreter can run List/Option/Seq/etc's *actual* bodies
-    // (Interpreter.scala's resolveExternalDefTree) instead of needing a
-    // hand-written intrinsic for every stdlib method a macro's own code
-    // happens to call. Compile-only (ahead of the plain one on this
-    // classpath, but never on linkCp below) -- linking still uses the real
-    // scala-native-blessed artifacts, untouched.
+    // dist/lib/scalalib-retained.jar (build/03b-build-scalalib-retained.sh): scala-library recompiled
+    // with dotc, so it has real TASTy and the macro interpreter can run List/Option/Seq bodies
+    // (Interpreter.scala's resolveExternalDefTree) without an intrinsic per stdlib method.
+    // Compile-only: ahead of the plain jar on this classpath, never on linkCp.
     val scalalibRetained = s"$dist/lib/scalalib-retained.jar"
 
-    // `compilerCp`/`nativelibsCp` each carry their own plain, scalac-compiled
-    // scala-library jar -- having *both* that jar and scalalibRetained's
-    // recompiled one on the same classpath is genuinely ambiguous, not just
-    // redundant: which one dotc's classpath scanning resolves
-    // scala.Option/scala.Some/etc to (and so whether resolveExternalDefTree
-    // finds a real body at all) turned out to depend on timing/caching, not
-    // just declaration order -- non-deterministic between otherwise-identical
-    // runs. Drop the plain jar entirely from the compile classpath so
-    // scalalibRetained is the only one providing it -- UNLESS it's the
-    // pinned Scala version's OWN jar (`scala-library-<SCALA_VERSION>.jar`):
-    // under Scala's unified 2.13/3.x versioning (3.8.x+), that filename is
-    // no longer just the legacy Scala-2 stdlib duplicate scalalibRetained
-    // substitutes for -- it's the ONLY place scala.caps/scala.compiletime/
-    // etc (and, per the real jar shipping genuine per-class .tasty now,
-    // arguably scalalibRetained's whole reason to exist) live at all;
-    // `scala3-library_3` itself publishes as a near-empty compat shim.
-    // Dropping it unconditionally removes essential Scala 3 stdlib content,
-    // not just a redundant duplicate.
+    // `compilerCp`/`nativelibsCp` each carry a plain scalac-compiled scala-library jar. With
+    // scalalibRetained's too, which one dotc resolves scala.Option etc. to (and so whether
+    // resolveExternalDefTree finds a body) varied between identical runs, so drop the plain jar from
+    // the compile classpath, UNLESS it is the pinned version's own `scala-library-<SCALA_VERSION>.jar`:
+    // since Scala 3.8 that is the only place scala.caps/scala.compiletime/etc live
+    // (`scala3-library_3` is a near-empty compat shim).
     def dropPlainScalaLibrary(cp: String): String =
       cp.split(CP_SEP).filterNot(j => j.matches(""".*/scala-library-[0-9.]+\.jar""") && !j.endsWith(s"/scala-library-${BuildInfo.scalaVersion}.jar")).mkString(CP_SEP)
 
@@ -2192,48 +1882,27 @@ object ScalinoCli:
       s"$dist/java.base.jar", "",
       List(extraClasspath, extraCompileOnlyClasspath).filter(_.nonEmpty).mkString(CP_SEP), "")
 
-  // ---------------------------------------------------------------------
-  // Incremental compilation -- own implementation, not real Zinc (see
-  // docs/findings.md remaining-work item 7 for the design writeup). Real
-  // sbt Zinc gets its invalidation graph from a "compiler bridge" hooked
-  // deep into the compiler's own symbol table -- exactly the kind of
-  // JVM/dotty-internals tie this project's vendor+patch+splice approach
-  // (see the top-level project summary) is built to avoid taking on
-  // wholesale. Instead of a real bridge, this reconstructs an
-  // *approximate* dependency graph purely from source text: which
-  // top-level names each file declares, and which of those names each
-  // *other* file's text mentions.
+  // Incremental compilation: own implementation, not Zinc (design in docs/findings.md, remaining-work
+  // item 7). Zinc takes its invalidation graph from a compiler bridge into dotc's symbol table,
+  // which this project's vendor+patch approach avoids. Instead an approximate dependency graph is
+  // built from source text: the top-level names each file declares, and which files mention them.
   //
-  // On a rebuild: hash every given source file's content, diff against
-  // the last successful build's manifest to get the changed set, then
-  // widen it by walking the textual "who mentions one of this file's
-  // declared names" graph to a fixed point. Only that closure is handed
-  // to scalino-dotc; everything else is resolved from its already-compiled
-  // .class/.tasty sitting in classesDir (added to the compile classpath),
-  // the same way real Zinc reuses unaffected compilation units instead of
-  // recompiling the whole project.
+  // On a rebuild: hash each source, diff against the last successful build's manifest, and widen
+  // the changed set along the "mentions a declared name" graph to a fixed point. Only that closure
+  // goes to scalino-dotc; the rest resolves from the .class/.tasty already in classesDir (on the
+  // compile classpath).
   //
-  // This is strictly more conservative than real Zinc's name-hashing --
-  // it invalidates a dependent on ANY change to a file it mentions, not
-  // just an API-visible one (real Zinc can skip recompiling a dependent
-  // when only a method body changed) -- but it can never *under*-invalidate:
-  // any textual mention of a changed or removed name recompiles the file
-  // mentioning it, so a stale binary isn't a risk this approach can create.
-  // A whole-project fingerprint (compile classpath, scalac options,
-  // scalino-dotc's own mtime) forces a full rebuild whenever any of those
-  // change, since none of them are tracked per-file.
-  // ---------------------------------------------------------------------
+  // More conservative than Zinc's name-hashing (any change invalidates dependents, not just
+  // API-visible ones) but never under-invalidates: any mention of a changed or removed name
+  // recompiles the mentioning file. A whole-project fingerprint (compile classpath, scalac
+  // options, scalino-dotc's mtime) forces a full rebuild when any of those change.
 
   case class FileRecord(hash: String, pkg: String, declaredNames: List[String])
   case class IncrManifest(fingerprint: String, files: Map[String, FileRecord])
 
-  // Top-level only by convention, not by indentation-tracking: matches
-  // scala-cli-shaped single-file examples fine, and under-matching (e.g. a
-  // name declared only inside a nested object) just means that name's
-  // edges are missing from the graph -- conservative, since a file with an
-  // untracked declared name still gets recompiled itself on any of its own
-  // changes, it just can't ripple further to a file that only mentions a
-  // nested name of its own.
+  // Top-level by convention, not indentation tracking. Missing a nested name only drops its edges
+  // from the graph: the declaring file is still recompiled on its own changes, it just can't
+  // ripple to files mentioning only that nested name.
   private val topLevelDeclRe =
     """(?m)^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:final|sealed|abstract|open|case|private|protected|implicit|inline|transparent|opaque|infix)(?:\[\w+\])?\s+)*(?:class|trait|object|enum|given)\s+([A-Za-z_][A-Za-z0-9_]*)""".r
   // `@main def foo` makes dotc emit a synthetic top-level class `foo`
@@ -2249,21 +1918,15 @@ object ScalinoCli:
     (topLevelDeclRe.findAllMatchIn(text).map(_.group(1)) ++
       mainMethodRe.findAllMatchIn(text).map(_.group(1))).toList.distinct
 
-  /** Whole-project fingerprint: anything that isn't tracked per-file
-   *  (dependency classpath, scalac flags, the compiler binary itself)
-   *  forces a full rebuild when it changes, rather than risk silently
-   *  reusing classfiles built under a now-stale environment. */
+  /** Whole-project fingerprint of what isn't tracked per file (dependency classpath, scalac flags,
+   *  the compiler binary): a change forces a full rebuild. */
   def computeFingerprint(cc: CompileClasspath, extraOptions: List[String]): String =
     val dotcMtime = Files.getLastModifiedTime(Paths.get(s"$dist/scalino-dotc")).toMillis
     hashKey(List(cc.compileCp, cc.javaBase, cc.pluginJar, extraOptions.mkString(" "), dotcMtime.toString).mkString(" "))
 
-  /** Parses the manifest this module itself wrote (see `saveManifest`) --
-   *  tab/newline-delimited like this project's other on-disk caches
-   *  (`deps-*.cp`, the test-probe cache), rather than pulling in a JSON
-   *  parser for one internal format nothing else needs to read. Any parse
-   *  trouble (missing file, corrupted line, a manifest from an old,
-   *  incompatible version of this code) is treated as a cache miss --
-   *  falling back to a full rebuild is always safe, just slower. */
+  /** Parses the manifest written by `saveManifest` (tab/newline-delimited, like the other on-disk
+   *  caches). Any parse trouble (missing file, corrupt line, old format) is a cache miss: a full
+   *  rebuild is always safe. */
   def loadManifest(path: Path): Option[IncrManifest] =
     try
       if !Files.exists(path) then None
@@ -2289,14 +1952,10 @@ object ScalinoCli:
   private def manifestPathFor(classesDir: Path): Path =
     classesDir.resolveSibling(classesDir.getFileName.toString + ".incr-manifest")
 
-  /** Deletes whatever `classesDir` holds for the given (package, declared
-   *  top-level names) -- `Name.class`/`Name.tasty`/`Name.nir` plus anything dotc
-   *  nests under it (`Name$.class` for an object's static forwarder,
-   *  `Name$Inner.class`, ...), matched by filename prefix. Called before
-   *  recompiling a changed file (in case a class inside it was renamed or
-   *  removed since the last build -- leaving the old file behind would
-   *  keep shipping a stale class on the link classpath) and for files
-   *  dropped from the source set entirely. */
+  /** Deletes what `classesDir` holds for the given (package, declared top-level names):
+   *  `Name.class`/`Name.tasty`/`Name.nir` plus nested outputs (`Name$.class`, `Name$Inner.class`),
+   *  matched by filename prefix. Called before recompiling a changed file (a renamed or removed
+   *  class would otherwise stay on the link classpath) and for files dropped from the source set. */
   def purgeArtifactsFor(classesDir: Path, pkg: String, names: List[String]): Unit =
     val dir = if pkg.isEmpty then classesDir else pkg.split("\\.").foldLeft(classesDir)(_.resolve(_))
     if Files.exists(dir) then
@@ -2305,11 +1964,9 @@ object ScalinoCli:
           .foreach(_.foreach(f => Files.deleteIfExists(f.toPath)))
       }
 
-  /** Just the scalino-dotc compile step (shared by `buildBinary` and the
-   *  `scalino test` pipeline, which needs to compile once to scan the resulting
-   *  classfiles for test discovery before a mainClass is known/generated).
-   *  Incremental by default (see the design note above) -- pass
-   *  `incremental = false` to always fully recompile (`--no-incremental`). */
+  /** The scalino-dotc compile step, shared by `buildBinary` and `scalino test` (which compiles once
+   *  to scan classfiles for test discovery before a mainClass exists). Incremental by default;
+   *  `incremental = false` always recompiles fully (`--no-incremental`). */
   def compileToClasses(
     sources: List[Path],
     classesDir: Path,
@@ -2321,9 +1978,7 @@ object ScalinoCli:
     val manifestPath = manifestPathFor(classesDir)
     val fingerprint = computeFingerprint(cc, extraOptions)
     val prev = if incremental then loadManifest(manifestPath) else None
-    // Keyed by path.toString throughout (not Path) -- the manifest itself
-    // is string-keyed (see FileRecord/IncrManifest), and the dependency
-    // graph below needs a plain-value key it can put in a Set/Queue.
+    // Keyed by path.toString (not Path): the manifest is string-keyed (FileRecord/IncrManifest).
     val texts = sources.map(p => p.toString -> readFile(p)).toMap
     val curHash = texts.view.mapValues(hashKey).toMap
     // `<File>$package` is where dotc puts top-level defs/vals/types, so it
@@ -2344,31 +1999,23 @@ object ScalinoCli:
         val removed = m.files.filter { case (p, _) => !curPaths(p) }
         val changed = sources.filter(p => m.files.get(p.toString).forall(_.hash != curHash(p.toString)))
 
-        // name -> declaring file(s), recomputed fresh from the CURRENT
-        // source set every run -- this is what stands in for dotc's own
-        // symbol table: any textual mention of a name is treated as a
-        // dependency edge on whoever currently declares it.
+        // name -> declaring file(s), recomputed from the current sources every run; stands in for
+        // dotc's symbol table: any textual mention of a name is an edge to its declarer.
         val nameToFile = curDeclared.toList.flatMap { case (p, names) => names.map(_ -> p) }.groupMap(_._1)(_._2)
-        // names that vanished because their declaring file was removed
-        // still need to invalidate whoever references them -- dotc will
-        // then fail that file with a real "not found" error, correctly.
+        // Names that vanished with their declaring file still invalidate their referrers (dotc then
+        // reports a real "not found").
         val removedNames = removed.values.flatMap(_.declaredNames).toSet
         val allKnownNames = nameToFile.keySet ++ removedNames
 
-        // Single pass over each text, tokenizing into identifiers once,
-        // then intersecting against the known-names set -- avoids
-        // recompiling/rescanning with one regex per known name (was
-        // O(files * names * textLen), now O(files * textLen)).
+        // Tokenize each text once and intersect with the known names, rather than one regex per name
+        // (O(files * names * textLen)).
         val identifierRe = "[A-Za-z_][A-Za-z0-9_]*".r
         def usedNames(text: String): Set[String] =
           identifierRe.findAllMatchIn(text).map(_.matched).toSet.intersect(allKnownNames)
         val usedBy = texts.view.mapValues(usedNames).toMap
         def dependentsOf(n: String): Iterable[String] = usedBy.collect { case (p, used) if used(n) => p }
 
-        // BFS closure: if file A is invalidated, anyone whose text
-        // mentions any name A declares is invalidated too (conservative:
-        // on ANY change to A, not just an API-visible one -- see the
-        // design note above).
+        // BFS closure: if A is invalidated, so is anyone mentioning a name A declares.
         val invalid = scala.collection.mutable.LinkedHashSet.empty[String]
         val queue = scala.collection.mutable.Queue.empty[String]
         def markInvalid(p: String): Unit = if invalid.add(p) then queue.enqueue(p)
@@ -2391,14 +2038,10 @@ object ScalinoCli:
         purgeArtifactsFor(classesDir, r.pkg, r.declaredNames)
 
     if toCompile.nonEmpty then
-      // scala-cli/sbt both print a line before a real compile -- scalino-dotc
-      // itself stays silent on success (no "compiling..." banner of its own),
-      // so without this a multi-second compile looks like scalino hung.
+      // scalino-dotc is silent on success, so print a line like scala-cli/sbt or a long compile looks hung.
       System.err.println(Color.gray(s"Compiling project (${if js then jsBuildLabel else buildLabel})"))
-      // classesDir on the compile classpath (harmless on a full rebuild --
-      // it's freshly emptied above) is what lets scalino-dotc resolve
-      // symbols from files it isn't recompiling this round out of their
-      // already-compiled .tasty/.class instead of needing their source.
+      // classesDir on the compile classpath (harmless on a full rebuild, it's emptied above) lets
+      // scalino-dotc resolve symbols of files not recompiled this round from their .tasty/.class.
       val compileCp = s"$classesDir$CP_SEP${cc.compileCp}"
       val compileCmd = List(
         s"$dist/scalino-dotc",
@@ -2423,11 +2066,8 @@ object ScalinoCli:
         System.err.println(Color.gray(s"Error compiling project (${if js then jsBuildLabel else buildLabel})"))
         fail(CompilationFailed)
       System.err.println(Color.gray(s"Compiled project (${if js then jsBuildLabel else buildLabel})"))
-      // On failure, the manifest is deliberately left untouched: it still
-      // describes the last known-good state, so the next attempt treats
-      // every file in this failed batch as still-changed and retries it
-      // (plus dependents) rather than caching a broken result as if it
-      // compiled.
+      // On failure the manifest stays untouched (the last good state), so the next attempt retries
+      // every file of this batch plus dependents.
 
     if incremental then
       val toCompileSet = toCompile.toSet
@@ -2442,12 +2082,9 @@ object ScalinoCli:
     else
       Files.deleteIfExists(manifestPath)
 
-  /** User-facing Scala Native build settings, resolved from `//> using
-   *  native*` directives and/or `--native-*` CLI flags (directives win --
-   *  same precedence as `explicitMainClass`/`options` above) and forwarded to
-   *  dist/scalino-linkdriver as extra flag-style argv (see LinkDriver.scala's
-   *  own parser). No `nativeVersion`: this toolchain only ever targets the
-   *  one pinned scala-native version it was built for. */
+  /** Scala Native build settings from `//> using native*` directives and/or `--native-*` flags,
+   *  forwarded to dist/scalino-linkdriver as flag-style argv (LinkDriver.scala's parser). There is
+   *  no `nativeVersion`: only the one pinned scala-native version is supported. */
   case class NativeOpts(
     mode: Option[String] = None,
     gc: Option[String] = None,
@@ -2482,10 +2119,8 @@ object ScalinoCli:
     postLink: List[String] = Nil
   )
 
-  /** Directives win over the equivalent `--native-*` CLI flag for
-   *  single-valued settings (matches `explicitMainClass`'s own precedence);
-   *  list-valued and boolean settings combine both sources instead, matching
-   *  how `options`/`deps` already combine directive and CLI values above. */
+  /** Directives win over the equivalent `--native-*` flag for single-valued settings (like
+   *  `explicitMainClass`); list-valued and boolean settings combine both (like `options`/`deps`). */
   def targetTriplesOf(directives: Directives, o: RunOpts): List[String] =
     (directives.nativeTargetTriples ++ o.cliNativeTargetTriples).flatMap(_.split(',').toList).map(_.trim).filter(_.nonEmpty).distinct
 
@@ -2518,15 +2153,11 @@ object ScalinoCli:
       targetTriples = triples,
       sysroots = directives.nativeSysroots ++ o.cliNativeSysroots,
       embedResources = directives.nativeEmbedResources.getOrElse(false) || o.cliEmbedResources,
-      // Default-on, same opt-out shape as directCodegen above:
-      // either source wins outright over the default if given explicitly.
+      // Default-on, same opt-out shape as directCodegen above.
       multithreading = directives.nativeMultithreading.orElse(o.cliNativeMultithreading).getOrElse(true),
-      // Default-on everywhere except Windows (DirectCodeGen.Capability.
-      // wholeBuildGatesOk gates out Windows permanently -- WindowsCompat is
-      // unported), with an explicit opt-out via the directive or
-      // `--native-direct-codegen=false` -- either one, if given,
-      // wins outright over the OS-based default. The OS is the target's
-      // when `--native-target-triple` is given, else the host's.
+      // Default-on except on Windows (DirectCodeGen.Capability.wholeBuildGatesOk gates it out:
+      // WindowsCompat is unported); the directive or `--native-direct-codegen=false` wins over the
+      // OS default. The OS is the target's with `--native-target-triple`, else the host's.
       directCodegen = directives.nativeDirectCodegen
         .orElse(o.cliNativeDirectCodegen)
         .getOrElse(!windowsTarget),
@@ -2544,10 +2175,8 @@ object ScalinoCli:
       compactByteArrays = directives.nativeCompactByteArrays.orElse(o.cliNativeCompactByteArrays),
       // Opt-in, commix GC only: see NativeConfig.gcStwSweep.
       gcStwSweep = directives.nativeGcStwSweep.getOrElse(false) || o.cliNativeGcStwSweep,
-      // Opt-in: gates SCALINO_HEAP_HISTOGRAM at C compile time -- see
-      // LinkDriver.scala's withCOptions. Off by default since the feature's
-      // always-linked static table otherwise bloats every binary by ~7.5MB
-      // regardless of whether it's ever used at runtime.
+      // Opt-in: gates SCALINO_HEAP_HISTOGRAM at C compile time (LinkDriver.scala's withCOptions);
+      // its static table would add ~7.5MB to every binary.
       heapHistogram = directives.nativeHeapHistogram.getOrElse(false) || o.cliNativeHeapHistogram,
       // Opt-in: source-level debug info (DWARF line/variable info) makes every
       // binary noticeably bigger and slower to link, so it is only emitted on request.
@@ -2562,11 +2191,8 @@ object ScalinoCli:
       postLink = directives.postLink ++ o.cliPostLink
     )
 
-  /** The compile-only half of a build: parses/resolves nothing itself (that's
-   *  already done by the caller), just runs sources through scalino-dotc and
-   *  returns the resulting classesDir -- no entry-point detection, no link
-   *  step. Shared by `scalino compile` (which stops here) and `buildBinary`
-   *  (which goes on to link). */
+  /** The compile-only half of a build: runs sources through scalino-dotc and returns classesDir,
+   *  with no entry-point detection or link. Shared by `scalino compile` and `buildBinary`. */
   def compileOnly(
     sources: List[Path],
     extraClasspath: String,
@@ -2744,12 +2370,10 @@ object ScalinoCli:
     else nativeOpts.targetTriples.foreach(t => collect(linkDir.resolve(t), outForTriple(mainClass, t)))
     mainClass
 
-  // ---------------------------------------------------------------------
   // Scala.js: `//> using platform js` / `--js`. Same front half as a native build (directives,
   // dependency resolution with `_sjs1_3` artifacts, incremental compile), but dotc runs with
   // `-scalajs` (patches/scala3-0039) and emits `.sjsir`; dist/scalino-jslink (the Scala.js linker,
   // itself a Scala Native binary) turns those into JavaScript; node runs it. No JVM anywhere.
-  // ---------------------------------------------------------------------
 
   /** `moduleKind`: commonjs | esmodule | none. `mode`: fast (no optimizer) | full (optimizer + minifier). */
   case class JsOpts(
@@ -3010,7 +2634,6 @@ object ScalinoCli:
         compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental, js = true)
         0
 
-  // ---------------------------------------------------------------------
   // `scalino test` on Scala.js. Same structure as the native pipeline (see the note above
   // `readAllBytes`): find the sbt-testing Frameworks on the class path, run a probe program for their
   // fingerprints, match the project's classes against them, generate a driver, run it. What differs:
@@ -3019,7 +2642,6 @@ object ScalinoCli:
   //  - Scala.js frameworks are asynchronous (`Task.execute` with a continuation), and the driver exits
   //    by setting `process.exitCode` once the last continuation has run;
   //  - no `--test-only` link trimming: the linker only keeps what the driver reaches.
-  // ---------------------------------------------------------------------
 
   /** Class name -> `ClassInfo` for every class in `entries` (directories and jars). The IR has no access
    *  flags: everything is public, and `abstract` means "declares a method without a body". */
@@ -3204,7 +2826,6 @@ object ScalinoCli:
       val (_, jsFile) = buildJs(expanded :+ driverSrc, o.progArgs, Some("ScalinoCliTestMain"), testClasspath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts)
       runInherited(jsRuntimeCommand() :+ jsFile.toString, extraEnv = runEnvOf(directives, o))
 
-  // ---------------------------------------------------------------------
   // CLI surface, scala-cli-shaped:
   //   scalino <sources...>                       run (default command, like
   //                                            `scala-cli Foo.scala`)
@@ -3216,7 +2837,6 @@ object ScalinoCli:
   // options: --main-class X | --dep coord | -S/--scala ver |
   //          -O/--scalac-option opt | -w/--watch | -o/--output path
   //          (package only) | -v/--verbose | -q/--quiet | -- <program args...>
-  // ---------------------------------------------------------------------
 
   def printVersion(): Unit =
     println(s"scalino ${BuildInfo.scalinoVersion} -- Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}, Scala.js ${BuildInfo.scalaJsVersion}")
@@ -3749,10 +3369,8 @@ object ScalinoCli:
     cliPostLink: List[String] = Nil,
     cliRunEnv: List[String] = Nil
   ):
-    // scala-cli-style: -v shows the full build-tool debug trace (raw
-    // clang/linker invocations, NativeConfig dumps), the default ("info")
-    // shows just progress lines, -q drops those too and only surfaces
-    // warnings/errors. -v wins if both are passed.
+    // scala-cli-style: -v shows the full build-tool debug trace (clang/linker invocations,
+    // NativeConfig dumps), the default ("info") progress lines, -q only warnings/errors. -v wins.
     def logLevel: String = if verbose then "verbose" else if quiet then "quiet" else "info"
 
   /** No source args -> default to the current directory, scala-cli-alike. */
@@ -3772,7 +3390,7 @@ object ScalinoCli:
         case "-w" | "--watch" => o = o.copy(watch = true)
         case "--watching" | "--watching-path" => o = o.copy(cliWatchingPaths = o.cliWatchingPaths :+ args(i + 1)); i += 1
         case "--args-file" => o = o.copy(cliOptions = o.cliOptions :+ s"@${args(i + 1)}"); i += 1
-        // no `-d` short form: real scala-cli's `-d` means `--output`, not `--dependency` -- don't collide with it.
+        // no `-d` short form: scala-cli's `-d` means `--output`, not `--dependency`.
         case "--dep" | "--dependency" => o = o.copy(cliDeps = o.cliDeps :+ args(i + 1)); i += 1
         case "--compile-dep" | "--compile-only-dependency" => o = o.copy(cliCompileOnlyDeps = o.cliCompileOnlyDeps :+ args(i + 1)); i += 1
         case "-r" | "--repo" | "--repository" => o = o.copy(cliRepositories = o.cliRepositories :+ args(i + 1)); i += 1
@@ -3881,11 +3499,9 @@ object ScalinoCli:
       i += 1
     o
 
-  /** Re-run for every rebuild: re-parses directives (they may have changed
-   *  under `-w`), resolves deps, detects the entry point, compiles+links,
-   *  and for `run` also executes the result. Throws BuildFailed on any
-   *  recoverable failure -- never calls `die`/`sys.exit` directly, so a
-   *  watch-mode caller can catch it and keep watching. */
+  /** Runs for every rebuild: re-parses directives (they may change under `-w`), resolves deps,
+   *  detects the entry point, compiles and links, and for `run` executes the result. Throws
+   *  BuildFailed on recoverable failures, never `die`/`sys.exit`, so watch mode keeps watching. */
   def buildAndMaybeRun(mode: String, expandedIn: List[Path], o: RunOpts): Int =
     val directives0 = parseDirectives(expandedIn)
     // `//> using target.platform` files drop out for the other platform (the platform itself comes from the rest)
@@ -3965,14 +3581,10 @@ object ScalinoCli:
         compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)
         0
 
-  /** Polls source mtimes every 500ms and reruns `attempt` on change --
-   *  simple and portable (no reliance on java.nio.file.WatchService, whose
-   *  support in this toolchain's javalib port is unverified). Runs once
-   *  immediately, same as scala-cli's `-w`. */
+  /** Polls source mtimes every 500ms and reruns `attempt` on change (java.nio.file.WatchService is
+   *  unverified in this javalib port). Runs once immediately, like scala-cli's `-w`. */
   def watchLoop(resolve: () => (List[Path], List[Path]))(attempt: List[Path] => Unit): Unit =
-    // Re-resolved every poll: files can be added, renamed or deleted while
-    // watching, so a source list fixed at startup goes stale (and then
-    // crashes reading a path that no longer exists).
+    // Re-resolved every poll: files can be added, renamed or deleted while watching.
     def mtimes(): Map[Path, Long] =
       val (build, extra) = resolve()
       (build ++ extra).distinct.flatMap { p =>
@@ -3983,11 +3595,10 @@ object ScalinoCli:
       val (build, _) = resolve()
       if build.isEmpty then System.err.println(Color.gray("No .scala files found"))
       else attempt(build)
-    // Same wording scala-cli prints after every iteration, success or failure.
+    // scala-cli's wording after every iteration.
     def watching(): Unit =
       System.err.println(Color.gray("Watching sources, press Ctrl+C to exit, or press Enter to re-run."))
-    // Enter on stdin forces a rebuild (scala-cli's behavior); swallow whatever
-    // was typed. A closed/non-interactive stdin just never reports bytes.
+    // Enter on stdin forces a rebuild (as in scala-cli); a closed stdin never reports bytes.
     def enterPressed(): Boolean =
       try
         val n = System.in.available()
@@ -4042,12 +3653,8 @@ object ScalinoCli:
       try sys.exit(buildAndMaybeRun(mode, expanded, o))
       catch case BuildFailed(msg) => exitBuildFailure(msg)
 
-  /** `scalino test` -- see the design note above `readAllBytes`/`ClassInfo` for
-   *  the overall approach (structural framework discovery, a probe binary
-   *  for real fingerprint data, structural test discovery, generated
-   *  driver). Unlike `run`/`compile`, compiles main *and* test scope
-   *  together (test sources depend on main scope) in one pass, so it
-   *  doesn't call `partitionSources` at all. */
+  /** `scalino test`; approach in the design note above `readAllBytes`/`ClassInfo`. Unlike
+   *  `run`/`compile`, compiles main *and* test scope together in one pass (no `partitionSources`). */
   def handleTest(args: Array[String]): Unit =
     val o = defaultToCwd(parseRunOpts(args))
     o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
@@ -4079,9 +3686,8 @@ object ScalinoCli:
       val options = directives.options ++ o.cliOptions ++ directives.testOptions
       val cc = computeCompileClasspath(testClasspath, extraCompileOnlyClasspath)
 
-      // Pass 1: compile the user's own sources only, to scan the result for
-      // test discovery before the driver (which references those classes
-      // by name) is even generated.
+      // Pass 1: compile only the user's sources, to scan for tests before generating the driver
+      // (which names those classes).
       val classesDir = Paths.get(".scalino-build", "_scratch", "test-classes")
       compileToClasses(expanded, classesDir, cc, options, !o.noIncremental)
 
@@ -4115,9 +3721,8 @@ object ScalinoCli:
           val re = globToRegex(glob)
           discovered.filter(m => re.matches(m.className))
         case None => discovered
-      // A selected test's own ancestors must stay linkable even when they are
-      // themselves discovered test classes (e.g. a concrete base suite): the
-      // linker can only keep what's still on its classpath.
+      // A selected test's ancestors must stay linkable even if they are discovered test classes
+      // themselves (e.g. a concrete base suite).
       val keep = scala.collection.mutable.Set.empty[String]
       def collectAncestors(name: String): Unit =
         if keep.add(name) then
@@ -4141,9 +3746,8 @@ object ScalinoCli:
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
         def build(exclude: Set[String]) =
           buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude)
-        // Besides inheritance (handled above), a selected test could reference
-        // an excluded test class some other way -- if the trimmed link fails,
-        // fall back to the full link rather than failing the run.
+        // A selected test could reference an excluded class other than by inheritance: if the
+        // trimmed link fails, fall back to the full link.
         try build(excluded)
         catch case BuildFailed(_) if excluded.nonEmpty =>
           System.err.println("scalino: warning: link with --test-only exclusions failed (a selected test references an excluded test class?) -- retrying with every test class linked")
@@ -4161,21 +3765,15 @@ object ScalinoCli:
       try sys.exit(attempt(expanded))
       catch case BuildFailed(msg) => exitBuildFailure(msg)
 
-  /** JSON string/array literals for `.scalino-build/scalino-lsp.json` -- hand-rolled rather
-   *  than pulling in a JSON library: the shape is fixed (see ProjectConfig
-   *  below) and every value here is either a plain path string or a flag
-   *  list, so escaping quotes/backslashes is all that's needed. */
+  /** JSON string/array literals for `.scalino-build/scalino-lsp.json`: the shape is fixed (see
+   *  ProjectConfig) and values are paths or flag lists, so escaping quotes/backslashes suffices. */
   def jsonStr(s: String): String = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
   def jsonArr(xs: List[String]): String = xs.map(jsonStr).mkString("[", ", ", "]")
 
-  /** `scalino setup-ide` -- same command name as scala-cli's own `setup-ide`,
-   *  but writes `.scalino-build/scalino-lsp.json` (dotty's pre-Metals IDE config format --
-   *  `ProjectConfig.java`, read by dist/scalino-lsp on `initialize`,
-   *  see DottyLanguageServer.IDE_CONFIG_FILE) instead of scala-cli's BSP
-   *  connection file: this toolchain's LSP speaks that format directly, no
-   *  BSP layer in between. Mirrors buildBinary's own compile flags/
-   *  classpath exactly (via computeCompileClasspath), so the IDE
-   *  type-checks against the same inputs a real build would use. */
+  /** `scalino setup-ide`: unlike scala-cli's BSP connection file, writes
+   *  `.scalino-build/scalino-lsp.json` (dotty's IDE config format, `ProjectConfig.java`), which
+   *  dist/scalino-lsp reads on `initialize`. Uses buildBinary's compile flags and classpath
+   *  (via computeCompileClasspath) so the IDE type-checks against what a build uses. */
   def handleSetupIde(args: Array[String]): Unit =
     val o = defaultToCwd(parseRunOpts(args))
     o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
@@ -4184,14 +3782,9 @@ object ScalinoCli:
     val (expanded, testSources) = partitionSources(allExpanded)
     if expanded.isEmpty then die("no main-scope .scala files found (only test sources under test/)")
 
-    // One IDE project per compilation scope, mirroring buildBinary (main) and
-    // handleTest (main + test together, test sources seeing main's). Declared
-    // per project, not as one merged classpath, so test-only dependencies stay
-    // invisible to main code. `platform`/`dependsOn` are what a future
-    // multi-target layout (say a native backend and a js frontend, each with
-    // its own main/test pair) extends: more entries, each with its own
-    // classpath and compiler arguments, no change to the format or to
-    // scalino-lsp's per-project routing.
+    // One IDE project per compilation scope, mirroring buildBinary (main) and handleTest (main +
+    // test, test seeing main's). Separate classpaths keep test-only dependencies invisible to main.
+    // `platform`/`dependsOn` let a multi-target layout add entries without format changes.
     val mainDirectives = parseDirectives(expanded)
     jsPlatform = resolvePlatform(mainDirectives, o) == "js"
     val allDirectives = if testSources.isEmpty then mainDirectives else parseDirectives(allExpanded)
@@ -4204,13 +3797,10 @@ object ScalinoCli:
     fetchSourcesBestEffort((mainDeps ++ (if testSources.isEmpty then Nil else testDeps) ++ compileOnlyDeps).distinct, depsCache, repos)
     fetchStdlibSourcesBestEffort()
 
-    // Unlike buildBinary, deliberately drop -Xplugin/-Xplugin-require:scalanative here:
-    // InteractiveCompiler (vendor/scala3 dotc.interactive) hardcodes its own phases
-    // list (Parser/TyperPhase/SetRootTree/CookComments only, no backend/scalanative
-    // phase ever runs), and scalino-lsp's native-image build never bakes in
-    // nscplugin's classes -- so requiring the plugin here always fails to load it
-    // reflectively and every request after `initialize` (which needs a driver built
-    // from these arguments) times out, regardless of native-image or not.
+    // Unlike buildBinary, drop -Xplugin/-Xplugin-require:scalanative: InteractiveCompiler
+    // (vendor/scala3 dotc.interactive) runs a fixed phase list (no backend/scalanative phase) and
+    // scalino-lsp doesn't bundle nscplugin, so requiring the plugin fails to load and every request
+    // after `initialize` times out.
     def project(
         id: String, dependsOn: List[String], sources: List[Path], classpathParts: List[String], options: List[String]
     ): String =
@@ -4238,8 +3828,7 @@ object ScalinoCli:
     val projects =
       if testSources.isEmpty then List(mainProject)
       else
-        // Same classpath handleTest compiles tests with: main's, plus
-        // test.dep, plus the test sources' own jars/resources.
+        // Same classpath handleTest compiles tests with: main's, test.dep, and the test sources' jars/resources.
         val testCp =
           if jsPlatform then List(resolveDeps((jsBaseDeps ++ allDirectives.deps ++ o.cliDeps ++ testDeps).distinct, depsCache, repos)) ++ allDirectives.jars ++ allDirectives.resourceDirs
           else List(
@@ -4262,41 +3851,22 @@ object ScalinoCli:
     }
     val json = (projects ++ clientProjects).mkString("[\n", ",\n", "\n]\n")
 
-    // Lives inside .scalino-build/ (patches/scala3-0015 moves scalino-lsp's
-    // own DottyLanguageServer.IDE_CONFIG_FILE to match) rather than at the
-    // project root as dotty's original ".dotty-ide.json" did, so a project's
-    // .gitignore only needs one entry (.scalino-build/) to cover it, not a
-    // second one just for this file.
+    // Inside .scalino-build/ (patches/scala3-0015) rather than dotty's ".dotty-ide.json" at the
+    // root, so one .gitignore entry covers it.
     val configPath = Paths.get(".scalino-build", "scalino-lsp.json")
     Files.createDirectories(configPath.getParent)
     Files.write(configPath, json.getBytes("UTF-8"))
     println(s"Wrote configuration file for ide in: ${configPath.toAbsolutePath}")
 
-    // No editor-specific settings.json is written here anymore: install.sh
-    // symlinks scalino-lsp onto PATH alongside scalino, and both editor
-    // extensions already fall back to a PATH lookup when no explicit binary
-    // path is configured (vscode-extension/src/extension.ts's findOnPath,
-    // zed-extension/src/lib.rs's worktree.which) -- so a project checkout
-    // needs zero editor-specific config for the common case. Zed users with
-    // metals-zed also installed still need the `file_types` override
-    // documented in zed-extension/README.md to avoid Zed arbitrarily
-    // picking metals-zed's "Scala" language for .scala files -- that's a
-    // per-project editor preference, not something this command should
-    // guess at or overwrite.
+    // No editor settings are written: install.sh puts scalino-lsp on PATH and both extensions fall
+    // back to a PATH lookup (vscode-extension's findOnPath, zed-extension's worktree.which). Zed
+    // users with metals-zed also need the `file_types` override in zed-extension/README.md.
 
-  // ---------------------------------------------------------------------
-  // `scalino completions <bash|zsh|fish>` -- static, hand-written scripts
-  // (no completion-generation library on this toolchain, and the command
-  // surface is small/stable enough not to need one) covering subcommand
-  // names, every long/short option `parseRunOpts`/`main` actually accept,
-  // and the handful of options with a closed value set (`--color`,
-  // `--native-mode`, `--native-gc`, `--native-lto`, `--native-target`,
-  // `--native-target-triple` -- completed from `Sysroot.Supported`, the same
-  // list `scalino sysroot build` accepts) plus `sysroot`'s own sub-arguments.
-  // Same convention as cargo/rustup/scala-cli's own `completions` command:
-  // prints the script to stdout, for the user to source or install
-  // themselves (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
-  // ---------------------------------------------------------------------
+  // `scalino completions <bash|zsh|fish>`: hand-written static scripts covering subcommands, every
+  // option `parseRunOpts`/`main` accept, options with closed value sets (`--color`, `--native-mode`,
+  // `--native-gc`, `--native-lto`, `--native-target`, `--native-target-triple`, the last from
+  // `Sysroot.Supported`) and `sysroot`'s sub-arguments. Prints to stdout, like cargo/rustup
+  // (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
 
   private val completionSubcommands = "run compile package test setup-ide lock clean sysroot version completions"
   private val completionSysrootActions = "build list path"
@@ -4490,9 +4060,8 @@ object ScalinoCli:
     if Files.exists(buildDir) then
       deleteRecursively(buildDir)
 
-  // Boolean flags accepted before the sub-command too (`scalino -w compile`),
-  // mill/bun-style: they're hoisted to just after it. Flags that take a value
-  // aren't hoisted -- can't tell their value from the sub-command position.
+  // Boolean flags are also accepted before the sub-command (`scalino -w compile`, mill/bun-style)
+  // and hoisted after it. Value-taking flags aren't: their value looks like the sub-command.
   private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental", "--offline")
   private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock")
 
@@ -4502,9 +4071,8 @@ object ScalinoCli:
     if lead.nonEmpty && rest.nonEmpty && HoistTargets.contains(rest(0)) then rest(0) +: (lead ++ rest.drop(1))
     else args
 
-  /** Last-resort handler: an exception nothing else caught still has to say
-   *  what it was. Every step is guarded -- the runtime's own uncaught-exception
-   *  path reports only the class name when printing the exception itself throws. */
+  /** Last-resort handler for uncaught exceptions. Every step is guarded: the runtime's own path
+   *  reports only the class name when printing the exception throws. */
   def main(rawArgs: Array[String]): Unit =
     try run(rawArgs)
     catch case e: Throwable =>

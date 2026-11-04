@@ -1,27 +1,15 @@
 #!/usr/bin/env bash
-# Recompiles the real scala-library (Scala 2.13, the same version pinned by
-# scala-native's own `scalalib_native0.5_2.13` -- see nativelibs.cp) from its
-# published sources with -Yretain-trees, producing dist/lib/scalalib-retained.jar.
+# Recompiles scala-library (Scala 2.13, the version scala-native's `scalalib_native0.5_2.13`
+# pins; see nativelibs.cp) from source with -Yretain-trees into dist/lib/scalalib-retained.jar.
 #
-# Why: the published org.scala-lang:scala-library jar is scalac-compiled --
-# it has zero .tasty, ever, for any Scala version, since scalac doesn't
-# produce TASTy at all. Our own-implementation macro interpreter
-# (Interpreter.scala's resolveExternalDefTree) can only run a stdlib method's
-# *real* body if a .tasty file exists to unpickle it from; without this,
-# every List/Option/Seq/etc method a macro's own code happens to call needs
-# its own hand-written intrinsic, which doesn't scale (see docs/findings.md).
-# Recompiling the exact same source with dotc instead of scalac produces
-# ordinary TASTy (with real, complete method bodies -- -Yretain-trees only
-# matters for the *current* run's own symbols, per Symbols.scala; it's
-# irrelevant to what ends up pickled in the .tasty this step produces) that
-# `rootTreeContaining` can unpickle from cold, on any later compiler run,
-# turning almost all of that hand-written-intrinsic surface into generically
-# interpreted real library code instead.
+# Why: the published scala-library is scalac-compiled and has no .tasty. The macro interpreter
+# (Interpreter.scala's resolveExternalDefTree) can only run a stdlib method's real body if a
+# .tasty exists to unpickle; otherwise every List/Option/Seq method a macro calls needs a
+# hand-written intrinsic (docs/findings.md). Compiling with dotc produces ordinary TASTy that
+# `rootTreeContaining` can unpickle on any later run.
 #
-# scalino (cli/ScalinoCli.scala) puts dist/lib/scalalib-retained.jar first on every
-# project's compile classpath, ahead of the plain scala-library from
-# nativelibs.cp, so this benefits every project automatically -- not just
-# ones we've manually special-cased.
+# cli/ScalinoCli.scala puts this jar first on every project's compile classpath, ahead of the
+# plain scala-library from nativelibs.cp.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -31,15 +19,9 @@ source ./00-env.sh
 
 VENDOR="$ROOT/vendor/scala3"
 
-# Scala's unified 2.13/3.x versioning (3.8.x+) merged the separate
-# scala2-library-bootstrapped/scala2-library-cc source trees this script
-# used to compile FROM directly into library/src itself -- and, more to the
-# point, the PUBLISHED scala-library-<ver>.jar for those versions already
-# ships genuine per-class .tasty (confirmed: scala/collection/immutable/
-# List.tasty is really in there), which was this whole script's reason to
-# exist (see the file header). So for 3.8+, this step is both unable to
-# find its old source directory AND unnecessary -- skip it cleanly instead
-# of failing on a missing path.
+# Since 3.8.x the published scala-library jar already ships per-class .tasty and the
+# scala2-library-bootstrapped source tree is gone, so this step is unnecessary and can't find
+# its sources: skip it.
 if [[ ! -d "$VENDOR/scala2-library-bootstrapped/src" ]]; then
   echo "skipping: vendor/scala3 has no scala2-library-bootstrapped (removed as of Scala's unified 2.13/3.x versioning, 3.8.x+) -- the published scala-library jar already ships real .tasty for this SCALA_VERSION, so scalalib-retained.jar is unnecessary" >&2
   exit 0
@@ -58,17 +40,14 @@ echo "fetching scala-library $STDLIB_VERSION sources..."
 SOURCES_JAR="$(cs fetch --classifier sources "org.scala-lang:scala-library:$STDLIB_VERSION")"
 (cd "$SRC_DIR" && "$JAR" xf "$SOURCES_JAR")
 
-# These are stubs for the handful of types dotc treats as compiler
-# builtins (defined instead by vendor/scala3/library/src) -- never compile
-# them from the plain scala-library source, same exclusion
-# scala2-library-bootstrapped's own sbt build applies.
+# Stubs for types dotc treats as compiler builtins (defined by vendor/scala3/library/src);
+# never compile them from plain scala-library source.
 for stub in Any AnyVal AnyRef Nothing Null Singleton; do
   rm -f "$SRC_DIR/scala/$stub.scala"
 done
 
-# scala2-library-bootstrapped/src holds a handful of dotc-specific overrides
-# of files that otherwise come from the plain scala-library source (see its
-# own sbt settings) -- copy all of them over, preserving relative paths.
+# scala2-library-bootstrapped/src holds dotc-specific overrides of plain scala-library files;
+# copy them all, preserving relative paths.
 (cd "$VENDOR/scala2-library-bootstrapped/src" && find . -name '*.scala' -print0) |
   while IFS= read -r -d '' relpath; do
     mkdir -p "$SRC_DIR/$(dirname "$relpath")"
@@ -76,11 +55,8 @@ done
   done
 
 echo "compiling with dist/scalino-dotc (the real compiler scalino itself runs)..."
-# `-javabootclasspath`: scalino-dotc is a self-hosted build with no real JDK
-# rt.jar/module-path of its own to fall back on (unlike a plain `$JAVA -cp
-# ... dotty.tools.dotc.Main` invocation) -- without it, even
-# `Definitions#init` itself fails (`ObjectClass`/`AnyRefAlias` can't resolve
-# `java.lang.Object`). Same flag scalino itself always passes.
+# -javabootclasspath: scalino-dotc has no JDK rt.jar/module path, and without it
+# `Definitions#init` can't resolve java.lang.Object. Same flag scalino always passes.
 "$DIST/scalino-dotc" \
   -javabootclasspath "$DIST/java.base.jar" \
   -classpath "$(cat "$WORK/compiler.cp")" \
@@ -89,18 +65,10 @@ echo "compiling with dist/scalino-dotc (the real compiler scalino itself runs)..
   $(find "$SRC_DIR" -name '*.scala')
 
 echo "merging in the plain jar's Java-sourced classes (scala.runtime.* etc, never compiled above)..."
-# The scala-library *sources* jar we compiled from only has .scala files
-# (`find ... -name '*.scala'` above) -- but real scala-library also has a
-# handful of .java sources (scala.runtime.Statics, BoxesRunTime, etc,
-# runtime-support classes with no .scala equivalent at all). Skipping them
-# isn't an oversight to fix by finding more sources to feed dotc (dotc
-# can't compile .java here anyway) -- merge the plain jar's own compiled
-# classes for anything CLASSES_DIR doesn't already provide, so
-# scalalib-retained.jar is a complete, self-contained replacement and
-# never needs the plain jar alongside it on the same classpath (see
-# cli/ScalinoCli.scala's dropPlainScalaLibrary -- two jars both providing
-# scala.Option/etc turned out to make dotc's classpath resolution
-# non-deterministic, not just redundant).
+# dotc can't compile the .java sources (scala.runtime.Statics, BoxesRunTime, ...), so merge the plain
+# jar's classes for anything missing. The result must be a self-contained replacement: two jars
+# providing scala.Option make dotc's classpath resolution non-deterministic
+# (cli/ScalinoCli.scala's dropPlainScalaLibrary).
 PLAIN_DIR="$WORK/scalalib-plain-classes"
 rm -rf "$PLAIN_DIR"
 mkdir -p "$PLAIN_DIR"

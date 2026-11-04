@@ -28,24 +28,18 @@ done
 [[ -n "$out" ]] || { echo "scalino-bootstrap: -o <output> is required" >&2; exit 1; }
 [[ ${#sources[@]} -gt 0 ]] || { echo "scalino-bootstrap: no source files given" >&2; exit 1; }
 
-# The entry-point object name doubles as the mainClass scala-native links.
-# Assumes a single top-level `object Foo` with a `def main` -- same
-# convention plain scalac/dotc use for "the main class of this program".
+# The entry-point object name doubles as scala-native's mainClass. Assumes a single top-level
+# `object Foo` with a `def main`.
 main_class="$(basename "${sources[0]}" .scala)"
 
-# A persistent, project-local cache dir (scala-cli calls its equivalent
-# .scala-build) -- NOT a throwaway mktemp dir. scala-native's own
-# Build.buildCachedAwait (see src/LinkDriver.scala) already skips recompiling
-# a dependency .c file when its .o is still valid; that cache lives under
-# $work/link/native/dependencies/. A fresh tmpdir every invocation, deleted
-# on exit, was silently discarding it -- forcing every single build to
-# recompile scala-native's C runtime sources from scratch. Persisting this
-# directory is what makes that existing cache actually take effect.
+# A persistent project-local cache dir (like scala-cli's .scala-build), not a throwaway mktemp:
+# scala-native's Build.buildCachedAwait (src/LinkDriver.scala) skips recompiling dependency .c
+# files whose .o is still valid (cached under $work/link/native/dependencies/); a fresh tmpdir
+# every run discarded it and recompiled the whole C runtime.
 work="$PWD/.scalino-bootstrap-build/$main_class"
 mkdir -p "$work"
 
-# compiler.cp/nativelibs.cp/nscplugin.jar.txt hold dist-relative paths
-# (see build/06-package.sh) so dist/ stays relocatable -- resolve to absolute.
+# the manifests hold dist-relative paths (build/06-package.sh); resolve to absolute.
 resolve_cp() { echo "$DIST/${1//:/:$DIST/}"; }
 
 compile_cp="$(resolve_cp "$(cat "$DIST/compiler.cp")"):$(resolve_cp "$(cat "$DIST/nativelibs.cp")")"

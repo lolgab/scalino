@@ -34,11 +34,8 @@ class CompletionItem() {
   def getDetail(): String = _detail
   def setDetail(detail: String): Unit = _detail = detail
 
-  // Real lsp4j types `documentation` as `Either<String, MarkupContent>`; the
-  // setter here only ever takes plain `MarkupContent` (matching real
-  // presentation-compiler usage), but the getter needs the real Either
-  // shape since `PcLanguageServer.scala` (this shim's own consumer) reads
-  // it back.
+  // lsp4j types `documentation` as `Either<String, MarkupContent>`. The setter takes only
+  // `MarkupContent` (all the PC uses), but the getter keeps the Either shape PcLanguageServer reads.
   def getDocumentation(): Either[String, MarkupContent] = _documentation
   def setDocumentation(documentation: MarkupContent): Unit = _documentation = Either.forRight(documentation)
 
@@ -55,14 +52,9 @@ class CompletionItem() {
   def getInsertTextMode(): InsertTextMode = _insertTextMode
   def setInsertTextMode(insertTextMode: InsertTextMode): Unit = _insertTextMode = insertTextMode
 
-  // Real lsp4j has ONLY the Either-typed overload (confirmed via javap of the
-  // real jar -- no plain-TextEdit overload exists). presentation-compiler's
-  // own `item.setTextEdit(textEdit)` call (a plain TextEdit) actually
-  // resolves through mtags-shared's `CommonMtagsEnrichments.XtensionCompletionItemData.setTextEdit`
-  // extension method (which wraps in `Either.forLeft` before calling this),
-  // not through a plain member overload -- confirmed by real-jar compile
-  // (invocation 1) succeeding with zero errors despite the real jar having
-  // no plain overload.
+  // Like real lsp4j, only the Either-typed overload exists. The PC's `item.setTextEdit(textEdit)`
+  // resolves to mtags-shared's `XtensionCompletionItemData.setTextEdit` extension, which wraps in
+  // `Either.forLeft` before calling this.
   def getTextEdit(): Either[TextEdit, InsertReplaceEdit] = _textEdit
   def setTextEdit(textEdit: Either[TextEdit, InsertReplaceEdit]): Unit = _textEdit = textEdit
 

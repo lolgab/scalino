@@ -16,11 +16,8 @@ class SignatureInformation() {
   def getLabel(): String = _label
   def setLabel(label: String): Unit = _label = label
 
-  // Real lsp4j types `documentation` as `Either<String, MarkupContent>`; the
-  // setter here only ever takes plain `MarkupContent` (matching real
-  // presentation-compiler usage), but the getter needs the real Either
-  // shape since `PcLanguageServer.scala` (this shim's own consumer) reads
-  // it back.
+  // lsp4j types `documentation` as `Either<String, MarkupContent>`. The setter takes only
+  // `MarkupContent` (all the PC uses), but the getter keeps the Either shape PcLanguageServer reads.
   def getDocumentation(): Either[String, MarkupContent] = _documentation
   def setDocumentation(documentation: MarkupContent): Unit = _documentation = Either.forRight(documentation)
 

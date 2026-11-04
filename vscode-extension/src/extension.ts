@@ -1,17 +1,13 @@
-// VS Code extension for scalino-lsp (scalino's JVM-free Scala LSP -- see
-// /README.md and /docs/findings.md "JVM-free language server (LSP)").
-// Attaches to `.scala` files by document selector, independent of whatever
-// grammar/language contribution owns the "scala" language id -- unlike Zed
-// (see ../zed-extension/README.md), VS Code merges multiple extensions'
-// `languages` contributions for the same id instead of picking one, so
-// there's no collision to dodge if Metals is also installed. If both are
-// installed and both attach, expect duplicate diagnostics/hover -- disable
-// one for the workspace.
+// VS Code extension for scalino-lsp (scalino's JVM-free Scala LSP; see /README.md and
+// /docs/findings.md "JVM-free language server (LSP)").
+// Attaches to `.scala` files by document selector, independent of whichever extension owns the
+// "scala" language id. Unlike Zed (see ../zed-extension/README.md), VS Code merges `languages`
+// contributions for the same id, so there is no collision with Metals; if both attach, expect
+// duplicate diagnostics/hover and disable one per workspace.
 //
-// No DAP support and no auto-download of `scalino-lsp` itself, same as the
-// Zed extension: it isn't published anywhere generic, it's this repo's own
-// dist/ build output (build/08-build-scalino-lsp.sh, or a release tarball).
-// Resolved via `scalino-lsp.path` setting, falling back to a PATH lookup.
+// No DAP support and no auto-download of `scalino-lsp`, same as the Zed extension: it is this
+// repo's dist/ build output (build/08-build-scalino-lsp.sh, or a release tarball). Resolved via
+// the `scalino-lsp.path` setting, falling back to a PATH lookup.
 
 import * as cp from "child_process";
 import * as fs from "fs";

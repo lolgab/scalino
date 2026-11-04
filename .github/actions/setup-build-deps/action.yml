@@ -21,60 +21,35 @@ runs:
       shell: bash
       run: |
         sudo apt-get update -y
-        # libzstd-dev provides libzstd.a (needed alongside, for the same
-        # reason -- llvm-config's own static libs don't include it even
-        # though LLVM_ENABLE_ZSTD pulls it in) and pkg-config is how the
-        # build script locates that .a instead of accidentally linking the
-        # dynamic libzstd.so sitting right next to it. libtinfo-dev provides
-        # the libtinfo.so dev symlink that -ltinfo needs at link time --
-        # libLLVMSupport.a calls set_curterm/setupterm/tigetnum/del_curterm
-        # directly (Process::FileDescriptorHasColors), which llvm-config
-        # --system-libs doesn't report (same gap as zstd); the runner ships
-        # libtinfo6's runtime .so.6 already (bash/less need it) but not the
-        # unversioned .so symlink -l needs.
+        # libzstd-dev provides libzstd.a (llvm-config's static libs omit it although LLVM_ENABLE_ZSTD
+        # needs it) and pkg-config lets the build script find that .a instead of the neighbouring
+        # libzstd.so. libtinfo-dev provides the libtinfo.so symlink for -ltinfo: libLLVMSupport.a calls
+        # set_curterm/setupterm/tigetnum/del_curterm, which llvm-config --system-libs omits; the runner
+        # only has the runtime libtinfo.so.6.
         #
-        # Deliberately NOT the distro's own `clang`/`llvm-dev` packages
-        # (Ubuntu 24.04 ships LLVM 18): apt.llvm.org's official script gets
-        # us a current release instead, matching what the macOS step below
-        # gets via `brew install llvm` (brew always tracks latest). This
-        # stopped being cosmetic once build/04-build-scalino-linkdriver.sh
-        # started linking scalino-linkdriver's own build in --mode
-        # release-fast (see docs/findings.md) -- release-fast's more
-        # aggressive optimization passes are exactly the kind of input that
-        # trips version-specific AArch64 backend miscompilation bugs, and
-        # linux-arm64 was the only CI leg still pinned to LLVM 18 while
-        # linux-x86_64 (different backend, same old LLVM) and both macOS
-        # legs (brew's current LLVM) were not -- consistent with a
-        # linux-arm64-only, release-fast-only GC segfault that a fresh
-        # macOS-arm64 (current LLVM) build of the same commit didn't
-        # reproduce in 15/15 local runs.
+        # Not the distro's clang/llvm-dev (Ubuntu 24.04: LLVM 18): apt.llvm.org gives a current LLVM,
+        # matching macOS's `brew install llvm`. This matters since scalino-linkdriver links in
+        # release-fast (docs/findings.md): its aggressive passes can trip version-specific AArch64
+        # backend miscompiles, and linux-arm64 was the only leg on LLVM 18, consistent with a
+        # linux-arm64-only release-fast GC segfault that a current-LLVM macOS-arm64 build of the same
+        # commit didn't reproduce in 15/15 runs.
         wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
         chmod +x /tmp/llvm.sh
-        # `all` pulls in llvm-20-dev too -- that's the package carrying the
-        # per-component libLLVM*.a static archives (same role llvm-dev
-        # played for the distro package below), not just the clang/lld
-        # binaries the bare form installs.
+        # `all` also installs llvm-20-dev, which carries the per-component libLLVM*.a static archives.
         sudo /tmp/llvm.sh 20 all
         sudo apt-get install -y libzstd-dev libtinfo-dev pkg-config
-        # /usr/lib/llvm-20/bin holds unversioned clang/clang++/llvm-config
-        # symlinks (apt.llvm.org's own convention) -- put it ahead of
-        # /usr/bin so `command -v clang` below picks these up, not any
-        # distro clang.
+        # /usr/lib/llvm-20/bin has the unversioned clang/clang++/llvm-config symlinks; put it ahead of
+        # /usr/bin so `command -v clang` doesn't pick the distro clang.
         echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
 
     - name: Install llvm-config/libLLVM (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        # Xcode command line tools ship clang/clang++ already, but not
-        # llvm-config/libLLVM -- the direct LLVM-C codegen backend is on by
-        # default (build/04-build-scalino-linkdriver.sh), which statically
-        # links scalino-linkdriver itself against libLLVM (+ zstd, pulled in
-        # transitively as the llvm formula's own build dependency) so the
-        # *released* binary needs nothing LLVM-related installed at runtime
-        # -- same reasoning as the Linux step above. pkg-config (used to
-        # locate zstd's static .a instead of its dylib) ships preinstalled
-        # on GitHub's macOS runners.
+        # Xcode CLT ships clang/clang++ but not llvm-config/libLLVM. The direct LLVM-C codegen backend
+        # (build/04-build-scalino-linkdriver.sh) links scalino-linkdriver statically against libLLVM
+        # (+ zstd, a dependency of the llvm formula) so the released binary needs no LLVM at runtime.
+        # pkg-config, used to find zstd's static .a, is preinstalled on the runners.
         brew install llvm
         echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
@@ -82,10 +57,8 @@ runs:
       if: runner.os == 'Windows'
       shell: bash
       run: |
-        # windows-latest images ship LLVM under this prefix;
-        # scala-native's C toolchain on Windows is experimental/best-effort
-        # (see docs/findings.md) -- this step just makes sure clang/clang++
-        # resolve, it doesn't guarantee scala-native links successfully.
+        # windows-latest images ship LLVM under this prefix; scala-native's C toolchain on Windows is
+        # best-effort (docs/findings.md), this only makes clang/clang++ resolve.
         if ! command -v clang >/dev/null 2>&1; then
           echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
         fi

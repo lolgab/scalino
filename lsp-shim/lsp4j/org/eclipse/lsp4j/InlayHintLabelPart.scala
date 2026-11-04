@@ -14,9 +14,8 @@ class InlayHintLabelPart() {
   def getValue(): String = _value
   def setValue(value: String): Unit = _value = value
 
-  // Real lsp4j types `tooltip` as `Either<String, MarkupContent>`; no call
-  // site in this codebase needs the `MarkupContent` shape, so only the
-  // plain-`String` overload is shimmed here.
+  // lsp4j types `tooltip` as `Either<String, MarkupContent>`; nothing needs the `MarkupContent`
+  // shape, so only the `String` overload is shimmed.
   def getTooltip(): String = _tooltip
   def setTooltip(tooltip: String): Unit = _tooltip = tooltip
 

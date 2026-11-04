@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Stress-test the self-hosted scalino-lsp binary against the real, multi-file
-~/scala/ape project -- NEW coverage beyond build/lsp-trace-drive.py's small
-fixed 3-file fixture:
-  - a real multi-directory project (6 sourceDirectories, 19 src files)
-  - a cross-PACKAGE symbol (BuildingInput defined in domain/Building.scala,
-    used in db/BuildingRepo.scala via a real import) for hover/definition/
-    references, instead of same-directory same-file resolution
-  - an incremental didChange to the DEFINITION file (not the usage file),
-    followed by re-querying hover on the (unchanged) USAGE file to confirm
-    the server's cross-file model actually invalidates/reflects the edit
-    (stronger than lsp-trace-drive.py's single-file didChange+diagnostics
-    check)
+"""Stress-test the self-hosted scalino-lsp binary against the real multi-file ~/scala/ape
+project, beyond build/lsp-trace-drive.py's 3-file fixture:
+  - a multi-directory project (6 sourceDirectories, 19 src files)
+  - a cross-package symbol (BuildingInput from domain/Building.scala, used in
+    db/BuildingRepo.scala) for hover/definition/references
+  - an incremental didChange to the definition file, then hover on the unchanged usage
+    file to confirm the cross-file model reflects the edit
 
 Usage: ape-lsp-stress.py <project-dir> <command...>
 """
@@ -235,11 +230,8 @@ def main():
         ok = ok and n is not None
 
         section("re-hover(BuildingInput) in db/BuildingRepo.scala -- does the cross-file model see the edit?")
-        # The usage file itself wasn't edited -- this tests whether the
-        # interactive driver's cross-file dependency tracking actually
-        # re-elaborates BuildingRepo.scala's view of BuildingInput after its
-        # *definition* changed elsewhere, not just re-diagnosing the edited
-        # file itself (a much weaker, single-file-only notion of "incremental").
+        # Only the definition file was edited: checks that cross-file dependency tracking
+        # re-elaborates BuildingRepo.scala's view of BuildingInput, not just the edited file.
         resp, elapsed = client.request("textDocument/hover", {"textDocument": {"uri": repo_uri}, "position": {"line": use_line, "character": use_col}})
         result = show("re-hover(BuildingInput) after cross-file edit", resp, elapsed)
         ok = ok and result is not None

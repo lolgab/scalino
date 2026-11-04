@@ -1,12 +1,9 @@
 package org.eclipse.lsp4j.jsonrpc.messages
 
-// Real lsp4j 1.0.0 shape (`javap`-verified): a protected two-slot union with
-// static `forLeft`/`forRight` factories. Presentation-compiler's own source
-// never touches this type (confirmed via grep — every real call site there
-// uses Scala's own `scala.util.Either`) but the ported `mtags-interfaces`
-// module's `ReferencesRequest`/`offsetOrSymbol()` does (`PcReferencesProvider
-// .scala:28,32,37` calls `.isLeft()`/`.getLeft()`/`.getRight()` on it), so
-// this needs real left/right semantics, not just a compile-time stub.
+// Same shape as lsp4j 1.0.0: a protected two-slot union with static `forLeft`/`forRight`
+// factories. The PC itself uses `scala.util.Either`, but mtags-interfaces' `ReferencesRequest`
+// (`offsetOrSymbol()`, read by `PcReferencesProvider`) calls `.isLeft()`/`.getLeft()`/`.getRight()`,
+// so this needs real left/right semantics.
 class Either[L, R] protected (left: L, right: R) {
   def getLeft(): L = left
   def getRight(): R = right

@@ -4,10 +4,8 @@
 # with the GPG key in $APT_GPG_PRIVATE_KEY. Output goes to $1 (default:
 # ./site), ready to hand to actions/upload-pages-artifact.
 #
-# Rebuilds the whole tree from scratch every run (via `gh release download`
-# across the latest $keep_releases tags) rather than keeping incremental state, since a GitHub
-# Pages deploy is itself a full-tree replace each time -- there's nowhere
-# durable to keep a partial apt/dnf repo between runs anyway.
+# Rebuilds the whole tree every run (via `gh release download` across the latest $keep_releases
+# tags): a Pages deploy replaces the full tree, so there is no durable partial state anyway.
 #
 # Requires on PATH: gh (authenticated), gpg, dpkg-scanpackages (dpkg-dev),
 # apt-ftparchive (apt-utils), createrepo_c, gzip.
@@ -28,10 +26,8 @@ echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
 key_id="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/ { print $5; exit }')"
 gpg --export --armor "$key_id" > "$work/pubkey.asc"
 
-# rpm's own --addsign shells out to gpg directly (not via this script's
-# GNUPGHOME export) -- point it at the same key/homedir explicitly. Default
-# %__gpg is /usr/bin/gpg2, which doesn't exist on Debian/Ubuntu (only
-# /usr/bin/gpg) -- override it too.
+# rpm --addsign calls gpg directly, not via GNUPGHOME; point it at the same key/homedir. The
+# default %__gpg (/usr/bin/gpg2) doesn't exist on Debian/Ubuntu, so override it too.
 cat > "$HOME/.rpmmacros" <<EOF
 %_signature gpg
 %_gpg_name $key_id
@@ -84,10 +80,8 @@ done
 
 cp "$work/pubkey.asc" "$site/scalino-signing-key.pub.asc"
 
-# The main site (docs/, deployed by pages.yml) owns the Pages root -- a
-# GitHub Pages deploy is a full-tree replace, so this job must merge the
-# apt/dnf repo tree UNDER that site rather than emitting its own index.html,
-# or it would clobber the homepage on every release.
+# The main site (docs/, deployed by pages.yml) owns the Pages root and a deploy replaces the whole
+# tree, so merge the apt/dnf tree under it instead of emitting an index.html that would clobber the homepage.
 cp -a docs/. "$site/"
 
 cat > "$site/install.html" <<'HTML'

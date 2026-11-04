@@ -11,20 +11,14 @@ class ParameterInformation() {
     _label = Either.forLeft(label)
   }
 
-  // Real lsp4j types `label` as `Either<String, Tuple$Two<Integer, Integer>>`;
-  // the constructor here only ever takes plain `String` (matching real
-  // presentation-compiler usage), but the getter needs the real Either
-  // shape since `PcLanguageServer.scala` (this shim's own consumer) reads
-  // it back. `AnyRef` stands in for the real `Tuple$Two<Integer,Integer>`
-  // right-branch type, never actually constructed here.
+  // lsp4j types `label` as `Either<String, Tuple$Two<Integer, Integer>>`. The constructor takes
+  // only `String`, but the getter keeps the Either shape PcLanguageServer reads; `AnyRef` stands in
+  // for the never-constructed right branch.
   def getLabel(): Either[String, AnyRef] = _label
   def setLabel(label: String): Unit = _label = Either.forLeft(label)
 
-  // Real lsp4j types `documentation` as `Either<String, MarkupContent>`; the
-  // setter here only ever takes plain `MarkupContent` (matching real
-  // presentation-compiler usage), but the getter needs the real Either
-  // shape since `PcLanguageServer.scala` (this shim's own consumer) reads
-  // it back.
+  // lsp4j types `documentation` as `Either<String, MarkupContent>`. The setter takes only
+  // `MarkupContent` (all the PC uses), but the getter keeps the Either shape PcLanguageServer reads.
   def getDocumentation(): Either[String, MarkupContent] = _documentation
   def setDocumentation(documentation: MarkupContent): Unit = _documentation = Either.forRight(documentation)
 }

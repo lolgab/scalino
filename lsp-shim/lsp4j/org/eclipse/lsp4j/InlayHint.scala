@@ -3,16 +3,10 @@ package org.eclipse.lsp4j
 import java.util as ju
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 
-// Real lsp4j 1.0.0 types `label` as `Either<String, List<InlayHintLabelPart>>`
-// and `tooltip` as `Either<String, MarkupContent>`, each with 3 setter
-// overloads (Either/String/right-branch, same shape as `Diagnostic.code` and
-// `CompletionItem.textEdit`). Confirmed a real, exercised call site now:
-// `InlayHints.makeInlayHint` (mtags-shared) calls `hint.setLabel(label.asJava)`
-// with a real `java.util.List[InlayHintLabelPart]` (composite hover-linked
-// labels, e.g. inferred types built from multiple `LabelPart`s) -- an
-// earlier version of this shim assumed (wrongly) that no call site needed
-// this, because `PcLanguageServer.scala.inlayHint` wasn't wired up yet to
-// actually exercise this code path via the real linker's reachability scan.
+// lsp4j types `label` as `Either<String, List<InlayHintLabelPart>>` and `tooltip` as
+// `Either<String, MarkupContent>`, each with 3 setter overloads (Either/String/right branch, like
+// `Diagnostic.code`). `InlayHints.makeInlayHint` (mtags-shared) calls `hint.setLabel(label.asJava)`
+// with a `java.util.List[InlayHintLabelPart]` for composite labels, so the List overload is needed.
 class InlayHint() {
   private var _position: Position = null
   private var _label: Either[String, ju.List[InlayHintLabelPart]] = null

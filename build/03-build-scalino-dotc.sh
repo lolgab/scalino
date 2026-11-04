@@ -3,22 +3,12 @@
 # both compiled to NIR and linked into a real Scala Native executable --
 # self-hosted, no JVM/GraalVM native-image anywhere in the resulting binary.
 #
-# Until 2026-09-07 this was a GraalVM-native-image AOT build of the
-# published, unmodified dotty JVM bytecode. See docs/findings.md's
-# "Self-hosting" arc for the full history: why each excluded compiler
-# source file is excluded, and the many real bugs found+fixed getting here
-# (patches/scala3-0001..0013, patches/scala-native-0001..0003). That prose
-# is the design record; this script is the reproducible recipe (folds in
-# what was, until this cutover, a separate opt-in experiment at
-# build/selfhost/build-dotc.sh, now removed).
+# Until 2026-09-07 this was a GraalVM native-image build of the published dotty bytecode; see
+# docs/findings.md "Self-hosting" for the history and why each compiler source is excluded.
 #
 # Prereqs: 00b-setup-vendor.sh, 01-fetch-deps.sh, 01a-publish-scala-native.sh,
-# 02-build-java-base.sh, 02b-gen-megaphase-overrides.sh,
-# 04-build-scalino-linkdriver.sh (dotc's own link step below runs LinkDriver
-# directly on the JVM, the same way 04's own second step links LinkDriver
-# itself -- see the note above the link step for why; $DIST/scalino-linkdriver
-# is still required here, as the smoke test at the bottom links Hello.scala
-# with it).
+# 02-build-java-base.sh, 02b-gen-megaphase-overrides.sh, 04-build-scalino-linkdriver.sh (the
+# link step runs it, and the smoke test links Hello.scala with $DIST/scalino-linkdriver).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./00-env.sh
@@ -37,25 +27,15 @@ FILE_LIST="$SELFHOST_DIR/file-list.txt"
 NIR_OUT="$SELFHOST_DIR/nir-out"
 LINK_WORK="$SELFHOST_DIR/link-work"
 
-# Substitute the published javalib_native0.5_3 jar for the locally-built one
-# with patches/scala-native-0003 (UnixPath/WindowsPath#toUri missing "//"
-# authority) actually applied -- see build/01a-publish-scala-native.sh.
-# Scoped to a copy of nativelibs.cp under $SELFHOST_DIR; $WORK/nativelibs.cp
-# itself is left untouched (still what 06-package.sh vendors for user-code
-# compilation, unaffected by which jar scalino-dotc's own build used).
+# Substitute the locally-built javalib jar (patches/scala-native-0003: UnixPath/WindowsPath#toUri
+# "//" authority; see 01a) in a copy of nativelibs.cp; $WORK/nativelibs.cp stays untouched since
+# 06-package.sh vendors it for user-code compilation.
 NATIVELIBS_CP="$SELFHOST_DIR/nativelibs.cp"
 LOCAL_JAVALIB_JAR="$HOME/.ivy2/local/org.scala-native/javalib_native0.5_3/${SCALA_NATIVE_VERSION}/jars/javalib_native0.5_3.jar"
 if [[ -f "$LOCAL_JAVALIB_JAR" ]]; then
-  # -F/-x, not the old -v '/javalib_native0\.5_3-' regex: 01a-publish-scala-native.sh
-  # now rewrites $WORK/nativelibs.cp in place to already point straight at
-  # $LOCAL_JAVALIB_JAR (its filename has no "-<version>" suffix, so that old
-  # pattern no longer matches it there) -- appending it again unconditionally
-  # then listed the same jar twice, and scala-native's linker does NOT treat
-  # that as harmless: it unpacks each classpath entry into its own numbered
-  # dependencies/ dir, so the same .o files come in twice and clang fails
-  # with "duplicate symbol" for every native javalib symbol (z.c, time_nano.c,
-  # etc). Filtering the exact local path too makes this idempotent regardless
-  # of whether $WORK/nativelibs.cp already has it.
+  # -F/-x rather than the old regex: 01a rewrites $WORK/nativelibs.cp to already contain
+  # $LOCAL_JAVALIB_JAR, and listing a jar twice makes clang fail with "duplicate symbol" for every
+  # native javalib symbol (the linker unpacks each entry separately). This keeps it idempotent.
   { tr "$CP_SEP" '\n' < "$WORK/nativelibs.cp" | grep -v '/javalib_native0\.5_3-' | grep -Fxv "$LOCAL_JAVALIB_JAR"; echo "$LOCAL_JAVALIB_JAR"; } | paste -sd"$CP_SEP" - > "$NATIVELIBS_CP"
   echo "  using locally-built, patched javalib jar: $LOCAL_JAVALIB_JAR"
 else
@@ -82,18 +62,15 @@ NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
   -d "$NIR_OUT" \
   "@$FILE_LIST"
 
-# dotty.tools.dotc.config.Properties#versionNumberString reads this as a
-# classpath resource, normally bundled inside the published scala3-compiler
-# jar -- absent when compiling dotc from source. Missing it breaks
-# nscplugin's version-gated lazy-val codegen (VarHandle vs pre-3.8 CAS) --
-# see docs/findings.md "Wiring in the real backend" for the full root cause.
+# dotty.tools.dotc.config.Properties#versionNumberString reads this classpath resource, which is
+# bundled in the published compiler jar but absent when compiling from source; without it
+# nscplugin's version-gated lazy-val codegen breaks (docs/findings.md "Wiring in the real backend").
 cp "$ROOT/build/selfhost/compiler.properties" "$NIR_OUT/compiler.properties"
 
 echo "== linking (scalino-linkdriver, entry point dotty.tools.dotc.Main) =="
 source ./pgo/pgo-lib.sh
-# $DIST/scalino-linkdriver's classpath needs both the just-compiled NIR AND the
-# Scala-Native-cross-compiled stdlib the compiled code links against --
-# NIR_OUT alone has no java.lang.Object etc.
+# The classpath needs the just-compiled NIR plus the Scala-Native-cross-compiled stdlib
+# (NIR_OUT alone has no java.lang.Object etc.).
 #
 # Runs the native scalino-linkdriver (04b-fetch-scalino-linkdriver.sh: the one
 # from the latest release; 04-build-scalino-linkdriver.sh's JVM-built one also
@@ -101,14 +78,11 @@ source ./pgo/pgo-lib.sh
 # the ZipFileSystemProvider (patches/scala-native-0009) and the GC's evacuation
 # keeps its heap small enough for dotc's link.
 #
-# --mode release-size: this was the released scalino-dotc binary's actual
-# shipped build (v0.0.1 shipped scala-native's *default* Mode -- debug --
-# since no --mode flag was passed at all). The JVM run used -Xss64m because
-# release-fast's null-guard-elimination pass StackOverflowed on dotc's large,
-# heavily-branching methods (docs/findings.md); if the native linkdriver hits
-# the same, raise its stack (ulimit -s) rather than going back to the JVM.
-# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), set for this command only: linking dotc-sized programs fragments the Immix
-# heap badly (interflow's garbage); without it the link runs out of heap.
+# --mode release-size is the shipped build (v0.0.1 shipped the default debug mode). The old JVM
+# run needed -Xss64m because release-fast's null-guard-elimination pass overflowed the stack on
+# dotc's large methods (docs/findings.md); if the native linkdriver hits that, raise `ulimit -s`.
+# SCALANATIVE_EVAC_ENABLE=1 (compacting GC), for this command only: linking dotc-sized programs
+# fragments the Immix heap badly (interflow garbage) and otherwise runs out of heap.
 LINK_EXTRA=()
 dotc_link() {
   rm -rf "$LINK_WORK"
