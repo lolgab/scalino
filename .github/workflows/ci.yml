@@ -17,6 +17,7 @@ concurrency:
 #
 #   core  (00b..06: patched javalib/nativelib, scalino-linkdriver, dist/)
 #     |-- dotc  (03, 03b, 07, 04d: scalino-dotc, the scalino CLI, scalino-jslink) + smoke tests
+#     |     `-- smoke (Scala.js, escape analysis, trampoline, cross-build; one job each)
 #     `-- lsp   (08: scalino-lsp; only needs core's output)
 #           `-- finish (LSP smoke test, needs dist/scalino from dotc)
 #
@@ -27,6 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
+      smoke: ${{ steps.m.outputs.smoke }}
     steps:
       - id: m
         shell: bash
@@ -39,6 +41,11 @@ jobs:
           fi
           # Windows x86_64 CI disabled -- see docs/findings.md.
           echo "matrix={\"include\":[$m]}" >> "$GITHUB_OUTPUT"
+          # One smoke job per (target, test); the cross-build runs on linux-x86_64 only.
+          smoke="$(echo "{\"include\":[$m]}" | jq -c '{include: [.include[] as $e
+            | ($e + {test: "js"}), ($e + {test: "escape"}), ($e + {test: "trampoline"}),
+              (if $e.target == "linux-x86_64" then $e + {test: "cross"} else empty end)]}')"
+          echo "smoke=$smoke" >> "$GITHUB_OUTPUT"
 
   core:
     name: core (${{ matrix.target }})
@@ -110,6 +117,9 @@ jobs:
       # Link with LinkDriver on a JVM (build/link-lib.sh): the native linkdriver
       # needs ~25 min and several GB more per link.
       SCALINO_JVM_LINK: '1'
+      # build/00-env.sh defaults linux-x86_64 to thin LTO; CI only checks the
+      # build works, so skip it (links stay in debug mode, release.yml opts in).
+      SCALINO_LINK_LTO: none
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -166,6 +176,9 @@ jobs:
       # Link with LinkDriver on a JVM (build/link-lib.sh): the native linkdriver
       # needs ~25 min and several GB more per link.
       SCALINO_JVM_LINK: '1'
+      # build/00-env.sh defaults linux-x86_64 to thin LTO; CI only checks the
+      # build works, so skip it (links stay in debug mode, release.yml opts in).
+      SCALINO_LINK_LTO: none
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -218,13 +231,6 @@ jobs:
           echo "$out"
           [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
 
-      - name: Smoke test -- Scala.js
-        # No JVM anywhere: dotc -scalajs, scalino-jslink, node. Program arguments, optimized ES module
-        # packaging, Scala.js dependencies, `scalino test` on node, `run -w` and the client/server
-        # example. See tests/js/run.sh.
-        shell: bash
-        run: ./tests/js/run.sh dist/scalino
-
       - name: Smoke test -- libraries built with Scala Native 0.5.12
         # snunit 0.13.0 from Maven Central references posixlib externs by their 0.5.12 link names.
         # See tests/native-compat/run.sh.
@@ -243,34 +249,6 @@ jobs:
         shell: bash
         run: ./dist/scalino run examples/interpreter-regressions/Test.scala examples/interpreter-regressions/Foo.scala
 
-      - name: Smoke test -- stack-allocated objects (escape analysis)
-        # Every release mode stack-allocates objects the escape analysis
-        # proves non-escaping. SCALANATIVE_STACK_POISON overwrites a frame's
-        # stack objects when it is left, so a wrong analysis crashes
-        # deterministically instead of reading dead-but-intact stack memory.
-        shell: bash
-        run: |
-          for mode in release-fast release-full; do
-            ./dist/scalino clean   # earlier steps leave other entry points in .scalino-build
-            out="$(SCALANATIVE_STACK_POISON=1 ./dist/scalino run examples/escape-analysis/Main.scala --main-class Main --native-mode "$mode")"
-            echo "$mode: $out"
-            [[ "$out" == *"sum=1412"* ]] || { echo "unexpected output"; exit 1; }
-          done
-
-      - name: Smoke test -- GC safepoint trampoline (patch 0069)
-        # A thread stopped at a GC yield point must resume with every register,
-        # the flags and the x86_64 red zone intact. The unit test checks the
-        # trampoline directly (Linux x86_64 only); the example checks it end to
-        # end: leaf loops that spill into the red zone while another thread
-        # forces GCs.
-        shell: bash
-        run: |
-          tests/safepoint-trampoline/run.sh
-          ./dist/scalino clean
-          # tee: show the program's output even when it fails (a bare $(...) hides it)
-          ./dist/scalino run examples/safepoint-trampoline/Main.scala --main-class Main --native-mode release-fast | tee safepoint-trampoline.out
-          grep -q "safepoint-trampoline: ok" safepoint-trampoline.out || { echo "unexpected output"; exit 1; }
-
       - name: Smoke test -- dist/ is relocatable (flat, like a release tarball)
         shell: bash
         run: |
@@ -285,19 +263,83 @@ jobs:
           cp examples/Hello.scala "$workdir/Hello.scala"
           ( cd "$workdir" && "$pkg/scalino" run Hello.scala )
 
+  # The heavy smoke tests run on their own runners, in parallel, from the dist
+  # artifact the dotc job uploads (they were 10-20 min of that job's tail).
+  smoke:
+    name: smoke ${{ matrix.test }} (${{ matrix.target }})
+    needs: [plan, dotc]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.smoke) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ runner.temp }}
+
+      - name: Unpack dist
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C dist -xzf "$RUNNER_TEMP/dist.tgz"
+
+      - name: Smoke test -- Scala.js
+        if: matrix.test == 'js'
+        # No JVM anywhere: dotc -scalajs, scalino-jslink, node. Program arguments, optimized ES module
+        # packaging, Scala.js dependencies, `scalino test` on node, `run -w` and the client/server
+        # example. See tests/js/run.sh.
+        shell: bash
+        run: ./tests/js/run.sh dist/scalino
+
+      - name: Smoke test -- stack-allocated objects (escape analysis)
+        if: matrix.test == 'escape'
+        # Every release mode stack-allocates objects the escape analysis
+        # proves non-escaping. SCALANATIVE_STACK_POISON overwrites a frame's
+        # stack objects when it is left, so a wrong analysis crashes
+        # deterministically instead of reading dead-but-intact stack memory.
+        shell: bash
+        run: |
+          for mode in release-fast release-full; do
+            ./dist/scalino clean   # earlier steps leave other entry points in .scalino-build
+            out="$(SCALANATIVE_STACK_POISON=1 ./dist/scalino run examples/escape-analysis/Main.scala --main-class Main --native-mode "$mode")"
+            echo "$mode: $out"
+            [[ "$out" == *"sum=1412"* ]] || { echo "unexpected output"; exit 1; }
+          done
+
+      - name: Smoke test -- GC safepoint trampoline (patch 0069)
+        if: matrix.test == 'trampoline'
+        # A thread stopped at a GC yield point must resume with every register,
+        # the flags and the x86_64 red zone intact. The unit test checks the
+        # trampoline directly (Linux x86_64 only); the example checks it end to
+        # end: leaf loops that spill into the red zone while another thread
+        # forces GCs.
+        shell: bash
+        run: |
+          tests/safepoint-trampoline/run.sh
+          ./dist/scalino clean
+          # tee: show the program's output even when it fails (a bare $(...) hides it)
+          ./dist/scalino run examples/safepoint-trampoline/Main.scala --main-class Main --native-mode release-fast | tee safepoint-trampoline.out
+          grep -q "safepoint-trampoline: ok" safepoint-trampoline.out || { echo "unexpected output"; exit 1; }
+
       # Same flow as the scalino-example release workflow: one Linux host
       # cross-builds an app for every supported target, using the scalino
       # just built from this commit (so cross-compilation is tested before a
       # release, not by it).
       - name: Cache cross-compilation sysroots
-        if: matrix.target == 'linux-x86_64'
+        if: matrix.test == 'cross'
         uses: actions/cache@v4
         with:
           path: ~/.cache/scalino/sysroots
           key: scalino-sysroots-${{ hashFiles('versions.env', 'cli/SysrootBuild.scala') }}
 
       - name: Cross-build -- every target from Linux
-        if: matrix.target == 'linux-x86_64'
+        if: matrix.test == 'cross'
         shell: bash
         run: |
           triples=(
