@@ -1,5 +1,5 @@
 diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
-index 1ffdfa98..d0d9b7ed 100644
+index 1ffdfa98e..d0d9b7ed4 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
 @@ -21,12 +21,17 @@ object ClassLoader {
@@ -32,7 +32,7 @@ index 1ffdfa98..d0d9b7ed 100644
      private val scopes = {
        val out =
 diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
-index 98b63367..243e6d23 100644
+index 98b63367c..243e6d235 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
 @@ -28,54 +28,129 @@ sealed trait ClassPath {
@@ -202,7 +202,7 @@ index 98b63367..243e6d23 100644
        serviceProviders.map {
          case (name, path) =>
 diff --git a/tools/src/main/scala/scala/scalanative/linker/Infos.scala b/tools/src/main/scala/scala/scalanative/linker/Infos.scala
-index 8af346d8..a1220013 100644
+index 8af346d89..a12200139 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/Infos.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/Infos.scala
 @@ -15,7 +15,28 @@ sealed abstract class ScopeInfo extends Info {
@@ -277,7 +277,7 @@ index 8af346d8..a1220013 100644
        val foundServiceProviders: FoundServiceProviders
    ) extends ReachabilityAnalysis {
 diff --git a/tools/src/main/scala/scala/scalanative/linker/Link.scala b/tools/src/main/scala/scala/scalanative/linker/Link.scala
-index e10d3a6c..547f8982 100644
+index e10d3a6cc..547f89825 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/Link.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/Link.scala
 @@ -5,17 +5,38 @@ import scalanative.util.Scope
@@ -325,7 +325,7 @@ index e10d3a6c..547f8982 100644
      Reach(config, entries, ClassLoader.fromMemory(defns))
  
 diff --git a/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala b/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
-index 8bfe217d..0bbb4bc8 100644
+index 8bfe217dd..0bbb4bc89 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/LinktimeValueResolver.scala
 @@ -24,6 +24,8 @@ private[linker] trait LinktimeValueResolver { self: Reach =>
@@ -338,7 +338,7 @@ index 8bfe217d..0bbb4bc8 100644
          conf.gc == GC.Immix ||
          conf.gc == GC.Commix ||
 diff --git a/tools/src/main/scala/scala/scalanative/linker/Reach.scala b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
-index 23a07026..f6bc42fc 100644
+index be04914bc..e7a090af5 100644
 --- a/tools/src/main/scala/scala/scalanative/linker/Reach.scala
 +++ b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
 @@ -8,14 +8,23 @@ import scala.collection.mutable
@@ -608,7 +608,7 @@ index 23a07026..f6bc42fc 100644
    def reachEntry(
        name: nir.Global
    )(implicit srcPosition: nir.SourcePosition): Unit = {
-@@ -340,7 +523,17 @@ private[linker] class Reach(
+@@ -341,7 +524,17 @@ private[linker] class Reach(
        case info: MemberInfo =>
          info.owner match {
            case owner: ScopeInfo =>
@@ -627,7 +627,7 @@ index 23a07026..f6bc42fc 100644
            case _ =>
              ()
          }
-@@ -1169,15 +1362,169 @@ private[linker] class Reach(
+@@ -1170,15 +1363,169 @@ private[linker] class Reach(
      )
  
    lazy val injects: Seq[nir.Defn] = UnsupportedFeatureExtractor.injects
@@ -799,7 +799,7 @@ index 23a07026..f6bc42fc 100644
    ): ReachabilityAnalysis = {
      val reachability = new Reach(config, entries, loader)
 diff --git a/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala b/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
-index ecd24ca0..ffffe1cc 100644
+index ecd24ca03..ffffe1ccb 100644
 --- a/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
 +++ b/tools/src/test/scala/scala/scalanative/linker/MinimalRequiredSymbolsTest.scala
 @@ -92,7 +92,7 @@ class MinimalRequiredSymbolsTest extends LinkerSpec {

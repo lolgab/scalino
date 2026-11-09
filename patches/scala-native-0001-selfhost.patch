@@ -1,5 +1,5 @@
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala
-index 86664bcc..69174a06 100644
+index 86664bcc3..69174a065 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/GenNIR.scala
 @@ -13,7 +13,11 @@ class GenNIR(settings: GenNIR.Settings) extends PluginPhase {
@@ -16,7 +16,7 @@ index 86664bcc..69174a06 100644
    override def run(using Context): Unit = {
      NirCodeGen(settings).run()
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
-index 8bea16ff..c7bfd433 100644
+index 8bea16fff..c7bfd4339 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
 @@ -123,8 +123,15 @@ class NirCodeGen(val settings: GenNIR.Settings)(using ctx: Context)
@@ -37,7 +37,7 @@ index 8bea16ff..c7bfd433 100644
        val generatedCaseInsensitiveNames =
          generatedDefns.collect {
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
-index 1e15d4fd..813a85b0 100644
+index 773dc2da4..d45b175e0 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
 @@ -3,6 +3,7 @@ package nscplugin
@@ -49,7 +49,7 @@ index 1e15d4fd..813a85b0 100644
  import dotty.tools.dotc.util.Property
  import dotty.tools.dotc.util.Spans.*
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala
-index 074d41eb..884d22c4 100644
+index 074d41eb6..884d22c4a 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenName.scala
 @@ -1,6 +1,7 @@
@@ -61,7 +61,7 @@ index 074d41eb..884d22c4 100644
  import dotty.tools.dotc.core
  import scala.language.implicitConversions
 diff --git a/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala b/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala
-index 27118cde..73176eed 100644
+index 27118cde6..73176eed4 100644
 --- a/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala
 +++ b/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala
 @@ -10,7 +10,8 @@ import dotty.tools.io.AbstractFile
@@ -75,7 +75,7 @@ index 27118cde..73176eed 100644
    type ScalaPrimitives = dotty.tools.backend.ScalaPrimitives
  
 diff --git a/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala b/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala
-index dccebc0d..f79a4215 100644
+index dccebc0de..f79a42159 100644
 --- a/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala
 +++ b/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala
 @@ -14,7 +14,8 @@ import scala.annotation.unused

@@ -1,5 +1,5 @@
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c
-index 4317dc82..8540efee 100644
+index 4317dc82b..8540efee3 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.c
 @@ -83,6 +83,25 @@ word_t *memoryMapPrealloc(size_t memorySize, size_t doPrealloc) {
@@ -29,7 +29,7 @@ index 4317dc82..8540efee 100644
  #ifdef _WIN32
      return VirtualAlloc(ref, memorySize, MEM_COMMIT, PAGE_READWRITE) != NULL;
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h
-index 4f661a24..ca0b2747 100644
+index 4f661a24d..ca0b2747b 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/MemoryMap.h
 @@ -7,6 +7,7 @@
@@ -41,14 +41,15 @@ index 4f661a24..ca0b2747 100644
  word_t *memoryMapPrealloc(size_t memorySize, size_t doPrealloc);
  
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
-index c542bf98..e8548d67 100644
+index e0b834af8..e8548d677 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-aarch64.S
-@@ -1,15 +1,22 @@
+@@ -1,28 +1,22 @@
  /* clang-format off */
  /*
   * POSIX aarch64: same role as SafepointPollTrampoline-x86_64.S.
-- * Saves Q0–Q7 and X0–X30, calls run_yield + load_resume_pc, br to resume.
+- * Saves Q0-Q31, X0-X30, NZCV and FPSR, calls run_yield + load_resume_pc, br
+- * to resume via x16 (clobbered by generated polls).
 + * Runs Synchronizer_yield, then `brk`s; the SIGTRAP handler in
 + * SafepointPollTrampoline.c restores the full interrupted context via sigreturn.
 + *
@@ -63,40 +64,69 @@ index c542bf98..e8548d67 100644
      defined(SCALANATIVE_GC_USE_YIELDPOINT_TRAPS) && !defined(_WIN32) &&         \
      defined(__aarch64__) && (defined(__linux__) || defined(__APPLE__))
  
--/* q0–q7 caller-saved (128 B) + x0–x30 + resume + pad */
--#define SFPT_FRAME 384
+-/* x0-x30 (248 B), nzcv, fpsr, resume pc + pad, q0-q31 (512 B) */
+-#define SFPT_NZCV 248
+-#define SFPT_FPSR 256
+-#define SFPT_RESUME 272
+-#define SFPT_Q 288
+-#define SFPT_FRAME 800
+-
+-#if defined(__APPLE__)
+-/* Darwin lets leaf functions use 128 bytes below sp; prepare_redirect skips
+- * them. Keep in sync with SN_RED_ZONE in SafepointPollTrampoline.c */
+-#define SFPT_RED_ZONE 128
+-#else
+-#define SFPT_RED_ZONE 0
+-#endif
 +/* q0–q7 caller-saved (128 B) + x0–x30 (248 B) + resume + nzcv, 16 B aligned */
 +#define SFPT_FRAME 400
  
  .text
  .balign 16
-@@ -28,59 +35,20 @@ _scalanative_gc_safepoint_poll_trampoline:
+@@ -41,93 +35,20 @@ _scalanative_gc_safepoint_poll_trampoline:
  .type scalanative_gc_safepoint_poll_trampoline, @function
  scalanative_gc_safepoint_poll_trampoline:
  #endif
 -    sub sp, sp, #SFPT_FRAME
 -
--    stp q0, q1, [sp, #0]
--    stp q2, q3, [sp, #32]
--    stp q4, q5, [sp, #64]
--    stp q6, q7, [sp, #96]
+-    stp x0, x1, [sp, #0]
+-    stp x2, x3, [sp, #16]
+-    stp x4, x5, [sp, #32]
+-    stp x6, x7, [sp, #48]
+-    stp x8, x9, [sp, #64]
+-    stp x10, x11, [sp, #80]
+-    stp x12, x13, [sp, #96]
+-    stp x14, x15, [sp, #112]
+-    stp x16, x17, [sp, #128]
+-    stp x18, x19, [sp, #144]
+-    stp x20, x21, [sp, #160]
+-    stp x22, x23, [sp, #176]
+-    stp x24, x25, [sp, #192]
+-    stp x26, x27, [sp, #208]
+-    stp x28, x29, [sp, #224]
+-    str x30, [sp, #240]
 -
--    stp x0, x1, [sp, #128]
--    stp x2, x3, [sp, #144]
--    stp x4, x5, [sp, #160]
--    stp x6, x7, [sp, #176]
--    stp x8, x9, [sp, #192]
--    stp x10, x11, [sp, #208]
--    stp x12, x13, [sp, #224]
--    stp x14, x15, [sp, #240]
--    stp x16, x17, [sp, #256]
--    stp x18, x19, [sp, #272]
--    stp x20, x21, [sp, #288]
--    stp x22, x23, [sp, #304]
--    stp x24, x25, [sp, #320]
--    stp x26, x27, [sp, #336]
--    stp x28, x29, [sp, #352]
--    str x30, [sp, #368]
+-    mrs x0, nzcv
+-    str x0, [sp, #SFPT_NZCV]
+-    mrs x0, fpsr
+-    str x0, [sp, #SFPT_FPSR]
+-
+-    stp q0, q1, [sp, #(SFPT_Q + 0)]
+-    stp q2, q3, [sp, #(SFPT_Q + 32)]
+-    stp q4, q5, [sp, #(SFPT_Q + 64)]
+-    stp q6, q7, [sp, #(SFPT_Q + 96)]
+-    stp q8, q9, [sp, #(SFPT_Q + 128)]
+-    stp q10, q11, [sp, #(SFPT_Q + 160)]
+-    stp q12, q13, [sp, #(SFPT_Q + 192)]
+-    stp q14, q15, [sp, #(SFPT_Q + 224)]
+-    stp q16, q17, [sp, #(SFPT_Q + 256)]
+-    stp q18, q19, [sp, #(SFPT_Q + 288)]
+-    stp q20, q21, [sp, #(SFPT_Q + 320)]
+-    stp q22, q23, [sp, #(SFPT_Q + 352)]
+-    stp q24, q25, [sp, #(SFPT_Q + 384)]
+-    stp q26, q27, [sp, #(SFPT_Q + 416)]
+-    stp q28, q29, [sp, #(SFPT_Q + 448)]
+-    stp q30, q31, [sp, #(SFPT_Q + 480)]
 -
 +    /* sp points at the machine context copy made by prepare_redirect, below
 +     * the red zone, 16-byte aligned. Every register may be clobbered here: the
@@ -105,32 +135,49 @@ index c542bf98..e8548d67 100644
 +     * conservative stack scan while the thread is stopped. */
      bl RUN_YIELD
 -    bl LOAD_RESUME
--    str x0, [sp, #376]
+-    str x0, [sp, #SFPT_RESUME]
 -
--    ldr x30, [sp, #368]
--    ldp x28, x29, [sp, #352]
--    ldp x26, x27, [sp, #336]
--    ldp x24, x25, [sp, #320]
--    ldp x22, x23, [sp, #304]
--    ldp x20, x21, [sp, #288]
--    ldp x18, x19, [sp, #272]
--    ldp x16, x17, [sp, #256]
--    ldp x14, x15, [sp, #240]
--    ldp x12, x13, [sp, #224]
--    ldp x10, x11, [sp, #208]
--    ldp x8, x9, [sp, #192]
--    ldp x6, x7, [sp, #176]
--    ldp x4, x5, [sp, #160]
--    ldp x2, x3, [sp, #144]
--    ldp x0, x1, [sp, #128]
+-    ldp q30, q31, [sp, #(SFPT_Q + 480)]
+-    ldp q28, q29, [sp, #(SFPT_Q + 448)]
+-    ldp q26, q27, [sp, #(SFPT_Q + 416)]
+-    ldp q24, q25, [sp, #(SFPT_Q + 384)]
+-    ldp q22, q23, [sp, #(SFPT_Q + 352)]
+-    ldp q20, q21, [sp, #(SFPT_Q + 320)]
+-    ldp q18, q19, [sp, #(SFPT_Q + 288)]
+-    ldp q16, q17, [sp, #(SFPT_Q + 256)]
+-    ldp q14, q15, [sp, #(SFPT_Q + 224)]
+-    ldp q12, q13, [sp, #(SFPT_Q + 192)]
+-    ldp q10, q11, [sp, #(SFPT_Q + 160)]
+-    ldp q8, q9, [sp, #(SFPT_Q + 128)]
+-    ldp q6, q7, [sp, #(SFPT_Q + 96)]
+-    ldp q4, q5, [sp, #(SFPT_Q + 64)]
+-    ldp q2, q3, [sp, #(SFPT_Q + 32)]
+-    ldp q0, q1, [sp, #(SFPT_Q + 0)]
 -
--    ldp q6, q7, [sp, #96]
--    ldp q4, q5, [sp, #64]
--    ldp q2, q3, [sp, #32]
--    ldp q0, q1, [sp, #0]
+-    ldr x0, [sp, #SFPT_FPSR]
+-    msr fpsr, x0
+-    ldr x0, [sp, #SFPT_NZCV]
+-    msr nzcv, x0
 -
--    ldr x16, [sp, #376]
--    add sp, sp, #SFPT_FRAME
+-    ldr x30, [sp, #240]
+-    ldp x28, x29, [sp, #224]
+-    ldp x26, x27, [sp, #208]
+-    ldp x24, x25, [sp, #192]
+-    ldp x22, x23, [sp, #176]
+-    ldp x20, x21, [sp, #160]
+-    ldp x18, x19, [sp, #144]
+-    ldp x16, x17, [sp, #128]
+-    ldp x14, x15, [sp, #112]
+-    ldp x12, x13, [sp, #96]
+-    ldp x10, x11, [sp, #80]
+-    ldp x8, x9, [sp, #64]
+-    ldp x6, x7, [sp, #48]
+-    ldp x4, x5, [sp, #32]
+-    ldp x2, x3, [sp, #16]
+-    ldp x0, x1, [sp, #0]
+-
+-    ldr x16, [sp, #SFPT_RESUME]
+-    add sp, sp, #(SFPT_FRAME + SFPT_RED_ZONE)
 -    br x16
 +#if defined(__APPLE__)
 +.globl _scalanative_gc_safepoint_poll_resume_brk
@@ -144,10 +191,23 @@ index c542bf98..e8548d67 100644
  #else
  .text
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
-index a6f685cb..c3f6afd1 100644
+index 70cfd0a50..c3f6afd1f 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
-@@ -93,6 +93,69 @@ void scalanative_gc_safepoint_poll_trampoline(void);
+@@ -81,12 +81,6 @@ void scalanative_gc_safepoint_poll_trampoline(void);
+ #define SN_UC_GET_PC(uc) ((uintptr_t)(uc)->uc_mcontext->__ss.__pc)
+ #define SN_UC_SET_PC(uc, addr)                                                 \
+     ((uc)->uc_mcontext->__ss.__pc = (__uint64_t)(uintptr_t)(addr))
+-#define SN_UC_GET_SP(uc) ((uintptr_t)(uc)->uc_mcontext->__ss.__sp)
+-#define SN_UC_SET_SP(uc, sp)                                                   \
+-    ((uc)->uc_mcontext->__ss.__sp = (__uint64_t)(uintptr_t)(sp))
+-/* Darwin arm64 lets leaf functions use 128 bytes below sp. Keep in sync with
+- * SFPT_RED_ZONE in SafepointPollTrampoline-aarch64.S */
+-#define SN_RED_ZONE 128
+ #elif defined(__linux__)
+ #define SN_UC_GET_PC(uc) ((uintptr_t)(uc)->uc_mcontext.pc)
+ #define SN_UC_SET_PC(uc, addr)                                                 \
+@@ -99,6 +93,69 @@ void scalanative_gc_safepoint_poll_trampoline(void);
  #define SN_UC_UNSUPPORTED 1
  #endif
  
@@ -217,7 +277,7 @@ index a6f685cb..c3f6afd1 100644
  bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
  #ifndef SN_UC_UNSUPPORTED
      MutatorThread *self = (MutatorThread *)mutatorThread;
-@@ -101,7 +164,26 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
+@@ -107,12 +164,29 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
      ucontext_t *uc = (ucontext_t *)uap;
      uintptr_t pc = SN_UC_GET_PC(uc);
      self->safepointResumePc = pc;
@@ -245,8 +305,13 @@ index a6f685cb..c3f6afd1 100644
      uintptr_t sp = SN_UC_GET_SP(uc) - 128 - sizeof(uintptr_t);
      *(uintptr_t *)sp = pc;
      SN_UC_SET_SP(uc, sp);
+-#elif defined(__aarch64__) && defined(SN_RED_ZONE)
+-    SN_UC_SET_SP(uc, SN_UC_GET_SP(uc) - SN_RED_ZONE);
+ #endif
+     SN_UC_SET_PC(uc, (void *)scalanative_gc_safepoint_poll_trampoline);
+     return true;
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h b/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
-index 2ebaa1dd..74de4514 100644
+index 2ebaa1dd1..74de4514b 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/ScalaNativeGC.h
 @@ -32,6 +32,9 @@ void *scalanative_GC_alloc_large(Rtti *info, size_t size);
@@ -275,7 +340,7 @@ index 2ebaa1dd..74de4514 100644
  
  void scalanative_GC_add_roots(void *addr_low, void *addr_high);
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c b/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c
-index 73e70c61..41fb38c3 100644
+index 73e70c61b..41fb38c3c 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.c
 @@ -13,6 +13,7 @@
@@ -568,7 +633,7 @@ index 73e70c61..41fb38c3 100644
  
  #endif
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.h b/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.h
-index e09b341b..62d748f6 100644
+index e09b341b2..62d748f6d 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.h
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/YieldPointTrap.h
 @@ -1,6 +1,8 @@
@@ -595,7 +660,7 @@ index e09b341b..62d748f6 100644
  
  #endif
 diff --git a/nativelib/src/main/resources/scala-native/module_load.c b/nativelib/src/main/resources/scala-native/module_load.c
-index 3321dc8e..65c10b03 100644
+index 3321dc8e1..65c10b03a 100644
 --- a/nativelib/src/main/resources/scala-native/module_load.c
 +++ b/nativelib/src/main/resources/scala-native/module_load.c
 @@ -13,6 +13,7 @@
@@ -631,7 +696,7 @@ index 3321dc8e..65c10b03 100644
      else
          return __scalanative_waitForModuleInitialization(slot, classInfo);
 diff --git a/nativelib/src/main/resources/scala-native/nativeThreadTLS.c b/nativelib/src/main/resources/scala-native/nativeThreadTLS.c
-index 2fb8a799..000f13da 100644
+index 2fb8a7992..000f13da8 100644
 --- a/nativelib/src/main/resources/scala-native/nativeThreadTLS.c
 +++ b/nativelib/src/main/resources/scala-native/nativeThreadTLS.c
 @@ -1,3 +1,7 @@
@@ -644,7 +709,7 @@ index 2fb8a799..000f13da 100644
  #include <windows.h>
 diff --git a/nativelib/src/main/resources/scala-native/rtti_table.c b/nativelib/src/main/resources/scala-native/rtti_table.c
 new file mode 100644
-index 00000000..08e6bc47
+index 000000000..08e6bc47f
 --- /dev/null
 +++ b/nativelib/src/main/resources/scala-native/rtti_table.c
 @@ -0,0 +1,7 @@
@@ -657,7 +722,7 @@ index 00000000..08e6bc47
 +#endif
 diff --git a/nativelib/src/main/resources/scala-native/thread_slots.c b/nativelib/src/main/resources/scala-native/thread_slots.c
 new file mode 100644
-index 00000000..a7334b47
+index 000000000..a7334b47e
 --- /dev/null
 +++ b/nativelib/src/main/resources/scala-native/thread_slots.c
 @@ -0,0 +1,45 @@
@@ -707,7 +772,7 @@ index 00000000..a7334b47
 +        atomic_store_explicit(&slots[slot], 0, memory_order_release);
 +}
 diff --git a/nativelib/src/main/resources/scala-native/zone/Zone.c b/nativelib/src/main/resources/scala-native/zone/Zone.c
-index 31fa0cf9..d5fbf4a9 100644
+index 31fa0cf9f..d5fbf4a9e 100644
 --- a/nativelib/src/main/resources/scala-native/zone/Zone.c
 +++ b/nativelib/src/main/resources/scala-native/zone/Zone.c
 @@ -7,6 +7,7 @@

@@ -45,7 +45,6 @@ Check each patched area against upstream before keeping it. Upstream has already
 
 The link name of an extern (`@name`) is part of its NIR global, so renaming one that already exists in a
 release breaks every library compiled against that release: "Unknown extern symbol
-scala.scalanative.posix.sys.socket$.socket". Upstream #5123 did this for `socket`, `nanosleep`,
-`clock_gettime`, `sigaltstack` and `setlocale`; `patches/scala-native-0013-posixlib-binary-compat.patch`
-reverts those names. When bumping `SCALA_NATIVE_REF`, diff added `@name` lines on pre-existing externs
-(`git diff <last release> <new ref> -- '*.scala' | grep '^+ *@name'`) and run `tests/native-compat/run.sh`.
+scala.scalanative.posix.sys.socket$.socket". Upstream keeps such renames linkable with `externRedirect`
+(#5190) and checks the NIR externs against the previous releases in its build (#5191), so scalino carries no
+patch for it. After bumping `SCALA_NATIVE_REF`, run `tests/native-compat/run.sh`.

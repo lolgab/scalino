@@ -1,5 +1,5 @@
 diff --git a/javalib/src/main/scala/java/lang/Boolean.scala b/javalib/src/main/scala/java/lang/Boolean.scala
-index d4bc1000..84e654c1 100644
+index d4bc1000c..84e654c17 100644
 --- a/javalib/src/main/scala/java/lang/Boolean.scala
 +++ b/javalib/src/main/scala/java/lang/Boolean.scala
 @@ -1,11 +1,29 @@
@@ -57,7 +57,7 @@ index d4bc1000..84e654c1 100644
    @inline def compare(x: scala.Boolean, y: scala.Boolean): scala.Int =
      if (x == y) 0 else if (x) 1 else -1
 diff --git a/javalib/src/main/scala/java/lang/Byte.scala b/javalib/src/main/scala/java/lang/Byte.scala
-index 2db7340e..d361f40b 100644
+index 2db7340e8..d361f40b5 100644
 --- a/javalib/src/main/scala/java/lang/Byte.scala
 +++ b/javalib/src/main/scala/java/lang/Byte.scala
 @@ -3,14 +3,24 @@ package java.lang
@@ -132,7 +132,7 @@ index 2db7340e..d361f40b 100644
    }
  
 diff --git a/javalib/src/main/scala/java/lang/Character.scala b/javalib/src/main/scala/java/lang/Character.scala
-index 88f142c7..213e6bac 100644
+index 88f142c79..213e6bac6 100644
 --- a/javalib/src/main/scala/java/lang/Character.scala
 +++ b/javalib/src/main/scala/java/lang/Character.scala
 @@ -4,21 +4,32 @@ import java.lang.constant.Constable
@@ -209,7 +209,7 @@ index 88f142c7..213e6bac 100644
    }
  
 diff --git a/javalib/src/main/scala/java/lang/Float.scala b/javalib/src/main/scala/java/lang/Float.scala
-index 27536564..0ca833f1 100644
+index 275365648..0ca833f10 100644
 --- a/javalib/src/main/scala/java/lang/Float.scala
 +++ b/javalib/src/main/scala/java/lang/Float.scala
 @@ -8,7 +8,7 @@ import scalanative.libc
@@ -256,7 +256,7 @@ index 27536564..0ca833f1 100644
    @inline override def hashCode(): Int =
      Float.hashCode(_value)
 diff --git a/javalib/src/main/scala/java/lang/Integer.scala b/javalib/src/main/scala/java/lang/Integer.scala
-index e13616e1..267f45c6 100644
+index e13616e11..267f45c62 100644
 --- a/javalib/src/main/scala/java/lang/Integer.scala
 +++ b/javalib/src/main/scala/java/lang/Integer.scala
 @@ -5,8 +5,9 @@ import java.{util => ju}
@@ -339,7 +339,7 @@ index e13616e1..267f45c6 100644
    }
  
 diff --git a/javalib/src/main/scala/java/lang/Short.scala b/javalib/src/main/scala/java/lang/Short.scala
-index 92c83ed6..3c29720e 100644
+index 92c83ed6d..3c29720ef 100644
 --- a/javalib/src/main/scala/java/lang/Short.scala
 +++ b/javalib/src/main/scala/java/lang/Short.scala
 @@ -4,14 +4,24 @@ import java.lang.constant.Constable
@@ -421,7 +421,7 @@ index 92c83ed6..3c29720e 100644
    }
  
 diff --git a/javalib/src/main/scala/java/lang/System.scala b/javalib/src/main/scala/java/lang/System.scala
-index 5b85c58d..81ae6fef 100644
+index 5b85c58d1..81ae6fef1 100644
 --- a/javalib/src/main/scala/java/lang/System.scala
 +++ b/javalib/src/main/scala/java/lang/System.scala
 @@ -39,8 +39,11 @@ object System {
@@ -439,10 +439,10 @@ index 5b85c58d..81ae6fef 100644
    def lineSeparator(): String = {
      if (isWindows) "\r\n"
 diff --git a/javalib/src/main/scala/java/lang/impl/PosixThread.scala b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
-index 7d6428ca..95020847 100644
+index bff34cfaa..ef0d94892 100644
 --- a/javalib/src/main/scala/java/lang/impl/PosixThread.scala
 +++ b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
-@@ -504,10 +504,16 @@ private[lang] object PosixThread extends NativeThread.Companion {
+@@ -511,10 +511,16 @@ private[lang] object PosixThread extends NativeThread.Companion {
        pthread_attr_init(attrs)
        val stackSize = stackalloc[CSize]()
        pthread_attr_getstacksize(attrs, stackSize)
@@ -461,7 +461,7 @@ index 7d6428ca..95020847 100644
    @alwaysinline private def LockOffset = 0
    @alwaysinline private def ConditionsOffset = pthread_mutex_t_size.toInt
 diff --git a/javalib/src/main/scala/java/nio/file/Files.scala b/javalib/src/main/scala/java/nio/file/Files.scala
-index 5eff5d9e..6fe74dde 100644
+index 5eff5d9e5..6fe74dde1 100644
 --- a/javalib/src/main/scala/java/nio/file/Files.scala
 +++ b/javalib/src/main/scala/java/nio/file/Files.scala
 @@ -369,14 +369,40 @@ object Files {
@@ -572,7 +572,7 @@ index 5eff5d9e..6fe74dde 100644
        val len = pathSize.toInt
        val bytes = scala.scalanative.runtime.ByteArray.alloc(len)
 diff --git a/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala b/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
-index fed7d4cb..060f1cac 100644
+index fed7d4cbd..060f1cacd 100644
 --- a/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
 +++ b/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
 @@ -15,6 +15,7 @@ import java.util.{LinkedList, List, Map, ServiceLoader, Set}
@@ -592,7 +592,7 @@ index fed7d4cb..060f1cac 100644
  
      list
 diff --git a/javalib/src/main/scala/java/util/zip/Deflater.scala b/javalib/src/main/scala/java/util/zip/Deflater.scala
-index c6b06fc3..35ff9775 100644
+index c6b06fc33..35ff97753 100644
 --- a/javalib/src/main/scala/java/util/zip/Deflater.scala
 +++ b/javalib/src/main/scala/java/util/zip/Deflater.scala
 @@ -63,6 +63,9 @@ class Deflater(private var compressLevel: Int, noHeader: Boolean)
@@ -628,7 +628,7 @@ index c6b06fc3..35ff9775 100644
          stream.nextIn = Deflater.empty.at(off)
        } else {
 diff --git a/javalib/src/main/scala/java/util/zip/Inflater.scala b/javalib/src/main/scala/java/util/zip/Inflater.scala
-index 0d07fe32..2e3c57dc 100644
+index 0d07fe321..2e3c57dc4 100644
 --- a/javalib/src/main/scala/java/util/zip/Inflater.scala
 +++ b/javalib/src/main/scala/java/util/zip/Inflater.scala
 @@ -139,12 +139,22 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
@@ -666,7 +666,7 @@ index 0d07fe32..2e3c57dc 100644
      if (err != zlib.Z_OK) {
 diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala
 new file mode 100644
-index 00000000..1587013d
+index 000000000..1587013dd
 --- /dev/null
 +++ b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala
 @@ -0,0 +1,153 @@
@@ -825,7 +825,7 @@ index 00000000..1587013d
 +}
 diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystemProvider.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystemProvider.scala
 new file mode 100644
-index 00000000..b4404057
+index 000000000..b4404057d
 --- /dev/null
 +++ b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystemProvider.scala
 @@ -0,0 +1,392 @@
@@ -1223,7 +1223,7 @@ index 00000000..b4404057
 +}
 diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipPath.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipPath.scala
 new file mode 100644
-index 00000000..2fb46bce
+index 000000000..2fb46bcee
 --- /dev/null
 +++ b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipPath.scala
 @@ -0,0 +1,273 @@

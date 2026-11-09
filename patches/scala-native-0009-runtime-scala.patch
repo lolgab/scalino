@@ -1,5 +1,5 @@
 diff --git a/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala b/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
-index be8f9763..2e354ec7 100644
+index be8f9763b..2e354ec7c 100644
 --- a/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/meta/LinktimeInfo.scala
 @@ -68,6 +68,16 @@ object LinktimeInfo {
@@ -20,7 +20,7 @@ index be8f9763..2e354ec7 100644
    @resolvedAtLinktime(
      "scala.scalanative.meta.linktimeinfo.contendedPaddingWidth"
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
-index 4f630f49..b51ccaae 100644
+index 4f630f493..b51ccaae7 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala
 @@ -32,7 +32,7 @@ import scalanative.unsigned._
@@ -186,7 +186,7 @@ index 4f630f49..b51ccaae 100644
      val array = castRawPtrToObject(arr).asInstanceOf[BlobArray]
      storeInt(elemRawPtr(arr, MemoryLayout.Array.LengthOffset), length)
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
-index 9e06318a..8b72b9b7 100644
+index 9e06318a0..8b72b9b7d 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Arrays.scala.gyb
 @@ -32,7 +32,7 @@ import scalanative.unsigned._
@@ -254,7 +254,7 @@ index 9e06318a..8b72b9b7 100644
      array
    }
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
-index 587c5896..99484f3f 100644
+index 587c5896c..99484f3ff 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Backtrace.scala
 @@ -26,7 +26,12 @@ private[runtime] object Backtrace {
@@ -327,7 +327,7 @@ index 587c5896..99484f3f 100644
                  val dSYMBin: BinaryFile = new BinaryFile(
                    new File(dSymPath)
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
-index 777fbed1..c3d8e991 100644
+index 777fbed1d..c3d8e9915 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
 @@ -30,6 +30,12 @@ object GC {
@@ -344,7 +344,7 @@ index 777fbed1..c3d8e991 100644
    @name("scalanative_GC_set_weak_references_collected_callback")
    private[runtime] def setWeakReferencesCollectedCallback(
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
-index 681d8691..e88967f4 100644
+index 681d86916..e88967f4c 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
 @@ -1,7 +1,11 @@
@@ -463,7 +463,7 @@ index 681d8691..e88967f4 100644
  
  }
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
-index cdacae75..95a4c63b 100644
+index 5c9d62e8e..61bdb68b1 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
 @@ -8,7 +8,11 @@ import scala.annotation.nowarn
@@ -479,7 +479,7 @@ index cdacae75..95a4c63b 100644
  import scala.scalanative.runtime.GC.{ThreadRoutineArg, ThreadStartRoutine}
  import scala.scalanative.runtime.Intrinsics._
  import scala.scalanative.runtime.ffi.stdatomic.atomic_thread_fence
-@@ -331,6 +335,8 @@ object NativeThread {
+@@ -337,6 +341,8 @@ object NativeThread {
          nativeThread.state = NativeThread.State.Terminated
          thread.notifyAll()
        }
@@ -489,7 +489,7 @@ index cdacae75..95a4c63b 100644
      }
      null
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
-index 227a0464..41d1cbf9 100644
+index 227a04644..41d1cbf94 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
 @@ -1,6 +1,9 @@
@@ -561,7 +561,7 @@ index 227a0464..41d1cbf9 100644
            elemRawPtr(clone, MemoryLayout.Array.LockWordOffset),
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala b/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
 new file mode 100644
-index 00000000..a3fdcc22
+index 000000000..a3fdcc22c
 --- /dev/null
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/SmiBox.scala
 @@ -0,0 +1,135 @@
@@ -701,7 +701,7 @@ index 00000000..a3fdcc22
 +    castRawPtrToObject(castLongToRawPtr(castRawPtrToLong(rawptr) | PtrDiscriminant))
 +}
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala b/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala
-index 62c59eb3..3248df1c 100644
+index 62c59eb30..3248df1ce 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/ffi.scala
 @@ -57,6 +57,26 @@ object ffi {
@@ -732,7 +732,7 @@ index 62c59eb3..3248df1c 100644
      private[runtime] def atomic_load_llong(
          ptr: RawPtr,
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
-index 8e7bc9cc..27121b0f 100644
+index 083ff34ce..c3ab6f8ae 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
 @@ -4,7 +4,10 @@ package monitor
@@ -911,7 +911,7 @@ index 8e7bc9cc..27121b0f 100644
                if (native != null) native.sleepNanos(backoffNanos)
                else Thread.`yield`()
                waitForOwnership(
-@@ -217,7 +273,14 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+@@ -225,7 +281,14 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
      // Since pointers are always aligned we can safely override N=sizeof(Word) right-most bits
      val monitorAddress = castObjectToRawPtr(objectMonitor)
      val inflated =
@@ -927,7 +927,7 @@ index 8e7bc9cc..27121b0f 100644
          val lockMark = (LockType.Inflated: Int) << LockTypeOffset
          val addr = castRawPtrToInt(monitorAddress)
          castIntToRawPtr(lockMark | addr)
-@@ -226,7 +289,8 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+@@ -234,7 +297,8 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
          val addr = castRawPtrToLong(monitorAddress)
          castLongToRawPtr(lockMark | addr)
        }
@@ -939,7 +939,7 @@ index 8e7bc9cc..27121b0f 100644
      objectMonitor
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
 new file mode 100644
-index 00000000..1a11d5ef
+index 000000000..1a11d5ef6
 --- /dev/null
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
 @@ -0,0 +1,108 @@
@@ -1053,7 +1053,7 @@ index 00000000..1a11d5ef
 +}
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
 new file mode 100644
-index 00000000..836d051d
+index 000000000..836d051dc
 --- /dev/null
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
 @@ -0,0 +1,16 @@
@@ -1074,7 +1074,7 @@ index 00000000..836d051d
 +  def releaseCurrent(): Unit = extern
 +}
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
-index d90efc16..00cdee46 100644
+index d90efc16e..00cdee46e 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
 @@ -1,7 +1,10 @@
@@ -1145,7 +1145,7 @@ index d90efc16..00cdee46 100644
    }
  
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
-index f0fb015e..98dff528 100644
+index 4b622ac9e..d1e43fcf1 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
 @@ -5,7 +5,10 @@ import java.{lang => jl}
@@ -1231,7 +1231,7 @@ index f0fb015e..98dff528 100644
          )
      }
    }
-@@ -293,6 +330,17 @@ package object runtime {
+@@ -294,6 +331,17 @@ package object runtime {
      else
        waitForModuleInitializationSingleThreaded(moduleSlot, cls)
  
@@ -1249,21 +1249,21 @@ index f0fb015e..98dff528 100644
    private def waitForModuleInitializationMultithreaded(
        moduleSlot: unsafe.Ptr[AnyRef],
        cls: Class[_]
-@@ -316,11 +364,10 @@ package object runtime {
-         cls.wait()
-       } else {
-         // Assumes Class[?] is always 1st filed in the object header
--        val rtti = Intrinsics.loadObject(moduleRef)
--        if (rtti eq cls)
-+        if (moduleHasClass(moduleRef, cls))
-           return Intrinsics.castRawPtrToObject(moduleRef) // happy-path
+@@ -324,11 +372,10 @@ package object runtime {
+             awaitNotification()
+           } else {
+             // Assumes Class[?] is always 1st filed in the object header
+-            val rtti = Intrinsics.loadObject(moduleRef)
+-            if (rtti eq cls)
++            if (moduleHasClass(moduleRef, cls))
+               return Intrinsics.castRawPtrToObject(moduleRef) // happy-path
  
--        if (rtti eq classOf[ExceptionInInitializerError]) {
-+        if (moduleHasClass(moduleRef, classOf[ExceptionInInitializerError])) {
-           val ex: ExceptionInInitializerError = Intrinsics
-             .castRawPtrToObject(moduleRef)
-             .asInstanceOf[ExceptionInInitializerError]
-@@ -344,9 +391,9 @@ package object runtime {
+-            if (rtti eq classOf[ExceptionInInitializerError]) {
++            if (moduleHasClass(moduleRef, classOf[ExceptionInInitializerError])) {
+               val ex: ExceptionInInitializerError = Intrinsics
+                 .castRawPtrToObject(moduleRef)
+                 .asInstanceOf[ExceptionInInitializerError]
+@@ -354,9 +401,9 @@ package object runtime {
          moduleSlot.rawptr,
          ffi.stdatomic.memory_order.memory_order_acquire
        )
@@ -1276,7 +1276,7 @@ index f0fb015e..98dff528 100644
          val ex = Intrinsics
            .castRawPtrToObject(moduleRef)
            .asInstanceOf[ExceptionInInitializerError]
-@@ -360,6 +407,23 @@ package object runtime {
+@@ -370,6 +417,23 @@ package object runtime {
      ???
    }
  
@@ -1301,7 +1301,7 @@ index f0fb015e..98dff528 100644
      @name("scalanative_StackOverflowGuards_size")
      def size: Int = extern
 diff --git a/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala b/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
-index e77bb9ae..4910e50f 100644
+index e77bb9aef..4910e50fb 100644
 --- a/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/unsafe/Ptr.scala
 @@ -10,8 +10,21 @@ import scala.scalanative.runtime._
@@ -1328,7 +1328,7 @@ index e77bb9ae..4910e50f 100644
      java.lang.Long.hashCode(toLong)
  
 diff --git a/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala b/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala
-index 31fa1050..5b1dd3b5 100644
+index 31fa1050d..5b1dd3b51 100644
 --- a/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/unsigned/UByte.scala
 @@ -1,15 +1,28 @@
@@ -1397,7 +1397,7 @@ index 31fa1050..5b1dd3b5 100644
    }
  }
 diff --git a/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala b/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala
-index 8b9315be..2744f2b1 100644
+index 8b9315be1..2744f2b1b 100644
 --- a/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/unsigned/UInt.scala
 @@ -4,17 +4,26 @@ package unsigned
@@ -1468,7 +1468,7 @@ index 8b9315be..2744f2b1 100644
    }
  
 diff --git a/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala b/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala
-index 68712025..e1e49899 100644
+index 68712025f..e1e49899d 100644
 --- a/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/unsigned/UShort.scala
 @@ -1,15 +1,28 @@

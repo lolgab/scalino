@@ -1,26 +1,8 @@
 diff --git a/tools/src/main/scala/scala/scalanative/build/Build.scala b/tools/src/main/scala/scala/scalanative/build/Build.scala
-index 8eb17b0c..7ba000f0 100644
+index d1b7d0f4d..db56ceb33 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Build.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Build.scala
-@@ -156,7 +156,7 @@ object Build {
-             .map(objects => link(config, linkerResult, objects))
-             .map(artifact => postProcess(config, artifact))
-         }
--        .andThen { case Success(_) => dumpUserConfigHash(config) }
-+        .andThen { case Success(_) => dumpUserConfigHash(config, defaultUserConfigHashPath(config)) }
-     }
-   }
- 
-@@ -172,7 +172,7 @@ object Build {
-         .sequence {
-           irGenerators.map(irGenerator =>
-             irGenerator.flatMap(generatedIR =>
--              LLVM.compile(config, analysis, generatedIR)
-+              LLVM.compile(config, analysis, generatedIR, defaultUserConfigHashPath(config))
-             )
-           )
-         }
-@@ -256,15 +256,37 @@ object Build {
+@@ -257,15 +257,37 @@ object Build {
      // - build configuration
      // - class paths' mtime
      // - the output native binary ('s mtime)
@@ -59,52 +41,7 @@ index 8eb17b0c..7ba000f0 100644
    /** Finds and compiles native libaries.
     *
     *  @param config
-@@ -318,13 +340,40 @@ object Build {
- 
-   private[scalanative] final val userConfigHashFile = "userConfigHash"
- 
--  private[scalanative] def userConfigHasChanged(config: Config): Boolean =
--    IO.readFully(config.workDir.resolve(userConfigHashFile))
-+  /** The original workDir-relative location, for call sites checking/dumping
-+   *  the top-level config's own hash (as opposed to a per-library one, see
-+   *  below). */
-+  private[scalanative] def defaultUserConfigHashPath(config: Config): Path =
-+    config.workDir.resolve(userConfigHashFile)
-+
-+  // own-implementation fix: hashPath is now an explicit, required parameter
-+  // (was implicitly always config.workDir.resolve(userConfigHashFile); every
-+  // pre-existing call site now passes defaultUserConfigHashPath(config) to
-+  // keep identical behavior). NativeLib.compileNativeLibrary passes a
-+  // *per-library* hashPath instead: it compiles each dependency with a
-+  // per-library `projConfig` (configureNativeLibrary appends reachability-
-+  // analysis-derived preprocessor flags per library, see NativeLib.scala),
-+  // but before this fix every such check compared that per-library config's
-+  // hash against the ONE shared file this module's dumpUserConfigHash writes
-+  // from the top-level, un-augmented config -- a structural mismatch, so
-+  // userConfigHasChanged effectively always returned true for every
-+  // vendored C/S dependency file, defeating LLVM.needsCompiling's mtime
-+  // check and forcing a full recompile of scala-native's own runtime
-+  // sources on every single build regardless of whether anything changed.
-+  // See docs/findings.md "Native-library object-file caching was inert".
-+  private[scalanative] def userConfigHasChanged(
-+      config: Config,
-+      hashPath: Path
-+  ): Boolean =
-+    IO.readFully(hashPath)
-       .forall(_.trim() != config.compilerConfig.##.toString())
- 
--  private[scalanative] def dumpUserConfigHash(config: Config): Unit =
-+  private[scalanative] def dumpUserConfigHash(
-+      config: Config,
-+      hashPath: Path
-+  ): Unit =
-     IO.write(
--      path = config.workDir.resolve(userConfigHashFile),
-+      path = hashPath,
-       content = config.compilerConfig.##.toString()
-     )
- 
-@@ -334,10 +383,33 @@ object Build {
+@@ -335,10 +357,33 @@ object Build {
      // Fatal errors, e.g. StackOverflowErrors are not propagated by Futures
      // Use a helper promise to get notified about the underlying problem
      val promise = Promise[T]()
@@ -141,7 +78,7 @@ index 8eb17b0c..7ba000f0 100644
          thread.setUncaughtExceptionHandler { (thread: Thread, ex: Throwable) =>
            promise.tryFailure(ex)
 diff --git a/tools/src/main/scala/scala/scalanative/build/Discover.scala b/tools/src/main/scala/scala/scalanative/build/Discover.scala
-index 9163a5db..a9279e04 100644
+index 9163a5dbb..a9279e040 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Discover.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Discover.scala
 @@ -122,6 +122,53 @@ object Discover {
@@ -199,7 +136,7 @@ index 9163a5db..a9279e04 100644
        majorVersion: Int,
        fullVersion: String,
 diff --git a/tools/src/main/scala/scala/scalanative/build/IO.scala b/tools/src/main/scala/scala/scalanative/build/IO.scala
-index fbf4be30..c9cc2d47 100644
+index fbf4be30b..c9cc2d471 100644
 --- a/tools/src/main/scala/scala/scalanative/build/IO.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/IO.scala
 @@ -4,10 +4,9 @@ package build
@@ -460,7 +397,7 @@ index fbf4be30..c9cc2d47 100644
          }
  
 diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
-index 1adf331f..507db3b1 100644
+index f1eb4dcbd..f7fd5a05a 100644
 --- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
 @@ -1,11 +1,10 @@
@@ -520,21 +457,7 @@ index 1adf331f..507db3b1 100644
    /** Compile the given files to object files
     *
     *  @param config
-@@ -49,18 +85,35 @@ private[scalanative] object LLVM {
-   def compile(
-       config: Config,
-       analysis: ReachabilityAnalysis.Result,
--      path: Path
-+      path: Path,
-+      // own-implementation fix: explicit, required hash-file path for the
-+      // userConfigHasChanged check (was implicitly always
-+      // config.workDir.resolve(Build.userConfigHashFile) -- pass
-+      // Build.defaultUserConfigHashPath(config) for identical behavior). See
-+      // the comment on Build.userConfigHasChanged for why this exists.
-+      hashPath: Path
-   )(implicit
-       ec: ExecutionContext
-   ): Future[Path] = {
+@@ -62,6 +98,17 @@ private[scalanative] object LLVM {
      implicit val _config: Config = config
      implicit val _analysis: ReachabilityAnalysis.Result = analysis
  
@@ -552,13 +475,7 @@ index 1adf331f..507db3b1 100644
      val inpath = path.abs
      val outpath = inpath + oExt
      val objPath = Paths.get(outpath)
-     // compile if out of date or no object file
--    if (needsCompiling(path, objPath)) compileFile(path, objPath)
-+    if (needsCompiling(path, objPath, hashPath)) compileFile(path, objPath)
-     else Future.successful(objPath)
-   }
- 
-@@ -91,13 +144,17 @@ private[scalanative] object LLVM {
+@@ -98,13 +145,17 @@ private[scalanative] object LLVM {
          if (config.compilerConfig.multithreadingSupport)
            Seq("-DSCALANATIVE_MULTITHREADING_ENABLED")
          else Nil
@@ -577,7 +494,7 @@ index 1adf331f..507db3b1 100644
      }
      val debugFlags = sourceLevelDebugFlags
  
-@@ -106,14 +163,14 @@ private[scalanative] object LLVM {
+@@ -113,14 +164,14 @@ private[scalanative] object LLVM {
          target ++ langOptions ++ platformFlags ++ debugFlags ++
          configFlags ++ Seq("-fvisibility=hidden", opt) ++
          Seq("-fomit-frame-pointer") ++
@@ -594,7 +511,7 @@ index 1adf331f..507db3b1 100644
      if (result != 0) {
        throw new BuildException(s"Failed to compile ${inpath}")
      }
-@@ -155,7 +212,7 @@ private[scalanative] object LLVM {
+@@ -162,7 +213,7 @@ private[scalanative] object LLVM {
          prepareArchiveCommand(objectsPaths)
      }
      // link
@@ -603,7 +520,7 @@ index 1adf331f..507db3b1 100644
      if (result != 0) {
        throw new BuildException(s"Failed to link ${buildPath}")
      }
-@@ -168,8 +225,11 @@ private[scalanative] object LLVM {
+@@ -175,8 +226,11 @@ private[scalanative] object LLVM {
     */
    def dsymutil(config: Config, path: Path): Unit =
      Discover.tryDiscover("dsymutil", "LLVM_BIN").flatMap { dsymutil =>
@@ -617,7 +534,7 @@ index 1adf331f..507db3b1 100644
        if (result != 0) {
          Failure(
            new BuildException(
-@@ -316,7 +376,7 @@ private[scalanative] object LLVM {
+@@ -323,7 +377,7 @@ private[scalanative] object LLVM {
  
      val command = Seq(compiler, s"@${configFile.getAbsolutePath()}")
      config.logger.running(command)
@@ -626,7 +543,7 @@ index 1adf331f..507db3b1 100644
    }
  
    private def prepareArchiveCommand(
-@@ -357,7 +417,7 @@ private[scalanative] object LLVM {
+@@ -364,7 +418,7 @@ private[scalanative] object LLVM {
        val command = Seq(ar.abs, "-M")
        config.logger.running(command)
  
@@ -635,7 +552,7 @@ index 1adf331f..507db3b1 100644
      }
  
      MRICompatibleAR match {
-@@ -365,7 +425,7 @@ private[scalanative] object LLVM {
+@@ -372,7 +426,7 @@ private[scalanative] object LLVM {
          val ar = Discover.discover("ar")
          val command = Seq(ar.abs, "rc", config.buildPath.abs) ++ stageFiles()
          config.logger.running(command)
@@ -644,22 +561,7 @@ index 1adf331f..507db3b1 100644
        case Some(path) => useMRIScript(path)
      }
    }
-@@ -381,11 +441,11 @@ private[scalanative] object LLVM {
-    *  @return
-    *    true if it needs compiling false otherwise.
-    */
--  @inline private def needsCompiling(in: Path, out: Path)(implicit
--      config: Config
-+  @inline private def needsCompiling(in: Path, out: Path, hashPath: Path)(
-+      implicit config: Config
-   ): Boolean = {
-     in.toFile().lastModified() > out.toFile().lastModified() ||
--    Build.userConfigHasChanged(config)
-+    Build.userConfigHasChanged(config, hashPath)
-   }
- 
-   /** Looks at all the object files to see if one is newer than the output
-@@ -457,6 +517,35 @@ private[scalanative] object LLVM {
+@@ -468,6 +522,35 @@ private[scalanative] object LLVM {
        case None     => Seq("-Wno-override-module")
      }
  
@@ -696,7 +598,7 @@ index 1adf331f..507db3b1 100644
      config.mode match {
        case Mode.Debug       => "-O0"
 diff --git a/tools/src/main/scala/scala/scalanative/build/Logger.scala b/tools/src/main/scala/scala/scalanative/build/Logger.scala
-index cc6bb2fd..01363ce2 100644
+index cc6bb2fd8..01363ce2f 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Logger.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Logger.scala
 @@ -1,7 +1,6 @@
@@ -769,7 +671,7 @@ index cc6bb2fd..01363ce2 100644
  
  }
 diff --git a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
-index 30cf99d3..27f8f483 100644
+index 30cf99d3e..27f8f483c 100644
 --- a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
 @@ -71,6 +71,23 @@ sealed trait NativeConfig {
@@ -937,33 +839,10 @@ index 30cf99d3..27f8f483 100644
            | - embedResources:          $embedResources
            | - resourceIncludePatterns: ${showSeq(resourceIncludePatterns)}
 diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
-index d49c90f4..ebd6bbf0 100644
+index d7e5e3726..15b429fa8 100644
 --- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
-@@ -44,9 +44,19 @@ private[scalanative] object NativeLib {
-     val destPath = unpackNativeCode(nativeLib)
-     val paths = findNativePaths(destPath)
-     val projConfig = configureNativeLibrary(config, analysis, destPath)
--    Future.sequence {
--      paths.map(LLVM.compile(projConfig, analysis, _))
--    }
-+    // own-implementation fix: a hash file scoped to THIS library's own
-+    // dest dir/projConfig, instead of the shared top-level workDir one --
-+    // see the comment on Build.userConfigHasChanged for why the shared file
-+    // made this per-library cache check always report "changed". destPath
-+    // already survives across runs (unpackNativeCode/unpackNativeJar only
-+    // wipe it when the source jar itself actually changed), so this file
-+    // does too.
-+    val hashPath = destPath.resolve(Build.userConfigHashFile)
-+    Future
-+      .sequence {
-+        paths.map(LLVM.compile(projConfig, analysis, _, hashPath))
-+      }
-+      .andThen { case Success(_) => Build.dumpUserConfigHash(projConfig, hashPath) }
-   }
- 
-   /** Update the project configuration if a project `Descriptor` is present.
-@@ -139,7 +149,9 @@ private[scalanative] object NativeLib {
+@@ -168,7 +168,9 @@ private[scalanative] object NativeLib {
          Seq(
            Some(s"-DSCALANATIVE_GC_${gcName}"),
            if (!config.useTrapBasedGCYieldPoints) None
@@ -974,16 +853,7 @@ index d49c90f4..ebd6bbf0 100644
          ).flatten
        }
  
-@@ -194,7 +206,7 @@ private[scalanative] object NativeLib {
-     val workDir = config.workDir
-     val classpath = config.classPath
-     val nativeCodeDir = workDir.resolve("dependencies")
--    if (Build.userConfigHasChanged(config))
-+    if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
-       IO.deleteRecursive(nativeCodeDir)
- 
-     val nativeLibPaths = classpath.flatMap { path =>
-@@ -297,18 +309,16 @@ private[scalanative] object NativeLib {
+@@ -326,18 +328,16 @@ private[scalanative] object NativeLib {
        IO.unzip(source, target)
      }
  
@@ -1013,7 +883,7 @@ index d49c90f4..ebd6bbf0 100644
    }
  
 diff --git a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
-index 51607936..840becc5 100644
+index 51607936e..840becc55 100644
 --- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
 @@ -66,7 +66,22 @@ private[scalanative] object ScalaNative {
@@ -1091,7 +961,7 @@ index 51607936..840becc5 100644
        config.logger.time(s"Dumping intermediate code ($phase)") {
          val path = config.workDir.resolve(phase + ".hnir")
 diff --git a/tools/src/main/scala/scala/scalanative/build/Validator.scala b/tools/src/main/scala/scala/scalanative/build/Validator.scala
-index 1e5c2811..fb07c8a6 100644
+index 1e5c2811d..fb07c8a6a 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Validator.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Validator.scala
 @@ -58,6 +58,22 @@ private[build] object Validator {
@@ -1118,7 +988,7 @@ index 1e5c2811..fb07c8a6 100644
        case Nil    => config
        case issues =>
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
-index d0137c97..2b5d849f 100644
+index d0137c97e..2b5d849f3 100644
 --- a/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/InliningTest.scala
 @@ -117,7 +117,7 @@ class InliningTest extends OptimizerSpec {
@@ -1140,7 +1010,7 @@ index d0137c97..2b5d849f 100644
            assertContainsAll(
              "Not all expression were inlined and constant folded",
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
-index 620fce85..a55f8b07 100644
+index 620fce857..a55f8b077 100644
 --- a/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/LexicalScopesTest.scala
 @@ -112,7 +112,7 @@ class LexicalScopesTest extends OptimizerSpec {
@@ -1180,7 +1050,7 @@ index 620fce85..a55f8b07 100644
            "named vals",
            Seq("a", "b", "myTmp"),
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
-index 0d3fcc48..ad4f3ea6 100644
+index 0d3fcc48a..ad4f3ea67 100644
 --- a/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/LocalNamesTest.scala
 @@ -79,7 +79,7 @@ class LocalNamesTest extends OptimizerSpec {
@@ -1239,7 +1109,7 @@ index 0d3fcc48..ad4f3ea6 100644
  }
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala
 new file mode 100644
-index 00000000..63cef374
+index 000000000..63cef374d
 --- /dev/null
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/MergePhiScalarJoinTest.scala
 @@ -0,0 +1,81 @@
@@ -1325,7 +1195,7 @@ index 00000000..63cef374
 +  }
 +}
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
-index d30d6a7d..c47d3a18 100644
+index d30d6a7dd..c47d3a182 100644
 --- a/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/PolyInlineGetClassTest.scala
 @@ -182,7 +182,7 @@ class PolyInlineGetClassTest extends OptimizerSpec {
@@ -1347,7 +1217,7 @@ index d30d6a7d..c47d3a18 100644
              case nir.Inst.Let(_, nir.Op.Method(obj, sig), _)
                  if sig == nir.Rt.GetClassSig =>
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala b/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
-index d3d4939c..4f599d2f 100644
+index d3d4939cf..4f599d2f7 100644
 --- a/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/StackallocStateRestoreTest.scala
 @@ -47,7 +47,7 @@ class StackallocStateRestoreTest extends OptimizerSpec {
@@ -1423,7 +1293,7 @@ index d3d4939c..4f599d2f 100644
              case nir.Inst.Let(id, nir.Op.Stackalloc(_, _), _) => id
            }
 diff --git a/tools/src/test/scala/scala/scalanative/optimizer/package.scala b/tools/src/test/scala/scala/scalanative/optimizer/package.scala
-index 3882202c..1ab55464 100644
+index 3882202c0..1ab554649 100644
 --- a/tools/src/test/scala/scala/scalanative/optimizer/package.scala
 +++ b/tools/src/test/scala/scala/scalanative/optimizer/package.scala
 @@ -111,7 +111,7 @@ package object optimizer {

@@ -1,5 +1,5 @@
 diff --git a/nativelib/src/main/resources/scala-native/gc/boehm/gc.c b/nativelib/src/main/resources/scala-native/gc/boehm/gc.c
-index 1264f54f..4f4354af 100644
+index 1264f54fc..4f4354af0 100644
 --- a/nativelib/src/main/resources/scala-native/gc/boehm/gc.c
 +++ b/nativelib/src/main/resources/scala-native/gc/boehm/gc.c
 @@ -32,19 +32,19 @@ void scalanative_GC_init() {
@@ -47,7 +47,7 @@ index 1264f54f..4f4354af 100644
  void scalanative_GC_set_weak_references_collected_callback(
      WeakReferencesCollectedCallback callback) {
 diff --git a/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c b/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c
-index 38fa5df5..df949cd3 100644
+index 38fa5df5c..df949cd3b 100644
 --- a/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c
 +++ b/nativelib/src/main/resources/scala-native/gc/commix/CommixGC.c
 @@ -60,10 +60,11 @@ INLINE void *scalanative_GC_alloc_small(Rtti *info, size_t size) {
@@ -64,7 +64,7 @@ index 38fa5df5..df949cd3 100644
  
  #endif // defined(SCALANATIVE_GC_COMMIX)
 diff --git a/nativelib/src/main/resources/scala-native/gc/commix/Constants.h b/nativelib/src/main/resources/scala-native/gc/commix/Constants.h
-index 1fc28360..7a13fa79 100644
+index 1fc283603..7a13fa796 100644
 --- a/nativelib/src/main/resources/scala-native/gc/commix/Constants.h
 +++ b/nativelib/src/main/resources/scala-native/gc/commix/Constants.h
 @@ -24,7 +24,7 @@
@@ -77,7 +77,7 @@ index 1fc28360..7a13fa79 100644
  
  #ifndef LAZY_SWEEP_MIN_BATCH
 diff --git a/nativelib/src/main/resources/scala-native/gc/commix/Heap.c b/nativelib/src/main/resources/scala-native/gc/commix/Heap.c
-index 657dc2eb..10f32b60 100644
+index 657dc2eb9..10f32b608 100644
 --- a/nativelib/src/main/resources/scala-native/gc/commix/Heap.c
 +++ b/nativelib/src/main/resources/scala-native/gc/commix/Heap.c
 @@ -269,6 +269,18 @@ bool Heap_Collect(Heap *heap, bool allowHeapGrowth) {
@@ -113,7 +113,7 @@ index 657dc2eb..10f32b60 100644
             freeBlockCount < heap->minFreeRatio * blockCount ||
             (unavailableBlockCount > blockCount * MAX_UNAVAILABLE_RATIO &&
 diff --git a/nativelib/src/main/resources/scala-native/gc/commix/Marker.c b/nativelib/src/main/resources/scala-native/gc/commix/Marker.c
-index 9a5ca640..48e1b9be 100644
+index 9a5ca640f..48e1b9beb 100644
 --- a/nativelib/src/main/resources/scala-native/gc/commix/Marker.c
 +++ b/nativelib/src/main/resources/scala-native/gc/commix/Marker.c
 @@ -118,7 +118,7 @@ void Marker_markObject(Heap *heap, Stats *stats, GreyPacket **outHolder,
@@ -225,7 +225,7 @@ index 9a5ca640..48e1b9be 100644
                  objectsTraced += Marker_markObjectArray(
                      heap, stats, object, outHolder, outWeakRefHolder);
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
-index 06cf29dd..3c35c612 100644
+index c66d8f56f..302ed8649 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.c
 @@ -7,6 +7,40 @@
@@ -269,7 +269,7 @@ index 06cf29dd..3c35c612 100644
  bool Allocator_getNextLine(Allocator *allocator);
  bool Allocator_newBlock(Allocator *allocator);
  bool Allocator_newOverflowBlock(Allocator *allocator);
-@@ -148,40 +182,49 @@ static bool Allocator_reserveHole(Allocator *allocator, BlockMeta *block,
+@@ -149,40 +183,49 @@ static bool Allocator_reserveHole(Allocator *allocator, BlockMeta *block,
      return false;
  }
  
@@ -347,7 +347,7 @@ index 06cf29dd..3c35c612 100644
      }
      return false;
  }
-@@ -224,6 +267,8 @@ bool Allocator_getNextLine(Allocator *allocator) {
+@@ -225,6 +268,8 @@ bool Allocator_getNextLine(Allocator *allocator) {
  bool Allocator_newBlock(Allocator *allocator) {
      assert(allocator != NULL);
      BlockMeta *block = BlockList_Poll(&allocator->recycledBlocks);
@@ -357,11 +357,11 @@ index 06cf29dd..3c35c612 100644
  
      if (block != NULL) {
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h
-index a5290c9c..881ff3ec 100644
+index 1e60e4661..b89940d38 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Allocator.h
-@@ -38,6 +38,15 @@ typedef struct {
-     bool canUseReserve;
+@@ -43,6 +43,15 @@ typedef struct {
+     uint32_t blocksTaken;
  } Allocator;
  
 +// Recycled blocks live in one shared pool instead of being dealt round-robin
@@ -377,7 +377,7 @@ index a5290c9c..881ff3ec 100644
                      Bytemap *bytemap, word_t *blockMetaStart,
                      word_t *heapStart);
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Block.c b/nativelib/src/main/resources/scala-native/gc/immix/Block.c
-index d6113b3d..b7342450 100644
+index d6113b3d8..b73424506 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Block.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Block.c
 @@ -3,6 +3,7 @@
@@ -398,7 +398,7 @@ index d6113b3d..b7342450 100644
      BlockAllocator_AddFreeBlocks(allocator->blockAllocator, blockMeta, 1);
      ObjectMeta_ClearBlockAt(Bytemap_Get(allocator->bytemap, blockStart));
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
-index 7ecf8924..3af7252b 100644
+index 2a5268972..3ab9120f0 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
 @@ -87,6 +87,9 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
@@ -437,7 +437,7 @@ index 7ecf8924..3af7252b 100644
  bool Heap_BeginEmergencyAllocation(Heap *heap) {
      bool expected = false;
      if (heap->emergencyBlockStart == NULL ||
-@@ -194,6 +209,15 @@ static bool Heap_collect(Heap *heap, Stack *stack, size_t allocationSize,
+@@ -243,6 +258,15 @@ static bool Heap_collect(Heap *heap, Stack *stack, size_t allocationSize,
          nullify_start_ns = Time_current_nanos();
      }
      WeakReferences_Nullify();
@@ -453,7 +453,7 @@ index 7ecf8924..3af7252b 100644
      if (stats != NULL) {
          sweep_start_ns = Time_current_nanos();
      }
-@@ -247,6 +271,7 @@ bool Heap_shouldGrow(Heap *heap) {
+@@ -316,6 +340,7 @@ bool Heap_shouldGrow(Heap *heap) {
      MutatorThreads_foreach(mutatorThreads, node) {
          recycledBlockCount += node->value->allocator.recycledBlockCount;
      }
@@ -461,7 +461,7 @@ index 7ecf8924..3af7252b 100644
      uint32_t unavailableBlockCount =
          blockCount - (freeBlockCount + recycledBlockCount);
  
-@@ -259,11 +284,116 @@ bool Heap_shouldGrow(Heap *heap) {
+@@ -328,6 +353,75 @@ bool Heap_shouldGrow(Heap *heap) {
                   usedLines, (uint64_t)blockCount * LINE_COUNT,
                   (usedLines * LINE_SIZE) >> 20);
  
@@ -537,7 +537,9 @@ index 7ecf8924..3af7252b 100644
      return freeBlockCount * 2 < blockCount ||
             (4 * unavailableBlockCount > blockCount &&
              20 * freeBlockCount < 13 * blockCount);
+@@ -381,6 +475,42 @@ static size_t Heap_collectRecycleTargets(void) {
  }
+ #endif
  
 +// Returning memory to the OS: after a collection, runs of completely free
 +// blocks hold no data (every allocation path zeroes what it hands out, and
@@ -577,8 +579,8 @@ index 7ecf8924..3af7252b 100644
 +
  void Heap_Recycle(Heap *heap) {
      Block_recycledFreeLines = 0;
-     MutatorThreads_foreach(mutatorThreads, node) {
-@@ -272,6 +402,7 @@ void Heap_Recycle(Heap *heap) {
+     LargeAllocator_sweptFreeBytes = 0;
+@@ -390,6 +520,7 @@ void Heap_Recycle(Heap *heap) {
          LargeAllocator_Clear(&thread->largeAllocator);
      }
      BlockAllocator_Clear(&blockAllocator);
@@ -586,7 +588,7 @@ index 7ecf8924..3af7252b 100644
  
      BlockMeta *current = (BlockMeta *)heap->blockMetaStart;
      word_t *currentBlockStart = heap->heapStart;
-@@ -301,9 +432,8 @@ void Heap_Recycle(Heap *heap) {
+@@ -415,9 +546,8 @@ void Heap_Recycle(Heap *heap) {
              // Keep the empty reserve out of the allocator while it is held.
              BlockAllocator_SweepDone(&blockAllocator);
          } else if (BlockMeta_IsSimpleBlock(current)) {
@@ -598,7 +600,7 @@ index 7ecf8924..3af7252b 100644
          } else if (BlockMeta_IsSuperblockStart(current)) {
              size = BlockMeta_SuperblockSize(current);
              MutatorThread *recycleBlocksTo = NextMutatorThread();
-@@ -339,6 +469,7 @@ void Heap_Recycle(Heap *heap) {
+@@ -459,6 +589,7 @@ void Heap_Recycle(Heap *heap) {
              }
          }
      }
@@ -607,7 +609,7 @@ index 7ecf8924..3af7252b 100644
      Heap_RefillEmergencyBlock(heap);
  #ifdef SCALANATIVE_MULTITHREADING_ENABLED
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.h b/nativelib/src/main/resources/scala-native/gc/immix/Heap.h
-index 7ef252e5..83a10146 100644
+index 1c71e4d09..563c8f2ff 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.h
 @@ -26,6 +26,10 @@ typedef struct {
@@ -620,8 +622,8 @@ index 7ef252e5..83a10146 100644
 +    uint8_t *hashedBlocks;
      Stats *stats;
      mutex_t lock;
- } Heap;
-@@ -33,6 +37,7 @@ typedef struct {
+     // For the GC overhead limit: when the last collection ended, and how many
+@@ -37,6 +41,7 @@ typedef struct {
  #include "immix_commix/HeapCommon.h"
  
  void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize);
@@ -630,7 +632,7 @@ index 7ef252e5..83a10146 100644
  void Heap_Collect(Heap *heap, Stack *stack);
  bool Heap_RecoverAllocation(Heap *heap, size_t size, uint64_t generation);
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c b/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c
-index 6d8c48d4..0b8c972c 100644
+index 6d8c48d4a..0b8c972c8 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/ImmixGC.c
 @@ -48,10 +48,14 @@ INLINE void *scalanative_GC_alloc_small(Rtti *info, size_t size) {
@@ -650,7 +652,7 @@ index 6d8c48d4..0b8c972c 100644
 +
  #endif
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
-index 4d9cc9ca..d40b1e9d 100644
+index 4d9cc9ca7..d40b1e9d0 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
 @@ -8,16 +8,1621 @@
@@ -2579,7 +2581,7 @@ index 4d9cc9ca..d40b1e9d 100644
      MutatorThreads_foreach(mutatorThreads, node) {
          MutatorThread *thread = node->value;
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
-index 7f2c4645..f2e00644 100644
+index 7f2c4645d..f2e006444 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
 @@ -6,5 +6,8 @@
@@ -2592,7 +2594,7 @@ index 7f2c4645..f2e00644 100644
  
  #endif // IMMIX_MARKER_H
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/CommonConstants.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/CommonConstants.h
-index dbcefb25..eefdd1b1 100644
+index dbcefb258..eefdd1b17 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/CommonConstants.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/CommonConstants.h
 @@ -38,8 +38,44 @@
@@ -2644,7 +2646,7 @@ index dbcefb25..eefdd1b1 100644
  #endif // IMMIX_COMMON_CONSTANTS_H
 \ No newline at end of file
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c
-index 050bc40d..e4e32b48 100644
+index a2c4d9e18..2ebc36953 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/MutatorThread.c
 @@ -81,8 +81,7 @@ bool MutatorThread_register(Field_t *stackbottom) {
@@ -2682,7 +2684,7 @@ index 050bc40d..e4e32b48 100644
  }
  
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c
-index 78b6da01..d9c520d6 100644
+index 78b6da018..d9c520d66 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.c
 @@ -12,8 +12,12 @@ word_t *Object_LastWord(Object *object) {
@@ -2750,7 +2752,7 @@ index 78b6da01..d9c520d6 100644
      // Mark the object itself
      ObjectMeta_SetMarked(objectMeta);
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.h
-index 2a8a200b..ba663d72 100644
+index 2a8a200b1..ba663d725 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/Object.h
 @@ -7,6 +7,14 @@
@@ -2769,7 +2771,7 @@ index 2a8a200b..ba663d72 100644
  
  #endif // IMMIX_COMMIX_OBJECT_H
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h
-index 3840546d..28599446 100644
+index 8f2c57aac..8aa50baf7 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/RegistersCapture.h
 @@ -12,7 +12,7 @@ typedef struct {
@@ -2829,9 +2831,9 @@ index 3840546d..28599446 100644
 +    void *fp; // x29
 +} RegistersBuffer;
  
- #else
- #define CAPTURE_SETJMP
-@@ -46,7 +87,29 @@ typedef jmp_buf RegistersBuffer;
+ #elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+ // Not setjmp: Android's bionic stores x19-x29 XOR-ed with a cookie.
+@@ -54,7 +95,29 @@ typedef jmp_buf RegistersBuffer;
  #ifdef CAPTURE_SETJMP
  #define RegistersCapture(out) (void)setjmp(out);
  #else
@@ -2862,7 +2864,7 @@ index 3840546d..28599446 100644
  #ifdef CAPTURE_X86
      void *regEsi;
      void *regEdi;
-@@ -104,6 +167,41 @@ INLINE static void RegistersCapture(RegistersBuffer out) {
+@@ -129,6 +192,41 @@ INLINE static void RegistersCapture(RegistersBuffer out) {
      out->r15 = reg15;
  #endif // GNU_C
  
@@ -2905,7 +2907,7 @@ index 3840546d..28599446 100644
  #error "Unable to capture registers state"
  #endif // CaptureRegisters
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c
-index 28160206..230eaaa2 100644
+index 6e3a2be37..e4855b6f3 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c
 @@ -40,7 +40,7 @@ INLINE void *scalanative_GC_alloc(Rtti *info, size_t size) {
@@ -2937,7 +2939,7 @@ index 28160206..230eaaa2 100644
  }
  
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.c
-index b4bb9656..229c1dc4 100644
+index b4bb9656a..229c1dc45 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.c
 @@ -95,8 +95,6 @@ static void Synchronizer_WaitForResumption(MutatorThread *selfThread);
@@ -2979,7 +2981,7 @@ index b4bb9656..229c1dc4 100644
  
  static void SafepointTrapHandler(int signal, siginfo_t *siginfo, void *uap) {
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h
-index e6a4a8ee..4781feb7 100644
+index e6a4a8ee1..4781feb7b 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/Synchronizer.h
 @@ -8,7 +8,7 @@
@@ -2992,7 +2994,7 @@ index e6a4a8ee..4781feb7 100644
  
  void Synchronizer_init();
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h
-index 6792961f..5be9ccf3 100644
+index 6792961fa..5be9ccf30 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h
 @@ -22,7 +22,8 @@ extern const int __array_ids_min;
@@ -3181,7 +3183,7 @@ index 6792961f..5be9ccf3 100644
      wchar_t *buf = calloc(nameLength + 1, sizeof(wchar_t));
      for (int i = 0; i < nameLength; i++) {
 diff --git a/nativelib/src/main/resources/scala-native/gc/none/gc.c b/nativelib/src/main/resources/scala-native/gc/none/gc.c
-index 7124f1f4..f00fbfe5 100644
+index 7124f1f46..f00fbfe54 100644
 --- a/nativelib/src/main/resources/scala-native/gc/none/gc.c
 +++ b/nativelib/src/main/resources/scala-native/gc/none/gc.c
 @@ -169,7 +169,7 @@ void *scalanative_GC_alloc(Rtti *info, size_t size) {

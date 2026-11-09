@@ -1,9 +1,9 @@
 diff --git a/tools/jvm/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala b/tools/jvm/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
 new file mode 100644
-index 00000000..6f953b01
+index 000000000..f7f1cda7a
 --- /dev/null
 +++ b/tools/jvm/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,44 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -43,16 +43,17 @@ index 00000000..6f953b01
 +  def emit(
 +      config: build.Config,
 +      env: Map[nir.Global, nir.Defn],
++      sections: GlobalSections,
 +      capableDefns: Seq[nir.Defn],
 +      objPath: Path
 +  )(implicit platform: PlatformInfo): Boolean = false
 +}
 diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
 new file mode 100644
-index 00000000..5b062ee1
+index 000000000..2177bcced
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
-@@ -0,0 +1,1416 @@
+@@ -0,0 +1,1461 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -202,6 +203,7 @@ index 00000000..5b062ee1
 +  def emit(
 +      config: build.Config,
 +      env: Map[nir.Global, nir.Defn],
++      sections: GlobalSections,
 +      capableDefns: Seq[nir.Defn],
 +      objPath: Path
 +  )(implicit platform: PlatformInfo): Boolean = {
@@ -211,7 +213,7 @@ index 00000000..5b062ee1
 +    // once", LLVM ERROR: inconsistency in registered CommandLine options).
 +    ensurePgoOptions()
 +    try {
-+      new DirectCodeGen(config, env, capableDefns).emitTo(objPath)
++      new DirectCodeGen(config, env, sections, capableDefns).emitTo(objPath)
 +      true
 +    } catch {
 +      // Catches everything non-fatal, not just Unsupported: `plan`'s scan is
@@ -308,6 +310,7 @@ index 00000000..5b062ee1
 +private[direct] final class DirectCodeGen(
 +    config: build.Config,
 +    env: Map[nir.Global, nir.Defn],
++    sections: GlobalSections,
 +    defns: Seq[nir.Defn]
 +)(implicit platform: PlatformInfo) {
 +  import DirectCodeGen.Capability.Unsupported
@@ -352,6 +355,8 @@ index 00000000..5b062ee1
 +  private val globalsByName = mutable.Map.empty[String, LLVMValueRef]
 +  private val hoistedConsts = mutable.Map.empty[nir.Val, LLVMValueRef]
 +  private var constCounter = 0
++  // Globals in a section marked `used` (kept under LTO), listed in @llvm.used.
++  private val usedGlobals = mutable.ArrayBuffer.empty[LLVMValueRef]
 +
 +  // Exception handling. Two personality/landingpad shapes, selected exactly
 +  // like UnixCompat (config.usingCppExceptions): the default ScalaNative
@@ -663,10 +668,15 @@ index 00000000..5b062ee1
 +        Zone.acquire { implicit z =>
 +          val g = C.LLVMAddGlobal(module, ty, toCString(name))
 +          C.LLVMSetInitializer(g, inner)
-+          C.LLVMSetGlobalConstant(g, 1)
 +          C.LLVMSetLinkage(g, LLVMPrivateLinkage)
-+          // Same as AbstractCodeGen.genStaticObjectAlignment
-+          if (platform.useCompactHeaders) C.LLVMSetAlignment(g, 16.toUInt)
++          sections.forConstant(v) match {
++            // A literal's characters are immutable, but its object header
++            // contains a mutable lock word: not a constant.
++            case Some(section) => setStaticObjectSection(g, section)
++            case None =>
++              C.LLVMSetGlobalConstant(g, 1)
++              setStaticObjectAlignment(g)
++          }
 +          g
 +        }
 +      }
@@ -832,6 +842,8 @@ index 00000000..5b062ee1
 +      case other => unsupported(other)
 +    }
 +
++    genUsedGlobals()
++
 +    if (debugInfoEnabled) {
 +      // Module flag first: without it LLVM's verifier-invoked
 +      // UpgradeDebugInfo silently strips every !dbg attachment (a warning,
@@ -879,9 +891,43 @@ index 00000000..5b062ee1
 +    val init = valueOf(rhs, locals = null)
 +    C.LLVMSetInitializer(g, init)
 +    if (isConst) C.LLVMSetGlobalConstant(g, 1)
-+    // Same as AbstractCodeGen.genStaticObjectAlignment
-+    if (platform.useCompactHeaders) C.LLVMSetAlignment(g, 16.toUInt)
++    sections.forGlobal(name) match {
++      case Some(section) =>
++        setStaticObjectSection(g, section)
++        if (section.used) usedGlobals += g
++      case None => setStaticObjectAlignment(g)
++    }
 +  }
++
++  // Same as AbstractCodeGen.genStaticObjectSection
++  private def setStaticObjectSection(
++      g: LLVMValueRef,
++      section: GlobalSections.Section
++  ): Unit = {
++    Zone.acquire { implicit z =>
++      C.LLVMSetSection(g, toCString(section.llvmName(config)))
++    }
++    C.LLVMSetAlignment(
++      g,
++      (if (platform.useCompactHeaders) 16 else platform.sizeOfPtr).toUInt
++    )
++  }
++
++  // Same as AbstractCodeGen.genStaticObjectAlignment
++  private def setStaticObjectAlignment(g: LLVMValueRef): Unit =
++    if (platform.useCompactHeaders) C.LLVMSetAlignment(g, 16.toUInt)
++
++  // Same as AbstractCodeGen.genUsedGlobals
++  private def genUsedGlobals(): Unit =
++    if (usedGlobals.nonEmpty) Zone.acquire { implicit z =>
++      val elems = alloc[LLVMValueRef](usedGlobals.size.toUSize)
++      foreachIndexed(usedGlobals.toSeq) { (g, i) => elems(i) = g }
++      val arr = C.LLVMConstArray2(ptrTy, elems, usedGlobals.size.toULong)
++      val used = C.LLVMAddGlobal(module, C.LLVMArrayType2(ptrTy, usedGlobals.size.toULong), c"llvm.used")
++      C.LLVMSetInitializer(used, arr)
++      C.LLVMSetLinkage(used, LLVMAppendingLinkage)
++      C.LLVMSetSection(used, c"llvm.metadata")
++    }
 +
 +  private def genFunctionBody(defn: nir.Defn.Define): Unit = {
 +    val fn = globalValueFor(defn.name)
@@ -1471,10 +1517,10 @@ index 00000000..5b062ee1
 +}
 diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
 new file mode 100644
-index 00000000..6635047f
+index 000000000..c122cbd2a
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,50 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -1519,17 +1565,18 @@ index 00000000..6635047f
 +  def emit(
 +      config: build.Config,
 +      env: Map[nir.Global, nir.Defn],
++      sections: GlobalSections,
 +      capableDefns: Seq[nir.Defn],
 +      objPath: Path
 +  )(implicit platform: PlatformInfo): Boolean =
-+    DirectCodeGen.emit(config, env, capableDefns, objPath)
++    DirectCodeGen.emit(config, env, sections, capableDefns, objPath)
 +}
 diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
 new file mode 100644
-index 00000000..dfcb68b9
+index 000000000..20193064c
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
-@@ -0,0 +1,588 @@
+@@ -0,0 +1,590 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -1606,6 +1653,7 @@ index 00000000..dfcb68b9
 +  // the first time, and LLVM's verifier caught it immediately: "Only global
 +  // arrays can have appending linkage!" on every hoisted __const global).
 +  final val LLVMExternalLinkage = 0
++  final val LLVMAppendingLinkage = 7
 +  final val LLVMPrivateLinkage = 9
 +
 +  // llvm-c/Core.h: LLVMVisibility
@@ -1827,6 +1875,7 @@ index 00000000..dfcb68b9
 +        name: CString
 +    ): LLVMValueRef = extern
 +    def LLVMSetAlignment(v: LLVMValueRef, bytes: CUnsignedInt): Unit = extern
++    def LLVMSetSection(global: LLVMValueRef, section: CString): Unit = extern
 +    def LLVMSetVolatile(memoryAccessInst: LLVMValueRef, isVolatile: LLVMBool): Unit = extern
 +    def LLVMSetThreadLocal(globalVar: LLVMValueRef, isThreadLocal: LLVMBool): Unit = extern
 +
@@ -2119,7 +2168,7 @@ index 00000000..dfcb68b9
 +  }
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala b/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
-index 97c85745..5b674d30 100644
+index 97c857456..5b674d301 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
 @@ -19,7 +19,7 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
@@ -2217,7 +2266,7 @@ index 97c85745..5b674d30 100644
  
    object Array
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
-index e2bf9d0e..9e4ddba5 100644
+index e2bf9d0e1..9e4ddba52 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
 @@ -18,7 +18,7 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
@@ -2314,7 +2363,7 @@ index e2bf9d0e..9e4ddba5 100644
 +      })
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Generate.scala b/tools/src/main/scala/scala/scalanative/codegen/Generate.scala
-index 56b0923a..517d2d82 100644
+index 4975b04d9..edddbe16a 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Generate.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Generate.scala
 @@ -15,14 +15,14 @@ private[codegen] object Generate {
@@ -2342,7 +2391,7 @@ index 56b0923a..517d2d82 100644
        genScanableTypesIds()
        genWeakRefUtils()
        genArrayIds()
-@@ -115,7 +116,7 @@ private[codegen] object Generate {
+@@ -122,7 +123,7 @@ private[codegen] object Generate {
      /* Generate class initializers to handle class instantiated using reflection */
      private def genClassInitializersCalls(
          unwind: () => nir.Next
@@ -2351,7 +2400,7 @@ index 56b0923a..517d2d82 100644
        defns.collect {
          case defn @ nir.Defn.Define(_, name: nir.Global.Member, _, _, _) if name.sig.isClinit =>
            nir.Inst.Let(
-@@ -259,7 +260,7 @@ private[codegen] object Generate {
+@@ -266,7 +267,7 @@ private[codegen] object Generate {
              val moduleTyName = name.member(nir.Sig.Generated("type"))
              val moduleTyVal = nir.Val.Global(moduleTyName, nir.Type.Ptr)
              val instanceName = name.member(nir.Sig.Generated("instance"))
@@ -2360,7 +2409,7 @@ index 56b0923a..517d2d82 100644
              // Needs to be defined as var, const does not allow to modify lock-word field
              val instanceDefn = nir.Defn.Var(
                nir.Attrs.None,
-@@ -374,6 +375,18 @@ private[codegen] object Generate {
+@@ -381,6 +382,18 @@ private[codegen] object Generate {
            meta.moduleArray.value
          )
  
@@ -2380,7 +2429,7 @@ index 56b0923a..517d2d82 100644
        buf +=
          nir.Defn.Const(
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/GenerateReflectiveProxies.scala b/tools/src/main/scala/scala/scalanative/codegen/GenerateReflectiveProxies.scala
-index 0d9a0901..0c1a8515 100644
+index 0d9a0901b..0c1a85157 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/GenerateReflectiveProxies.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/GenerateReflectiveProxies.scala
 @@ -144,8 +144,8 @@ private[codegen] object GenerateReflectiveProxies {
@@ -2394,21 +2443,8 @@ index 0d9a0901..0c1a8515 100644
    ): Seq[nir.Defn.Define] = {
  
      // filters methods with same name and args but different return type for each given type
-diff --git a/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala b/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
-index 35a11108..fdf67753 100644
---- a/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
-+++ b/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
-@@ -18,7 +18,7 @@ private[codegen] class IncrementalCodeGenContext(config: build.Config) {
-   private val dumpPackage2hash: Path = config.workDir.resolve("package2hash")
- 
-   def collectFromPreviousState(): Unit = {
--    if (Build.userConfigHasChanged(config))
-+    if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
-       Files.deleteIfExists(dumpPackage2hash)
-     else if (Files.exists(dumpPackage2hash)) {
-       Source
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
-index bdfe0b38..9e1b348c 100644
+index a48bbbed0..da30fce68 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 @@ -52,11 +52,15 @@ private[scalanative] object Lower {
@@ -2691,7 +2727,7 @@ index bdfe0b38..9e1b348c 100644
      def genGuardInBounds(
          buf: nir.InstructionBuilder,
          idx: nir.Val,
-@@ -1148,7 +1358,12 @@ private[scalanative] object Lower {
+@@ -1143,7 +1353,12 @@ private[scalanative] object Lower {
            s"The virtual table of ${cls.name} does not contain $sig"
          )
  
@@ -2705,7 +2741,7 @@ index bdfe0b38..9e1b348c 100644
          val methptrptr = let(
            nir.Op.Elem(
              rtti(cls).struct,
-@@ -1167,7 +1382,7 @@ private[scalanative] object Lower {
+@@ -1162,7 +1377,7 @@ private[scalanative] object Lower {
              .indexOf(sig)
              .ensuring(_ >= 0, s"Not found ${sig.show} entry in ${trt.name.id} methods")
          )
@@ -2714,7 +2750,7 @@ index bdfe0b38..9e1b348c 100644
          genItableLookup(trt, buf, mayBeNotFound = false)(Some(n), rtti, nir.Type.Ptr)(
            genFastPath = (buf, traitId, itableSize, resultLabel) => {
              val itablesPtr = let(nir.Op.Elem(ClassRtti.layout, rtti, ClassRttiItablesPath), unwind)
-@@ -1272,8 +1487,10 @@ private[scalanative] object Lower {
+@@ -1267,8 +1482,10 @@ private[scalanative] object Lower {
          val methodIndex =
            meta.analysis.dynsigs.zipWithIndex.find(_._1 == sig).get._2
  
@@ -2727,7 +2763,7 @@ index bdfe0b38..9e1b348c 100644
          // Load the dynamic hash map for given type, make sure it's not null
          val mapelem = elem(classRttiType, typeptr, ClassRttiDynmapPath, unwind)
          val mapptr = load(nir.Type.Ptr, mapelem, unwind)
-@@ -1340,16 +1557,26 @@ private[scalanative] object Lower {
+@@ -1335,16 +1552,26 @@ private[scalanative] object Lower {
          scopeId: nir.ScopeId
      ): nir.Val = {
        import buf._
@@ -2756,7 +2792,7 @@ index bdfe0b38..9e1b348c 100644
            val idptr = let(nir.Op.Elem(Rtti.layout, typeptr, RttiClassIdPath), unwind)
            val id = let(nir.Op.Load(nir.Type.Int, idptr), unwind)
            val ge = let(nir.Op.Comp(nir.Comp.Sle, nir.Type.Int, nir.Val.Int(range.start), id), unwind)
-@@ -1362,7 +1589,7 @@ private[scalanative] object Lower {
+@@ -1357,7 +1584,7 @@ private[scalanative] object Lower {
              case _             =>
            }
            val traitId = nir.Val.Int(meta.ids(trt))
@@ -2765,7 +2801,7 @@ index bdfe0b38..9e1b348c 100644
            genItableLookup(trt, buf, mayBeNotFound = true)(None, rtti, nir.Type.Bool)(
              genFastPath = (buf, traitId, itableSize, _) => {
                val itablesPtr = let(nir.Op.Elem(ClassRtti.layout, rtti, ClassRttiItablesPath), unwind)
-@@ -1453,6 +1680,99 @@ private[scalanative] object Lower {
+@@ -1448,6 +1675,99 @@ private[scalanative] object Lower {
          buf: nir.InstructionBuilder,
          n: nir.Local,
          op: nir.Op.Classalloc
@@ -2865,7 +2901,7 @@ index bdfe0b38..9e1b348c 100644
      )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
        val nir.Op.Classalloc(ClassRef(cls), v) = op: @unchecked
        val zone = v.map(genVal(buf, _))
-@@ -1750,6 +2070,33 @@ private[scalanative] object Lower {
+@@ -1745,6 +2065,33 @@ private[scalanative] object Lower {
        val nir.Op.Box(ty, v) = op
        val from = genVal(buf, v)
  
@@ -2899,7 +2935,7 @@ index bdfe0b38..9e1b348c 100644
        val methodName = BoxTo(ty)
        val moduleName = methodName.top
  
-@@ -1767,6 +2114,161 @@ private[scalanative] object Lower {
+@@ -1762,6 +2109,161 @@ private[scalanative] object Lower {
        )
      }
  
@@ -3061,7 +3097,7 @@ index bdfe0b38..9e1b348c 100644
      def genUnboxOp(
          buf: nir.InstructionBuilder,
          n: nir.Local,
-@@ -1775,19 +2277,159 @@ private[scalanative] object Lower {
+@@ -1770,19 +2272,159 @@ private[scalanative] object Lower {
        val nir.Op.Unbox(ty, v) = op
        val from = genVal(buf, v)
  
@@ -3231,7 +3267,7 @@ index bdfe0b38..9e1b348c 100644
          unwind
        )
      }
-@@ -1823,6 +2465,10 @@ private[scalanative] object Lower {
+@@ -1818,6 +2460,10 @@ private[scalanative] object Lower {
          op: nir.Op.Arrayalloc
      )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
        val nir.Op.Arrayalloc(ty, v1, v2) = op
@@ -3242,7 +3278,7 @@ index bdfe0b38..9e1b348c 100644
        val init = genVal(buf, v1)
        val zone = v2.map(genVal(buf, _))
        init match {
-@@ -1883,10 +2529,16 @@ private[scalanative] object Lower {
+@@ -1878,10 +2524,16 @@ private[scalanative] object Lower {
      }
  
      private def arrayMemoryLayout(
@@ -3260,7 +3296,7 @@ index bdfe0b38..9e1b348c 100644
      )
      private def arrayValuePath(idx: nir.Val) = Seq(zero, one, idx)
  
-@@ -1903,7 +2555,7 @@ private[scalanative] object Lower {
+@@ -1898,7 +2550,7 @@ private[scalanative] object Lower {
        genArraylengthOp(buf, len, nir.Op.Arraylength(arr))
        genGuardInBounds(buf, idx, nir.Val.Local(len, nir.Type.Int))
  
@@ -3269,7 +3305,7 @@ index bdfe0b38..9e1b348c 100644
        val elemPtr = buf.elem(arrTy, arr, arrayValuePath(idx), unwind)
        genLoadOp(buf, n, nir.Op.Load(ty, elemPtr, Some(nir.MemoryOrder.Unordered)))
      }
-@@ -1920,7 +2572,7 @@ private[scalanative] object Lower {
+@@ -1915,7 +2567,7 @@ private[scalanative] object Lower {
        genArraylengthOp(buf, len, nir.Op.Arraylength(arr))
        genGuardInBounds(buf, idx, nir.Val.Local(len, nir.Type.Int))
  
@@ -3278,9 +3314,9 @@ index bdfe0b38..9e1b348c 100644
        val elemPtr = buf.elem(arrTy, arr, arrayValuePath(idx), unwind)
        genStoreOp(buf, n, nir.Op.Store(ty, elemPtr, value, Some(nir.MemoryOrder.Unordered)))
      }
-@@ -2000,10 +2652,11 @@ private[scalanative] object Lower {
-       val charsLength = nir.Val.Int(chars.length)
-       val charsConst = nir.Val.Const(
+@@ -1996,10 +2648,11 @@ private[scalanative] object Lower {
+       val charsConst = meta.globalSections.constant(
+         GlobalSections.Strings,
          nir.Val.StructValue(
 -          rtti(CharArrayCls).const ::
 +          meta.headerWordVal(CharArrayCls) ::
@@ -3292,16 +3328,16 @@ index bdfe0b38..9e1b348c 100644
              nir.Val.ArrayValue(
                nir.Type.Char,
                chars.toSeq.map(nir.Val.Char(_))
-@@ -2026,7 +2679,7 @@ private[scalanative] object Lower {
- 
-       nir.Val.Const(
+@@ -2023,7 +2676,7 @@ private[scalanative] object Lower {
+       meta.globalSections.constant(
+         GlobalSections.Strings,
          nir.Val.StructValue(
 -          rtti(StringCls).const ::
 +          meta.headerWordVal(StringCls) ::
              meta.lockWordVals ++
              fieldValues
          )
-@@ -2503,6 +3156,18 @@ private[scalanative] object Lower {
+@@ -2499,6 +3152,18 @@ private[scalanative] object Lower {
      buf += CharArrayName
      buf += BoxesRunTime
      buf += RuntimeBoxes
@@ -3321,7 +3357,7 @@ index bdfe0b38..9e1b348c 100644
      buf ++= BoxTo.values
      buf ++= UnboxTo.values
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala b/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
-index d1703913..b1f0ccfe 100644
+index 4fc2a4a8e..4b33f4b49 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
 @@ -13,10 +13,34 @@ private[scalanative] class Metadata(
@@ -3358,9 +3394,9 @@ index d1703913..b1f0ccfe 100644
 +    else rtti(cls).const
 +
    val layouts = new CommonMemoryLayouts()
+   val globalSections = new GlobalSections
    val rtti = mutable.Map.empty[linker.Info, RuntimeTypeInformation]
-   val vtable = mutable.Map.empty[linker.Class, VirtualTable]
-@@ -27,6 +51,11 @@ private[scalanative] class Metadata(
+@@ -28,6 +52,11 @@ private[scalanative] class Metadata(
    val ranges = mutable.Map.empty[linker.Class, Range]
  
    val classes = initClassIdsAndRanges()
@@ -3372,7 +3408,7 @@ index d1703913..b1f0ccfe 100644
    val (traits, traitIdsContext) = initTraitIds()
    val moduleArray = new ModuleArray(this)
  
-@@ -36,9 +65,15 @@ private[scalanative] class Metadata(
+@@ -37,9 +66,15 @@ private[scalanative] class Metadata(
    val canAlwaysUseFastITables = rtti.valuesIterator.forall(_.canUseFastITables)
  
    def initTraitIds(): (Seq[Trait], TraitsUniverse.TraitId.Context) = {
@@ -3389,7 +3425,7 @@ index d1703913..b1f0ccfe 100644
      val universe = new TraitsUniverse(traits)
      val ctx = universe.assignIds(ids)
      (traits, ctx)
-@@ -105,3 +140,12 @@ private[scalanative] class Metadata(
+@@ -106,3 +141,12 @@ private[scalanative] class Metadata(
      }
    }
  }
@@ -3403,7 +3439,7 @@ index d1703913..b1f0ccfe 100644
 +  final val MaxCompactHeaderClasses = (1 << 16) - 1
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/PerfectHashMap.scala b/tools/src/main/scala/scala/scalanative/codegen/PerfectHashMap.scala
-index b7be9305..a118230d 100644
+index b7be93052..a118230dd 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/PerfectHashMap.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/PerfectHashMap.scala
 @@ -169,8 +169,8 @@ private[codegen] class PerfectHashMap[K, V](
@@ -3418,7 +3454,7 @@ index b7be9305..a118230d 100644
  
      val signaturesWithIndex =
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala b/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
-index 684b058b..cc0764c4 100644
+index 684b058b2..cc0764c44 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
 @@ -7,6 +7,8 @@ private[scalanative] case class PlatformInfo(
@@ -3440,7 +3476,7 @@ index 684b058b..cc0764c4 100644
        Discover.features.opaquePointers(config.compilerConfig).isAvailable,
      useGCYieldPointTraps = config.useTrapBasedGCYieldPoints,
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala b/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala
-index 08eeb944..9048ce0a 100644
+index 08eeb9449..9048ce0a1 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala
 @@ -69,6 +69,11 @@ private[codegen] class RuntimeTypeInformation(info: ScopeInfo)(implicit
@@ -3489,7 +3525,7 @@ index 08eeb944..9048ce0a 100644
              meta.vtable(cls).value ::
              Nil
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala b/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala
-index e157b2bd..a8c20984 100644
+index e157b2bd1..a8c209846 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala
 @@ -116,6 +116,16 @@ private[codegen] class SourceCodeCache(config: build.Config) {
@@ -3518,7 +3554,7 @@ index e157b2bd..a8c20984 100644
            .orElse {
              if (loggedMissingSourcesForCp.add(pos.nirSource.directory))
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/VirtualTable.scala b/tools/src/main/scala/scala/scalanative/codegen/VirtualTable.scala
-index ee920507..a0ccfffb 100644
+index ee920507e..a0ccfffb9 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/VirtualTable.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/VirtualTable.scala
 @@ -28,6 +28,9 @@ private[codegen] class VirtualTable(cls: linker.Class)(implicit
@@ -3532,18 +3568,32 @@ index ee920507..a0ccfffb 100644
        if (cls.targets(sig).size > 1) {
          if (!impls.contains(sig)) {
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
-index 60a48801..f9e7964e 100644
+index c22c7ca98..f34dd5653 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
-@@ -203,6 +203,7 @@ private[codegen] abstract class AbstractCodeGen(
-         genGlobal(name)
-         str(" = private unnamed_addr constant ")
-         genVal(v)
-+        genStaticObjectAlignment()
+@@ -220,7 +220,10 @@ private[codegen] abstract class AbstractCodeGen(
+           else " = private unnamed_addr constant "
+         )
+         genVal(value)
+-        section.foreach(genStaticObjectSection)
++        section match {
++          case Some(section) => genStaticObjectSection(section)
++          case None          => genStaticObjectAlignment()
++        }
      }
    }
  
-@@ -222,12 +223,6 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -228,7 +231,8 @@ private[codegen] abstract class AbstractCodeGen(
+       sb: ShowBuilder
+   ): Unit = {
+     val name = section.llvmName(meta.buildConfig)
+-    sb.str(s""", section "$name", align ${platform.sizeOfPtr}""")
++    val align = if (platform.useCompactHeaders) 16 else platform.sizeOfPtr
++    sb.str(s""", section "$name", align $align""")
+   }
+ 
+   private def genDefn(defn: nir.Defn)(implicit
+@@ -247,12 +251,6 @@ private[codegen] abstract class AbstractCodeGen(
        unsupported(defn)
    }
  
@@ -3556,7 +3606,7 @@ index 60a48801..f9e7964e 100644
    private[codegen] def genGlobalDefn(
        attrs: nir.Attrs,
        name: nir.Global,
-@@ -240,18 +235,23 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -265,18 +263,17 @@ private[codegen] abstract class AbstractCodeGen(
      genGlobal(name)
      str(" = ")
      str(if (attrs.isExtern) "external " else "hidden ")
@@ -3569,9 +3619,20 @@ index 60a48801..f9e7964e 100644
        genType(ty)
      } else {
        genVal(rhs)
-+      genStaticObjectAlignment()
+-      meta.globalSections.forGlobal(name).foreach { section =>
+-        genStaticObjectSection(section)
+-        if (section.used) usedGlobals += name
++      meta.globalSections.forGlobal(name) match {
++        case Some(section) =>
++          genStaticObjectSection(section)
++          if (section.used) usedGlobals += name
++        case None => genStaticObjectAlignment()
+       }
      }
    }
+@@ -296,6 +293,13 @@ private[codegen] abstract class AbstractCodeGen(
+       str("""], section "llvm.metadata"""")
+     }
  
 +  /** Compact headers start with a 32 bit word, so a static object is only 4
 +   *  byte aligned by default. Keep them aligned like the heap objects, both the
@@ -3583,7 +3644,7 @@ index 60a48801..f9e7964e 100644
    private[codegen] def genFunctionDefn(
        defn: nir.Defn,
        insts: Seq[nir.Inst],
-@@ -1041,19 +1041,10 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -1092,19 +1096,10 @@ private[codegen] abstract class AbstractCodeGen(
        case Lower.GCYield if useGCYieldPointTraps =>
          // We can't express volatile load in NIR, inline only expected usage.
          //
@@ -3608,7 +3669,7 @@ index 60a48801..f9e7964e 100644
          val nir.Sig.Extern(safepointTrapField) =
            Lower.GCYieldPointTrapName.sig.unmangled: @unchecked
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
-index a477edfc..12181cc3 100644
+index a477edfce..0ff8f7455 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
 @@ -13,6 +13,7 @@ import scala.scalanative.build
@@ -3619,15 +3680,6 @@ index a477edfc..12181cc3 100644
  import scala.scalanative.codegen.{Metadata => CodeGenMetadata}
  import scala.scalanative.io.VirtualDirectory
  import scala.scalanative.linker.ReachabilityAnalysis
-@@ -71,7 +72,7 @@ object CodeGen {
-     Scope { implicit in =>
-       val env = assembly.map(defn => defn.name -> defn).toMap
-       val outputDirPath = config.workDir.resolve("generated")
--      if (Build.userConfigHasChanged(config))
-+      if (Build.userConfigHasChanged(config, Build.defaultUserConfigHashPath(config)))
-         IO.deleteRecursive(outputDirPath)
-       Files.createDirectories(outputDirPath)
-       val outputDir = VirtualDirectory.real(outputDirPath)
 @@ -81,15 +82,65 @@ object CodeGen {
          defn.pos.source.directory
            .getOrElse(EmptyPath)
@@ -3676,7 +3728,7 @@ index a477edfc..12181cc3 100644
 +              case DirectCodeGenPlan.Split(capable, incapable) =>
 +                val objPath = outputDirPath.resolve(s"$id.o")
 +                val directFuture = Future {
-+                  if (DirectCodeGenDispatch.emit(config, env, capable, objPath)(meta.platform))
++                  if (DirectCodeGenDispatch.emit(config, env, meta.globalSections, capable, objPath)(meta.platform))
 +                    objPath
 +                  else
 +                    // emit() failed partway through: fall back to text for
@@ -3775,7 +3827,7 @@ index a477edfc..12181cc3 100644
 +                val directFuture = Future {
 +                  ctx.addEntry(directKey, capable)
 +                  if (ctx.shouldCompile(directKey) || !Files.exists(objPath)) {
-+                    if (DirectCodeGenDispatch.emit(config, env, capable, objPath)(meta.platform))
++                    if (DirectCodeGenDispatch.emit(config, env, meta.globalSections, capable, objPath)(meta.platform))
 +                      objPath
 +                    else
 +                      // see separate()'s identical fallback for why this
@@ -3823,7 +3875,7 @@ index a477edfc..12181cc3 100644
        override def gen(unused: String, dir: VirtualDirectory): Path = {
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenPlan.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenPlan.scala
 new file mode 100644
-index 00000000..2499f4b6
+index 000000000..2499f4b6f
 --- /dev/null
 +++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenPlan.scala
 @@ -0,0 +1,31 @@

@@ -1,5 +1,5 @@
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala
-index f10b7c66..980d6019 100644
+index f10b7c668..980d6019f 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/PrepNativeInterop.scala
 @@ -4,6 +4,7 @@ import dotty.tools._
