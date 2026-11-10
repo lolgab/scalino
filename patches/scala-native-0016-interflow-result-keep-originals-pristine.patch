@@ -1,0 +1,41 @@
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+index 0ce020b..bf1f11b 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+@@ -356,17 +356,25 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+     blockFreshTl.set(blockFreshTl.get.tail)
+ 
+   def result(): Seq[nir.Defn] = {
+-    // Was `originals.clone()` then merging `done` into the clone: this
+-    // Interflow instance (and therefore `originals`) is discarded the
+-    // instant this method returns (see `Interflow.optimize` below --
+-    // `interflow` is never referenced again after `.result()`), so the
+-    // clone was a second full-corpus-sized copy of `originals` with no
+-    // downstream reader. Mutating in place removes that copy -- traced,
+-    // via real profiling on dotc's own NIR (~77K reachable methods), to
+-    // the exact site of an `Out of heap space` crash under scala-native's
+-    // own GC linking something at that scale.
+-    originals ++= done.asScala
+-    originals.values.toSeq
++    // `originals` must stay the pristine input: this instance is reused by
++    // `incrementalReprocess`, which diffs `originals` against the next
++    // build's input to find what changed (merging the optimized bodies in, as
++    // this used to, made every optimized method look changed on a relink).
++    // Still no second map the size of the corpus: just the result sequence.
++    val out = Vector.newBuilder[nir.Defn]
++    out.sizeHint(originals.size)
++    originals.foreach {
++      case (name, defn) =>
++        val optimized =
++          name match {
++            case m: nir.Global.Member => done.get(m)
++            case _                    => null
++          }
++        out += (if (optimized != null) optimized else defn)
++    }
++    // Defns that exist only as optimizer output (e.g. specializations).
++    done.forEach { (name, defn) => if (!originals.contains(name)) out += defn }
++    out.result()
+   }
+ 
+   protected def mode: build.Mode = config.compilerConfig.mode

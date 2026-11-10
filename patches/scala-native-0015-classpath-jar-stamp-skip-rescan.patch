@@ -1,0 +1,137 @@
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+index 243e6d2..874f38d 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+@@ -94,6 +94,23 @@ object ClassPath {
+     private val cache =
+       mutable.Map.empty[nir.Global.Top, (java.nio.file.attribute.FileTime, Option[Seq[nir.Defn]])]
+ 
++    // A jar cannot change under a running process short of being rebuilt, so a
++    // (mtime, size) stamp is enough to skip, on a relink, everything that scales
++    // with the jar rather than with the edit: walking its zip directory,
++    // stat'ing every entry in `load`, reading the prelude of every NIR file in
++    // `classesWithEntryPoints` and re-reading the service files. Directories
++    // (the project's own classes) are always rescanned, but their entry-point
++    // check is cached per file by mtime.
++    private val jarFile: java.io.File =
++      try directory.path.toFile
++      catch { case _: UnsupportedOperationException => null }
++    private var jarStamp: (Long, Long) = null
++    private var jarStable = false
++    private var entryPointsCache: Iterable[nir.Global.Top] = null
++    private var providersCache: Map[nir.Global.Top, Seq[nir.Global.Top]] = null
++    private val entryPointByFile =
++      mutable.Map.empty[Path, (java.nio.file.attribute.FileTime, Boolean)]
++
+     /** Re-scans `directory.files` and drops any cached entry whose backing
+      *  file is gone (deleted/renamed since the last scan) so a stale parsed
+      *  `Defn` can never linger and be linked in by mistake. Idempotent and
+@@ -103,6 +120,20 @@ object ClassPath {
+      *  *parse* is what this cache is actually saving.
+      */
+     def refresh(): Unit = {
++      val stamp =
++        if (jarFile != null && jarFile.isFile) (jarFile.lastModified(), jarFile.length())
++        else null
++      if (stamp != null && stamp == jarStamp) jarStable = true
++      else {
++        jarStable = false
++        jarStamp = stamp
++        entryPointsCache = null
++        providersCache = null
++        rescan()
++      }
++    }
++
++    private def rescan(): Unit = {
+       nirFiles.clear()
+       serviceProviders.clear()
+       directory.files
+@@ -134,14 +165,18 @@ object ClassPath {
+       nirFiles.get(name.top) match {
+         case None => None
+         case Some(file) =>
+-          val mtime = directory.lastModified(file)
+           cache.get(name) match {
+-            case Some((cachedMtime, cachedResult)) if cachedMtime == mtime =>
+-              cachedResult
+-            case _ =>
+-              val result = Some(deserializeBinary(directory, file))
+-              cache.update(name, (mtime, result))
+-              result
++            case Some((_, cachedResult)) if jarStable => cachedResult
++            case cached =>
++              val mtime = directory.lastModified(file)
++              cached match {
++                case Some((cachedMtime, cachedResult)) if cachedMtime == mtime =>
++                  cachedResult
++                case _ =>
++                  val result = Some(deserializeBinary(directory, file))
++                  cache.update(name, (mtime, result))
++                  result
++              }
+           }
+       }
+ 
+@@ -150,23 +185,49 @@ object ClassPath {
+     // on every incremental relink, so a value memoized from the first build
+     // would silently go stale (e.g. a newly-added entry point or service
+     // provider file would never be picked up in a later build).
+-    def classesWithEntryPoints: Iterable[nir.Global.Top] = {
++    def classesWithEntryPoints: Iterable[nir.Global.Top] =
++      if (jarStamp != null) {
++        if (entryPointsCache == null) entryPointsCache = scanEntryPoints()
++        entryPointsCache
++      } else scanEntryPoints()
++
++    private def scanEntryPoints(): Iterable[nir.Global.Top] = {
++      val perFile = jarStamp == null
+       nirFiles.filter {
+         case (_, file) =>
+-          def logUnreadableFile(err: NirDeserializationException): Unit =
+-            log.warn(
+-              s"Can't check if file contains entrypoints, ${file} would be ignored: ${err.getMessage()}"
+-            )
+-          val buffer = directory.read(file, len = NirPrelude.length)
+-          NirPrelude
+-            .tryReadFrom(buffer, nir.NIRSource(directory.path, file).debugName)
+-            .left
+-            .map(logUnreadableFile)
+-            .exists(_.hasEntryPoints)
++          def hasEntryPoints: Boolean = {
++            def logUnreadableFile(err: NirDeserializationException): Unit =
++              log.warn(
++                s"Can't check if file contains entrypoints, ${file} would be ignored: ${err.getMessage()}"
++              )
++            val buffer = directory.read(file, len = NirPrelude.length)
++            NirPrelude
++              .tryReadFrom(buffer, nir.NIRSource(directory.path, file).debugName)
++              .left
++              .map(logUnreadableFile)
++              .exists(_.hasEntryPoints)
++          }
++          if (!perFile) hasEntryPoints
++          else {
++            val mtime = directory.lastModified(file)
++            entryPointByFile.get(file) match {
++              case Some((cachedMtime, has)) if cachedMtime == mtime => has
++              case _ =>
++                val has = hasEntryPoints
++                entryPointByFile.update(file, (mtime, has))
++                has
++            }
++          }
+       }.keySet
+     }
+ 
+-    def definedServicesProviders
++    def definedServicesProviders: Map[nir.Global.Top, Seq[nir.Global.Top]] =
++      if (jarStamp != null) {
++        if (providersCache == null) providersCache = readServicesProviders()
++        providersCache
++      } else readServicesProviders()
++
++    private def readServicesProviders()
+         : Map[nir.Global.Top, Seq[nir.Global.Top]] = {
+       serviceProviders.map {
+         case (name, path) =>

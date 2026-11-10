@@ -1,0 +1,104 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+index 15b429f..2a32f66 100644
+--- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
++++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+@@ -22,6 +22,25 @@ private[scalanative] object NativeLib {
+   /** Name of directory that contains native code: "scala-native" */
+   val nativeCodeDir = "scala-native"
+ 
++  // Dependency jars do not change under a running process short of being
++  // rebuilt, so a (mtime, size) stamp is enough to reuse, across the relinks of
++  // scalino's `--long-running` linkdriver, what only depends on a jar's
++  // contents: whether it carries native sources, its SHA-1 and the list of
++  // sources found once unpacked. Without this every link re-scanned the zip
++  // entries of every classpath jar, re-hashed the native-lib jars and re-globbed
++  // their unpacked directories: ~150ms with no compiler running.
++  private final case class Stamp(mtime: Long, size: Long)
++  private def stampOf(path: Path): Stamp = {
++    val file = path.toFile()
++    Stamp(file.lastModified(), file.length())
++  }
++  private val jarHasNativeCache =
++    new java.util.concurrent.ConcurrentHashMap[Path, (Stamp, Boolean)]()
++  private val jarSha1Cache =
++    new java.util.concurrent.ConcurrentHashMap[Path, (Stamp, Array[Byte])]()
++  private val nativePathsCache =
++    new java.util.concurrent.ConcurrentHashMap[Path, (Stamp, Seq[Path])]()
++
+   /** Project Descriptor properties file: "scala-native.properties" */
+   private val nativeProjectProps = s"${nativeCodeDir}.properties"
+ 
+@@ -47,7 +66,7 @@ private[scalanative] object NativeLib {
+       nativeLib: NativeLib
+   )(implicit ec: ExecutionContext): Future[Seq[Path]] = {
+     val destPath = unpackNativeCode(nativeLib)
+-    val paths = findNativePaths(destPath)
++    val paths = findNativePaths(nativeLib, destPath)
+     val projConfig = configureNativeLibrary(config, analysis, destPath)
+     /* `projConfig` extends the user's config with flags derived from the
+      * linked program (e.g. `@define`s) and the environment, so it is
+@@ -271,9 +290,19 @@ private[scalanative] object NativeLib {
+    *  @return
+    *    All file paths to compile
+    */
+-  private def findNativePaths(destPath: Path): Seq[Path] = {
+-    val srcPatterns = destSrcPattern(destPath)
+-    IO.getAll(destPath, srcPatterns)
++  private def findNativePaths(nativeLib: NativeLib, destPath: Path): Seq[Path] = {
++    def glob() = IO.getAll(destPath, destSrcPattern(destPath))
++    if (!isJar(nativeLib)) glob()
++    else {
++      val stamp = stampOf(nativeLib.src)
++      val cached = nativePathsCache.get(destPath)
++      if (cached != null && cached._1 == stamp && Files.exists(destPath)) cached._2
++      else {
++        val paths = glob()
++        nativePathsCache.put(destPath, (stamp, paths))
++        paths
++      }
++    }
+   }
+ 
+   /** The linker uses the VirtualDirectory which is sensitive to empty
+@@ -328,7 +357,16 @@ private[scalanative] object NativeLib {
+       IO.unzip(source, target)
+     }
+ 
+-    val jarhash = IO.sha1(source)
++    val jarhash = {
++      val stamp = stampOf(source)
++      val cached = jarSha1Cache.get(source)
++      if (cached != null && cached._1 == stamp) cached._2
++      else {
++        val hash = IO.sha1(source)
++        jarSha1Cache.put(source, (stamp, hash))
++        hash
++      }
++    }
+     val jarhashPath = target.resolve("jarhash")
+     def unpacked =
+       Files.exists(target) &&
+@@ -402,11 +440,18 @@ private[scalanative] object NativeLib {
+       case false => None
+     }
+ 
+-  private def readJar(path: Path): Option[Path] =
+-    IO.existsInJar(path, isNativeFile) match {
+-      case true  => Some(path)
+-      case false => None
+-    }
++  private def readJar(path: Path): Option[Path] = {
++    val stamp = stampOf(path)
++    val cached = jarHasNativeCache.get(path)
++    val hasNative =
++      if (cached != null && cached._1 == stamp) cached._2
++      else {
++        val has = IO.existsInJar(path, isNativeFile)
++        jarHasNativeCache.put(path, (stamp, has))
++        has
++      }
++    if (hasNative) Some(path) else None
++  }
+ 
+   /** Used to find native source files in directories */
+   private def srcPatterns(path: Path, elems: String*): String = {

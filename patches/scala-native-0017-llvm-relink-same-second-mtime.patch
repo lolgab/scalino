@@ -1,0 +1,17 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+index f7fd5a0..e951c54 100644
+--- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
++++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+@@ -468,7 +468,11 @@ private[scalanative] object LLVM {
+   @inline private def needsLinking(in: Seq[Path], out: Path): Boolean = {
+     val inmax = in.map(_.toFile().lastModified()).max
+     val outmax = out.toFile().lastModified()
+-    inmax > outmax
++    // `>=`, not `>`: lastModified has second resolution on some platforms, and
++    // an object rewritten in the same second the previous binary was linked
++    // would otherwise look up to date, leaving a stale binary (seen in watch
++    // mode, where a relink takes well under a second).
++    inmax >= outmax
+   }
+ 
+   /** DWARF debug sections embedded in the binary (PE or ELF), used by stack
