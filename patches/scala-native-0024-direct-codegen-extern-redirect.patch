@@ -1,0 +1,25 @@
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+index 2177bcc..4949b6d 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+@@ -539,8 +539,19 @@ private[direct] final class DirectCodeGen(
+     case nir.Next.None             => Seq.empty
+   }
+ 
++  // A redirect (`externRedirect`, see nir.Defn.isExternRedirect) keeps the old
++  // name of an extern for libraries built against it and forwards to the
++  // current one: a definition with an extern sig that must NOT take the bare
++  // C name, which belongs to the native function it calls. Under the bare
++  // name `globalsByName` would hand the wrapper back for the native function
++  // too, and the wrapper would call itself until the stack ran out (snunit
++  // built for 0.5.12 crashed in `scalanative_socket`). Same rule as
++  // AbstractCodeGen.mangled.
++  private def isExternRedirect(g: nir.Global): Boolean =
++    env.get(g).exists(_.isExternRedirect)
++
+   private def mangledName(g: nir.Global): String = g match {
+-    case nir.Global.Member(_, sig) if sig.isExtern =>
++    case nir.Global.Member(_, sig) if sig.isExtern && !isExternRedirect(g) =>
+       val nir.Sig.Extern(id) = sig.unmangled: @unchecked
+       // A handful of LLVM intrinsics are overloaded (parametric on an
+       // address-space-qualified pointer type) and must be declared under
