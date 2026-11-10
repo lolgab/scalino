@@ -3610,14 +3610,25 @@ object ScalinoCli:
     watching()
     var last = mtimes()
     while true do
-      // 10 x 50ms rather than one 500ms sleep: a SIGTERM is answered promptly
-      var slept = 0
-      while slept < 10 && Signals.pending == 0 do { Thread.sleep(50); slept += 1 }
+      // 50ms: the poll interval is the average edit-to-rebuild latency floor (it was 500ms), and
+      // a SIGTERM is answered promptly
+      if Signals.pending == 0 then Thread.sleep(50)
       checkSignal()
       val cur = mtimes()
       val enter = enterPressed()
       if cur != last || enter then
-        last = cur
+        // The writer may still be at it (an editor that truncates and then writes, a tool that writes in
+        // pieces): build once the files have stopped changing, not from half a file, and not twice for
+        // one save (the second build would only report "Build skipped").
+        var settled = cur
+        var changing = true
+        while changing && Signals.pending == 0 do
+          Thread.sleep(50)
+          val next = mtimes()
+          changing = next != settled
+          settled = next
+        checkSignal()
+        last = settled
         run()
         checkSignal()
         watching()
