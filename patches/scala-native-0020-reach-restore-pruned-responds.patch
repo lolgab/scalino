@@ -1,0 +1,55 @@
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Reach.scala b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+index e7a090a..0cd3097 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Reach.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Reach.scala
+@@ -112,6 +112,24 @@ private[linker] class Reach(
+       )
+   }
+ 
++  // What `cleanup` removed from the classes' `responds`/`defaultResponds`
++  // (class, signature, target, whether it was a default), so that
++  // `incrementalReprocess` can put it back: pruning is only right once nothing
++  // more is reached, which a Reach instance reused for the next build does not
++  // satisfy (a body that newly calls a method of an already loaded class that
++  // nothing called before would find no target for it).
++  private val pruned =
++    mutable.ArrayBuffer.empty[(Class, nir.Sig, nir.Global.Member, Boolean)]
++
++  private def restorePruned(): Unit = {
++    pruned.foreach {
++      case (cls, sig, name, isDefault) =>
++        if (isDefault) cls.defaultResponds(sig) = name
++        else cls.responds(sig) = name
++    }
++    pruned.clear()
++  }
++
+   def cleanup(): Unit = {
+     // Remove all unreachable methods from the
+     // responds and defaultResponds of every class.
+@@ -124,6 +142,7 @@ private[linker] class Reach(
+           case (sig, name) =>
+             if (!done.contains(name)) {
+               cls.responds -= sig
++              pruned += ((cls, sig, name, false))
+             }
+         }
+ 
+@@ -132,6 +151,7 @@ private[linker] class Reach(
+           case (sig, name) =>
+             if (!done.contains(name)) {
+               cls.defaultResponds -= sig
++              pruned += ((cls, sig, name, true))
+             }
+         }
+ 
+@@ -1476,6 +1496,9 @@ private[linker] class Reach(
+           // Second pass: only now, having proven every changed Top safe,
+           // actually mutate this instance.
+           loader = newLoader
++          // The last `result()` pruned the classes' `responds`: undo it before
++          // reaching anything new, `result()` prunes again at the end.
++          restorePruned()
+           bodyPatches.foreach {
+             case (top, TopPatch(freshDefns, defines)) =>
+               val scope = loaded(top)
