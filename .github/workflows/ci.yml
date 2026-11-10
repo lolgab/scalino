@@ -327,6 +327,8 @@ jobs:
         # forces GCs.
         shell: bash
         run: |
+          # the unit test compiles the trampoline sources from the patched vendor tree
+          VENDOR_ONLY=scala-native ./build/00b-setup-vendor.sh
           tests/safepoint-trampoline/run.sh
           ./dist/scalino clean
           # tee: show the program's output even when it fails (a bare $(...) hides it)

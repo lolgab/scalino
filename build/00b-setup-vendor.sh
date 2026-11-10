@@ -66,5 +66,6 @@ setup_one() {
   echo "OK: $vendor patched"
 }
 
-setup_one scala3 https://github.com/scala/scala3.git "$SCALA_VERSION" scala3
+# VENDOR_ONLY=scala-native: just that clone (CI jobs that only need its sources)
+[[ "${VENDOR_ONLY:-scala3}" == scala3 ]] && setup_one scala3 https://github.com/scala/scala3.git "$SCALA_VERSION" scala3
 setup_one scala-native https://github.com/scala-native/scala-native.git "$SCALA_NATIVE_REF" scala-native
