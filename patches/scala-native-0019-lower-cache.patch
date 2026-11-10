@@ -1,0 +1,1050 @@
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+index da30fce..ed3fa53 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -16,15 +16,50 @@ private[scalanative] object Lower {
+   def apply(
+       defns: Seq[nir.Defn]
+   )(implicit meta: Metadata, logger: build.Logger): Seq[nir.Defn] =
+-    (new Impl).onDefns(defns)
+-
+-  private final class Impl(implicit meta: Metadata, logger: build.Logger) extends nir.Transform {
++    (new Impl(meta)).onDefns(defns)
++
++  private final class Impl(metaRaw: Metadata)(implicit logger: build.Logger) extends nir.Transform {
++    // Lowering sees the program only through `knowledge` (see LowerKnowledge/LowerCache), and of the
++    // metadata only its configuration-level parts: whatever depends on the reachability analysis
++    // (infos, class ids, layouts, vtables, rtti) is read through it, so that it is recorded.
++    private implicit val knowledge: LowerKnowledge = new LowerKnowledge(metaRaw)
++    private object meta {
++      def config = metaRaw.config
++      implicit def platform: PlatformInfo = metaRaw.platform
++      val layouts = metaRaw.layouts
++      def globalSections = metaRaw.globalSections
++      def lockWordVals = metaRaw.lockWordVals
++      def lockWordType = metaRaw.lockWordType
++      def usesLockWords = metaRaw.usesLockWords
++      def useCompactHeaders = metaRaw.useCompactHeaders
++      def useCompactByteArrays = metaRaw.useCompactByteArrays
++      def headerWordType = metaRaw.headerWordType
++      def rttiTableName = metaRaw.rttiTableName
++      def canAlwaysUseFastITables = knowledge.canAlwaysUseFastITables
++      def headerWordVal(cls: Class) = knowledge.headerWordVal(cls)
++      def layout(cls: Class) = knowledge.layout(cls)
++      def vtable(cls: Class) = knowledge.vtable(cls)
++      def ids(info: ScopeInfo) = knowledge.ids(info)
++      def ranges(cls: Class) = knowledge.ranges(cls)
++      val rtti = knowledge.rtti
++    }
+     import meta._
+     import meta.layouts.{ArrayHeader, ClassRtti, ITable, Rtti}
+ 
+-    implicit val analysis: ReachabilityAnalysis.Result = meta.analysis
++    private trait Extractor[T] {
++      def unapply(name: nir.Global): Option[T]
++      def unapply(ty: nir.Type): Option[T] = ty match {
++        case ty: nir.Type.RefKind => unapply(ty.className)
++        case _                    => None
++      }
++    }
++    private object ScopeRef extends Extractor[ScopeInfo] { def unapply(name: nir.Global): Option[ScopeInfo] = knowledge.scope(name) }
++    private object ClassRef extends Extractor[Class] { def unapply(name: nir.Global): Option[Class] = knowledge.cls(name) }
++    private object TraitRef extends Extractor[Trait] { def unapply(name: nir.Global): Option[Trait] = knowledge.trt(name) }
++    private object MethodRef extends Extractor[(Info, Method)] { def unapply(name: nir.Global): Option[(Info, Method)] = knowledge.method(name) }
++    private object FieldRef extends Extractor[(Info, Field)] { def unapply(name: nir.Global): Option[(Info, Field)] = knowledge.field(name) }
+ 
+-    val Object = analysis.infos(nir.Rt.Object.name).asInstanceOf[Class]
++    val Object = knowledge.infoOrThrow(nir.Rt.Object.name).asInstanceOf[Class]
+ 
+     private val zero = nir.Val.Int(0)
+     private val one = nir.Val.Int(1)
+@@ -37,7 +72,7 @@ private[scalanative] object Lower {
+ 
+     // Type of the bare runtime type information struct.
+     private val classRttiType =
+-      rtti(analysis.infos(nir.Global.Top("java.lang.Object"))).struct
++      rtti(knowledge.infoOrThrow(nir.Global.Top("java.lang.Object"))).struct
+ 
+     // Names of the fields of the java.lang.String in the memory layout order.
+     private val stringFieldNames = {
+@@ -107,7 +142,12 @@ private[scalanative] object Lower {
+         nir.Next.Unwind(exc, nir.Next.Label(handler, Seq(exc)))
+       }
+ 
++    // The program-wide values read while this `Impl` was constructed, which every method may depend on.
++    private lazy val implGlobals: Long =
++      (smiBoxRttiConst, ptrTagBoxRttiConst, shouldCarrierCompensateBlockingExtern.value, classRttiType, stringFieldNames).##.toLong
++
+     override def onDefns(defns: Seq[nir.Defn]): Seq[nir.Defn] = {
++      LowerCache.checkImplGlobals(implGlobals)
+       val buf = mutable.UnrolledBuffer.empty[nir.Defn]
+ 
+       defns.foreach {
+@@ -117,6 +157,8 @@ private[scalanative] object Lower {
+           ()
+         case nir.Defn.Var(attrs, FieldRef(_: Class, _), _, _) if !attrs.isExtern =>
+           ()
++        case defn: nir.Defn.Define if LowerCache.mode != 0 =>
++          buf += onDefineCached(defn)
+         case defn =>
+           buf += onDefn(defn)
+       }
+@@ -124,6 +166,40 @@ private[scalanative] object Lower {
+       buf.toSeq
+     }
+ 
++    // String constants registered in `meta.globalSections` while lowering the
++    // current method, so a cache hit can register them again (see LowerCache).
++    private var recordedConstants: mutable.ArrayBuffer[(GlobalSections.Section, nir.Val)] = null
++
++    private def registerConstant(section: GlobalSections.Section, value: nir.Val): nir.Val.Const = {
++      if (recordedConstants != null) recordedConstants += ((section, value))
++      meta.globalSections.constant(section, value)
++    }
++
++    private def onDefineCached(defn: nir.Defn.Define): nir.Defn = {
++      val hit = LowerCache.lookup(defn)
++      if (hit != null && LowerCache.mode == 1) {
++        hit.constants.foreach { case (section, value) => meta.globalSections.constant(section, value) }
++        LowerCache.recordHit()
++        hit.output
++      } else {
++        val constants = mutable.ArrayBuffer.empty[(GlobalSections.Section, nir.Val)]
++        recordedConstants = constants
++        knowledge.startRecording()
++        var subjects: Array[Subject] = null
++        val out =
++          try onDefn(defn)
++          finally {
++            recordedConstants = null
++            subjects = knowledge.stopRecording()
++          }
++        val recorded = constants.toArray
++        if (hit != null) LowerCache.verify(defn, out, recorded, hit)
++        LowerCache.recordLowered()
++        LowerCache.store(defn, out, recorded, subjects)
++        out
++      }
++    }
++
+     override def onDefn(defn: nir.Defn): nir.Defn = defn match {
+       case defn: nir.Defn.Define =>
+         val nir.Type.Function(_, ty) = defn.ty
+@@ -287,8 +363,8 @@ private[scalanative] object Lower {
+           else
+             currentDefn.get.name match {
+               case nir.Global.Member(ClassRef(cls), sig) if sig.isCtor && {
+-                    (config.semanticsConfig.finalFields.isStrict && cls.hasFinalFields) ||
+-                    (config.semanticsConfig.finalFields.isRelaxed && cls.hasFinalSafePublishFields)
++                    (config.semanticsConfig.finalFields.isStrict && knowledge.hasFinalFields(cls)) ||
++                    (config.semanticsConfig.finalFields.isRelaxed && knowledge.hasFinalSafePublishFields(cls))
+                   } =>
+                 // Release memory fence after initialization of constructor with final fields
+                 buf.fence(nir.MemoryOrder.Release)
+@@ -699,7 +775,7 @@ private[scalanative] object Lower {
+     private val smiBoxRttiConst: Map[Int, nir.Val] = {
+       import nir.Type.Smi._
+       def constOf(name: String): Option[nir.Val] =
+-        analysis.infos.get(nir.Global.Top(name)).flatMap(rtti.get).map(_.const)
++        knowledge.info(nir.Global.Top(name)).flatMap(rtti.get).map(_.const)
+       Seq(
+         BooleanDiscriminant -> "java.lang.Boolean",
+         ByteDiscriminant -> "java.lang.Byte",
+@@ -717,8 +793,8 @@ private[scalanative] object Lower {
+      *  just `Ptr[T]`, discriminant 1). See `nir.Type.PtrTag`.
+      */
+     private val ptrTagBoxRttiConst: Option[nir.Val] =
+-      analysis.infos
+-        .get(nir.Global.Top("scala.scalanative.unsafe.Ptr"))
++      knowledge
++        .info(nir.Global.Top("scala.scalanative.unsafe.Ptr"))
+         .flatMap(rtti.get)
+         .map(_.const)
+ 
+@@ -1088,7 +1164,7 @@ private[scalanative] object Lower {
+               ownerName == "java.lang.AbstractStringBuilder" ||
+               ownerName == "java.lang.System$"
+             }
+-        !shouldSkip && meta.analysis.references.isSelfRecursive(defn.name)
++        !shouldSkip && knowledge.isSelfRecursive(defn.name)
+       }
+     }
+ 
+@@ -1245,7 +1321,7 @@ private[scalanative] object Lower {
+       }
+     }
+     def shouldSwitchThreadState(name: nir.Global.Member) =
+-      platform.isMultithreadingEnabled && analysis.infos.get(name).exists { info =>
++      platform.isMultithreadingEnabled && knowledge.info(name).exists { info =>
+         val attrs = info.attrs
+         attrs.isExtern && {
+           config.semanticsConfig.strictExternCallSemantics match {
+@@ -1257,13 +1333,14 @@ private[scalanative] object Lower {
+ 
+     object shouldCarrierCompensateBlockingExtern {
+       private val usesVirtualThreads = platform.isMultithreadingEnabled && {
+-        analysis.infos.get(RuntimeVirtualThread).exists {
+-          case info: ScopeInfo => info.implementors.exists(_.allocations > 0)
++        knowledge.info(RuntimeVirtualThread).exists {
++          case info: ScopeInfo => knowledge.anyImplementorAllocated(info)
+           case _               => false
+         }
+       }
++      def value = usesVirtualThreads
+       def apply(name: nir.Global.Member) =
+-        usesVirtualThreads && analysis.infos.get(name).exists { info =>
++        usesVirtualThreads && knowledge.info(name).exists { info =>
+           val attrs = info.attrs
+           attrs.isExtern && attrs.isBlocking
+         }
+@@ -1395,7 +1472,7 @@ private[scalanative] object Lower {
+       }
+ 
+       def genMethodLookup(scope: ScopeInfo): Unit = {
+-        scope.targets(sig).toSeq match {
++        knowledge.targets(scope, sig).toSeq match {
+           case Seq() =>
+             // logger.warn(s"Unable to call ${sig.show} on instance of ${scope.name.id} in ${srcPosition.show}. It would result in NullPointerException at runtime")
+             let(n, nir.Op.Copy(nir.Val.Null), unwind)
+@@ -1405,7 +1482,7 @@ private[scalanative] object Lower {
+             obj.ty match {
+               case ClassRef(cls) =>
+                 genClassVirtualLookup(cls)
+-              case TraitRef(_) if Object.calls.contains(sig) =>
++              case TraitRef(_) if knowledge.callsContains(Object, sig) =>
+                 genClassVirtualLookup(Object)
+               case TraitRef(trt) =>
+                 genTraitVirtualLookup(trt)
+@@ -1415,8 +1492,8 @@ private[scalanative] object Lower {
+       }
+ 
+       def genStaticMethod(cls: Class): Unit = {
+-        val method = cls
+-          .resolve(sig)
++        val method = knowledge
++          .resolve(cls, sig)
+           .getOrElse {
+             unsupported(
+               s"Did not find the signature of method $sig in ${cls.name}"
+@@ -1426,7 +1503,7 @@ private[scalanative] object Lower {
+       }
+ 
+       def staticMethodIn(cls: Class): Boolean =
+-        !sig.isVirtual || !cls.calls.contains(sig)
++        !sig.isVirtual || !knowledge.callsContains(cls, sig)
+ 
+       // We check type of original value, because it may change inside `genVal` transformation
+       // Eg. nir.Val.String is transformed to Const(StructValue) which changes type from Ref to Ptr
+@@ -1480,7 +1557,7 @@ private[scalanative] object Lower {
+ 
+       def genReflectiveLookup(): nir.Val = {
+         val methodIndex =
+-          meta.analysis.dynsigs.zipWithIndex.find(_._1 == sig).get._2
++          knowledge.dynsigIndex(sig)
+ 
+         // Load the type information pointer. `obj` may be a SMI-tagged
+         // immediate (reflective/dynamic calls are prime territory for
+@@ -1625,7 +1702,7 @@ private[scalanative] object Lower {
+ 
+           label(checkIfIsInstanceOfL)
+           val isInstanceOf = genIsOp(buf, ty, v)
+-          val toTy = rtti(analysis.infos(ty.className)).const
++          val toTy = rtti(knowledge.infoOrThrow(ty.className)).const
+           branch(
+             isInstanceOf,
+             nir.Next(castL),
+@@ -1650,7 +1727,7 @@ private[scalanative] object Lower {
+     )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
+       val size = op.ty match {
+         case ClassRef(cls) if op.ty != nir.Type.Unit =>
+-          if (!cls.allocated) {
++          if (!knowledge.allocated(cls)) {
+             val nir.Global.Top(clsName) = cls.name
+             logger.warn(
+               s"Referencing size of non allocated type ${clsName} in ${srcPosition.show}"
+@@ -2436,8 +2513,8 @@ private[scalanative] object Lower {
+     )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId) = {
+       val nir.Op.Module(name) = op
+ 
+-      meta.analysis.infos(name) match {
+-        case cls: Class if cls.isConstantModule =>
++      knowledge.infoOrThrow(name) match {
++        case cls: Class if knowledge.isConstantModule(cls) =>
+           val instance = name.member(nir.Sig.Generated("instance"))
+           buf.let(
+             n,
+@@ -2645,7 +2722,7 @@ private[scalanative] object Lower {
+ 
+       val chars = value.toCharArray
+       val charsLength = nir.Val.Int(chars.length)
+-      val charsConst = meta.globalSections.constant(
++      val charsConst = registerConstant(
+         GlobalSections.Strings,
+         nir.Val.StructValue(
+           meta.headerWordVal(CharArrayCls) ::
+@@ -2673,7 +2750,7 @@ private[scalanative] object Lower {
+           util.unreachable
+       }
+ 
+-      meta.globalSections.constant(
++      registerConstant(
+         GlobalSections.Strings,
+         nir.Val.StructValue(
+           meta.headerWordVal(StringCls) ::
+@@ -2736,7 +2813,7 @@ private[scalanative] object Lower {
+     object UnsignedMultiplyHigh extends IntrinsicCall
+ 
+     private def resolveIntrinsicCall(owner: nir.Global.Top, sig: nir.Sig)(implicit
+-        metadata: Metadata,
++        knowledge: LowerKnowledge,
+         logger: build.Logger,
+         srcPos: nir.SourcePosition,
+         currentDefn: util.ScopedVar[nir.Defn.Define]
+@@ -2748,7 +2825,7 @@ private[scalanative] object Lower {
+         case (_, nir.Sig.Method("intrinsic", _, _)) if owner == nir.Rt.Runtime.name =>
+           val symbol @ nir.Global.Member(owner, sig) = currentDefn.get.name
+           // Reflective proxies might make the intrinsic method reachable, but they're unlikely to be called
+-          def isMaybeReflectiveProxy = metadata.analysis.dynimpls.contains(symbol)
++          def isMaybeReflectiveProxy = knowledge.isDynImpl(symbol)
+           // Ingore intrinsic call form intrinsic methods. It was already handled
+           if (!isMaybeReflectiveProxy && resolveIntrinsicCall(owner, sig).isEmpty) {
+             logger.warn(s"Instrinsic method was not resolved by Scala Native, it would lead to runtime exception. Defined at ${srcPos.show}")
+@@ -2759,7 +2836,7 @@ private[scalanative] object Lower {
+     }
+ 
+     def unapply(op: nir.Op.Call)(implicit
+-        metadata: Metadata,
++        knowledge: LowerKnowledge,
+         logger: build.Logger,
+         srcPos: nir.SourcePosition,
+         intrinsicMethods: util.ScopedVar[mutable.Map[nir.Local, IntrinsicCall]],
+@@ -2773,7 +2850,7 @@ private[scalanative] object Lower {
+     // Required only in non-optimized builds
+     def unapply(
+         op: nir.Op.Method
+-    )(implicit metadata: Metadata, logger: build.Logger, srcPos: nir.SourcePosition, currentDefn: util.ScopedVar[nir.Defn.Define]): Option[IntrinsicCall] =
++    )(implicit knowledge: LowerKnowledge, logger: build.Logger, srcPos: nir.SourcePosition, currentDefn: util.ScopedVar[nir.Defn.Define]): Option[IntrinsicCall] =
+       op.obj.ty match {
+         case owner: nir.Type.RefKind => resolveIntrinsicCall(owner.className, op.sig)
+         case _                       => None
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala b/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala
+new file mode 100644
+index 0000000..10b7e1c
+--- /dev/null
++++ b/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala
+@@ -0,0 +1,476 @@
++package scala.scalanative
++package codegen
++
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.atomic.AtomicInteger
++
++import scala.scalanative.linker._
++
++/** A fact about the program that lowering a method can depend on. Modelled on
++ *  the knowledge queries of Scala.js' incremental optimizer (Doeraene and
++ *  Schlatter, "Parallel Incremental Whole-Program Optimizations for Scala.js",
++ *  OOPSLA 2016) and its emitter's `KnowledgeGuardian`: a method asks for facts
++ *  only through `LowerKnowledge`, which records which ones; when a fact has a
++ *  different value than in the previous link, exactly the methods that asked
++ *  for it are lowered again.
++ */
++private[scalanative] sealed abstract class Subject
++private[scalanative] object Subject {
++
++  /** The immutable shape of an info (class, trait, method, field), or its
++   *  absence: attributes, parent, traits, type, ...
++   */
++  final case class Kind(name: nir.Global) extends Subject
++
++  /** The mutable reachability state of a class or trait: allocated, `calls`,
++   *  `responds`, subclasses, implementors, ...
++   */
++  final case class Mut(name: nir.Global) extends Subject
++
++  /** The metadata derived for a class or trait: id, range, field layout,
++   *  vtable, rtti.
++   */
++  final case class Meta(name: nir.Global) extends Subject
++
++  /** The position of a signature in the dynamic method table. */
++  final case class DynSig(sig: nir.Sig) extends Subject
++
++  /** Whether a method is the implementation of a reflective proxy. */
++  final case class DynImpl(name: nir.Global) extends Subject
++
++  /** Present (and equal to 1) for the methods that are reachable from themselves
++   *  in the graph of direct references between methods.
++   */
++  final case class SelfRec(name: nir.Global.Member) extends Subject
++}
++
++/** Opt-in cache of lowered method bodies across the relinks of scalino's
++ *  `--long-running` linkdriver (`SCALINO_LOWER_CACHE=1`; `verify` additionally
++ *  re-lowers every cached method and compares).
++ *
++ *  Lowering a `Defn.Define` is a function of the method itself and of the
++ *  facts it asks `LowerKnowledge` for, plus one side effect: the string
++ *  constants it registers in `meta.globalSections`. A cached result is reused
++ *  when the method is unchanged (`eq`, else structurally equal) and none of the
++ *  facts it asked for changed since it was lowered.
++ *
++ *  Per link, `begin` computes the current value of every fact, diffs it with
++ *  the previous link's values and marks the askers of each fact that changed.
++ *  A change of anything not modelled as a per-subject fact (`implGlobals`,
++ *  `globalHash`: configuration, platform, a few program-wide values that every
++ *  lowered method may depend on) drops the whole cache, which is just today's
++ *  full lowering. The one side effect lowering has is recorded per method and
++ *  replayed on a hit.
++ */
++private[scalanative] object LowerCache {
++  final val EnvName = "SCALINO_LOWER_CACHE"
++
++  /** 0 off, 1 on, 2 verify */
++  val mode: Int = sys.env.get(EnvName) match {
++    case Some("verify")              => 2
++    case None | Some("") | Some("0") => 0
++    case Some(_)                     => 1
++  }
++
++  final class Entry(
++      val input: nir.Defn.Define,
++      val output: nir.Defn,
++      val constants: Array[(GlobalSections.Section, nir.Val)],
++      val subjects: Array[Subject],
++      @volatile var seen: Int
++  )
++
++  private val entries = new ConcurrentHashMap[nir.Global, Entry]()
++  private val askers =
++    new ConcurrentHashMap[Subject, java.util.Set[nir.Global]]()
++  // methods to lower again although they are unchanged
++  private val stale = ConcurrentHashMap.newKeySet[nir.Global]()
++
++  private var generation = 0
++  private var previousValues: java.util.HashMap[Subject, java.lang.Long] = null
++  private var previousGlobal = 0L
++  private var implGlobals = 0L
++  private var implGlobalsLink = -1
++
++  private val hits = new AtomicInteger(0)
++  private val lowered = new AtomicInteger(0)
++  private val verified = new AtomicInteger(0)
++
++  /** Called once per code generation, before any lowering. */
++  def begin(meta: Metadata)(implicit logger: build.Logger): Unit =
++    if (mode != 0) synchronized {
++      val t0 = System.nanoTime()
++      generation += 1
++      hits.set(0)
++      lowered.set(0)
++      verified.set(0)
++      stale.clear()
++
++      val global = globalHash(meta)
++      val values = currentValues(meta)
++      var dropped = false
++      var changed = 0
++      if (previousValues == null || global != previousGlobal) {
++        dropped = true
++        dropAll()
++      } else {
++        val prev = previousValues
++        val it = values.entrySet().iterator()
++        while (it.hasNext) {
++          val e = it.next()
++          val old = prev.get(e.getKey)
++          if (old == null || old.longValue != e.getValue.longValue) {
++            changed += 1
++            markAskers(e.getKey)
++          }
++        }
++        val itPrev = prev.keySet().iterator()
++        while (itPrev.hasNext) {
++          val key = itPrev.next()
++          if (!values.containsKey(key)) {
++            changed += 1
++            markAskers(key)
++          }
++        }
++      }
++      previousValues = values
++      previousGlobal = global
++      val ms = (System.nanoTime() - t0) / 1000000
++      logger.debug(
++        s"Lower cache: ${if (dropped) "context changed (cache dropped)" else s"$changed facts changed, ${stale.size} methods to lower again"} ($ms ms)"
++      )
++    }
++
++  /** Called when a `Lower.Impl` is created, with the program-wide values it
++   *  reads while being constructed (before lowering any method). Every `Impl`
++   *  of a link computes the same value; the first one to arrive compares it
++   *  with the previous link's.
++   */
++  def checkImplGlobals(value: Long): Unit =
++    if (mode != 0) synchronized {
++      if (implGlobalsLink != generation) {
++        if (implGlobalsLink >= 0 && value != implGlobals) dropAll()
++        implGlobals = value
++        implGlobalsLink = generation
++      }
++    }
++
++  // --- self-recursive methods ------------------------------------------------
++
++  private var recursionFor: ReachabilityAnalysis.Result = null
++  private var recursive: java.util.HashSet[nir.Global.Member] = null
++
++  /** The methods reachable from themselves in `analysis.references`' graph of
++   *  direct references (computed once per analysis).
++   */
++  def selfRecursive(
++      analysis: ReachabilityAnalysis.Result
++  ): java.util.Set[nir.Global.Member] = synchronized {
++    if (recursionFor ne analysis) {
++      recursive = computeSelfRecursive(analysis)
++      recursionFor = analysis
++    }
++    recursive
++  }
++
++  /** Tarjan's algorithm, iterative (the graph is deep). A method is
++   *  self-recursive if its component has several members or it refers to
++   *  itself.
++   */
++  private def computeSelfRecursive(
++      analysis: ReachabilityAnalysis.Result
++  ): java.util.HashSet[nir.Global.Member] = {
++    val graph = analysis.references.methodDirectSymbolRefs
++    val result = new java.util.HashSet[nir.Global.Member]()
++    val index = new java.util.HashMap[nir.Global.Member, Integer]()
++    val lowlink = new java.util.HashMap[nir.Global.Member, Integer]()
++    val onStack = new java.util.HashSet[nir.Global.Member]()
++    val stack = new java.util.ArrayDeque[nir.Global.Member]()
++    var counter = 0
++
++    // explicit call stack: (node, iterator over its neighbours that are nodes)
++    val nodeStack = new java.util.ArrayDeque[nir.Global.Member]()
++    val iterStack = new java.util.ArrayDeque[Iterator[nir.Global.Member]]()
++
++    def visit(root: nir.Global.Member): Unit = {
++      def enter(v: nir.Global.Member): Unit = {
++        index.put(v, counter)
++        lowlink.put(v, counter)
++        counter += 1
++        stack.push(v)
++        onStack.add(v)
++        nodeStack.push(v)
++        iterStack.push(graph(v).iterator.filter(graph.contains))
++      }
++      enter(root)
++      while (!nodeStack.isEmpty) {
++        val v = nodeStack.peek()
++        val it = iterStack.peek()
++        if (it.hasNext) {
++          val w = it.next()
++          if (w == v) result.add(v) // refers to itself
++          if (!index.containsKey(w)) enter(w)
++          else if (onStack.contains(w))
++            lowlink.put(v, math.min(lowlink.get(v).intValue, index.get(w).intValue))
++        } else {
++          nodeStack.pop()
++          iterStack.pop()
++          if (!nodeStack.isEmpty) {
++            val parent = nodeStack.peek()
++            lowlink.put(parent, math.min(lowlink.get(parent).intValue, lowlink.get(v).intValue))
++          }
++          if (lowlink.get(v).intValue == index.get(v).intValue) {
++            val component = new java.util.ArrayList[nir.Global.Member]()
++            var w: nir.Global.Member = null.asInstanceOf[nir.Global.Member]
++            while ({ w = stack.pop(); onStack.remove(w); component.add(w); w != v }) ()
++            if (component.size > 1) result.addAll(component)
++          }
++        }
++      }
++    }
++
++    graph.keysIterator.foreach(v => if (!index.containsKey(v)) visit(v))
++    result
++  }
++
++  private def dropAll(): Unit = {
++    entries.clear()
++    askers.clear()
++    stale.clear()
++  }
++
++  private def markAskers(subject: Subject): Unit = {
++    val set = askers.get(subject)
++    if (set != null) stale.addAll(set)
++  }
++
++  /** Called once lowering is complete: forgets the methods that were not part
++   *  of this build.
++   */
++  def end()(implicit logger: build.Logger): Unit =
++    if (mode != 0) synchronized {
++      val gen = generation
++      val it = entries.values().iterator()
++      while (it.hasNext) {
++        val entry = it.next()
++        if (entry.seen != gen) {
++          unregister(entry.input.name, entry.subjects)
++          it.remove()
++        }
++      }
++      val verifiedMsg = if (mode == 2) s", ${verified.get} verified" else ""
++      logger.info(
++        s"Lower cache: ${hits.get} reused, ${lowered.get} lowered$verifiedMsg"
++      )
++    }
++
++  def lookup(defn: nir.Defn.Define): Entry = {
++    val entry = entries.get(defn.name)
++    if (entry != null && !stale.contains(defn.name) &&
++        ((entry.input eq defn) || entry.input == defn)) {
++      entry.seen = generation
++      entry
++    } else null
++  }
++
++  def recordHit(): Unit = hits.incrementAndGet()
++  def recordLowered(): Unit = lowered.incrementAndGet()
++
++  def store(
++      input: nir.Defn.Define,
++      output: nir.Defn,
++      constants: Array[(GlobalSections.Section, nir.Val)],
++      subjects: Array[Subject]
++  ): Unit = {
++    val name = input.name
++    val old = entries.put(
++      name,
++      new Entry(input, output, constants, subjects, generation)
++    )
++    if (old != null) unregister(name, old.subjects)
++    var i = 0
++    while (i < subjects.length) {
++      var set = askers.get(subjects(i))
++      if (set == null) {
++        val fresh = ConcurrentHashMap.newKeySet[nir.Global]()
++        set = askers.putIfAbsent(subjects(i), fresh)
++        if (set == null) set = fresh
++      }
++      set.add(name)
++      i += 1
++    }
++  }
++
++  private def unregister(name: nir.Global, subjects: Array[Subject]): Unit = {
++    var i = 0
++    while (i < subjects.length) {
++      val set = askers.get(subjects(i))
++      if (set != null) set.remove(name)
++      i += 1
++    }
++  }
++
++  /** `verify` mode: `fresh` was just lowered although `cached` was available. */
++  def verify(
++      defn: nir.Defn.Define,
++      fresh: nir.Defn,
++      freshConstants: Array[(GlobalSections.Section, nir.Val)],
++      cached: Entry
++  ): Unit = {
++    verified.incrementAndGet()
++    val sameOutput = fresh == cached.output
++    val sameConstants = freshConstants.toSet == cached.constants.toSet
++    if (!sameOutput || !sameConstants)
++      throw new IllegalStateException(
++        s"Lower cache mismatch for ${defn.name.show}: " +
++          s"output ${if (sameOutput) "same" else "DIFFERENT"}, " +
++          s"registered constants ${if (sameConstants) "same" else "DIFFERENT"}. " +
++          "A fact lowering reads is not declared in LowerKnowledge (or hashed in LowerCache)."
++      )
++  }
++
++  // --- fact values ---------------------------------------------------------
++
++  private def mix(x0: Long): Long = {
++    var x = x0
++    x ^= x >>> 33
++    x *= 0xff51afd7ed558ccdL
++    x ^= x >>> 33
++    x *= 0xc4ceb9fe1a85ec53L
++    x ^= x >>> 33
++    x
++  }
++  // order-dependent
++  private def h(acc: Long, v: Long): Long = acc * 0x100000001b3L + v
++  private def hi(acc: Long, v: Int): Long = h(acc, v.toLong)
++  private def hb(acc: Long, v: Boolean): Long = h(acc, if (v) 1L else 0L)
++
++  // order-independent
++  private def setHash[T](xs: Iterable[T])(f: T => Long): Long = {
++    var sum = 0L
++    xs.foreach(x => sum += mix(f(x)))
++    sum
++  }
++
++  private def emptyShape(insts: Array[nir.Inst]): Boolean = insts match {
++    case Array(_: nir.Inst.Label, _: nir.Inst.Ret) => true
++    case _                                         => false
++  }
++
++  /** The immutable shape of an info. */
++  private def kindHash(info: Info): Long = info match {
++    case t: Trait =>
++      var x = hi(1L, t.name.##)
++      x = hi(x, t.attrs.##)
++      t.traits.foreach(p => x = hi(x, p.name.##))
++      x
++    case c: Class =>
++      var x = hi(2L, c.name.##)
++      x = hi(x, c.attrs.##)
++      x = hi(x, c.parent.map(_.name.##).getOrElse(0))
++      c.traits.foreach(p => x = hi(x, p.name.##))
++      hb(x, c.isModule)
++    case m: Method =>
++      var x = hi(3L, m.name.##)
++      x = hi(x, m.attrs.##)
++      x = hi(x, m.ty.##)
++      x = hb(x, m.isConcrete)
++      // the one thing `Class.isConstantModule` reads from a constructor body
++      hb(x, emptyShape(m.insts))
++    case f: Field =>
++      var x = hi(4L, f.name.##)
++      x = hi(x, f.attrs.##)
++      x = hb(x, f.isConst)
++      x = hi(x, f.ty.##)
++      hi(x, f.init.##)
++    case u: Unavailable =>
++      hi(5L, u.name.##)
++  }
++
++  /** The mutable reachability state of a class or trait. */
++  private def mutHash(info: ScopeInfo): Long = info match {
++    case t: Trait =>
++      var x = 11L
++      x = h(x, setHash(t.implementors)(i => h(i.name.##.toLong, if (i.allocated) 1L else 0L)))
++      x = h(x, setHash(t.subtraits)(_.name.##.toLong))
++      x = h(x, setHash(t.calls)(_.##.toLong))
++      h(x, setHash(t.responds)(kv => h(kv._1.##.toLong, kv._2.##.toLong)))
++    case c: Class =>
++      var x = hb(12L, c.allocated)
++      x = h(x, setHash(c.subclasses)(_.name.##.toLong))
++      x = h(x, setHash(c.implementors)(i => h(i.name.##.toLong, if (i.allocated) 1L else 0L)))
++      x = h(x, setHash(c.calls)(_.##.toLong))
++      x = h(x, setHash(c.responds)(kv => h(kv._1.##.toLong, kv._2.##.toLong)))
++      h(x, setHash(c.defaultResponds)(kv => h(kv._1.##.toLong, kv._2.##.toLong)))
++  }
++
++  /** The metadata derived for a class or trait. */
++  private def metaHash(meta: Metadata, info: ScopeInfo): Long = info match {
++    case cls: Class =>
++      var x = hi(21L, meta.ids(cls))
++      val range = meta.ranges(cls)
++      x = hi(x, range.start)
++      x = hi(x, range.end)
++      val layout = meta.layout(cls)
++      x = h(x, layout.size)
++      x = hi(x, layout.struct.##)
++      layout.entries.foreach { f =>
++        x = hi(x, f.name.##)
++        x = hi(x, f.attrs.##)
++        x = hi(x, f.ty.##)
++      }
++      val vtable = meta.vtable(cls)
++      x = hi(x, vtable.value.##)
++      x = hi(x, vtable.ty.##)
++      val rtti = meta.rtti(cls)
++      x = hi(x, rtti.struct.##)
++      hb(x, rtti.canUseFastITables)
++    case trt: Trait =>
++      var x = hi(22L, meta.ids(trt))
++      val rtti = meta.rtti(trt)
++      x = hi(x, rtti.struct.##)
++      hb(x, rtti.canUseFastITables)
++  }
++
++  private def currentValues(
++      meta: Metadata
++  ): java.util.HashMap[Subject, java.lang.Long] = {
++    val analysis = meta.analysis
++    val values = new java.util.HashMap[Subject, java.lang.Long](analysis.infos.size * 3)
++    analysis.infos.valuesIterator.foreach { info =>
++      values.put(Subject.Kind(info.name), java.lang.Long.valueOf(kindHash(info)))
++      info match {
++        case scope: ScopeInfo =>
++          values.put(Subject.Mut(scope.name), java.lang.Long.valueOf(mutHash(scope)))
++          values.put(Subject.Meta(scope.name), java.lang.Long.valueOf(metaHash(meta, scope)))
++        case _ => ()
++      }
++    }
++    analysis.dynsigs.zipWithIndex.foreach {
++      case (sig, index) =>
++        values.put(Subject.DynSig(sig), java.lang.Long.valueOf(index.toLong))
++    }
++    analysis.dynimpls.foreach { name =>
++      values.put(Subject.DynImpl(name), java.lang.Long.valueOf(1L))
++    }
++    selfRecursive(analysis).forEach { name =>
++      values.put(Subject.SelfRec(name), java.lang.Long.valueOf(1L))
++    }
++    values
++  }
++
++  /** What every lowered method may depend on and is not worth a subject:
++   *  configuration, platform and a few program-wide values. A change drops the
++   *  cache.
++   */
++  private def globalHash(meta: Metadata): Long = {
++    val analysis = meta.analysis
++    var x = 17L
++    x = hi(x, meta.config.##)
++    x = hi(x, meta.platform.##)
++    x = hb(x, meta.canAlwaysUseFastITables)
++    analysis.entries.foreach(e => x = hi(x, e.##))
++    x = h(x, setHash(analysis.resolvedVals)(kv => h(kv._1.##.toLong, kv._2.##.toLong)))
++    mix(x)
++  }
++}
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/LowerKnowledge.scala b/tools/src/main/scala/scala/scalanative/codegen/LowerKnowledge.scala
+new file mode 100644
+index 0000000..b97b9bc
+--- /dev/null
++++ b/tools/src/main/scala/scala/scalanative/codegen/LowerKnowledge.scala
+@@ -0,0 +1,213 @@
++package scala.scalanative
++package codegen
++
++import scala.collection.mutable
++
++import scala.scalanative.linker._
++
++/** The facts about the program that `Lower` is allowed to read, each recording
++ *  that the method being lowered asked for it (see `LowerCache`).
++ *
++ *  `Lower` has no other access to the reachability analysis or to the metadata
++ *  that depends on it (it sees only the configuration-level members of
++ *  `Metadata`), so a fact it reads cannot be forgotten: it does not compile.
++ *
++ *  Reading an immutable property of an info (name, attributes, parent, types)
++ *  depends on its `Kind`; looking an info up records that. The mutable
++ *  properties and the derived metadata have their own subjects.
++ */
++private[codegen] final class LowerKnowledge(meta: Metadata) {
++  import Subject._
++
++  private val analysis = meta.analysis
++
++  // Confined to the thread that lowers (one `Lower.Impl` per batch).
++  private var recorder: java.util.HashSet[Subject] = null
++
++  def startRecording(): Unit = recorder = new java.util.HashSet[Subject]()
++  def stopRecording(): Array[Subject] = {
++    val r = recorder
++    recorder = null
++    r.toArray(new Array[Subject](r.size))
++  }
++
++  private def kind(name: nir.Global): Unit =
++    if (recorder != null) recorder.add(new Kind(name))
++  private def mut(name: nir.Global): Unit =
++    if (recorder != null) recorder.add(new Mut(name))
++  private def metaOf(name: nir.Global): Unit =
++    if (recorder != null) recorder.add(new Meta(name))
++
++  // --- infos -----------------------------------------------------------------
++
++  def info(name: nir.Global): Option[Info] = {
++    kind(name)
++    analysis.infos.get(name)
++  }
++  def infoOrThrow(name: nir.Global): Info = {
++    kind(name)
++    analysis.infos(name)
++  }
++  def scope(name: nir.Global): Option[ScopeInfo] = info(name).collect {
++    case node: ScopeInfo => node
++  }
++  def cls(name: nir.Global): Option[Class] = info(name).collect {
++    case node: Class => node
++  }
++  def trt(name: nir.Global): Option[Trait] = info(name).collect {
++    case node: Trait => node
++  }
++  def method(name: nir.Global): Option[(Info, Method)] = info(name).collect {
++    case node: Method => (node.owner, node)
++  }
++  def field(name: nir.Global): Option[(Info, Field)] = info(name).collect {
++    case node: Field => (node.owner, node)
++  }
++
++  // --- mutable reachability state -------------------------------------------
++
++  def allocated(cls: Class): Boolean = {
++    mut(cls.name)
++    cls.allocated
++  }
++
++  def callsContains(scope: ScopeInfo, sig: nir.Sig): Boolean = {
++    mut(scope.name)
++    scope.calls.contains(sig)
++  }
++
++  def resolve(cls: Class, sig: nir.Sig): Option[nir.Global.Member] = {
++    mut(cls.name)
++    cls.resolve(sig)
++  }
++
++  /** `ScopeInfo.targets`: reads this class or trait, and every subclass or
++   *  implementor.
++   */
++  def targets(scope: ScopeInfo, sig: nir.Sig): mutable.Set[nir.Global.Member] = {
++    mut(scope.name)
++    scope match {
++      case c: Class =>
++        c.subclasses.foreach(s => mut(s.name))
++      case t: Trait =>
++        t.implementors.foreach(i => mut(i.name))
++    }
++    scope.targets(sig)
++  }
++
++  def anyImplementorAllocated(scope: ScopeInfo): Boolean = {
++    mut(scope.name)
++    scope.implementors.foreach(i => mut(i.name))
++    scope.implementors.exists(_.allocations > 0)
++  }
++
++  /** `Class.isConstantModule`: the class, its fields (part of its layout) and
++   *  its constructor.
++   */
++  def isConstantModule(cls: Class): Boolean = {
++    kind(cls.name)
++    metaOf(cls.name)
++    kind(cls.name.member(nir.Sig.Ctor(Seq.empty)))
++    cls.isConstantModule(analysis)
++  }
++
++  /** Whether the fields of `cls` (own and inherited) include a final one, in
++   *  the two flavours of the final-fields semantics.
++   */
++  def hasFinalFields(cls: Class): Boolean = {
++    metaOf(cls.name)
++    cls.hasFinalFields
++  }
++  def hasFinalSafePublishFields(cls: Class): Boolean = {
++    metaOf(cls.name)
++    cls.hasFinalSafePublishFields
++  }
++
++  // --- call graph -------------------------------------------------------------
++
++  /** Whether `name` is reachable from itself in the graph of direct references
++   *  between methods (`analysis.references`). With the cache on this is read
++   *  from the strongly connected components of that graph, computed once per
++   *  link, so that it is a fact about `name` alone and not about every method
++   *  it can reach; `verify` mode checks it against the plain search.
++   */
++  def isSelfRecursive(name: nir.Global.Member): Boolean =
++    if (LowerCache.mode == 0) analysis.references.isSelfRecursive(name)
++    else {
++      if (recorder != null) recorder.add(new SelfRec(name))
++      val answer = LowerCache.selfRecursive(analysis).contains(name)
++      if (LowerCache.mode == 2 && answer != analysis.references.isSelfRecursive(name))
++        throw new IllegalStateException(
++          s"Lower cache: self-recursion of ${name.show} by components is $answer, by search it is ${!answer}"
++        )
++      answer
++    }
++
++  // --- dynamic dispatch -------------------------------------------------------
++
++  def dynsigIndex(sig: nir.Sig): Int = {
++    if (recorder != null) recorder.add(new DynSig(sig))
++    analysis.dynsigs.zipWithIndex.find(_._1 == sig).get._2
++  }
++
++  def isDynImpl(name: nir.Global.Member): Boolean = {
++    if (recorder != null) recorder.add(new DynImpl(name))
++    analysis.dynimpls.contains(name)
++  }
++
++  // --- derived metadata -------------------------------------------------------
++
++  def layout(cls: Class): FieldLayout = {
++    metaOf(cls.name)
++    meta.layout(cls)
++  }
++
++  def vtable(cls: Class): VirtualTable = {
++    metaOf(cls.name)
++    meta.vtable(cls)
++  }
++
++  def ids(info: ScopeInfo): Int = {
++    metaOf(info.name)
++    meta.ids(info)
++  }
++
++  def ranges(cls: Class): Range = {
++    metaOf(cls.name)
++    meta.ranges(cls)
++  }
++
++  def headerWordVal(cls: Class): nir.Val = {
++    // the class id, or the address of the rtti
++    metaOf(cls.name)
++    meta.headerWordVal(cls)
++  }
++
++  /** The rtti of a class or trait. Its `const` is only the name of a global;
++   *  everything else about it is metadata.
++   */
++  object rtti {
++    final class View(info: Info) {
++      private def r = meta.rtti(info)
++      def const: nir.Val.Global = {
++        kind(info.name)
++        r.const
++      }
++      def struct: nir.Type.StructValue = {
++        metaOf(info.name)
++        r.struct
++      }
++      def canUseFastITables: Boolean = {
++        metaOf(info.name)
++        r.canUseFastITables
++      }
++    }
++    def apply(info: Info): View = new View(info)
++    def get(info: Info): Option[View] = {
++      kind(info.name)
++      if (meta.rtti.contains(info)) Some(new View(info)) else None
++    }
++  }
++
++  def canAlwaysUseFastITables: Boolean = meta.canAlwaysUseFastITables
++}
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
+index 0ff8f74..00b2997 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
+@@ -51,6 +51,7 @@ object CodeGen {
+       ec: ExecutionContext
+   ): Future[Seq[nir.Defn]] = {
+ 
++    LowerCache.begin(meta)
+     val loweringJobs = partitionBy(defns)(_.name).map {
+       case (_, defns) => Future(Lower(defns))
+     }
+@@ -60,6 +61,7 @@ object CodeGen {
+         case (buffer, defns) => buffer ++= defns
+       }
+       .map(_.toSeq)
++      .andThen { case Success(_) => LowerCache.end() }
+   }
+ 
+   private final val EmptyPath = "__empty"

@@ -231,6 +231,12 @@ jobs:
           echo "$out"
           [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
 
+      - name: Smoke test -- Lower cache (SCALINO_LOWER_CACHE)
+        # Edit sequence under `package -w`, binary compared with a fresh uncached link after every
+        # step, in verify mode and in plain mode. See tests/lower-cache/run.sh.
+        shell: bash
+        run: ./tests/lower-cache/run.sh dist/scalino
+
       - name: Smoke test -- libraries built with Scala Native 0.5.12
         # snunit 0.13.0 from Maven Central references posixlib externs by their 0.5.12 link names.
         # See tests/native-compat/run.sh.
