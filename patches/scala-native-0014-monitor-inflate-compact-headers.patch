@@ -1,0 +1,17 @@
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
+index c3ab6f8..0a553b2 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
+@@ -266,8 +266,11 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+ 
+   @inline private def inflate(thread: Thread): ObjectMonitor = {
+     // Preserve the RawPtr value-class ABI used by existing getMonitor callers.
++    // With compact headers the lock lives in the header word, so the lock
++    // reference is the object itself (and LockWordOffset does not exist).
+     val obj = castRawPtrToObject(
+-      elemRawPtr(lockWordRef, -MemoryLayout.Object.LockWordOffset)
++      if (isCompactHeaders) lockWordRef
++      else elemRawPtr(lockWordRef, -MemoryLayout.Object.LockWordOffset)
+     )
+     val cls = obj.getClass()
+     if ((cls eq classOf[Class[_]]) || (cls eq classOf[String]))

@@ -1,0 +1,55 @@
+diff --git a/nativelib/src/main/resources/scala-native/platform/posix/libunwind/Registers.hpp b/nativelib/src/main/resources/scala-native/platform/posix/libunwind/Registers.hpp
+index 3ea72e370..5b724cbc2 100644
+--- a/nativelib/src/main/resources/scala-native/platform/posix/libunwind/Registers.hpp
++++ b/nativelib/src/main/resources/scala-native/platform/posix/libunwind/Registers.hpp
+@@ -1980,11 +1980,20 @@ private:
+   // The sysctl is missing on CPUs that do not implement FEAT_PAuth_LR.
+   static bool hasPAuthLR() {
+ #if defined(__APPLE__)
+-    int has = 0;
+-    size_t size = sizeof(has);
+-    if (sysctlbyname("hw.optional.arm.FEAT_PAuth_LR", &has, &size, NULL, 0))
+-      return false;
+-    return has != 0;
++    // Cached: the sysctl is a syscall and this runs once per unwound frame.
++    // Hand-rolled instead of a function-local static: nativelib's libunwind
++    // is built without a C++ runtime, so __cxa_guard_acquire is unavailable.
++    static int cached = 0; // 0 unknown, 1 no, 2 yes; racing writers agree
++    int c = __atomic_load_n(&cached, __ATOMIC_RELAXED);
++    if (c == 0) {
++      int has = 0;
++      size_t size = sizeof(has);
++      if (sysctlbyname("hw.optional.arm.FEAT_PAuth_LR", &has, &size, NULL, 0))
++        has = 0;
++      c = has != 0 ? 2 : 1;
++      __atomic_store_n(&cached, c, __ATOMIC_RELAXED);
++    }
++    return c == 2;
+ #else
+     return false;
+ #endif
+@@ -2011,11 +2020,19 @@ private:
+ 
+ #if defined(__APPLE__)
+   static bool checkHasSME() {
+-    int has_sme = 0;
+-    size_t size = sizeof(has_sme);
+-    if (sysctlbyname("hw.optional.arm.FEAT_SME", &has_sme, &size, NULL, 0))
+-      return false;
+-    return has_sme != 0;
++    // Cached: this initializes every Registers_arm64, i.e. every unwound frame.
++    // No function-local static: see hasPAuthLR.
++    static int cached = 0; // 0 unknown, 1 no, 2 yes; racing writers agree
++    int c = __atomic_load_n(&cached, __ATOMIC_RELAXED);
++    if (c == 0) {
++      int has_sme = 0;
++      size_t size = sizeof(has_sme);
++      if (sysctlbyname("hw.optional.arm.FEAT_SME", &has_sme, &size, NULL, 0))
++        has_sme = 0;
++      c = has_sme != 0 ? 2 : 1;
++      __atomic_store_n(&cached, c, __ATOMIC_RELAXED);
++    }
++    return c == 2;
+   }
+ #elif defined(_LIBUNWIND_HAVE_GETAUXVAL)
+   static bool checkHasSME() {
