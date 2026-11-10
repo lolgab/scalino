@@ -1,0 +1,177 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/IO.scala b/tools/src/main/scala/scala/scalanative/build/IO.scala
+index ccf2285..caede0d 100644
+--- a/tools/src/main/scala/scala/scalanative/build/IO.scala
++++ b/tools/src/main/scala/scala/scalanative/build/IO.scala
+@@ -134,12 +134,13 @@ private[scalanative] object IO {
+   def existsInJar(path: Path, matcher: String => Boolean): Boolean = {
+     import java.util.zip.ZipFile
+     val zf = new ZipFile(path.toFile)
+-    val it = zf.entries()
+-    while (it.hasMoreElements()) {
+-      if (matcher(it.nextElement().getName()))
+-        return true
+-    }
+-    false
++    try {
++      val it = zf.entries()
++      var found = false
++      while (!found && it.hasMoreElements())
++        found = matcher(it.nextElement().getName())
++      found
++    } finally zf.close()
+   }
+ 
+   /** Deletes recursively `directory` and all its content. */
+diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+index 40eff6d..cc9e381 100644
+--- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
++++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+@@ -256,10 +256,12 @@ private[scalanative] object NativeLib {
+     if (Build.userConfigHasChanged(config))
+       IO.deleteRecursive(nativeCodeDir)
+ 
++    val persisted = new PersistedFlags(workDir.resolve("nativejars"))
+     val nativeLibPaths = classpath.flatMap { path =>
+-      if (isJar(path)) readJar(path)
++      if (isJar(path)) readJar(path, persisted)
+       else readDir(path)
+     }
++    persisted.save()
+ 
+     val extractPaths =
+       for ((path, index) <- nativeLibPaths.zipWithIndex) yield {
+@@ -465,19 +467,59 @@ private[scalanative] object NativeLib {
+       case false => None
+     }
+ 
+-  private def readJar(path: Path): Option[Path] = {
++  private def readJar(path: Path, persisted: PersistedFlags): Option[Path] = {
+     val stamp = stampOf(path)
+     val cached = jarHasNativeCache.get(path)
+     val hasNative =
+       if (cached != null && cached._1 == stamp) cached._2
+       else {
+-        val has = IO.existsInJar(path, isNativeFile)
++        // across processes (a one-shot build is a new process every time):
++        // keyed by the same (size, modification time, inode) stamp as `jarstamp`
++        val stampText = persistedStamp(path)
++        val has = persisted.get(path, stampText).getOrElse {
++          val scanned = IO.existsInJar(path, isNativeFile)
++          persisted.put(path, stampText, scanned)
++          scanned
++        }
+         jarHasNativeCache.put(path, (stamp, has))
+         has
+       }
+     if (hasNative) Some(path) else None
+   }
+ 
++  /** Which classpath jars carry native sources, as found by earlier builds,
++   *  in `nativejars` of the work directory: one line per jar, `path`, stamp
++   *  and 0/1 separated by tabs.
++   */
++  private final class PersistedFlags(file: Path) {
++    private val flags = new java.util.HashMap[String, (String, Boolean)]()
++    private var dirty = false
++    if (Files.exists(file))
++      new String(Files.readAllBytes(file), "UTF-8").split("\n").foreach { line =>
++        line.split("\t") match {
++          case Array(path, stamp, flag) => flags.put(path, (stamp, flag == "1"))
++          case _                        => ()
++        }
++      }
++    def get(path: Path, stamp: String): Option[Boolean] = {
++      val entry = flags.get(path.toString)
++      if (entry != null && entry._1 == stamp) Some(entry._2) else None
++    }
++    def put(path: Path, stamp: String, value: Boolean): Unit = {
++      flags.put(path.toString, (stamp, value))
++      dirty = true
++    }
++    def save(): Unit =
++      if (dirty) {
++        val text = new java.lang.StringBuilder
++        flags.forEach { (path, entry) =>
++          text.append(path).append('\t').append(entry._1).append('\t').append(if (entry._2) "1" else "0").append('\n')
++        }
++        try IO.write(file, text.toString)
++        catch { case _: java.io.IOException => () } // only a cache
++      }
++  }
++
+   /** Used to find native source files in directories */
+   private def srcPatterns(path: Path, elems: String*): String = {
+     val glob = allFilesPattern(path, elems: _*)
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+index 874f38d..208ed1f 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+@@ -136,7 +136,12 @@ object ClassPath {
+     private def rescan(): Unit = {
+       nirFiles.clear()
+       serviceProviders.clear()
+-      directory.files
++      directory
++        .filesMatching(name =>
++          name.endsWith(".nir") ||
++            name.startsWith("/META-INF/services/") ||
++            name.startsWith("META-INF/services/")
++        )
+         .foreach {
+           case path if path.toString.endsWith(".nir") =>
+             val name = nir.Global.Top(io.packageNameFromPath(path))
+diff --git a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
+index c6e82cf..d18d1ff 100644
+--- a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
++++ b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
+@@ -37,6 +37,16 @@ sealed trait VirtualDirectory {
+   /** List all files in this directory. */
+   def files: Seq[Path]
+ 
++  /** The paths in `files` whose rendering (`Path.toString`: absolute inside a
++   *  jar) satisfies `accept`. Same result as filtering `files`, but a jar can
++   *  answer from the names of its entries, without asking the file system
++   *  about each of them (a walk with an attribute lookup per entry was most of
++   *  the time spent opening the classpath, whose jars hold thousands of
++   *  entries that are not NIR).
++   */
++  def filesMatching(accept: String => Boolean): Seq[Path] =
++    files.filter(path => accept(path.toString))
++
+   /** Last-modified time of the file at `path`, used by scalino's persistent
+    *  in-process NIR parse cache (ClassPath.Impl) to invalidate a single
+    *  cached Defn without a full directory rescan/reparse. For a jar entry
+@@ -184,7 +194,9 @@ object VirtualDirectory {
+   private final class JarDirectory(override val path: Path)(implicit in: Scope)
+       extends NioDirectory {
+     def uri: URI = URI.create(s"jar:${path.toUri}")
+-    private val fileSystem: FileSystem =
++    // Opened on first use: a jar with nothing the caller asks for (the classpath
++    // also holds jars without NIR) is never opened.
++    private lazy val fileSystem: FileSystem =
+       acquire {
+         try {
+           val params = new HashMap[String, String]()
+@@ -199,6 +211,22 @@ object VirtualDirectory {
+     override def pathMatcher(pattern: String): PathMatcher =
+       fileSystem.getPathMatcher(pattern)
+ 
++    override def filesMatching(accept: String => Boolean): Seq[Path] = {
++      val zip = new java.util.zip.ZipFile(path.toFile)
++      try {
++        val out = Seq.newBuilder[Path]
++        val entries = zip.entries()
++        while (entries.hasMoreElements) {
++          val entry = entries.nextElement()
++          if (!entry.isDirectory) {
++            val name = "/" + entry.getName
++            if (accept(name)) out += fileSystem.getPath(name)
++          }
++        }
++        out.result()
++      } finally zip.close()
++    }
++
+     override def files: Seq[Path] = {
+       val roots = jIteratorToSeq(fileSystem.getRootDirectories.iterator())
+ 

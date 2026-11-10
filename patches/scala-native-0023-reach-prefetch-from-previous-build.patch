@@ -1,0 +1,176 @@
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
+index d0d9b7e..ca3bcde 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassLoader.scala
+@@ -15,6 +15,11 @@ sealed abstract class ClassLoader {
+ 
+   def load(global: nir.Global.Top): Option[Seq[nir.Defn]]
+ 
++  /** Hint that these classes will be loaded: parses them, in parallel, before
++   *  returning. Same result as loading them one by one later.
++   */
++  def prefetch(tops: Seq[nir.Global.Top]): Unit = ()
++
+ }
+ 
+ object ClassLoader {
+@@ -47,6 +52,51 @@ object ClassLoader {
+         case path if path.contains(global) =>
+           path.load(global)
+       }.flatten
++
++    override def prefetch(tops: Seq[nir.Global.Top]): Unit = {
++      val jobs = tops.flatMap { top =>
++        classpath.find(_.contains(top)).map(path => (path, top))
++      }
++      val threads = math.min(
++        sys.env
++          .get("SCALINO_PREFETCH_THREADS")
++          .flatMap(v => scala.util.Try(v.trim.toInt).toOption)
++          .filter(_ > 0)
++          // Reads of a jar's entries share one file handle (SN's `ZipFile`
++          // serializes them), so more threads add contention before they
++          // add speed: measured on hello world, 4 threads take ~75ms off the
++          // ~110ms of serial parsing for ~3% more CPU, 10 threads no more
++          // time but 3x the extra CPU.
++          .getOrElse(math.min(4, scala.scalanative.util.procs)),
++        jobs.size
++      )
++      def run(job: (ClassPath, nir.Global.Top)): Unit =
++        // only a hint: a class that cannot be parsed here fails when it is loaded
++        try job._1.preload(job._2)
++        catch { case scala.util.control.NonFatal(_) => () }
++      if (threads <= 1) jobs.foreach(run)
++      else {
++        val next = new java.util.concurrent.atomic.AtomicInteger(0)
++        val work = jobs.toIndexedSeq
++        // big stacks, like the build's own threads: NIR of a big method nests deeply
++        val workers = (0 until threads).map { i =>
++          new Thread(
++            null,
++            () => {
++              var k = next.getAndIncrement()
++              while (k < work.size) {
++                run(work(k))
++                k = next.getAndIncrement()
++              }
++            },
++            s"nir-prefetch-$i",
++            64L * 1024 * 1024
++          )
++        }
++        workers.foreach(_.start())
++        workers.foreach(_.join())
++      }
++    }
+   }
+ 
+   final class FromMemory(defns: collection.Seq[nir.Defn]) extends ClassLoader {
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+index 208ed1f..6c39bab 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/ClassPath.scala
+@@ -20,6 +20,12 @@ sealed trait ClassPath {
+   /** Load given global and info about its dependencies. */
+   private[scalanative] def load(name: nir.Global.Top): Option[Seq[nir.Defn]]
+ 
++  /** Parses `name` now if it is not parsed yet, for `ClassLoader.prefetch`:
++   *  safe to call from several threads on different names, as long as
++   *  nothing else uses this classpath meanwhile.
++   */
++  private[scalanative] def preload(name: nir.Global.Top): Unit
++
+   private[scalanative] def classesWithEntryPoints: Iterable[nir.Global.Top]
+ 
+   private[scalanative] def definedServicesProviders
+@@ -185,6 +191,17 @@ object ClassPath {
+           }
+       }
+ 
++    def preload(name: nir.Global.Top): Unit =
++      nirFiles.get(name.top).foreach { file =>
++        if (!cache.synchronized(cache.get(name).exists(_ => jarStable))) {
++          val mtime = directory.lastModified(file)
++          if (!cache.synchronized(cache.get(name).exists(_._1 == mtime))) {
++            val result = Some(deserializeBinary(directory, file))
++            cache.synchronized(cache.update(name, (mtime, result)))
++          }
++        }
++      }
++
+     // Not `lazy val`: `Impl` now outlives a single build (see `registry`
+     // above), and `refresh()` mutates `nirFiles`/`serviceProviders` in place
+     // on every incremental relink, so a value memoized from the first build
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Link.scala b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+index 547f898..e912ed5 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Link.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+@@ -24,11 +24,14 @@ object Link {
+     previousReach
+       .flatMap(_.incrementalReprocess(config, entries, loader))
+       .getOrElse {
++        ReachHint.prefetch(config, loader)
+         val reach = new Reach(config, entries, loader)
+         reach.process()
+         reach.processDelayed()
+         previousReach = Some(reach)
+-        reach.result()
++        val result = reach.result()
++        if (result.isSuccessful) ReachHint.save(config, reach.rawLoaded.keys)
++        result
+       }
+   }
+ 
+diff --git a/tools/src/main/scala/scala/scalanative/linker/ReachHint.scala b/tools/src/main/scala/scala/scalanative/linker/ReachHint.scala
+new file mode 100644
+index 0000000..b7ef9b1
+--- /dev/null
++++ b/tools/src/main/scala/scala/scalanative/linker/ReachHint.scala
+@@ -0,0 +1,47 @@
++package scala.scalanative
++package linker
++
++import java.nio.file.Files
++
++import scala.util.control.NonFatal
++
++/** The classes the previous build of this work directory loaded, kept in
++ *  `reachset` next to its other caches. A build starts by parsing them in
++ *  parallel (`ClassLoader.prefetch`) instead of one at a time as the
++ *  reachability analysis asks for them: that is ~110ms of serial NIR
++ *  parsing in a one-shot build of hello world, which is a new process every
++ *  time and so has nothing parsed. It is only a hint: a class the new build
++ *  does not need is parsed for nothing, one it needs and is not listed is
++ *  parsed when asked for, and a missing or damaged file is ignored.
++ *  `SCALINO_REACH_PREFETCH=0` turns it off.
++ */
++private[linker] object ReachHint {
++  private val enabled = !sys.env.get("SCALINO_REACH_PREFETCH").contains("0")
++  private def file(config: build.Config) = config.workDir.resolve("reachset")
++
++  def prefetch(config: build.Config, loader: ClassLoader): Unit =
++    if (enabled)
++      try {
++        val path = file(config)
++        if (Files.exists(path)) {
++          val tops = new String(Files.readAllBytes(path), "UTF-8")
++            .split('\n')
++            .iterator
++            .filter(_.nonEmpty)
++            .map(nir.Global.Top(_))
++            .toSeq
++          loader.prefetch(tops)
++        }
++      } catch { case NonFatal(_) => () }
++
++  def save(config: build.Config, tops: Iterable[nir.Global.Top]): Unit =
++    if (enabled)
++      try {
++        val text = tops.iterator.map(_.id).toSeq.sorted.mkString("", "\n", "\n")
++        val path = file(config)
++        val unchanged =
++          Files.exists(path) &&
++            new String(Files.readAllBytes(path), "UTF-8") == text
++        if (!unchanged) build.IO.write(path, text)
++      } catch { case NonFatal(_) => () }
++}

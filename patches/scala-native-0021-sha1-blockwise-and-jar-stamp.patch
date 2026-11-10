@@ -1,0 +1,220 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/IO.scala b/tools/src/main/scala/scala/scalanative/build/IO.scala
+index c9cc2d4..ccf2285 100644
+--- a/tools/src/main/scala/scala/scalanative/build/IO.scala
++++ b/tools/src/main/scala/scala/scalanative/build/IO.scala
+@@ -192,7 +192,7 @@ private[scalanative] object IO {
+   }
+ 
+   /** Compute a SHA-1 hash of `path`. */
+-  def sha1(path: Path, bufSize: Int = 1024): Array[Byte] = {
++  def sha1(path: Path, bufSize: Int = 65536): Array[Byte] = {
+     val digest = new Sha1Digest()
+     val stream = Files.newInputStream(path)
+     try {
+@@ -209,7 +209,7 @@ private[scalanative] object IO {
+   }
+ 
+   /** Compute a SHA-1 hash of `files`. */
+-  def sha1files(files: Seq[Path], bufSize: Int = 1024): Array[Byte] = {
++  def sha1files(files: Seq[Path], bufSize: Int = 65536): Array[Byte] = {
+     val digest = new Sha1Digest()
+     files.foreach { file =>
+       val stream = Files.newInputStream(file)
+@@ -244,16 +244,16 @@ private[scalanative] object IO {
+     private val w = new Array[Int](80)
+ 
+     private def processBlock(block: Array[Byte], off: Int): Unit = {
++      val w = this.w
+       var i = 0
+       while (i < 16) {
+-        val j = off + i * 4
++        val j = off + (i << 2)
+         w(i) = ((block(j) & 0xff) << 24) |
+           ((block(j + 1) & 0xff) << 16) |
+           ((block(j + 2) & 0xff) << 8) |
+           (block(j + 3) & 0xff)
+         i += 1
+       }
+-      i = 16
+       while (i < 80) {
+         val v = w(i - 3) ^ w(i - 8) ^ w(i - 14) ^ w(i - 16)
+         w(i) = (v << 1) | (v >>> 31)
+@@ -266,30 +266,27 @@ private[scalanative] object IO {
+       var d = h3
+       var e = h4
+ 
++      // One loop per group of 20 rounds: no per-round choice of function and
++      // constant.
+       i = 0
++      while (i < 20) {
++        val t = ((a << 5) | (a >>> 27)) + ((b & c) | (~b & d)) + e + 0x5a827999 + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
++        i += 1
++      }
++      while (i < 40) {
++        val t = ((a << 5) | (a >>> 27)) + (b ^ c ^ d) + e + 0x6ed9eba1 + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
++        i += 1
++      }
++      while (i < 60) {
++        val t = ((a << 5) | (a >>> 27)) + ((b & c) | (b & d) | (c & d)) + e + 0x8f1bbcdc + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
++        i += 1
++      }
+       while (i < 80) {
+-        var f = 0
+-        var k = 0
+-        if (i < 20) {
+-          f = (b & c) | ((~b) & d)
+-          k = 0x5a827999
+-        } else if (i < 40) {
+-          f = b ^ c ^ d
+-          k = 0x6ed9eba1
+-        } else if (i < 60) {
+-          f = (b & c) | (b & d) | (c & d)
+-          k = 0x8f1bbcdc
+-        } else {
+-          f = b ^ c ^ d
+-          k = 0xca62c1d6
+-        }
+-
+-        val temp = ((a << 5) | (a >>> 27)) + f + e + k + w(i)
+-        e = d
+-        d = c
+-        c = (b << 30) | (b >>> 2)
+-        b = a
+-        a = temp
++        val t = ((a << 5) | (a >>> 27)) + (b ^ c ^ d) + e + 0xca62c1d6 + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
+         i += 1
+       }
+ 
+@@ -300,33 +297,48 @@ private[scalanative] object IO {
+       h4 += e
+     }
+ 
+-    private def updateByte(b: Byte): Unit = {
+-      buffer(bufferLen) = b
+-      bufferLen += 1
+-      messageLen += 1
+-      if (bufferLen == 64) {
+-        processBlock(buffer, 0)
+-        bufferLen = 0
+-      }
+-    }
+-
++    // Whole blocks are hashed straight from `input`; only what is left of
++    // a block is copied (this used to push every byte through a 64-byte buffer
++    // one at a time, a large part of the time spent hashing the toolchain's
++    // native libraries).
+     def update(input: Array[Byte], offset: Int, len: Int): Unit = {
+-      var i = 0
+-      while (i < len) {
+-        updateByte(input(offset + i))
+-        i += 1
++      messageLen += len
++      var off = offset
++      var left = len
++      if (bufferLen > 0) {
++        val n = math.min(64 - bufferLen, left)
++        System.arraycopy(input, off, buffer, bufferLen, n)
++        bufferLen += n
++        off += n
++        left -= n
++        if (bufferLen == 64) {
++          processBlock(buffer, 0)
++          bufferLen = 0
++        }
++      }
++      while (left >= 64) {
++        processBlock(input, off)
++        off += 64
++        left -= 64
++      }
++      if (left > 0) {
++        System.arraycopy(input, off, buffer, 0, left)
++        bufferLen = left
+       }
+     }
+ 
+     def digest(): Array[Byte] = {
+       val bitLen = messageLen * 8
+-      updateByte(0x80.toByte)
+-      while (bufferLen != 56) updateByte(0.toByte)
+-      var i = 7
+-      while (i >= 0) {
+-        updateByte(((bitLen >>> (i * 8)) & 0xff).toByte)
+-        i -= 1
++      val padding = new Array[Byte](
++        (if (bufferLen < 56) 56 - bufferLen else 120 - bufferLen) + 8
++      )
++      padding(0) = 0x80.toByte
++      var i = 0
++      while (i < 8) {
++        padding(padding.length - 1 - i) = ((bitLen >>> (i * 8)) & 0xff).toByte
++        i += 1
+       }
++      update(padding, 0, padding.length)
+ 
+       val result = new Array[Byte](20)
+       val words = Array(h0, h1, h2, h3, h4)
+diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+index 2a32f66..40eff6d 100644
+--- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
++++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
+@@ -30,6 +30,15 @@ private[scalanative] object NativeLib {
+   // entries of every classpath jar, re-hashed the native-lib jars and re-globbed
+   // their unpacked directories: ~150ms with no compiler running.
+   private final case class Stamp(mtime: Long, size: Long)
++  /** Persisted across processes (see `unpackNativeJar`). */
++  private def persistedStamp(path: Path): String = {
++    val attrs =
++      Files.readAttributes(path, classOf[java.nio.file.attribute.BasicFileAttributes])
++    val key = attrs.fileKey()
++    val mtime = attrs.lastModifiedTime()
++    s"${attrs.size()}:${mtime.toMillis()}:${mtime.hashCode()}:${if (key == null) 0 else key.hashCode()}"
++  }
++
+   private def stampOf(path: Path): Stamp = {
+     val file = path.toFile()
+     Stamp(file.lastModified(), file.length())
+@@ -357,7 +366,7 @@ private[scalanative] object NativeLib {
+       IO.unzip(source, target)
+     }
+ 
+-    val jarhash = {
++    def jarhash = {
+       val stamp = stampOf(source)
+       val cached = jarSha1Cache.get(source)
+       if (cached != null && cached._1 == stamp) cached._2
+@@ -368,13 +377,29 @@ private[scalanative] object NativeLib {
+       }
+     }
+     val jarhashPath = target.resolve("jarhash")
++    // A (size, modification time, inode) stamp of the jar, kept next to its
++    // hash. While it is unchanged the jar is not hashed again: for the native
++    // libraries of the toolchain (~12MB) that was the largest part of what a
++    // one-shot build spent before compiling anything, on every build. The hash
++    // is still what decides when the stamp differs (or is missing).
++    val jarstampPath = target.resolve("jarstamp")
++    val currentStamp = persistedStamp(source)
++    def storedStamp: String =
++      if (Files.exists(jarstampPath))
++        new String(Files.readAllBytes(jarstampPath), "UTF-8")
++      else ""
+     def unpacked =
+       Files.exists(target) &&
+         Files.exists(jarhashPath) &&
+-        Arrays.equals(jarhash, Files.readAllBytes(jarhashPath))
++        (storedStamp == currentStamp ||
++          Arrays.equals(jarhash, Files.readAllBytes(jarhashPath)))
+     if (!unpacked) {
+       unpack()
+       IO.write(jarhashPath, jarhash)
++      IO.write(jarstampPath, currentStamp)
++    } else if (storedStamp != currentStamp) {
++      // contents confirmed by the hash: remember the stamp for next time
++      IO.write(jarstampPath, currentStamp)
+     }
+     target
+   }
