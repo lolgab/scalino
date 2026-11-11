@@ -1,0 +1,31 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/IO.scala b/tools/src/main/scala/scala/scalanative/build/IO.scala
+index caede0dee..3cca78ea7 100644
+--- a/tools/src/main/scala/scala/scalanative/build/IO.scala
++++ b/tools/src/main/scala/scala/scalanative/build/IO.scala
+@@ -383,17 +383,20 @@ private[scalanative] object IO {
+         val rootDirectories = zipFS.getRootDirectories().iterator
+         while (rootDirectories.hasNext) {
+           val root = rootDirectories.next()
+-          // Native-lib jars mix compiled `.class` files in with the C/C++/S
+-          // sources this unpacks them for -- the driver only ever compiles
+-          // the latter, so extracting the former is pure wasted time/disk.
+-          copyRecursive(root, target, skip = isClassFile)
++          // Native-lib jars mix compiled `.class`, `.tasty` and `.nir` files in
++          // with the C/C++/S sources this unpacks them for -- the driver only
++          // ever compiles the latter (the linker reads the former from the
++          // jar itself), so extracting them is pure wasted time/disk.
++          copyRecursive(root, target, skip = isCompiledScalaFile)
+         }
+       } finally zipFS.close()
+     }
+   }
+ 
+-  private def isClassFile(file: Path): Boolean =
+-    file.getFileName.toString.endsWith(".class")
++  private def isCompiledScalaFile(file: Path): Boolean = {
++    val name = file.getFileName.toString
++    name.endsWith(".class") || name.endsWith(".tasty") || name.endsWith(".nir")
++  }
+ 
+   /** Copy source directory and contents to target directory. */
+   def copyDirectory(source: Path, target: Path): Unit = {

@@ -1,0 +1,22 @@
+diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+index e951c54d8..f2feed3a3 100644
+--- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
++++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
+@@ -257,7 +257,16 @@ private[scalanative] object LLVM {
+     try {
+       config.compilerConfig.buildTarget match {
+         case BuildTarget.Application =>
+-          Files.copy(buildPath, outPath, StandardCopyOption.REPLACE_EXISTING)
++          // A hard link rather than a second copy of the binary: nothing
++          // writes either name in place (the linker and the CLI both replace
++          // files), so the two never diverge.
++          try {
++            Files.deleteIfExists(outPath)
++            Files.createLink(outPath, buildPath)
++          } catch {
++            case _: IOException | _: UnsupportedOperationException =>
++              Files.copy(buildPath, outPath, StandardCopyOption.REPLACE_EXISTING)
++          }
+         case _: BuildTarget.Library => outPath
+       }
+     } catch {

@@ -244,6 +244,19 @@ object ScalinoCli:
   def runProgram(cmd: List[String], watch: Boolean, env: Map[String, String] = Map.empty): Int =
     if watch then runManaged(cmd, env) else runInherited(cmd, extraEnv = env)
 
+  /** Copies `src` over `dst` as a copy-on-write clone where the filesystem has them (APFS, btrfs, XFS):
+   *  the linked binary is kept twice, as the link output and as the hooked copy, and a clone stores
+   *  its blocks once. Falls back to a plain copy. */
+  def copyBinary(src: Path, dst: Path): Unit =
+    Files.deleteIfExists(dst)
+    val os = System.getProperty("os.name", "").toLowerCase
+    val cloneCmd =
+      if os.contains("mac") then Some(List("cp", "-c", src.toString, dst.toString))
+      else if os.contains("linux") then Some(List("cp", "--reflink=auto", src.toString, dst.toString))
+      else None
+    val cloned = cloneCmd.exists(cmd => try runCaptureAll(cmd)._1 == 0 catch case _: java.io.IOException => false)
+    if !cloned then Files.copy(src, dst, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+
   /** Runs scalino-dotc with stdout+stderr merged and captured, so `Diagnostics` can re-render them. */
   def runCaptureAll(cmd: List[String]): (Int, String) =
     val pb = new JProcessBuilder(cmd.asJava)
@@ -2356,7 +2369,7 @@ object ScalinoCli:
       // vnode keeps its cached code signature, so later launches get SIGKILLed.
       val tmp = out.resolveSibling(out.getFileName.toString + ".tmp")
       try
-        Files.copy(actual, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        copyBinary(actual, tmp)
         tmp.toFile.setExecutable(true)
         Files.move(tmp, out, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
       finally Files.deleteIfExists(tmp)
