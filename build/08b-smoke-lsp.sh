@@ -15,5 +15,18 @@ python3 "$ROOT/build/lsp-trace-drive.py" "$FIXTURE" "$DIST/scalino-lsp" -stdio
 echo "== smoke test: build/lsp-js-smoke.py against build/lsp-js-fixture (Scala.js project) =="
 JS_FIXTURE="$ROOT/build/lsp-js-fixture"
 (cd "$JS_FIXTURE" && "$DIST/scalino" setup-ide App.scala Union.scala >/dev/null)
-python3 "$ROOT/build/lsp-js-smoke.py" "$JS_FIXTURE" "$DIST/scalino-lsp" -stdio
+js_smoke() { python3 "$ROOT/build/lsp-js-smoke.py" "$JS_FIXTURE" "$DIST/scalino-lsp" -stdio; }
+if ! js_smoke; then
+  # The Scala.js smoke test has crashed intermittently in CI (signal 11 during textDocument/definition).
+  # Keep the first failure's output above, then rerun with stack poisoning and a few plain retries to
+  # tell a flake from a regression and to catch dangling stack objects; the job still fails.
+  echo "== js smoke FAILED on $(uname -sm); diagnosing ==" >&2
+  for i in 1 2 3; do
+    if js_smoke >/dev/null 2>&1; then echo "retry $i (plain): passed" >&2; else echo "retry $i (plain): FAILED" >&2; fi
+  done
+  for i in 1 2 3; do
+    if SCALANATIVE_STACK_POISON=1 js_smoke >/dev/null 2>&1; then echo "retry $i (stack poison): passed" >&2; else echo "retry $i (stack poison): FAILED" >&2; fi
+  done
+  exit 1
+fi
 echo "OK: smoke test passed (scalino-lsp handled every endpoint lsp-trace-drive.py exercises)"
