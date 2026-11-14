@@ -97,6 +97,36 @@ jobs:
             assets/*.tar.gz.sha256
           if-no-files-found: error
 
+      - name: Cross-link the toolchain for Windows and zip it (Linux x86_64 leg only)
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        run: |
+          # the mingw sysroot's libc++ needs clang >= 21
+          wget -O /tmp/llvm22.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm22.sh 22
+          export PATH="/usr/lib/llvm-22/bin:$PATH"
+          version="${{ inputs.tag || github.ref_name }}"
+          mkdir -p assets
+          for arch in x86_64 aarch64; do
+            ./build/13-cross-link-toolchain.sh "$arch-pc-windows-gnu"
+            winarch="$([[ "$arch" == aarch64 ]] && echo arm64 || echo "$arch")"
+            pkg="scalino-${version}-windows-${winarch}"
+            rm -rf "out/$pkg"; mkdir -p "out/$pkg"
+            cp -a "dist-cross/$arch-pc-windows-gnu/." "out/$pkg/"
+            cp README.md LICENSE NOTICE "out/$pkg/"
+            ( cd out && zip -qr -9 "../assets/$pkg.zip" "$pkg" )
+            ( cd assets && sha256sum "$pkg.zip" > "$pkg.zip.sha256" )
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'linux-x86_64'
+        with:
+          name: dist-windows
+          path: |
+            assets/*.zip
+            assets/*.zip.sha256
+          if-no-files-found: error
+
       # .deb/.rpm for apt/dnf users (pulls in clang as a dependency) instead of tarball+install.sh.
       # Linux only: fpm's rpm backend needs rpmbuild, not installed on the macOS/Windows legs.
       - name: Package .deb/.rpm (Linux only)
@@ -125,62 +155,51 @@ jobs:
             assets/*.rpm.sha256
           if-no-files-found: error
 
-  # Windows x86_64 release build disabled -- see docs/findings.md.
-  # build-windows:
-  #   name: build (windows-x86_64)
-  #   runs-on: windows-latest
-  #   # Windows x86_64 support is untested/experimental -- see docs/findings.md.
-  #   # Not a release gate: publish depends only on the Linux/macOS build job
-  #   # below, so a broken Windows leg never blocks the release.
-  #   continue-on-error: true
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: ./.github/actions/setup-build-deps
-  #
-  #     - name: Build toolchain
-  #       shell: bash
-  #       run: ./build/all.sh
-  #
-  #     - name: Smoke test -- plain program
-  #       shell: bash
-  #       run: ./dist/scalino run examples/Hello.scala
-  #
-  #     - name: Smoke test -- real macro
-  #       # Known-failing, not a regression: see ci.yml's identical step for
-  #       # the full explanation (jsoniter-scala's derivation macro hits a
-  #       # genuine, still-open interpreter gap -- docs/findings.md's
-  #       # "Remaining work" #1). Without continue-on-error here, this step's
-  #       # failure skipped every later step in the job (Package included),
-  #       # so a release build that actually succeeded still shipped zero
-  #       # assets for every platform.
-  #       continue-on-error: true
-  #       shell: bash
-  #       run: ./dist/scalino run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala
-  #
-  #     - name: Package
-  #       shell: bash
-  #       run: |
-  #         version="${{ inputs.tag || github.ref_name }}"
-  #         pkg="scalino-${version}-windows-x86_64"
-  #         mkdir -p "out/$pkg"
-  #         cp -a dist/. "out/$pkg/"
-  #         cp README.md LICENSE NOTICE "out/$pkg/"
-  #         mkdir -p assets
-  #         tar czf "assets/$pkg.tar.gz" -C out "$pkg"
-  #         ( cd assets && (sha256sum "$pkg.tar.gz" 2>/dev/null || shasum -a 256 "$pkg.tar.gz") > "$pkg.tar.gz.sha256" )
-  #
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: dist-windows-x86_64
-  #         path: |
-  #           assets/*.tar.gz
-  #           assets/*.tar.gz.sha256
-  #         if-no-files-found: error
+  # The Windows toolchain is cross-linked on the Linux x86_64 leg above (build/13-cross-link-toolchain.sh) and
+  # run on real Windows here: x86_64 on windows-latest, arm64 on windows-11-arm. Not a release gate yet:
+  # `publish` waits for it but ships whatever built.
+  windows-smoke:
+    name: windows smoke (${{ matrix.arch }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, os: windows-latest}
+          - {arch: arm64, os: windows-11-arm}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-windows
+          path: assets
+
+      - name: Unpack
+        shell: bash
+        run: |
+          # RUNNER_TEMP is D:\a\_temp: bash mangles the backslashes, so work in the POSIX form and hand GITHUB_PATH the Windows one
+          t="$(cygpath -u "$RUNNER_TEMP")"
+          mkdir -p "$t/unpacked"
+          unzip -q assets/scalino-*-windows-${{ matrix.arch }}.zip -d "$t/unpacked"
+          d="$(echo "$t"/unpacked/scalino-*-windows-${{ matrix.arch }})"
+          cygpath -w "$d" >> "$GITHUB_PATH"
+
+      - name: Smoke test -- plain program
+        shell: bash
+        run: |
+          scalino --version
+          out="$(scalino run examples/Hello.scala)"
+          echo "$out"
+          [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
 
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [build, windows-smoke]
+    # ship whatever built: a Windows smoke failure does not hold the other platforms back
+    if: ${{ !cancelled() && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -200,6 +219,8 @@ jobs:
           files: |
             assets/*.tar.gz
             assets/*.tar.gz.sha256
+            assets/*.zip
+            assets/*.zip.sha256
             assets/*.deb
             assets/*.deb.sha256
             assets/*.rpm

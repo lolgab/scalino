@@ -1,0 +1,28 @@
+--- a/javalib/src/main/scala/java/nio/file/Files.scala
++++ b/javalib/src/main/scala/java/nio/file/Files.scala
+@@ -342,11 +342,21 @@
+ 
+   def copy(source: Path, target: Path, options: Array[CopyOption]): Path = {
+     val linkOpts = Array(LinkOption.NOFOLLOW_LINKS)
+-    val attrsCls =
+-      if (isWindows) classOf[DosFileAttributes]
+-      else classOf[PosixFileAttributes]
++    // A source in another provider's file system (a jar, through ZipFileSystemProvider) has the
++    // basic view only: the Dos one comes back null there, and readAttributes dereferences it.
++    // The branches are nested, never `&&`-ed: see the link-time/runtime note below.
++    val attrsCls: Class[_ <: BasicFileAttributes] =
++      if (isWindows) {
++        if (source.getFileSystem().provider().getScheme() == "file")
++          classOf[DosFileAttributes]
++        else classOf[BasicFileAttributes]
++      } else classOf[PosixFileAttributes]
+ 
+-    val attrs = Files.readAttributes(source, attrsCls, linkOpts)
++    val attrs = Files.readAttributes(
++      source,
++      attrsCls.asInstanceOf[Class[BasicFileAttributes]],
++      linkOpts
++    )
+     val targetExists = exists(target, linkOpts)
+     if (targetExists && !options.contains(REPLACE_EXISTING))
+       throw new FileAlreadyExistsException(target.toString)

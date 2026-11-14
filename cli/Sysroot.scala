@@ -29,7 +29,10 @@ object Sysroot:
   /** Where `build` installs. */
   def cacheRoot: Path =
     env("SCALINO_SYSROOT_DIR").map(Paths.get(_)).getOrElse(
-      env("XDG_CACHE_HOME").map(Paths.get(_)).getOrElse(Paths.get(env("HOME").getOrElse("."), ".cache")).resolve("scalino").resolve("sysroots")
+      if ScalinoCli.isWindows then
+        Paths.get(env("LOCALAPPDATA").getOrElse(Paths.get(System.getProperty("user.home"), "AppData", "Local").toString), "scalino", "sysroots")
+      else
+        env("XDG_CACHE_HOME").map(Paths.get(_)).getOrElse(Paths.get(env("HOME").getOrElse("."), ".cache")).resolve("scalino").resolve("sysroots")
     )
 
   /** Everything searched, in order. `<dist>/sysroots` is where OS packages

@@ -33,6 +33,9 @@ object ScalinoCli:
   // "C:\..." at the drive letter. dist/*.cp is written with the same separator (build/06-package.sh).
   val CP_SEP: String = java.io.File.pathSeparator
 
+  /** A tool shipped in `dist/`, by its name without extension: Windows has `.exe` on it. */
+  def tool(name: String): String = if isWindows then s"$dist/$name.exe" else s"$dist/$name"
+
   // Color output, cargo/scala-cli-style: on when the stream is a terminal, off when redirected.
   // Overridable by NO_COLOR (https://no-color.org: any non-empty value turns it off),
   // CLICOLOR_FORCE, TERM=dumb, and `--color always|auto|never`, which wins over the env vars.
@@ -181,8 +184,11 @@ object ScalinoCli:
         catch case _: Throwable => ()
 
     def send(p: Process, sig: Int): Unit =
-      try scala.scalanative.posix.signal.kill(p.pid().toInt, sig)
-      catch case _: Throwable => p.destroy()
+      // no kill(2) on Windows (a link-time constant, so the call is not even linked there)
+      if scala.scalanative.meta.LinktimeInfo.isWindows then p.destroy()
+      else
+        try scala.scalanative.posix.signal.kill(p.pid().toInt, sig)
+        catch case _: Throwable => p.destroy()
 
   /** `run -w`: the program keeps running while the sources are rebuilt, and is stopped and started again once
    *  a build has succeeded (scala-cli's `--restart`). A failed build leaves the running program alone. */
@@ -438,10 +444,21 @@ object ScalinoCli:
         Option(p.toFile.listFiles()).foreach(_.foreach(f => deleteRecursively(f.toPath)))
       Files.delete(p)
 
+  def isWindows: Boolean = sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
+
+  /** The first executable called `name` on PATH (with PATHEXT's extensions on Windows), what
+   *  `sh -c 'command -v name'` finds, without a shell: Windows has none. */
+  def findOnPathOpt(name: String): Option[String] =
+    val exts =
+      if isWindows then "" :: Option(System.getenv("PATHEXT")).getOrElse(".COM;.EXE;.BAT;.CMD").split(';').toList.filter(_.nonEmpty)
+      else List("")
+    val dirs = Option(System.getenv("PATH")).getOrElse("").split(java.io.File.pathSeparator).toList.map(_.stripPrefix("\"").stripSuffix("\"")).filter(_.nonEmpty)
+    val candidates = for d <- dirs.iterator; e <- exts.iterator yield
+      try Some(Paths.get(d, name + e)) catch case _: java.nio.file.InvalidPathException => None
+    candidates.flatten.find(p => Files.isRegularFile(p) && Files.isExecutable(p)).map(_.toString)
+
   def findOnPath(name: String): String =
-    val (code, out) = runCaptureStdout(List("sh", "-c", s"command -v $name"))
-    if code != 0 || out.isEmpty then fail(s"'$name' not found on PATH")
-    out
+    findOnPathOpt(name).getOrElse(fail(s"'$name' not found on PATH"))
 
   // Directives: `//> using <key> "value"[, "value2"...]`, one per line, anywhere in the file.
   // Single-line form only (no multi-line `//> using` blocks), with plural aliases
@@ -829,7 +846,7 @@ object ScalinoCli:
   /** The `cs fetch --classpath` call behind `resolveDeps` (no caching or lockfile); also what
    *  `scalino lock` runs. */
   private def csFetchClasspath(deps: List[String], repositories: List[String]): String =
-    val cs = s"$dist/scalino-cs"
+    val cs = tool("scalino-cs")
     val coords = deps.map(toCoursierCoord) ::: alwaysIncludedArtifacts
     // The native runtime libraries are scalino's own; a Scala.js build takes what its dependencies say.
     val excludeFlags = if jsPlatform then Nil else excludedArtifacts.flatMap(a => List("-E", a))
@@ -863,6 +880,7 @@ object ScalinoCli:
     envOpt("SCALINO_CACHE").orElse(envOpt("COURSIER_CACHE")).map(Paths.get(_)).getOrElse {
       val home = System.getProperty("user.home")
       if System.getProperty("os.name", "").contains("Mac") then Paths.get(home, "Library", "Caches", "Coursier", "v1")
+      else if isWindows then Paths.get(envOpt("LOCALAPPDATA").getOrElse(s"$home\\AppData\\Local"), "Coursier", "Cache", "v1")
       else Paths.get(envOpt("XDG_CACHE_HOME").getOrElse(s"$home/.cache"), "coursier", "v1")
     }
 
@@ -984,7 +1002,7 @@ object ScalinoCli:
   private def csFetchSourceJars(deps: List[String], repositories: List[String]): List[String] =
     val repoFlags = repositories.flatMap(r => List("-r", r))
     val (code, out) = runCaptureStdout(
-      s"$dist/scalino-cs" :: "fetch" :: deps.map(toCoursierCoord) ::: repoFlags ::: List("--classifier", "sources"))
+      tool("scalino-cs") :: "fetch" :: deps.map(toCoursierCoord) ::: repoFlags ::: List("--classifier", "sources"))
     if code != 0 then
       System.err.println(Color.warn(s"scalino: warning: no sources jars recorded for ${deps.mkString(", ")} (not all are published)"))
       Nil
@@ -1175,7 +1193,7 @@ object ScalinoCli:
         val key = sanitizeKey(((if jsPlatform then List("platform=js") else Nil) ::: deps.sorted ::: repositories.sorted).mkString(","))
         val marker = cacheDir.resolve(s"deps-$key.sources-fetched")
         if !offlineMode && !Files.exists(marker) then
-          val cs = s"$dist/scalino-cs"
+          val cs = tool("scalino-cs")
           val coords = deps.map(toCoursierCoord)
           val repoFlags = repositories.flatMap(r => List("-r", r))
           System.err.println(Color.action(s"scalino: fetching sources for ${deps.mkString(", ")} (best-effort, for go-to-definition)"))
@@ -1195,7 +1213,7 @@ object ScalinoCli:
       Files.createDirectories(libDir)
       val marker = libDir.resolve(s".stdlib-sources-fetched-${BuildInfo.scalaVersion}")
       if !offlineMode && !Files.exists(marker) then
-        val cs = s"$dist/scalino-cs"
+        val cs = tool("scalino-cs")
         val artifacts = List(
           ("org.scala-lang", "scala-library"),
           ("org.scala-lang", "scala3-library_3")
@@ -1608,12 +1626,13 @@ object ScalinoCli:
       compileToClasses(List(probeSrc), probeClasses, ccWithUserClasses)
       val linkDir = scratch.resolve("link")
       val linkCp = s"$probeClasses$CP_SEP$userClassesDir$CP_SEP${cc.nativelibsCp}$CP_SEP$testClasspath"
-      val clang = findOnPath("clang")
-      val clangpp = findOnPath("clang++")
-      val linkExit = runInherited(List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, "ScalinoCliProbeMain", clang, clangpp, logLevel))
+      val (clang, clangpp) = hostClangs(NativeOpts())
+      val (probeTriple, probeFlags) = windowsHostLink(NativeOpts(), linkCp)
+      val linkExit = runInherited(List(tool("scalino-linkdriver"), linkCp, linkDir.toString, "ScalinoCliProbeMain", clang, clangpp, logLevel) ++ probeFlags)
       if linkExit != 0 then fail("linking the test-framework probe failed")
-      val produced = linkDir.resolve("ScalinoCliProbeMain")
-      val actual = if Files.exists(produced) then produced else linkDir.resolve("sncliprobemain")
+      val producedDir = probeTriple.fold(linkDir)(linkDir.resolve(_))
+      val produced = List("ScalinoCliProbeMain.exe", "ScalinoCliProbeMain").map(producedDir.resolve).find(Files.exists(_)).getOrElse(producedDir.resolve("ScalinoCliProbeMain"))
+      val actual = if Files.exists(produced) then produced else producedDir.resolve("sncliprobemain")
       if !Files.exists(actual) then fail(s"expected probe binary at $actual, not found")
       val (exit, out) = runCaptureStdout(List(actual.toString))
       if exit != 0 then fail("test-framework probe binary failed to run")
@@ -1934,7 +1953,7 @@ object ScalinoCli:
   /** Whole-project fingerprint of what isn't tracked per file (dependency classpath, scalac flags,
    *  the compiler binary): a change forces a full rebuild. */
   def computeFingerprint(cc: CompileClasspath, extraOptions: List[String]): String =
-    val dotcMtime = Files.getLastModifiedTime(Paths.get(s"$dist/scalino-dotc")).toMillis
+    val dotcMtime = Files.getLastModifiedTime(Paths.get(tool("scalino-dotc"))).toMillis
     hashKey(List(cc.compileCp, cc.javaBase, cc.pluginJar, extraOptions.mkString(" "), dotcMtime.toString).mkString(" "))
 
   /** Parses the manifest written by `saveManifest` (tab/newline-delimited, like the other on-disk
@@ -2057,7 +2076,7 @@ object ScalinoCli:
       // scalino-dotc resolve symbols of files not recompiled this round from their .tasty/.class.
       val compileCp = s"$classesDir$CP_SEP${cc.compileCp}"
       val compileCmd = List(
-        s"$dist/scalino-dotc",
+        tool("scalino-dotc"),
         "-javabootclasspath", cc.javaBase,
         "-classpath", compileCp,
       ) ++ (
@@ -2296,6 +2315,33 @@ object ScalinoCli:
   def checkBinaryOutPath(out: Path): Unit =
     if Files.isDirectory(out) then fail(s"output path '$out' is a directory")
 
+  /** Name of a linked program next to its build files (`run`, `test`): Windows only runs a file with the .exe. */
+  def hostBinName: String = if isWindows then "bin.exe" else "bin"
+
+  /** clang and clang++ for a build. On Windows nothing is assumed installed (the C toolchain there is MSVC's, or
+   *  older than the mingw libc++ needs), so unless the build names its own, llvm-mingw's is fetched on first
+   *  use (`SysrootBuild.windowsHostToolchain`). */
+  def hostClangs(n: NativeOpts): (String, String) =
+    if isWindows && n.clang.isEmpty && n.clangpp.isEmpty then
+      val tc = SysrootBuild.windowsHostToolchain(Packaging.detectHost())
+      (tc.clang.toString, tc.clangpp.toString)
+    else (n.clang.getOrElse(findOnPath("clang")), n.clangpp.getOrElse(findOnPath("clang++")))
+
+  /** A build on a Windows host with no `--native-target-triple` is a cross build to the host's own
+   *  `<arch>-pc-windows-gnu`, so it uses the same sysroot, lld and flags as one from another OS, and the
+   *  result is the same everywhere. The triple and the extra linkdriver flags; none elsewhere, or when the
+   *  build brings its own clang. */
+  def windowsHostLink(n: NativeOpts, classpath: String): (Option[String], List[String]) =
+    if !isWindows || n.targetTriples.nonEmpty || n.clang.nonEmpty then (None, Nil)
+    else
+      val t = Packaging.detectHost().triple
+      val ld = n.ldPath.orElse(Sysroot.ensureLld(List(t)))
+      (Some(t),
+        List("--target-triple", t) ++
+        Sysroot.resolve(List(t), n.sysroots).flatMap(v => List("--sysroot", v)) ++
+        Sysroot.resolveAddons(List(t), classpath).flatMap(v => List("--lib-addon", v)) ++
+        ld.toList.flatMap(v => List("--ld-path", v)))
+
   /** Compiles `sources`, detects the entry point from the compiled classfiles (or takes
    *  `explicitMainClass`, see `detectMainClass`), links, and copies the binary to
    *  `outFor(mainClass)`. Compilation targets one persistent mainClass-independent dir (the entry
@@ -2361,10 +2407,10 @@ object ScalinoCli:
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir$CP_SEP${cc.nativelibsCp}"
       else s"$classesDir$CP_SEP${cc.nativelibsCp}$CP_SEP$extraClasspath"
-    val clang = nativeOpts.clang.getOrElse(findOnPath("clang"))
-    val clangpp = nativeOpts.clangpp.getOrElse(findOnPath("clang++"))
+    val (clang, clangpp) = hostClangs(nativeOpts)
+    val (hostTriple, hostFlags) = windowsHostLink(nativeOpts, linkCp)
 
-    val nativeFlags =
+    val nativeFlags = hostFlags ++
       nativeOpts.mode.toList.flatMap(v => List("--mode", v)) ++
       nativeOpts.gc.toList.flatMap(v => List("--gc", v)) ++
       nativeOpts.lto.toList.flatMap(v => List("--lto", v)) ++
@@ -2389,7 +2435,7 @@ object ScalinoCli:
       nativeOpts.cppCompile.flatMap(v => List("--cpp-compile", v)) ++
       nativeOpts.prune.flatMap(v => List("--prune", v))
 
-    val linkCmd = List(s"$dist/scalino-linkdriver", linkCp, linkDirArg, mainClasses.mkString(","), clang, clangpp, logLevel) ++ nativeFlags
+    val linkCmd = List(tool("scalino-linkdriver"), linkCp, linkDirArg, mainClasses.mkString(","), clang, clangpp, logLevel) ++ nativeFlags
     val linkExit = if longRunning then linkIncremental(linkCmd) else runInherited(linkCmd)
     if linkExit != 0 then fail("linking failed")
 
@@ -2414,7 +2460,7 @@ object ScalinoCli:
         throw e
     for mainClass <- mainClasses do
       val linkDir = linkDirFor(mainClass)
-      if nativeOpts.targetTriples.isEmpty then collect(mainClass, linkDir, outFor(mainClass))
+      if nativeOpts.targetTriples.isEmpty then collect(mainClass, hostTriple.fold(linkDir)(linkDir.resolve(_)), outFor(mainClass))
       else nativeOpts.targetTriples.foreach(t => collect(mainClass, linkDir.resolve(t), outForTriple(mainClass, t)))
     mainClasses
 
@@ -2499,7 +2545,7 @@ object ScalinoCli:
     outDirOverride: Option[Path] = None
   ): (String, Path) =
     val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental, js = true)
-    val jslink = s"$dist/scalino-jslink"
+    val jslink = tool("scalino-jslink")
     val mainClass = explicitMainClass.getOrElse {
       val (code, out) = runCaptureStdout(List(jslink, "--find-mains", compiledDir.toString))
       if code != 0 then fail("could not scan the compiled classes for an entry point")
@@ -2552,7 +2598,7 @@ object ScalinoCli:
     if wipe then deleteRecursively(outDir)
     Files.createDirectories(outDir)
     val cmd =
-      List(s"$dist/scalino-jslink", "--out", outDir.toString, "--main", mainClass, "--module-kind", js.moduleKind, "--mode", js.mode, "--log", logLevel) ++
+      List(tool("scalino-jslink"), "--out", outDir.toString, "--main", mainClass, "--module-kind", js.moduleKind, "--mode", js.mode, "--log", logLevel) ++
       progArgs.flatMap(a => List("--main-arg", a)) ++
       (if js.sourceMaps then Nil else List("--no-source-maps")) ++
       (if js.checkIr then List("--check-ir") else Nil) ++
@@ -2580,9 +2626,7 @@ object ScalinoCli:
     val name = jsRuntime
     if name != "node" && name != "deno" && name != "bun" then fail(s"unknown js runtime '$name' (expected node, deno or bun)")
     val exe = (if name == "node" then envOpt("SCALINO_NODE") else None).getOrElse {
-      val (code, found) = runCaptureStdout(List("sh", "-c", s"command -v $name"))
-      if code != 0 || found.isEmpty then fail(s"'$name' not found on PATH -- a Scala.js program runs on $name (--js-runtime picks another, $$SCALINO_NODE names node)")
-      found
+      findOnPathOpt(name).getOrElse(fail(s"'$name' not found on PATH -- a Scala.js program runs on $name (--js-runtime picks another, $$SCALINO_NODE names node)"))
     }
     if !Files.isExecutable(Paths.get(exe)) then fail(s"cannot run '$exe' -- is it an executable file?")
     if name == "deno" then List(exe, "run", "--allow-all") else List(exe)
@@ -2695,7 +2739,7 @@ object ScalinoCli:
   /** Class name -> `ClassInfo` for every class in `entries` (directories and jars). The IR has no access
    *  flags: everything is public, and `abstract` means "declares a method without a body". */
   def jsClassTable(entries: List[String]): Map[String, ClassInfo] =
-    val (code, out) = runCaptureStdout(List(s"$dist/scalino-jslink", "--class-table") ++ entries)
+    val (code, out) = runCaptureStdout(List(tool("scalino-jslink"), "--class-table") ++ entries)
     if code != 0 then fail("could not read the class hierarchy of the test class path")
     out.linesIterator.flatMap { line =>
       line.split("\t", -1) match
@@ -3595,11 +3639,11 @@ object ScalinoCli:
         if nativeOpts.targetTriples.exists(t => Packaging.hostFromTriple(t) != Packaging.detectHost()) || nativeOpts.targetTriples.size > 1 then
           fail(s"run: can't execute a binary for ${nativeOpts.targetTriples.mkString(", ")} on this machine -- use `scalino package`")
         val hostOpts = nativeOpts.copy(targetTriples = Nil, sysroots = Nil)
-        def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
+        def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(hostBinName)
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
         runProgram(binPathFor(mainClass).toString :: o.progArgs, o.watch, runEnvOf(directives, o))
       case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
-        def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve("bin")
+        def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(hostBinName)
         def binPathForTriple(mc: String, t: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(s"bin-$t")
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch, outForTriple = binPathForTriple)
         val meta = Packaging.resolveMeta(directives.pkg, mainClass, o.pkgName, o.pkgVersion, o.releaseUrl)
@@ -3616,7 +3660,9 @@ object ScalinoCli:
         val several = splitMainClasses(explicitMainClass).size > 1
         def outPathFor(mc: String): Path =
           val name = mc.substring(mc.lastIndexOf('.') + 1)
-          if several then Paths.get(o.out.getOrElse(".")).resolve(name) else Paths.get(o.out.getOrElse(name))
+          val p = if several then Paths.get(o.out.getOrElse(".")).resolve(name) else Paths.get(o.out.getOrElse(name))
+          // a Windows program only runs with the .exe
+          if isWindows && !p.getFileName.toString.toLowerCase.endsWith(".exe") then p.resolveSibling(s"${p.getFileName}.exe") else p
         // One cross target: -o as given. Several: `<out>-<triple>`.
         def outPathForTriple(mc: String, t: String): Path =
           val base = outPathFor(mc)
@@ -3812,7 +3858,7 @@ object ScalinoCli:
           if clientResources.nonEmpty then n.copy(embedResources = true) else n
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
-        val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", "bin")
+        val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", hostBinName)
         def build(exclude: Set[String]) =
           buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude)
         // A selected test could reference an excluded class other than by inheritance: if the

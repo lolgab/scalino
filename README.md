@@ -58,9 +58,19 @@ for your OS/arch, verifies its checksum, and installs `scalino` to
 `~/.local/bin`. You can override this with `$SCALINO_INSTALL_DIR`,
 `$SCALINO_BIN_DIR` or `$SCALINO_VERSION`.
 
+On Windows (x86_64 and arm64), from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/lolgab/scalino/main/install.ps1 | iex
+```
+
+It installs into `%LOCALAPPDATA%\scalino` and adds it to your `PATH`; no administrator
+rights and nothing else to install. See [Windows](#windows).
+
 **Requirement:** `clang`/`clang++` for Scala Native builds (the default); every
 Scala Native build links through clang. macOS has it with the Xcode Command Line
-Tools; elsewhere use `apt install clang` or similar. Scala.js builds need no C
+Tools; elsewhere use `apt install clang` or similar. Windows needs nothing: scalino
+downloads llvm-mingw's clang on the first build. Scala.js builds need no C
 toolchain, only `node` (or `deno`/`bun`) to run them, and the Scala.js base
 libraries ship in the tarball, so they build offline. Dependency resolution
 needs no separate install: scalino bundles a renamed copy of
@@ -70,8 +80,7 @@ needs no separate install: scalino bundles a renamed copy of
 
 - **Tarball:** each release ships a self-contained `dist/` tarball (compiler +
   linker + Scala.js linker + `scalino` + `scalino-lsp`) for Linux (x86_64/arm64), macOS
-  (x86_64/arm64), and Windows (x86_64, experimental, see
-  [`docs/findings.md`](docs/findings.md)). Extract it and run `dist/scalino`.
+  (x86_64/arm64) and Windows (x86_64/arm64, a `.zip`). Extract it and run `dist/scalino`.
 - **Debian/Ubuntu and Fedora/RHEL/openSUSE:** every release publishes
   `.deb` and `.rpm` packages, with `clang` declared as a dependency. Both
   install to `/usr/lib/scalino/`, with symlinks in `/usr/bin/`:
@@ -299,7 +308,6 @@ Known gaps:
 - Scala.js `package --format`: deb/rpm/docker/brew wrapping is Native only.
 - JUnit-style `@Test` discovery: test frameworks must use `SubclassFingerprint`,
   as munit, utest, scalatest and zio-test-sbt do.
-- Windows is experimental.
 
 [`docs/findings.md`](docs/findings.md) has the full list of verified, blocked
 and pending items.
@@ -349,7 +357,7 @@ parsed only once.
 | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | any host | `scalino sysroot build <triple>` (run for you on first use) |
 | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | any host | same; glibc 2.31 from Debian 11, runs on any distro with glibc >= 2.31 |
 | `x86_64-apple-darwin`, `aarch64-apple-darwin` | any host | `scalino sysroot build <triple>` (run for you on first use), on a Mac too |
-| `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot build <triple>`, plus `lld` (**experimental**, see below) |
+| `x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnu` | any host | `scalino sysroot build <triple>`, plus `lld` |
 
 The musl targets are fully static, so one binary runs on every distro. Cross
 links use `ld.lld`; if none is on `PATH`, scalino downloads one from the
@@ -404,6 +412,24 @@ Mac it can use Apple frameworks.
 
 `run` and `test` always build for the host, because the result has to run on
 this machine.
+
+## Windows
+
+scalino runs natively on Windows 10/11 on x86_64 and arm64: `build`, `run`, `test`, `package`,
+Scala.js, and `scalino-lsp`. Nothing but scalino has to be installed. The first build downloads
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw)'s `clang` and `lld` (about 190 MB) and assembles
+the mingw-w64 sysroot, both into `%LOCALAPPDATA%\scalino\sysroots`. A build on Windows is a
+cross build to the machine's own `<arch>-pc-windows-gnu` target, so it links the same way as one
+from Linux or macOS: statically, with libc++ and no dependency on Visual Studio or an MSVC runtime.
+
+- Programs link through llvm-mingw, not MSVC: libraries that need the MSVC ABI or `.lib` files from
+  a Visual Studio install are not supported.
+- `--native-clang`/`--native-clangpp` replace the downloaded toolchain; the target stays MinGW.
+- Windows builds go through clang's textual LLVM IR: the direct LLVM codegen and compact object headers
+  that Linux and macOS use are off there, so builds are somewhat slower and objects a little bigger.
+- `$SCALINO_SYSROOT_DIR` moves the cache, `$SCALINO_SYSROOT_SOURCES` can be pre-filled to build offline,
+  as everywhere else.
+- Windows needs `tar` (it ships with Windows 10 and later) and `curl` for the first-time downloads.
 
 ## Hermetic / Nix builds
 

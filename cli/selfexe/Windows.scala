@@ -6,7 +6,7 @@ import scala.scalanative.unsafe.*
 import scala.scalanative.unsigned.*
 
 @extern
-@link("Kernel32")
+@link("kernel32")
 private object Kernel32:
   def GetModuleFileNameA(hModule: Ptr[Byte], lpFilename: CString, nSize: CInt): CInt = extern
 

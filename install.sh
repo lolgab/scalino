@@ -27,7 +27,7 @@ arch="$(uname -m)"
 case "$os" in
   Linux) plat="linux" ;;
   Darwin) plat="macos" ;;
-  *) die "unsupported OS: $os (this toolchain also ships experimental Windows builds -- see the release page for those tarballs)" ;;
+  *) die "unsupported OS: $os (on Windows use install.ps1: irm https://raw.githubusercontent.com/lolgab/scalino/main/install.ps1 | iex)" ;;
 esac
 
 case "$arch" in

@@ -1,0 +1,26 @@
+--- a/javalib/src/main/scala/java/nio/file/PathMatcherImpl.scala
++++ b/javalib/src/main/scala/java/nio/file/PathMatcherImpl.scala
+@@ -25,7 +25,21 @@
+ }
+ 
+ private class GlobPathMatcher(pattern: String) extends PathMatcher {
+-  val globPattern = GlobPattern.compile(pattern)
++  /* The glob parser knows '/' as the name separator. On Windows a pattern written for
++   * paths spells it as an escaped backslash ("C:\\dir\\**.c", as Scala Native's own build code does)
++   * and Path.toString has plain backslashes: turn both into '/' so they meet.
++   */
++  val globPattern = GlobPattern.compile(
++    if (scala.scalanative.meta.LinktimeInfo.isWindows)
++      pattern.replace("\\\\", "/")
++    else pattern
++  )
+   override def matches(p: Path): Boolean =
+-    globPattern.matcher(p.toString).matches()
++    globPattern
++      .matcher(
++        if (scala.scalanative.meta.LinktimeInfo.isWindows)
++          p.toString.replace('\\', '/')
++        else p.toString
++      )
++      .matches()
+ }

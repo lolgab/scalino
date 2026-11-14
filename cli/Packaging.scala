@@ -59,6 +59,7 @@ object Packaging:
     def triple: String = os match
       case "linux" => s"$arch-unknown-linux-$libc"
       case "macos" => s"$arch-apple-darwin"
+      case "windows" => s"$arch-pc-windows-gnu"
       case other => s"$arch-$other"
 
   private def uname(flag: String): String =
@@ -79,6 +80,11 @@ object Packaging:
   def detectHost(): Host =
     Option(System.getenv("SCALINO_PACKAGE_TRIPLE")).filter(_.nonEmpty) match
       case Some(t) => hostFromTriple(t)
+      case None if ScalinoCli.isWindows =>
+        // No uname there. PROCESSOR_ARCHITECTURE is the machine's (os.arch would be the process's, and
+        // x86_64 programs run on Windows on ARM); PROCESSOR_ARCHITEW6432 is set for a 32-bit process on a 64-bit host.
+        val a = Option(System.getenv("PROCESSOR_ARCHITEW6432")).filter(_.nonEmpty).orElse(Option(System.getenv("PROCESSOR_ARCHITECTURE"))).getOrElse("AMD64")
+        Host("windows", normalizeArch(a.toLowerCase), "")
       case None =>
         val os = uname("-s") match
           case "Linux" => "linux"

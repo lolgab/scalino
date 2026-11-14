@@ -9,7 +9,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCALINO="$(cd "$(dirname "${1:-$ROOT/dist/scalino}")" && pwd)/$(basename "${1:-$ROOT/dist/scalino}")"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; for pid in "${SERVER_PID:-}" "${WATCH_PID:-}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done' EXIT
+# processes first: Windows can't delete a directory a running program has as its working directory (best effort there)
+trap 'for pid in "${SERVER_PID:-}" "${WATCH_PID:-}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done; sleep 1; rm -rf "$WORK" 2>/dev/null || true' EXIT
 command -v node >/dev/null || { echo "node not found" >&2; exit 1; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 expect() { [[ "$1" == *"$2"* ]] || fail "expected '$2' in: $1"; }
@@ -92,7 +93,13 @@ sed -i.bak 's/version 1/version 2/' W.scala && rm -f W.scala.bak
 wait_for "version 2"; grep -q "Restarting the application" watch.log || fail "no restart message"
 printf 'val broken: Int = "x"\n' >> W.scala
 sleep 6; ! grep -q "version 3" watch.log || fail "restarted on a failed build"
-pgrep -f '\.scalino-build/w/js/main\.js' >/dev/null || fail "the running program was stopped by a failed build"
+# Git for Windows' bash has no pgrep
+js_running() {
+  if command -v pgrep >/dev/null; then pgrep -f '\.scalino-build/w/js/main\.js' >/dev/null
+  else powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*scalino-build*w*js*main.js*' }) { exit 0 } else { exit 1 }"
+  fi
+}
+js_running || fail "the running program was stopped by a failed build"
 kill "$WATCH_PID" 2>/dev/null || true; wait "$WATCH_PID" 2>/dev/null || true
 cd "$WORK"
 
@@ -173,7 +180,7 @@ echo "== --js-module-split-style smallestmodules writes many modules, listed in 
 expect "$(cat "$WORK/cs-split/manifest.json")" '"entry": "main.mjs"'
 [[ "$(ls "$WORK/cs-split"/*.mjs | wc -l)" -gt 1 ]] || fail "expected several modules in the split output"
 for f in "$WORK/cs-split"/*.mjs; do expect "$(cat "$WORK/cs-split/manifest.json")" "\"path\": \"$(basename "$f")\""; done
-node --input-type=module -e 'globalThis.document = { getElementById: () => ({ set innerHTML(v) { console.log("DOM <- " + v) } }) }; await import(process.argv[1])' "$WORK/cs-split/main.mjs" > dom3.log
+node --input-type=module -e 'globalThis.document = { getElementById: () => ({ set innerHTML(v) { console.log("DOM <- " + v) } }) }; await import((await import("node:url")).pathToFileURL(process.argv[1]).href)' "$WORK/cs-split/main.mjs" > dom3.log
 expect "$(cat dom3.log)" "<h1>Hello, Scala.js!</h1><p>2, 4, 6</p>"
 if "$SCALINO" package server -q --js-module-split-style smallestmodules --js-module-kind esmodule -o app-bad >/dev/null 2>&1; then fail "a split jsClient must not be embedded"; fi
 

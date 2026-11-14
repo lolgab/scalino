@@ -62,6 +62,45 @@ object LinkDriver:
     if o.targetTriples.nonEmpty then o.targetTriples.exists(t => t.contains("windows") || t.contains("mingw"))
     else sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
 
+  /** What MinGW lacks of MSVC's C runtime and intrinsics that libraries' `_WIN64` code calls (jsoniter-scala-core's
+   *  `multiply_high.c` uses `__mulh`/`__umulh`: MSVC's, and clang's headers only declare them). Weak, so a runtime
+   *  that has them wins. A one-directory classpath entry, so it is compiled and linked like a library's C sources. */
+  def writeWindowsCompat(workDir: Path): Path =
+    val dir = workDir.resolve("windows-compat")
+    val src = dir.resolve("scala-native").resolve("scalino_windows_compat.c")
+    java.nio.file.Files.createDirectories(src.getParent)
+    val text =
+      """#if defined(_WIN64)
+        |__attribute__((weak)) long long __mulh(long long x, long long y) { return (long long)(((__int128)x * y) >> 64); }
+        |__attribute__((weak)) unsigned long long __umulh(unsigned long long x, unsigned long long y) {
+        |  return (unsigned long long)(((unsigned __int128)x * y) >> 64);
+        |}
+        |#endif
+        |""".stripMargin
+    // aarch64 mingw's headers don't declare them at all (clang's intrin.h only does for x86_64), and C99 makes an
+    // implicit declaration an error: -include'd into every C file (and .S, hence __ASSEMBLER__) (see `windowsCompatHeader`)
+    val header =
+      """#if defined(_WIN64) && !defined(__ASSEMBLER__) && !defined(SCALINO_WINDOWS_COMPAT_H)
+        |#define SCALINO_WINDOWS_COMPAT_H
+        |#ifdef __cplusplus
+        |extern "C" {
+        |#endif
+        |long long __mulh(long long x, long long y);
+        |unsigned long long __umulh(unsigned long long x, unsigned long long y);
+        |#ifdef __cplusplus
+        |}
+        |#endif
+        |#endif
+        |""".stripMargin
+    def write(f: Path, t: String): Unit =
+      if !java.nio.file.Files.exists(f) || new String(java.nio.file.Files.readAllBytes(f), "UTF-8") != t then
+        java.nio.file.Files.write(f, t.getBytes("UTF-8"))
+    write(src, text)
+    write(windowsCompatHeader(workDir), header)
+    dir
+
+  def windowsCompatHeader(workDir: Path): Path = workDir.resolve("windows-compat").resolve("scalino_windows_compat.h")
+
   val LayoutDependentLibraries = List("jsoniter-scala-core_native")
 
   val Usage: String =
@@ -167,7 +206,7 @@ object LinkDriver:
       sys.exit(2)
     // File.pathSeparator, not ":": a hardcoded ":" splits Windows paths at the drive letter
     // ("C:\..."), giving garbage entries and "Discovered 0 classes".
-    val cp = args(0).split(java.io.File.pathSeparator).toSeq.map(s => Paths.get(s))
+    val cpArgs = args(0).split(java.io.File.pathSeparator).toSeq.map(s => Paths.get(s))
     // Several main classes share this process: one parse of the classpath's
     // NIR, and in --long-running mode each keeps its own incremental Reach and
     // Interflow (patches/scala-native-0029), each in its own work dir.
@@ -183,6 +222,8 @@ object LinkDriver:
       fail(s"unknown log level '$logLevel' (expected quiet, info or verbose); flags go after it")
     val logger = loggerFor(logLevel)
     val opts = parseOpts(if args.length > 6 then args.drop(6) else Array.empty)
+    def cpFor(workDir: Path): Seq[Path] = if windowsTarget(opts) then cpArgs :+ writeWindowsCompat(workDir) else cpArgs
+    val cp = cpFor(workDir)
 
     def die(msg: String): Nothing =
       System.err.println(s"scalino-linkdriver: $msg")
@@ -272,9 +313,33 @@ object LinkDriver:
       sys.env.getOrElse("PATH", "").split(java.io.File.pathSeparator).exists { d =>
         d.nonEmpty && List("ld.lld", "ld.lld.exe").exists(n => java.nio.file.Files.isExecutable(Paths.get(d, n)))
       }
+    // Windows: the host clang's own target is MSVC or MinGW, ours is always the mingw sysroot's
+    // (`scalino` picks the host's windows-gnu triple and gives it a sysroot), so a given sysroot makes it a cross target.
     def isHostTarget(t: String): Boolean =
       normArch(t.takeWhile(_ != '-')) == normArch(hostTriple.takeWhile(_ != '-')) &&
-        osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl"))
+        osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl")) &&
+        (osOf(t) != "windows" || !opts.sysroots.contains(t))
+    /** `link` as a view of the directory `target`: a symlink, or a copy where those need a privilege (Windows). */
+    def linkDir(target: Path, link: Path): Unit =
+      import java.nio.file.{Files, LinkOption}
+      def rmTree(p: Path): Unit =
+        if Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS) then Files.list(p).forEach(rmTree(_))
+        Files.deleteIfExists(p)
+      val stamp = link.resolveSibling(link.getFileName.toString + ".src")
+      val current = Files.exists(stamp) && new String(Files.readAllBytes(stamp), "UTF-8") == target.toString
+      if !(Files.exists(link) && current) then
+        rmTree(link)
+        try
+          Files.createSymbolicLink(link, target)
+          Files.deleteIfExists(stamp)
+        catch case _: java.io.IOException | _: UnsupportedOperationException | _: SecurityException =>
+          val s = Files.walk(target)
+          try s.forEach { src =>
+            val dst = link.resolve(target.relativize(src).toString)
+            if Files.isDirectory(src) then Files.createDirectories(dst) else Files.copy(src, dst)
+          } finally s.close()
+          Files.write(stamp, target.toString.getBytes("UTF-8"))
+
     /** `-rtlib=compiler-rt -resource-dir=...` for a `scalino sysroot build`
      *  sysroot `d` (layout in cli/SysrootBuild.scala). clang only looks for
      *  compiler-rt's builtins (and crtbegin/crtend) in its own resource dir,
@@ -293,8 +358,8 @@ object LinkDriver:
         // Absolute: clang's own cwd while linking is not ours.
         val res = targetDir.toAbsolutePath.resolve("clang-resource")
         java.nio.file.Files.createDirectories(res)
-        run("ln", "-sfn", hostInclude.toString, res.resolve("include").toString)
-        run("ln", "-sfn", rt.toString, res.resolve("lib").toString)
+        linkDir(hostInclude, res.resolve("include"))
+        linkDir(rt, res.resolve("lib"))
         List("-rtlib=compiler-rt", s"-resource-dir=$res")
 
     /** Link flags for a Linux sysroot: musl is linked statically, glibc
@@ -309,7 +374,8 @@ object LinkDriver:
      *  with it, since the Windows runtime is built on C++ exceptions. */
     def windowsSysrootLinkFlags(d: String, targetDir: Path): List[String] =
       val sysrootAbs = Paths.get(d).toAbsolutePath
-      List(s"--sysroot=$sysrootAbs", "-stdlib=libc++", "--unwindlib=libunwind", "-static") ++ compilerRtFlags(sysrootAbs, targetDir)
+      // --stack: the main thread's, 1 MB by default on Windows; the 8 MB of Linux and macOS is what programs expect
+      List(s"--sysroot=$sysrootAbs", "-stdlib=libc++", "--unwindlib=libunwind", "-static", "-Wl,--stack,8388608") ++ compilerRtFlags(sysrootAbs, targetDir)
 
     def forTriple(config: Config, workDir: Path, t: String): Config =
       val withDir = config.withBaseDir(workDir.resolve(t))
@@ -342,7 +408,14 @@ object LinkDriver:
           case _ => List(s"--sysroot=$d"))
         // Scala Native's Windows code declares its own pid_t (MSVC has none);
         // mingw-w64 defines one too unless _PID_T_ says it is already there.
-        val cDefines = if osOf(t) == "windows" then List("-D_PID_T_") else Nil
+        val cDefines =
+          if osOf(t) == "windows" then List("-D_PID_T_", "-include", windowsCompatHeader(workDir).toAbsolutePath.toString)
+          else Nil
+        // The headers every mingw arch shares live in generic-w64-mingw32/include; <arch>-w64-mingw32/include,
+        // the one clang searches, is a symlink to it that a Windows-built sysroot can't have. -idirafter: last,
+        // so libc++'s own C wrappers (stdlib.h...) still come first for C++.
+        val genericInclude = sysroot.toList.filter(_ => osOf(t) == "windows").flatMap(d =>
+          List("-idirafter", Paths.get(d).toAbsolutePath.resolve("generic-w64-mingw32/include").toString))
         // C++ only: libc++'s headers shadow the C ones if added for C files too.
         val cppFlags = sysroot.toList.flatMap(d =>
           if osOf(t) == "windows" then
@@ -374,14 +447,14 @@ object LinkDriver:
           _.withTargetTriple(Some(t))
             .withLinkingOptions(linkFlags ++ lld ++ opts.linking)
             .withCompileOptions(compileFlags ++ opts.compile)
-            .withCppOptions(cDefines ++ cppFlags ++ opts.cppCompile)
-            .withCOptions(cDefines ++ addonCompile ++ opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
+            .withCppOptions(cDefines ++ cppFlags ++ genericInclude ++ opts.cppCompile)
+            .withCOptions(cDefines ++ genericInclude ++ addonCompile ++ opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
         )
     val configs: List[Config] = mainClasses.flatMap { m =>
       val dir = workDirFor(m)
       val forMain =
         if m == mainClass then config
-        else config.withBaseDir(dir).withModuleName(m).withMainClass(Some(m))
+        else config.withBaseDir(dir).withModuleName(m).withMainClass(Some(m)).withClassPath(cpFor(dir))
       if opts.targetTriples.isEmpty then List(forMain) else opts.targetTriples.distinct.map(forTriple(forMain, dir, _))
     }
     // SCALINO_LOWER_CACHE keeps one slot per process (patches/scala-native-0029): with several main

@@ -39,7 +39,6 @@ jobs:
           if [[ "${{ github.event_name }}" != pull_request ]]; then
             m+=',{"target":"macos-x86_64","os":"macos-15-intel"}'
           fi
-          # Windows x86_64 CI disabled -- see docs/findings.md.
           echo "matrix={\"include\":[$m]}" >> "$GITHUB_OUTPUT"
           # One smoke job per (target, test); the cross-build runs on linux-x86_64 only.
           smoke="$(echo "{\"include\":[$m]}" | jq -c '{include: [.include[] as $e
@@ -66,36 +65,70 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # core's output (ci-state.sh's tarball) depends only on what build/all.sh's core stage reads, so a change
+      # to none of it (the CLI, the tests, a workflow, the README, the LSP...) reuses the tarball instead of
+      # rebuilding Scala Native, the compiler and the linkdriver (~20-40 min per target). The hash covers every
+      # file those scripts read: versions.env, patches/, tools/ (the Scala.js IR checksum, the mini-phase generator),
+      # src/ (LinkDriver.scala), build/ (the scripts, build/pgo, the sysroot data 06-package.sh vendors, and
+      # ci-state.sh, whose format the tarball has) and the toolchain setup action. Left out, because the core scripts
+      # never read them: the dotc/lsp-stage scripts (03*, 04d, 07, 08*, lsp-*), buildinfo-lib.sh and 13-*.
+      # Two things no file hash can see are covered by hand: the week stamp bounds drift of the runner image and of
+      # unpinned apt packages (clang) to a week, and `v1` is bumped to force a rebuild. The tarball is ~800 MB per
+      # target; GitHub evicts the least recently used entries beyond 10 GB, which only costs a rebuild.
+      - name: Week stamp for the core cache key
+        id: week
+        shell: bash
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore core's build state
+        id: core-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/state.tgz
+          key: scalino-core-state-v1-${{ matrix.target }}-${{ steps.week.outputs.week }}-${{ hashFiles('build/**', '!build/03*', '!build/04d-*', '!build/07-*', '!build/08*', '!build/lsp-*', '!build/buildinfo-lib.sh', '!build/13-*', 'patches/**', 'versions.env', 'src/**', 'tools/**', '.github/actions/setup-build-deps/**') }}
+
       - uses: ./.github/actions/setup-build-deps
+        if: steps.core-cache.outputs.cache-hit != 'true'
 
       - uses: ./.github/actions/memory-watchdog
+        if: steps.core-cache.outputs.cache-hit != 'true'
 
       # Scala Native, built from source with our patches (01a), takes ~8 min on
       # macOS and only changes with the patches and the pinned commit, so keep
       # what it publishes to ~/.ivy2/local.
       - name: Cache patched scala-native libs
         id: sn-cache
+        if: steps.core-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.ivy2/local/org.scala-native
           key: scalino-sn-published-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('patches/scala-native-*.patch', 'versions.env', 'build/01a-publish-scala-native.sh') }}
 
       - name: Build toolchain (core)
+        if: steps.core-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           SCALINO_REUSE_PUBLISHED: ${{ steps.sn-cache.outputs.cache-hit == 'true' && '1' || '' }}
         run: ./build/all.sh core
 
       - name: Memory log
-        if: always() && runner.os == 'Linux'
+        if: always() && runner.os == 'Linux' && steps.core-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           tail -40 "$RUNNER_TEMP/mem.log" || true
           sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -10 || true
 
       - name: Save build state
+        if: steps.core-cache.outputs.cache-hit != 'true'
         shell: bash
         run: ./build/ci-state.sh save "$RUNNER_TEMP/state.tgz"
+
+      - name: Cache core's build state
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/state.tgz
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -150,6 +183,26 @@ jobs:
         run: |
           tail -40 "$RUNNER_TEMP/mem.log" || true
           sudo dmesg 2>/dev/null | grep -iE "out of memory|oom-kill|killed process" | tail -10 || true
+
+      # Cross-linked for Windows by the `windows-lsp` job, which has the scalino CLI (sysroots) this job lacks.
+      - name: Package the LSP's NIR for the Windows cross-link
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        run: |
+          # lsp-link.cp itself plus every entry on it: the dependency jars (jsoniter, java.time, ...) are fetched by
+          # this job, so core's saved state does not have them
+          cp_file=.build-work/selfhost/lsp-link.cp
+          { echo "${PWD#/}/$cp_file"; tr ':' '\n' < "$cp_file" | sed 's|^/||'; } > "$RUNNER_TEMP/lsp-nir.list"
+          tar -C / -czf "$RUNNER_TEMP/lsp-nir.tgz" -T "$RUNNER_TEMP/lsp-nir.list"
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'linux-x86_64'
+        with:
+          name: lsp-nir
+          path: ${{ runner.temp }}/lsp-nir.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
       # tar, not a bare path: artifact upload drops the executable bit.
       - name: Package scalino-lsp
@@ -220,6 +273,32 @@ jobs:
         with:
           name: dist-${{ matrix.target }}
           path: ${{ runner.temp }}/dist.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      # The Windows toolchain is cross-linked here, from this job's NIR (build/13-cross-link-toolchain.sh), and run
+      # for real by the `windows` job below. Only on linux-x86_64: one host is enough, and it has the matching state.
+      - name: Cross-link the toolchain for Windows (x86_64, arm64)
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        run: |
+          # the mingw sysroot's libc++ needs clang >= 21; the toolchain build above uses LLVM 20
+          wget -O /tmp/llvm22.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm22.sh 22
+          export PATH="/usr/lib/llvm-22/bin:$PATH"
+          for arch in x86_64 aarch64; do
+            SCALINO_WINDOWS_PDB=1 ./build/13-cross-link-toolchain.sh "$arch-pc-windows-gnu" dotc linkdriver jslink cli
+            tar -C "dist-cross/$arch-pc-windows-gnu" -czf "$RUNNER_TEMP/windows-$arch.tgz" .
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'linux-x86_64'
+        with:
+          name: windows-dist
+          path: |
+            ${{ runner.temp }}/windows-x86_64.tgz
+            ${{ runner.temp }}/windows-aarch64.tgz
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
@@ -388,6 +467,169 @@ jobs:
             echo "$t: $out"
             [[ "$out" == *"ello"* ]] || { echo "unexpected output from $t binary"; exit 1; }
           done
+
+  # scalino-lsp for Windows: needs the LSP's NIR (lsp job) and the scalino CLI that builds the mingw sysroots (dotc job).
+  windows-lsp:
+    name: windows-lsp
+    needs: [dotc, lsp]
+    runs-on: ubuntu-24.04
+    env:
+      SCALANATIVE_LINK_THREADS: '1'
+      SCALINO_LINK_RAM_PERCENT: '55'
+      SCALINO_JVM_LINK: '1'
+      SCALINO_LINK_LTO: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build-deps
+
+      - uses: ./.github/actions/memory-watchdog
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: state-linux-x86_64
+          path: ${{ runner.temp }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-linux-x86_64
+          path: ${{ runner.temp }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lsp-nir
+          path: ${{ runner.temp }}
+
+      - name: Assemble state
+        shell: bash
+        run: |
+          ./build/ci-state.sh restore "$RUNNER_TEMP/state.tgz"
+          tar -C dist -xzf "$RUNNER_TEMP/dist.tgz"
+          tar -C / -xzf "$RUNNER_TEMP/lsp-nir.tgz"
+
+      - name: Cross-link scalino-lsp for Windows (x86_64, arm64)
+        shell: bash
+        run: |
+          wget -O /tmp/llvm22.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm22.sh 22
+          export PATH="/usr/lib/llvm-22/bin:$PATH"
+          for arch in x86_64 aarch64; do
+            SCALINO_CROSS_PROGRAMS_ONLY=1 SCALINO_WINDOWS_PDB=1 ./build/13-cross-link-toolchain.sh "$arch-pc-windows-gnu" lsp
+            mkdir -p "lsp-win-$arch"
+            cp ".build-work/cross/$arch-pc-windows-gnu/lsp.bin" "lsp-win-$arch/scalino-lsp.exe"
+            [[ ! -f ".build-work/cross/$arch-pc-windows-gnu/lsp.pdb" ]] || cp ".build-work/cross/$arch-pc-windows-gnu/lsp.pdb" "lsp-win-$arch/"
+            tar -C "lsp-win-$arch" -czf "$RUNNER_TEMP/windows-lsp-$arch.tgz" .
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-lsp
+          path: |
+            ${{ runner.temp }}/windows-lsp-x86_64.tgz
+            ${{ runner.temp }}/windows-lsp-aarch64.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # The toolchain cross-linked above, run on real Windows: x86_64 on windows-latest, arm64 on windows-11-arm.
+  # Nothing here builds scalino itself; the first build downloads llvm-mingw's clang and assembles the sysroot.
+  windows:
+    name: windows (${{ matrix.arch }})
+    needs: [dotc, windows-lsp]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, os: windows-latest}
+          - {arch: aarch64, os: windows-11-arm}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: ${{ runner.temp }}/win
+          merge-multiple: true
+
+      - name: Assemble dist
+        shell: bash
+        run: |
+          # RUNNER_TEMP is D:\a\_temp: bash mangles the backslashes and tar reads `D:` as a remote host
+          t="$(cygpath -u "$RUNNER_TEMP")"
+          mkdir -p "$t/scalino"
+          tar -C "$t/scalino" -xzf "$t/win/windows-${{ matrix.arch }}.tgz"
+          tar -C "$t/scalino" -xzf "$t/win/windows-lsp-${{ matrix.arch }}.tgz"
+          echo "$RUNNER_TEMP\\scalino" >> "$GITHUB_PATH"
+          echo "_NT_SYMBOL_PATH=$RUNNER_TEMP\\scalino" >> "$GITHUB_ENV"
+
+      - name: Cache sysroots and the C toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\scalino\sysroots
+          key: scalino-windows-sysroots-${{ matrix.arch }}-${{ hashFiles('versions.env', 'cli/SysrootBuild.scala') }}
+
+      - name: Smoke test -- version
+        shell: bash
+        run: scalino --version
+
+      - name: Smoke test -- plain program
+        shell: bash
+        run: |
+          out="$(scalino run examples/Hello.scala)"
+          echo "$out"
+          [[ "$out" == *"hello"* || "$out" == *"Hello"* ]] || { echo "unexpected output"; exit 1; }
+
+      - name: Smoke test -- dependency (coursier)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cat > Dep.scala <<'EOF'
+          //> using dep com.lihaoyi::os-lib::0.11.3
+          @main def dep() = println(os.pwd.last.nonEmpty)
+          EOF
+          out="$(scalino run Dep.scala)"
+          echo "$out"
+          [[ "$out" == *true* ]]
+
+      - name: Smoke test -- package a binary
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          scalino package examples/Hello.scala -o hello
+          ./hello.exe
+
+      - name: Smoke test -- test framework
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          mkdir -p t && cd t
+          cat > T.test.scala <<'EOF'
+          //> using test.dep "org.scalameta::munit::1.0.2"
+          class T extends munit.FunSuite:
+            test("one") { assertEquals(1 + 1, 2) }
+          EOF
+          scalino test .
+
+      - name: Smoke test -- release-fast mode
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          out="$(scalino run --native-mode release-fast examples/Hello.scala)"
+          echo "$out"
+          [[ "$out" == *"hello"* || "$out" == *"Hello"* ]]
+
+      - name: Smoke test -- scalino-lsp
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          (cd build/lsp-trace-fixture && scalino setup-ide Model.scala Greeter.scala Main.scala)
+          python build/lsp-trace-drive.py "$PWD/build/lsp-trace-fixture" "$(command -v scalino-lsp)" -stdio
+
+      - name: Smoke test -- Scala.js
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: ./tests/js/run.sh "$(command -v scalino)"
 
   # scalino-lsp's smoke test drives it through `dist/scalino setup-ide`, so it
   # can only run once both the lsp and dotc jobs are done.

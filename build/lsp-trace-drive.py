@@ -15,6 +15,10 @@ there (e.g. via `dist/scalino setup-ide Model.scala Greeter.scala Main.scala`).
 import json, subprocess, sys, threading, time, queue, os
 
 def uri(path):
+    # file:///D:/a/b on Windows (file://D:\a\b is not a URI); POSIX paths already start with a slash
+    if os.name == "nt":
+        import pathlib
+        return pathlib.Path(path).as_uri()
     return "file://" + path
 
 class LspClient:

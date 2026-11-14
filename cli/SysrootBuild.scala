@@ -48,8 +48,14 @@ object SysrootBuild:
     Files.move(part, f, StandardCopyOption.REPLACE_EXISTING)
     f
 
+  /** Windows' own bsdtar reads zip, xz and zstd; a `tar` further down PATH (Git's GNU tar) may not. */
+  private def tarExe: String =
+    if ScalinoCli.isWindows then
+      Option(System.getenv("SystemRoot")).map(r => Paths.get(r, "System32", "tar.exe")).filter(Files.exists(_)).map(_.toString).getOrElse("tar")
+    else "tar"
+
   private def tar(args: String*): Unit =
-    if runInherited("tar" :: args.toList) != 0 then die(s"sysroot build: `tar ${args.mkString(" ")}` failed")
+    if runInherited(tarExe :: args.toList) != 0 then die(s"sysroot build: `tar ${args.mkString(" ")}` failed")
 
   /** Unpacks the data.tar.* member of a Debian package into `into`. */
   private def unpackDeb(deb: Path, into: Path): Unit =
@@ -317,6 +323,25 @@ object SysrootBuild:
       .getOrElse(die(s"sysroot build: no compiler-rt builtins for $arch in $lm"))
     copy(builtins, out.resolve("resource/lib/windows").resolve(builtins.getFileName))
     addLicense(out, root.resolve("LICENSE.TXT"), "llvm-LICENSE.TXT")
+    // zlib (javalib's java.util.zip, `@link("z")`): llvm-mingw has none, MSYS2's static build does.
+    // Static archive only: the .dll.a import library next to it would win a -lz lookup.
+    val env = if arch == "x86_64" then "clang64" else "clangarm64"
+    val zver = pin("ZLIB_MSYS2_VERSION")
+    val zf = s"mingw-w64-clang-$arch-zlib-$zver-any.pkg.tar.zst"
+    val zpkg = download(s"https://repo.msys2.org/mingw/$env/$zf", zf, pin(s"ZLIB_MSYS2_${arch.toUpperCase}_SHA256"))
+    val zex = Files.createDirectories(work.resolve("zlib-extracted"))
+    tar("-xf", zpkg.toString, "-C", zex.toString, s"$env/include/zlib.h", s"$env/include/zconf.h", s"$env/lib/libz.a", s"$env/share/licenses/zlib")
+    // generic-w64-mingw32/include is where clang finds the headers every mingw arch shares: <arch>-w64-mingw32/include
+    // is a symlink to it in the tarball, which a Windows tar can't always extract as one
+    copy(zex.resolve(env).resolve("include/zlib.h"), out.resolve("generic-w64-mingw32").resolve("include/zlib.h"))
+    copy(zex.resolve(env).resolve("include/zconf.h"), out.resolve("generic-w64-mingw32").resolve("include/zconf.h"))
+    val archInclude = out.resolve(mw).resolve("include")
+    if ScalinoCli.isWindows && Files.exists(archInclude, java.nio.file.LinkOption.NOFOLLOW_LINKS) && !Files.isDirectory(archInclude, java.nio.file.LinkOption.NOFOLLOW_LINKS) then
+      Files.delete(archInclude)
+    copy(zex.resolve(env).resolve("lib/libz.a"), out.resolve(mw).resolve("lib/libz.a"))
+    // javalib's Windows binding is `@link("zlib")` (the MSVC library's name), which makes lld look for libzlib.a
+    copy(zex.resolve(env).resolve("lib/libz.a"), out.resolve(mw).resolve("lib/libzlib.a"))
+    for f <- walk(zex.resolve(env).resolve("share/licenses/zlib")) if Files.isRegularFile(f) do addLicense(out, f, s"msys2-zlib-${f.getFileName}")
     // The mingw-w64 runtime's licensing files, written for binaries statically linked against it.
     val tag = pin("MINGW_W64_LICENSE_TAG")
     for (f, sha) <- List("COPYING.MinGW-w64-runtime" -> pin("MINGW_W64_RUNTIME_LICENSE_SHA256"), "COPYING.MinGW-w64" -> pin("MINGW_W64_LICENSE_SHA256")) do
@@ -342,6 +367,7 @@ object SysrootBuild:
    *  in the sysroot cache. None when llvm-mingw has no build for this host. */
   def hostLld(host: Packaging.Host): Option[Path] =
     val ver = pin("LLVM_MINGW_VERSION")
+    if host.os == "windows" then return Some(windowsHostToolchain(host).lld)
     val (suffix, sha) = (host.os, host.arch, host.libc) match
       case ("linux", "x86_64", "gnu") => ("ubuntu-22.04-x86_64", pin("LLVM_MINGW_SHA256"))
       case ("linux", "aarch64", "gnu") => ("ubuntu-22.04-aarch64", pin("LLVM_MINGW_LINUX_AARCH64_SHA256"))
@@ -356,7 +382,7 @@ object SysrootBuild:
     val work = Files.createTempDirectory(Sysroot.cacheRoot, ".build-lld-")
     try
       // lld links the shared libLLVM next to it (rpath ../lib); its names carry the LLVM version
-      val (_, listing) = ScalinoCli.runCaptureStdout(List("tar", "-tf", tarball.toString))
+      val (_, listing) = ScalinoCli.runCaptureStdout(List(tarExe, "-tf", tarball.toString))
       val libLlvm = listing.linesIterator.map(_.trim).filter(l => l.startsWith(s"$lm/lib/libLLVM") && !l.endsWith("/")).toList
       if libLlvm.isEmpty then die(s"sysroot build: no libLLVM in $lm")
       tar((List("-xf", tarball.toString, "-C", work.toString, "--strip-components=1", s"$lm/bin/lld", s"$lm/LICENSE.TXT") ++ libLlvm)*)
@@ -368,6 +394,51 @@ object SysrootBuild:
       Files.move(work, home)
       println(s"installed lld -> $dest")
       Some(dest)
+    finally ScalinoCli.deleteRecursively(work)
+
+  // ---- Windows host toolchain -----------------------------------------------
+
+  /** What a Windows-hosted scalino compiles and links with. */
+  case class HostToolchain(clang: Path, clangpp: Path, lld: Path)
+
+  /** clang, clang++ and ld.lld for a Windows host: no C toolchain is assumed there (the runners'
+   *  clang is MSVC-flavoured and older than the mingw libc++ needs), so llvm-mingw's own Windows
+   *  build is downloaded on first use and kept in the sysroot cache, like the sysroots. Only what a
+   *  build runs is unpacked (clang and its shared libraries, lld, llvm-ar, clang's headers). */
+  def windowsHostToolchain(host: Packaging.Host): HostToolchain =
+    val ver = pin("LLVM_MINGW_VERSION")
+    val sha = host.arch match
+      case "x86_64" => pin("LLVM_MINGW_WINDOWS_X86_64_SHA256")
+      case "aarch64" => pin("LLVM_MINGW_WINDOWS_AARCH64_SHA256")
+      case other => die(s"no llvm-mingw build for a Windows $other host")
+    val home = Sysroot.cacheRoot.resolve("tools").resolve(s"llvm-mingw-$ver-windows-${host.arch}")
+    val bin = home.resolve("bin")
+    val tc = HostToolchain(bin.resolve("clang.exe"), bin.resolve("clang++.exe"), bin.resolve("ld.lld.exe"))
+    if Files.exists(tc.clang) && Files.exists(tc.clangpp) && Files.exists(tc.lld) then return tc
+    val lm = s"llvm-mingw-$ver-ucrt-${host.arch}"
+    val zip = download(s"https://github.com/mstorsjo/llvm-mingw/releases/download/$ver/$lm.zip", s"$lm.zip", sha)
+    Files.createDirectories(Sysroot.cacheRoot)
+    val work = Files.createTempDirectory(Sysroot.cacheRoot, ".build-toolchain-")
+    try
+      val (_, listing) = ScalinoCli.runCaptureStdout(List(tarExe, "-tf", zip.toString))
+      val members = listing.linesIterator.map(_.trim.replace('\\', '/')).filter(_.nonEmpty).toList
+      def inBin(m: String): Option[String] =
+        Option(m).filter(_.startsWith(s"$lm/bin/")).map(_.stripPrefix(s"$lm/bin/")).filter(n => n.nonEmpty && !n.contains('/'))
+      val SharedLibs = List("libLLVM-", "libclang-cpp", "libc++", "libunwind", "libwinpthread", "libffi", "libzstd", "zlib", "libxml2", "liblzma", "libiconv")
+      def wanted(n: String): Boolean =
+        n.endsWith(".cfg") ||
+          Set("clang.exe", "clang++.exe", "clang-target-wrapper.exe", "ld.lld.exe", "lld.exe", "llvm-ar.exe", "llvm-ranlib.exe", "llvm-wrapper.exe").contains(n) ||
+          "clang-[0-9]+\\.exe".r.matches(n) ||
+          (n.endsWith(".dll") && SharedLibs.exists(n.startsWith))
+      val files = members.flatMap(m => inBin(m).filter(wanted).map(_ => m))
+      if !files.exists(_.endsWith("/clang.exe")) then die(s"sysroot build: no bin/clang.exe in $lm.zip")
+      tar((List("-xf", zip.toString, "-C", work.toString, "--strip-components=1", s"$lm/LICENSE.TXT", s"$lm/lib/clang") ++ files)*)
+      Files.move(work.resolve("LICENSE.TXT"), work.resolve("llvm-LICENSE.TXT"))
+      rm(home)
+      Files.createDirectories(home.getParent)
+      Files.move(work, home)
+      println(s"installed the llvm-mingw toolchain -> $home")
+      tc
     finally ScalinoCli.deleteRecursively(work)
 
   // ---- addons --------------------------------------------------------------
