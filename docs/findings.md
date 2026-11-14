@@ -2635,7 +2635,39 @@ GC threads: 70 runs, every output identical to the single-threaded one; `SCALANA
 no stale reference after a parallel evacuation; `tests/escape-analysis/run.sh` passes; a
 `--native-multithreading=false` build runs the same collector inline.
 
-Not done: a prefetch queue in the marker (Cher/Garner: pop into a small FIFO, prefetch the header, scan on exit)
-would overlap the misses of those serial chains and help every thread count; evacuation's candidate scoring is
+Not done: evacuation's candidate scoring is
 still sequential (one pass over block metadata, cheap); Windows is only syntax-checked (`GCWorkers.c` uses
 `SRWLOCK`/`CONDITION_VARIABLE`); the default cap of 8 threads is a guess for bigger machines.
+
+### Prefetching in the marker (patch 0034, 2026-11-15)
+
+Marking an object costs two cache misses once the heap is bigger than the cache: the target's mark byte and
+its header (`Object_Mark` needs the size to mark the lines). Scanning it later costs a third if it has left the
+cache in between. Done one reference at a time, those misses queue up behind each other. Two changes in
+`Marker.c`, both per worker and without any shared state:
+
+- **Edge queue** (edge enqueuing with prefetch, Garner et al., "Effective prefetch for mark-sweep garbage
+  collection"). `Marker_markField` no longer looks at the target at once: it issues prefetches for the mark byte
+  and the header, puts the reference in a 16-slot ring and looks at the reference that has waited longest instead.
+  `Marker_drain` flushes the ring when the worker's stack is empty, before it asks the shared list, so a worker
+  is idle only with stack and ring empty and the termination rule is unchanged. Depth 8 is slightly worse, 32 the
+  same. The graph dump attributes edges to the object being scanned, so it bypasses the ring.
+- **Stack lookahead.** `MarkWorker_pop` prefetches the entry four pops ahead. Distance 8 measures the same.
+
+Mark time per collection, 300MB live set, `par` = patch 0030, 3 runs each:
+
+| heap | threads | 0030 | + prefetch |
+| --- | --- | --- | --- |
+| objects in allocation order (`gclive`) | 1 | 161-182ms | 141-145ms |
+| | 8 | 32-34ms | 28-34ms |
+| references shuffled (`gcrand`) | 1 | 939-1126ms | 297-331ms |
+| | 8 | 158-174ms | 70-79ms |
+
+On the shuffled heap the queue alone gives 936 -> 765ms on one thread and 155 -> 77ms on eight; the stack
+lookahead takes one thread to 300ms and changes nothing on eight. The http4s link (cold, 8 GC threads, 6
+interleaved rounds): mark total 2.2-2.7s -> 1.8-2.0s, link `Total` 8.8-9.4s -> 8.3-9.6s (inside the noise); one GC
+thread is unchanged (5.8-7.5s). A cold link's heap is young: objects still lie in allocation order, which the
+hardware prefetcher already follows, and a chain (`List`) only reveals the next object after the current one
+is scanned, which no software prefetch can shorten. The gain is for heaps whose references no longer follow
+memory order: long-running processes (watch mode, the LSP), anything after an evacuation. Stress loop (60 runs,
+1-8 GC threads, evacuation and poison) and the evacuation validator stay clean.
