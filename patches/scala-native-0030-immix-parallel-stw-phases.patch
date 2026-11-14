@@ -221,7 +221,13 @@ new file mode 100644
 index 000000000..390017886
 --- /dev/null
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.c
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,301 @@
++// _GNU_SOURCE must come before any include: glibc declares
++// pthread_setname_np only with it.
++#if defined(__linux__) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE 1
++#endif
++
 +#if defined(SCALANATIVE_GC_IMMIX)
 +
 +#include "GCWorkers.h"
