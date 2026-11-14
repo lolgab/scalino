@@ -2176,37 +2176,38 @@ object ScalinoCli:
     val windowsTarget =
       if triples.nonEmpty then triples.exists(t => t.contains("windows") || t.contains("mingw"))
       else sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
+    // An explicit `--native-*` flag wins over the same setting's `//> using` directive (scala-cli's precedence).
     val pkgModules = (directives.nativePkgConfig ++ o.cliNativePkgConfig).distinct
     NativeOpts(
-      mode = directives.nativeMode.orElse(o.cliNativeMode),
-      gc = directives.nativeGc.orElse(o.cliNativeGc),
-      lto = directives.nativeLto.orElse(o.cliNativeLto),
-      clang = directives.nativeClang.orElse(o.cliNativeClang),
-      clangpp = directives.nativeClangPP.orElse(o.cliNativeClangpp),
-      target = directives.nativeTarget.orElse(o.cliNativeTarget),
+      mode = o.cliNativeMode.orElse(directives.nativeMode),
+      gc = o.cliNativeGc.orElse(directives.nativeGc),
+      lto = o.cliNativeLto.orElse(directives.nativeLto),
+      clang = o.cliNativeClang.orElse(directives.nativeClang),
+      clangpp = o.cliNativeClangpp.orElse(directives.nativeClangPP),
+      target = o.cliNativeTarget.orElse(directives.nativeTarget),
       targetTriples = triples,
       sysroots = directives.nativeSysroots ++ o.cliNativeSysroots,
       embedResources = directives.nativeEmbedResources.getOrElse(false) || o.cliEmbedResources,
       // Default-on, same opt-out shape as directCodegen above.
-      multithreading = directives.nativeMultithreading.orElse(o.cliNativeMultithreading).getOrElse(true),
+      multithreading = o.cliNativeMultithreading.orElse(directives.nativeMultithreading).getOrElse(true),
       // Default-on except on Windows (DirectCodeGen.Capability.wholeBuildGatesOk gates it out:
-      // WindowsCompat is unported); the directive or `--native-direct-codegen=false` wins over the
+      // WindowsCompat is unported); `--native-direct-codegen=false` or the directive wins over the
       // OS default. The OS is the target's with `--native-target-triple`, else the host's.
-      directCodegen = directives.nativeDirectCodegen
-        .orElse(o.cliNativeDirectCodegen)
+      directCodegen = o.cliNativeDirectCodegen
+        .orElse(directives.nativeDirectCodegen)
         .getOrElse(!windowsTarget),
       // Default-on everywhere except Windows (untested there), with an explicit
       // opt-out via the directive or `--native-compact-headers=false`. Only
       // takes effect for 64-bit targets linked with the immix GC (see
       // NativeConfig.compactHeadersEnabled), anything else silently falls back
       // to regular object headers.
-      compactHeaders = directives.nativeCompactHeaders
-        .orElse(o.cliNativeCompactHeaders)
+      compactHeaders = o.cliNativeCompactHeaders
+        .orElse(directives.nativeCompactHeaders)
         .getOrElse(!windowsTarget),
       // Default-on, but scalino-linkdriver turns it off when the classpath has
       // a library reading byte arrays through raw pointers (jsoniter-scala-core),
       // unless given explicitly. See NativeConfig.compactByteArrays.
-      compactByteArrays = directives.nativeCompactByteArrays.orElse(o.cliNativeCompactByteArrays),
+      compactByteArrays = o.cliNativeCompactByteArrays.orElse(directives.nativeCompactByteArrays),
       // Opt-in, commix GC only: see NativeConfig.gcStwSweep.
       gcStwSweep = directives.nativeGcStwSweep.getOrElse(false) || o.cliNativeGcStwSweep,
       // Opt-in: gates SCALINO_HEAP_HISTOGRAM at C compile time (LinkDriver.scala's withCOptions);
@@ -2214,9 +2215,9 @@ object ScalinoCli:
       heapHistogram = directives.nativeHeapHistogram.getOrElse(false) || o.cliNativeHeapHistogram,
       // Opt-in: source-level debug info (DWARF line/variable info) makes every
       // binary noticeably bigger and slower to link, so it is only emitted on request.
-      debugInfo = directives.nativeDebugInfo.orElse(o.cliNativeDebugInfo).getOrElse(false),
+      debugInfo = o.cliNativeDebugInfo.orElse(directives.nativeDebugInfo).getOrElse(false),
       // Default-on, same opt-out shape as multithreading/directCodegen above.
-      optimize = directives.nativeOptimize.orElse(o.cliNativeOptimize).getOrElse(true),
+      optimize = o.cliNativeOptimize.orElse(directives.nativeOptimize).getOrElse(true),
       linking = directives.nativeLinking ++ o.cliNativeLinking ++ pkgConfig("--libs", pkgModules),
       compile = directives.nativeCompile ++ o.cliNativeCompile ++ pkgConfig("--cflags", pkgModules),
       cCompile = directives.nativeCCompile ++ o.cliNativeCCompile,
@@ -3069,7 +3070,8 @@ object ScalinoCli:
        |  --run-env <KEY=VALUE>     extra environment variable for the program run/test start, on top of
        |                             scalino's own (repeatable; applied again after every -w restart)
        |  --native-compile <opt>     extra compile option, all sources (repeatable)
-       |  --native-c-compile <opt>   extra compile option, C files only (repeatable)
+       |  --native-c-compile <opt>   extra compile option, C and assembler (.S) files, not C++ (repeatable): guard
+       |                             -include'd headers with __ASSEMBLER__
        |  --native-cpp-compile <opt> extra compile option, C++ files only (repeatable)
        |  --native-prune <pattern>   link-time prune: replace the bodies of every method of a class
        |                             (`pkg.Class`), package (`pkg.sub`) or method (`pkg.Class#name`) with a
@@ -3615,7 +3617,7 @@ object ScalinoCli:
     if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives)
     if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
     // `compile` only type-checks the server: it doesn't need the bundle.
-    val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = directives.nativeMode.orElse(o.cliNativeMode)))
+    val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = o.cliNativeMode.orElse(directives.nativeMode)))
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
@@ -3793,7 +3795,7 @@ object ScalinoCli:
       }
       if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
       // Same as `run`: the client is built (dev mode unless --js-mode says otherwise) and embedded, so tests can read /client/main.js.
-      val clientResources = directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = directives.nativeMode.orElse(o.cliNativeMode)))
+      val clientResources = directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = o.cliNativeMode.orElse(directives.nativeMode)))
       val repos = (directives.repositories ++ o.cliRepositories).distinct
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)

@@ -1,0 +1,137 @@
+diff --git a/javalib/src/main/scala/java/net/UnixPlainSocketImpl.scala b/javalib/src/main/scala/java/net/UnixPlainSocketImpl.scala
+--- a/javalib/src/main/scala/java/net/UnixPlainSocketImpl.scala
++++ b/javalib/src/main/scala/java/net/UnixPlainSocketImpl.scala
+@@ -4,6 +4,7 @@
+ 
+ import scala.annotation.tailrec
+ 
++import scala.scalanative.libc.LibcExt
+ import scala.scalanative.posix.errno._
+ import scala.scalanative.posix.fcntl._
+ import scala.scalanative.posix.poll._
+@@ -68,14 +69,16 @@
+           if ((revents & POLLNVAL) != 0) {
+             val msg = s"connect failed, invalid poll request: ${revents}"
+             throw new ConnectException(msg)
+-          } else if ((revents & (POLLIN | POLLHUP)) != 0) {
+-            // Not enough information at this point to report remote host:port.
+-            val msg = "Connection refused"
+-            throw new ConnectException(msg)
+-          } else if ((revents & POLLERR) != 0) { // an error was recognized.
+-            val msg = s"connect failed, poll POLLERR: ${revents}"
+-            throw new ConnectException(msg)
+-          } // else should be POLLOUT - Open for Business, ignore XSI bits if set
++          } else {
++            // POLLIN and POLLHUP say nothing about the outcome: a peer that
++            // writes (or closes) right after accept leaves them set on a
++            // connection that succeeded. SO_ERROR holds the connect result.
++            val soError = connectResult()
++            if (soError != 0) {
++              // Not enough information at this point to report remote host:port.
++              throw new ConnectException(LibcExt.strError(soError))
++            } // else Open for Business, ignore XSI bits if set
++          }
+       }
+     }
+ 
+@@ -84,6 +87,29 @@
+ 
+   }
+ 
++  /** The pending error of the non-blocking connect: 0 when it succeeded. */
++  private def connectResult(): CInt = {
++    val soError = stackalloc[CInt]()
++    val len = stackalloc[socket.socklen_t]()
++    !soError = 0
++    !len = sizeof[CInt].toUInt
++
++    if (
++      socket.getsockopt(
++        fd.fd,
++        socket.SOL_SOCKET,
++        socket.SO_ERROR,
++        soError.asInstanceOf[Ptr[Byte]],
++        len
++      ) != 0
++    ) {
++      throw new ConnectException(
++        s"connect failed, getsockopt SO_ERROR errno: $errno"
++      )
++    }
++    !soError
++  }
++
+   protected def tryPollOnAccept(): Unit = {
+     val nAlloc = 1.toUInt
+     val pollFd: Ptr[struct_pollfd] = stackalloc[struct_pollfd](nAlloc)
+diff --git a/unit-tests/shared/src/test/scala/org/scalanative/testsuite/javalib/net/SocketTest.scala b/unit-tests/shared/src/test/scala/org/scalanative/testsuite/javalib/net/SocketTest.scala
+--- a/unit-tests/shared/src/test/scala/org/scalanative/testsuite/javalib/net/SocketTest.scala
++++ b/unit-tests/shared/src/test/scala/org/scalanative/testsuite/javalib/net/SocketTest.scala
+@@ -234,6 +234,67 @@
+     }
+   }
+ 
++  // A server that writes right after accept makes the client's socket readable
++  // by the time its non-blocking connect is polled: that is still a success.
++  @Test def connectWithTimeoutWhenServerWritesImmediately(): Unit = {
++    val server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())
++    val serverThread = new Thread(() => {
++      val peer = server.accept()
++      try {
++        peer.getOutputStream().write("hello".getBytes("UTF-8"))
++        peer.getOutputStream().flush()
++        // keep the connection open until the client has read
++        peer.getInputStream().read()
++      } finally peer.close()
++    })
++    serverThread.setDaemon(true)
++    serverThread.start()
++
++    val s = new Socket()
++    try {
++      s.connect(
++        new InetSocketAddress(
++          InetAddress.getLoopbackAddress(),
++          server.getLocalPort()
++        ),
++        5000
++      )
++      assertTrue("connected", s.isConnected())
++      val buf = new Array[Byte](5)
++      var n = 0
++      while (n < buf.length) {
++        val r = s.getInputStream().read(buf, n, buf.length - n)
++        assertTrue("unexpected end of stream", r > 0)
++        n += r
++      }
++      assertEquals("hello", new String(buf, "UTF-8"))
++    } finally {
++      s.close()
++      server.close()
++    }
++    serverThread.join(5000)
++  }
++
++  @Test def connectWithTimeoutToClosedPort(): Unit = {
++    // bind then close: the port is almost certainly unused afterwards
++    val probe = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())
++    val port = probe.getLocalPort()
++    probe.close()
++
++    val s = new Socket()
++    try {
++      assertThrows(
++        classOf[ConnectException],
++        s.connect(
++          new InetSocketAddress(InetAddress.getLoopbackAddress(), port),
++          5000
++        )
++      )
++    } finally {
++      s.close()
++    }
++  }
++
+   @Test def bind(): Unit = {
+     val s1 = new Socket()
+     try {

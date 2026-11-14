@@ -478,6 +478,21 @@ jobs:
           done
           check zip-aarch64-unknown-linux-musl 'ELF 64-bit.*aarch64'
           check zip-aarch64-unknown-linux-gnu  'ELF 64-bit.*aarch64'
+          # Programs that reach what Hello does not: the commix GC (macOS sys/posix_sem.h), windowslib's time.c
+          # (UCRT headers) and a connect() whose peer writes at once (javalib's poll handling).
+          all_triples="$(IFS=,; echo "${triples[*]}")"
+          ./dist/scalino package tests/cross/Commix.scala --native-mode release-fast --native-target-triple "$all_triples" -o cross-out/commix
+          ./dist/scalino package tests/cross/Time.scala --native-mode release-fast --native-target-triple "$all_triples" -o cross-out/time
+          ./dist/scalino package tests/cross/Connect.scala --native-mode release-fast \
+            --native-target-triple x86_64-unknown-linux-musl,x86_64-unknown-linux-gnu -o cross-out/connect
+          check commix-aarch64-apple-darwin 'Mach-O 64-bit.*arm64'
+          check time-x86_64-pc-windows-gnu.exe 'PE32\+.*x86-64'
+          check time-aarch64-pc-windows-gnu.exe 'PE32\+.*Aarch64'
+          for t in musl gnu; do
+            [[ "$(cross-out/commix-x86_64-unknown-linux-$t)" == *"commix ok"* ]] || { echo "commix $t failed"; exit 1; }
+            [[ "$(cross-out/time-x86_64-unknown-linux-$t)" == *"time ok"* ]] || { echo "time $t failed"; exit 1; }
+            [[ "$(cross-out/connect-x86_64-unknown-linux-$t)" == *"connect ok"* ]] || { echo "connect $t failed"; exit 1; }
+          done
 
   # scalino-lsp for Windows: needs the LSP's NIR (lsp job) and the scalino CLI that builds the mingw sysroots (dotc job).
   windows-lsp:

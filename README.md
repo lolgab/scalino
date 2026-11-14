@@ -400,6 +400,8 @@ compiled.
   macOS sysroot's `libobjc` stub (`@link("objc")` adds `-lobjc`; C code can autolink it with
   `__asm__(".linker_option \"-lobjc\"")`, which `ld64.lld` honours; `#pragma comment(lib)` is not implemented for
   Mach-O). Frameworks themselves are not in the sysroot.
+- A sysroot carries a stamp of the recipe that built it; one built by an older scalino (or an edited recipe) is rebuilt automatically on next use. The macOS sysroot includes a minimal `sys/posix_sem.h`, so `nativeGc commix` cross-builds.
+- `--native-c-compile` also reaches `.S` files: guard `-include`d headers with `__ASSEMBLER__`.
 - `$SCALINO_SYSROOT_DIR` changes where sysroots are installed.
 - Downloads are cached in `<sysroots>/.sources`, or `$SCALINO_SYSROOT_SOURCES`; pre-fill it to build offline.
 

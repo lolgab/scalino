@@ -12,6 +12,7 @@
 // llvm-mingw's mingw-w64 data.
 
 import java.nio.file.{Files, Path, Paths}
+import java.nio.charset.StandardCharsets.UTF_8
 import ScalinoCli.{die, fail, dist}
 
 object Sysroot:
@@ -43,10 +44,19 @@ object Sysroot:
   private def looksLikeSysroot(d: Path): Boolean =
     Files.isDirectory(d.resolve("usr")) || Files.isDirectory(d.resolve("generic-w64-mingw32"))
 
-  /** Whether an installed sysroot has everything this scalino links against. Linux ones built before zlib was added
-   *  (java.util.zip's `@link("z")`) lack `zlib.h`: such a sysroot is rebuilt by `SysrootBuild.build` instead of used. */
+  /** Name of the file `SysrootBuild.build` writes into a sysroot: `BuildInfo.sysrootRecipe` at the time. */
+  val StampFile = ".scalino-recipe"
+
+  /** Whether an installed sysroot has everything this scalino links against. One in the cache that was
+   *  assembled by another recipe (no stamp, as before the stamp existed, or a different one: a scalino that
+   *  adds zlib, libobjc, a header, ...) is rebuilt by `SysrootBuild.build` instead of used. Sysroots from an
+   *  OS package (`<dist>/sysroots`) are not scalino's to rebuild, and are taken as they are. */
   def complete(triple: String, d: Path): Boolean =
-    !triple.contains("linux") || Files.exists(d.resolve("usr/include/zlib.h"))
+    if d.getParent != cacheRoot then true
+    else
+      val stamp = d.resolve(StampFile)
+      try Files.isRegularFile(stamp) && new String(Files.readAllBytes(stamp), UTF_8).trim == BuildInfo.sysrootRecipe
+      catch case _: java.io.IOException => false
 
   def find(triple: String): Option[Path] =
     roots.map(_.resolve(triple)).find(d => looksLikeSysroot(d) && complete(triple, d))

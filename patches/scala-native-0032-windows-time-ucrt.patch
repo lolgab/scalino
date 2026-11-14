@@ -1,0 +1,17 @@
+diff --git a/windowslib/src/main/resources/scala-native/windows/time.c b/windowslib/src/main/resources/scala-native/windows/time.c
+--- a/windowslib/src/main/resources/scala-native/windows/time.c
++++ b/windowslib/src/main/resources/scala-native/windows/time.c
+@@ -12,8 +12,12 @@
+ #define timezone _timezone
+ #define tzname _tzname
+ void tzset() { _tzset(); }
++#elif defined(_UCRT)
++// — MinGW targeting the Universal CRT (llvm-mingw's default) —
++// declares asctime_s(), gmtime_s() and localtime_s() like MSVC does,
++// and has no *_r variants: nothing to define here.
+ #else
+-// — Non-MSVC Windows (MinGW, Cygwin, TDM-GCC, Clang-mingw, etc.) —
++// — Non-MSVC Windows with the older msvcrt (MinGW, Cygwin, TDM-GCC, etc.) —
+ // these CRTs already offer:
+ //    asctime(), asctime_r(), gmtime_r(), localtime_r(), tzset()
+ // so we just alias the “secure” names to the POSIX names
