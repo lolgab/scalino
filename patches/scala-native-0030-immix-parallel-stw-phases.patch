@@ -1,0 +1,2504 @@
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Block.c b/nativelib/src/main/resources/scala-native/gc/immix/Block.c
+index b73424506..79c51c5ad 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Block.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Block.c
+@@ -7,104 +7,112 @@
+ #include "immix_commix/metadata/ObjectMeta.h"
+ #include "Allocator.h"
+ 
+-INLINE void Block_recycleUnmarkedBlock(Allocator *allocator,
+-                                       BlockMeta *blockMeta,
+-                                       word_t *blockStart) {
++INLINE static void Block_freeUnmarkedBlock(BlockMeta *blockMeta,
++                                           word_t *blockStart) {
+     memset(blockMeta, 0, sizeof(BlockMeta));
+     if (heap.hashedBlocks != NULL)
+-        heap.hashedBlocks[(size_t)(blockStart - heap.heapStart) / WORDS_IN_BLOCK] = 0;
++        heap.hashedBlocks[(size_t)(blockStart - heap.heapStart) /
++                          WORDS_IN_BLOCK] = 0;
+     // does not unmark in LineMetas because those are ignored by the allocator
+-    BlockAllocator_AddFreeBlocks(allocator->blockAllocator, blockMeta, 1);
+-    ObjectMeta_ClearBlockAt(Bytemap_Get(allocator->bytemap, blockStart));
++    ObjectMeta_ClearBlockAt(Bytemap_Get(heap.bytemap, blockStart));
+ }
+ 
+ // Free lines found in partially used blocks by the current sweep.
+ uint64_t Block_recycledFreeLines = 0;
+ 
+-/**
+- * recycles a block and adds it to the allocator
+- */
+-void Block_Recycle(Allocator *allocator, BlockMeta *blockMeta,
+-                   word_t *blockStart, LineMeta *lineMetas) {
++void FreeRuns_Add(BlockList *runs, BlockMeta *block, uint32_t count) {
++    assert(count > 0);
++    BlockMeta *last = runs->last;
++    if (last != NULL && last + BlockMeta_SuperblockSize(last) == block) {
++        BlockMeta_SetSuperblockSize(last,
++                                    BlockMeta_SuperblockSize(last) + count);
++    } else {
++        BlockList_AddLast(runs, block);
++        BlockMeta_SetSuperblockSize(block, count);
++    }
++}
+ 
++bool Block_Sweep(BlockMeta *blockMeta, word_t *blockStart, LineMeta *lineMetas,
++                 BlockList *recycled, uint32_t *recycledCount,
++                 uint64_t *freeLines) {
+     // If the block is not marked, it means that it's completely free
+     if (!BlockMeta_IsMarked(blockMeta)) {
+-        Block_recycleUnmarkedBlock(allocator, blockMeta, blockStart);
+-    } else {
+-        // If the block is marked, we need to recycle line by line
+-        assert(BlockMeta_IsMarked(blockMeta));
+-        BlockMeta_Unmark(blockMeta);
+-        Bytemap *bytemap = allocator->bytemap;
++        Block_freeUnmarkedBlock(blockMeta, blockStart);
++        return true;
++    }
++    // If the block is marked, we need to recycle line by line
++    assert(BlockMeta_IsMarked(blockMeta));
++    BlockMeta_Unmark(blockMeta);
++    Bytemap *bytemap = heap.bytemap;
+ 
+-        // start at line zero, keep separate pointers into all affected data
+-        // structures
+-        int lineIndex = 0;
+-        LineMeta *lineMeta = lineMetas;
+-        word_t *lineStart = blockStart;
+-        ObjectMeta *bytemapCursor = Bytemap_Get(bytemap, lineStart);
++    // start at line zero, keep separate pointers into all affected data
++    // structures
++    int lineIndex = 0;
++    LineMeta *lineMeta = lineMetas;
++    word_t *lineStart = blockStart;
++    ObjectMeta *bytemapCursor = Bytemap_Get(bytemap, lineStart);
+ 
+-        FreeLineMeta *lastRecyclable = NULL;
+-        while (lineIndex < LINE_COUNT) {
+-            // If the line is marked, we need to unmark all objects in the line
+-            if (Line_IsMarked(lineMeta)) {
+-                // Unmark line
+-                Line_Unmark(lineMeta);
+-                ObjectMeta_SweepLineAt(bytemapCursor);
++    FreeLineMeta *lastRecyclable = NULL;
++    while (lineIndex < LINE_COUNT) {
++        // If the line is marked, we need to unmark all objects in the line
++        if (Line_IsMarked(lineMeta)) {
++            // Unmark line
++            Line_Unmark(lineMeta);
++            ObjectMeta_SweepLineAt(bytemapCursor);
+ 
+-                // next line
+-                lineIndex++;
+-                lineMeta++;
+-                lineStart += WORDS_IN_LINE;
+-                bytemapCursor = Bytemap_NextLine(bytemapCursor);
++            // next line
++            lineIndex++;
++            lineMeta++;
++            lineStart += WORDS_IN_LINE;
++            bytemapCursor = Bytemap_NextLine(bytemapCursor);
++        } else {
++            // If the line is not marked, we need to merge all continuous
++            // unmarked lines.
++
++            // If it's the first free line, update the block header to point
++            // to it.
++            if (lastRecyclable == NULL) {
++                BlockMeta_SetFirstFreeLine(blockMeta, lineIndex);
+             } else {
+-                // If the line is not marked, we need to merge all continuous
+-                // unmarked lines.
++                // Update the last recyclable line to point to the current
++                // one
++                assert(lineIndex >= 0);
++                lastRecyclable->next = lineIndex;
++            }
++            ObjectMeta_ClearLineAt(bytemapCursor);
++            lastRecyclable = (FreeLineMeta *)lineStart;
++
++            // next line
++            lineIndex++;
++            lineMeta++;
++            lineStart += WORDS_IN_LINE;
++            bytemapCursor = Bytemap_NextLine(bytemapCursor);
+ 
+-                // If it's the first free line, update the block header to point
+-                // to it.
+-                if (lastRecyclable == NULL) {
+-                    BlockMeta_SetFirstFreeLine(blockMeta, lineIndex);
+-                } else {
+-                    // Update the last recyclable line to point to the current
+-                    // one
+-                    assert(lineIndex >= 0);
+-                    lastRecyclable->next = lineIndex;
+-                }
++            uint8_t size = 1;
++            while (lineIndex < LINE_COUNT && !Line_IsMarked(lineMeta)) {
+                 ObjectMeta_ClearLineAt(bytemapCursor);
+-                lastRecyclable = (FreeLineMeta *)lineStart;
++                size++;
+ 
+                 // next line
+                 lineIndex++;
+                 lineMeta++;
+                 lineStart += WORDS_IN_LINE;
+                 bytemapCursor = Bytemap_NextLine(bytemapCursor);
+-
+-                uint8_t size = 1;
+-                while (lineIndex < LINE_COUNT && !Line_IsMarked(lineMeta)) {
+-                    ObjectMeta_ClearLineAt(bytemapCursor);
+-                    size++;
+-
+-                    // next line
+-                    lineIndex++;
+-                    lineMeta++;
+-                    lineStart += WORDS_IN_LINE;
+-                    bytemapCursor = Bytemap_NextLine(bytemapCursor);
+-                }
+-                lastRecyclable->size = size;
+-                Block_recycledFreeLines += size;
+             }
++            lastRecyclable->size = size;
++            *freeLines += size;
+         }
+-        // If there is no recyclable line, the block is unavailable
+-        if (lastRecyclable != NULL) {
+-            lastRecyclable->next = LAST_HOLE;
+-            BlockList_AddLast(&allocator->recycledBlocks, blockMeta);
++    }
++    // If there is no recyclable line, the block is unavailable
++    if (lastRecyclable != NULL) {
++        lastRecyclable->next = LAST_HOLE;
++        BlockList_AddLast(recycled, blockMeta);
+ 
+-            assert(BlockMeta_FirstFreeLine(blockMeta) >= 0);
+-            assert(BlockMeta_FirstFreeLine(blockMeta) < LINE_COUNT);
+-            atomic_fetch_add_explicit(&allocator->recycledBlockCount, 1,
+-                                      memory_order_relaxed);
+-        }
++        assert(BlockMeta_FirstFreeLine(blockMeta) >= 0);
++        assert(BlockMeta_FirstFreeLine(blockMeta) < LINE_COUNT);
++        (*recycledCount)++;
+     }
++    return false;
+ }
+ 
+ #endif
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Block.h b/nativelib/src/main/resources/scala-native/gc/immix/Block.h
+index a2b99c218..4af78e6d4 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Block.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Block.h
+@@ -2,10 +2,23 @@
+ #define IMMIX_BLOCK_H
+ 
+ #include "immix_commix/metadata/BlockMeta.h"
++#include "datastructures/BlockList.h"
+ #include "Allocator.h"
+ 
+ extern uint64_t Block_recycledFreeLines;
+ 
+-void Block_Recycle(Allocator *allocator, BlockMeta *block, word_t *blockStart,
+-                   LineMeta *lineMetas);
++// Runs of free blocks found by a sweep, in address order: a list of each
++// run's first block, with the run's length kept in that block's superblock
++// size field. Appends [block, block + count), merging it into the previous
++// run when adjacent.
++void FreeRuns_Add(BlockList *runs, BlockMeta *block, uint32_t count);
++
++// Sweeps a simple block after marking. Returns true if the block is
++// completely free (the caller records it); a block with free lines is
++// appended to `recycled`, counted in *recycledCount and its free lines
++// added to *freeLines; a full block is left as it is.
++bool Block_Sweep(BlockMeta *blockMeta, word_t *blockStart, LineMeta *lineMetas,
++                 BlockList *recycled, uint32_t *recycledCount,
++                 uint64_t *freeLines);
++
+ #endif // IMMIX_BLOCK_H
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.c b/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.c
+new file mode 100644
+index 000000000..390017886
+--- /dev/null
++++ b/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.c
+@@ -0,0 +1,295 @@
++#if defined(SCALANATIVE_GC_IMMIX)
++
++#include "GCWorkers.h"
++#include "shared/GCTypes.h"
++#include "shared/Log.h"
++#include "shared/Parsing.h"
++#include "shared/ThreadUtil.h"
++#include <assert.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <stdio.h>
++
++#ifdef SCALANATIVE_MULTITHREADING_ENABLED
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#else
++#include <errno.h>
++#include <pthread.h>
++#include <signal.h>
++#include <string.h>
++#include <unistd.h>
++#endif
++
++static struct {
++    int maxCount; // 0 = not read yet
++    int started;  // pool threads created (worker ids 1..started)
++    // The current dispatch, read by the pool threads under the lock
++    GCWorkers_Task task;
++    void *arg;
++    int runCount;
++    uint64_t generation;
++    // Pool threads of the current dispatch that have not finished yet
++    atomic_int remaining;
++#ifdef _WIN32
++    SRWLOCK lock;
++    CONDITION_VARIABLE wake;
++    CONDITION_VARIABLE done;
++#else
++    pthread_mutex_t lock;
++    pthread_cond_t wake;
++    pthread_cond_t done;
++#endif
++} pool;
++
++// The generation each pool thread starts from, written before its creation
++static uint64_t poolStartGeneration[GCWORKERS_MAX_THREADS + 1];
++
++static inline void pool_lock(void) {
++#ifdef _WIN32
++    AcquireSRWLockExclusive(&pool.lock);
++#else
++    pthread_mutex_lock(&pool.lock);
++#endif
++}
++static inline void pool_unlock(void) {
++#ifdef _WIN32
++    ReleaseSRWLockExclusive(&pool.lock);
++#else
++    pthread_mutex_unlock(&pool.lock);
++#endif
++}
++static inline void pool_waitWake(void) {
++#ifdef _WIN32
++    SleepConditionVariableSRW(&pool.wake, &pool.lock, INFINITE, 0);
++#else
++    pthread_cond_wait(&pool.wake, &pool.lock);
++#endif
++}
++static inline void pool_waitDone(void) {
++#ifdef _WIN32
++    SleepConditionVariableSRW(&pool.done, &pool.lock, INFINITE, 0);
++#else
++    pthread_cond_wait(&pool.done, &pool.lock);
++#endif
++}
++static inline void pool_broadcastWake(void) {
++#ifdef _WIN32
++    WakeAllConditionVariable(&pool.wake);
++#else
++    pthread_cond_broadcast(&pool.wake);
++#endif
++}
++static inline void pool_signalDone(void) {
++#ifdef _WIN32
++    WakeConditionVariable(&pool.done);
++#else
++    pthread_cond_signal(&pool.done);
++#endif
++}
++
++static void pool_initSync(void) {
++#ifdef _WIN32
++    InitializeSRWLock(&pool.lock);
++    InitializeConditionVariable(&pool.wake);
++    InitializeConditionVariable(&pool.done);
++#else
++    pthread_mutex_init(&pool.lock, NULL);
++    pthread_cond_init(&pool.wake, NULL);
++    pthread_cond_init(&pool.done, NULL);
++#endif
++}
++
++static int GCWorkers_processorCount(void) {
++#ifdef _WIN32
++    SYSTEM_INFO sysInfo;
++    GetSystemInfo(&sysInfo);
++    return (int)sysInfo.dwNumberOfProcessors;
++#else
++    long n = sysconf(_SC_NPROCESSORS_ONLN);
++    return n > 0 ? (int)n : 1;
++#endif
++}
++
++int GCWorkers_MaxCount(void) {
++    if (pool.maxCount == 0) {
++        int processors = GCWorkers_processorCount();
++        int count = processors < GCWORKERS_DEFAULT_MAX ? processors
++                                                       : GCWORKERS_DEFAULT_MAX;
++        const char *env = getenv("GC_NPROCS");
++        if (env != NULL) {
++            long parsed = strtol(env, NULL, 10);
++            if (parsed >= 1 && parsed <= GCWORKERS_MAX_THREADS)
++                count = (int)parsed;
++            else
++                GC_LOG_WARN("Ignoring GC_NPROCS=%s, using %d GC threads", env,
++                            count);
++        }
++        if (count < 1)
++            count = 1;
++        pool.maxCount = count;
++        GC_LOG_INFO("Using %d GC threads (GC_NPROCS)", count);
++    }
++    return pool.maxCount;
++}
++
++static void *GCWorkers_loop(void *arg) {
++    int id = (int)(intptr_t)arg;
++#ifndef _WIN32
++    // Signals (SIGINT/SIGTERM handlers run Scala code; the GC's own wakeup
++    // signal is for mutators) must never land on a GC thread. Synchronous
++    // faults stay deliverable so a crash still reports.
++    sigset_t blocked;
++    sigfillset(&blocked);
++    sigdelset(&blocked, SIGSEGV);
++    sigdelset(&blocked, SIGBUS);
++    sigdelset(&blocked, SIGILL);
++    sigdelset(&blocked, SIGFPE);
++    sigdelset(&blocked, SIGTRAP);
++    sigdelset(&blocked, SIGABRT);
++    pthread_sigmask(SIG_BLOCK, &blocked, NULL);
++#if defined(__APPLE__)
++    char name[32];
++    snprintf(name, sizeof(name), "GC worker %d", id);
++    pthread_setname_np(name);
++#elif defined(__linux__)
++    char name[16];
++    snprintf(name, sizeof(name), "GC worker %d", id);
++    pthread_setname_np(pthread_self(), name);
++#endif
++#endif
++    // The generation when the leader created this thread, between runs: that
++    // dispatch is complete (after fork the child's pool still holds the
++    // parent's last one) and the next is not. Reading pool.generation here
++    // instead would race with a dispatch made before this thread first runs.
++    uint64_t seen = poolStartGeneration[id];
++    for (;;) {
++        pool_lock();
++        while (pool.generation == seen)
++            pool_waitWake();
++        seen = pool.generation;
++        GCWorkers_Task task = pool.task;
++        void *taskArg = pool.arg;
++        int count = pool.runCount;
++        pool_unlock();
++        if (id < count) {
++            task(id, count, taskArg);
++            if (atomic_fetch_sub_explicit(&pool.remaining, 1,
++                                          memory_order_acq_rel) == 1) {
++                // Under the lock, so the leader cannot miss it between its
++                // check and its wait.
++                pool_lock();
++                pool_signalDone();
++                pool_unlock();
++            }
++        }
++    }
++    return NULL;
++}
++
++#ifndef _WIN32
++static void GCWorkers_afterForkChild(void) {
++    // The pool threads do not exist in the child: recreate on demand, with no
++    // dispatch pending.
++    pool.started = 0;
++    pool.task = NULL;
++    pool.arg = NULL;
++    pool.runCount = 0;
++    atomic_store_explicit(&pool.remaining, 0, memory_order_relaxed);
++    pool_initSync();
++}
++#endif
++
++// Makes sure `wanted` pool threads exist; returns how many do.
++static int GCWorkers_ensureStarted(int wanted) {
++    static bool initialized = false;
++    if (!initialized) {
++        pool_initSync();
++        atomic_init(&pool.remaining, 0);
++#ifndef _WIN32
++        pthread_atfork(NULL, NULL, GCWorkers_afterForkChild);
++#endif
++        initialized = true;
++    }
++    while (pool.started < wanted) {
++        int id = pool.started + 1;
++        // Written before the thread exists, so it sees the value
++        poolStartGeneration[id] = pool.generation;
++        thread_t handle;
++        if (!thread_create(&handle, GCWorkers_loop, (void *)(intptr_t)id)) {
++            GC_LOG_WARN("Could not create GC thread %d, using %d GC threads",
++                        id, pool.started + 1);
++            // Do not retry on every collection
++            pool.maxCount = pool.started + 1;
++            break;
++        }
++#ifdef _WIN32
++        CloseHandle(handle);
++#else
++        pthread_detach(handle);
++#endif
++        pool.started = id;
++    }
++    return pool.started;
++}
++
++int GCWorkers_Prepare(int count) {
++    if (count > GCWorkers_MaxCount())
++        count = GCWorkers_MaxCount();
++    if (count > 1) {
++        int available = GCWorkers_ensureStarted(count - 1) + 1;
++        if (count > available)
++            count = available;
++    }
++    return count < 1 ? 1 : count;
++}
++
++void GCWorkers_Run(int count, GCWorkers_Task task, void *arg) {
++    assert(count <= pool.started + 1);
++    if (count <= 1) {
++        task(0, 1, arg);
++        return;
++    }
++    pool_lock();
++    pool.task = task;
++    pool.arg = arg;
++    pool.runCount = count;
++    atomic_store_explicit(&pool.remaining, count - 1, memory_order_release);
++    pool.generation++;
++    pool_broadcastWake();
++    pool_unlock();
++
++    task(0, count, arg);
++
++    // The helpers usually finish within microseconds of the leader; a short
++    // spin avoids the condition variable's wakeup latency in that case.
++    for (int i = 0; i < 2000 && atomic_load_explicit(&pool.remaining,
++                                                     memory_order_acquire) > 0;
++         i++)
++        thread_yield();
++    pool_lock();
++    while (atomic_load_explicit(&pool.remaining, memory_order_acquire) > 0)
++        pool_waitDone();
++    pool_unlock();
++}
++
++#else // !SCALANATIVE_MULTITHREADING_ENABLED
++
++int GCWorkers_MaxCount(void) { return 1; }
++
++int GCWorkers_Prepare(int count) {
++    (void)count;
++    return 1;
++}
++
++void GCWorkers_Run(int count, GCWorkers_Task task, void *arg) {
++    (void)count;
++    task(0, 1, arg);
++}
++
++#endif // SCALANATIVE_MULTITHREADING_ENABLED
++
++#endif // SCALANATIVE_GC_IMMIX
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.h b/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.h
+new file mode 100644
+index 000000000..aa1344a46
+--- /dev/null
++++ b/nativelib/src/main/resources/scala-native/gc/immix/GCWorkers.h
+@@ -0,0 +1,32 @@
++#ifndef IMMIX_GCWORKERS_H
++#define IMMIX_GCWORKERS_H
++
++// Threads that help the collecting mutator with the stop-the-world phases
++// (marking, sweeping, evacuation). They are plain OS threads, not mutators:
++// they never run Scala code or allocate from the heap, so the synchronizer
++// does not know about them. Between collections they sleep on a condition
++// variable; a phase wakes the ones it uses and returns once all are done.
++//
++// Only multithreaded builds have the pool. Elsewhere, and with GC_NPROCS=1,
++// every phase runs on the collecting thread alone, as before.
++
++// task(worker, workers, arg): worker 0 is the collecting thread
++typedef void (*GCWorkers_Task)(int worker, int workers, void *arg);
++
++// Threads a phase may use, the collecting thread included: $GC_NPROCS, else
++// the processor count capped at GCWORKERS_DEFAULT_MAX. At least 1.
++int GCWorkers_MaxCount(void);
++
++// Makes sure `count` threads (the caller included) can run a phase and
++// returns how many can: fewer if the pool cannot grow.
++int GCWorkers_Prepare(int count);
++
++// Runs task on `count` threads (the caller as worker 0, after
++// GCWorkers_Prepare(count)) and returns when all of them finished.
++void GCWorkers_Run(int count, GCWorkers_Task task, void *arg);
++
++#define GCWORKERS_DEFAULT_MAX 8
++// Upper bound of $GC_NPROCS
++#define GCWORKERS_MAX_THREADS 256
++
++#endif // IMMIX_GCWORKERS_H
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+index 3ab9120f0..5e547bd87 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Heap.c
+@@ -7,6 +7,7 @@
+ #include "shared/Log.h"
+ #include "Allocator.h"
+ #include "Marker.h"
++#include "GCWorkers.h"
+ #include "State.h"
+ #include "StackTrace.h"
+ #include "immix_commix/Settings.h"
+@@ -511,6 +512,177 @@ static void Heap_ReleaseFreeBlocks(Heap *heap) {
+     }
+ }
+ 
++/* ---- Sweep ----------------------------------------------------------------
++ * The heap is swept in batches of blocks by the GC workers (GCWorkers.c).
++ * Batch boundaries never split a superblock, so a worker owns every block
++ * and line of its batch and nothing else; what a batch finds is recorded on
++ * its own (the blocks with free lines, the runs of free blocks, see
++ * FreeRuns_Add; free chunks of superblocks go to the worker's own large
++ * allocator). The collecting thread then applies the batches in address
++ * order, so the block allocator receives the same sequence of free runs
++ * (coalesced the same way) and the recycle pool the same block order as a
++ * sequential sweep would produce.
++ */
++
++// Heap blocks per sweeping thread: a smaller heap wakes fewer threads
++#define SWEEP_BLOCKS_PER_WORKER 64
++
++typedef struct {
++    BlockList recycled; // simple blocks with free lines, in address order
++    BlockList freeRuns; // runs of free blocks, see FreeRuns_Add
++    uint32_t recycledCount;
++    uint64_t freeLines;
++} SweepBatch;
++
++typedef struct {
++    LargeAllocator large; // free chunks found in superblocks
++    uint64_t sweptFreeBytes;
++    bool initialized;
++} SweepWorker;
++
++// 128 bytes apart so that no two workers share a cache line
++#define SWEEP_WORKER_STRIDE 128
++static_assert(sizeof(SweepWorker) <= SWEEP_WORKER_STRIDE,
++              "SweepWorker must fit its stride");
++
++static struct {
++    uint32_t *batchStart; // batchCount + 1 entries, the last is blockCount
++    uint32_t batchStartCapacity;
++    uint32_t batchCount;
++    SweepBatch *batches;
++    uint32_t batchesCapacity;
++    char *workersRaw;
++    char *workersBase;
++    int workerCapacity;
++} sweep;
++static _Alignas(128) atomic_uint sweepCursor = 0;
++
++static inline SweepWorker *Sweep_worker(int id) {
++    return (SweepWorker *)(sweep.workersBase + (size_t)id * SWEEP_WORKER_STRIDE);
++}
++
++static void Sweep_prepareWorkers(Heap *heap, int count) {
++    if (count > sweep.workerCapacity) {
++        size_t bytes =
++            (size_t)count * SWEEP_WORKER_STRIDE + SWEEP_WORKER_STRIDE;
++        char *raw = (char *)malloc(bytes);
++        if (raw == NULL)
++            Heap_exitWithOutOfMemory("allocate sweep workers");
++        char *base = (char *)(((uintptr_t)raw + SWEEP_WORKER_STRIDE - 1) &
++                              ~(uintptr_t)(SWEEP_WORKER_STRIDE - 1));
++        memset(base, 0, (size_t)count * SWEEP_WORKER_STRIDE);
++        if (sweep.workersBase != NULL)
++            memcpy(base, sweep.workersBase,
++                   (size_t)sweep.workerCapacity * SWEEP_WORKER_STRIDE);
++        free(sweep.workersRaw);
++        sweep.workersRaw = raw;
++        sweep.workersBase = base;
++        sweep.workerCapacity = count;
++    }
++    for (int i = 0; i < count; i++) {
++        SweepWorker *sw = Sweep_worker(i);
++        if (!sw->initialized) {
++            LargeAllocator_Init(&sw->large, &blockAllocator, heap->bytemap,
++                                heap->blockMetaStart, heap->heapStart);
++            sw->initialized = true;
++        }
++        LargeAllocator_Clear(&sw->large);
++        sw->sweptFreeBytes = 0;
++    }
++}
++
++// Splits [0, blockCount) into batches of about `batchSize` blocks, moving a
++// boundary that falls inside a superblock to the superblock's end.
++static void Sweep_prepareBatches(Heap *heap, uint32_t batchSize) {
++    uint32_t blockCount = heap->blockCount;
++    uint32_t maxBatches = blockCount / batchSize + 2;
++    if (maxBatches + 1 > sweep.batchStartCapacity) {
++        uint32_t *grown = (uint32_t *)realloc(
++            sweep.batchStart, (size_t)(maxBatches + 1) * sizeof(uint32_t));
++        if (grown == NULL)
++            Heap_exitWithOutOfMemory("allocate sweep batches");
++        sweep.batchStart = grown;
++        sweep.batchStartCapacity = maxBatches + 1;
++    }
++    if (maxBatches > sweep.batchesCapacity) {
++        SweepBatch *grown = (SweepBatch *)realloc(
++            sweep.batches, (size_t)maxBatches * sizeof(SweepBatch));
++        if (grown == NULL)
++            Heap_exitWithOutOfMemory("allocate sweep batches");
++        sweep.batches = grown;
++        sweep.batchesCapacity = maxBatches;
++    }
++    uint32_t n = 0;
++    sweep.batchStart[0] = 0;
++    for (uint32_t next = batchSize; next < blockCount; next += batchSize) {
++        uint32_t i = next;
++        while (i < blockCount &&
++               BlockMeta_IsSuperblockMiddle(
++                   BlockMeta_GetFromIndex(heap->blockMetaStart, i)))
++            i++;
++        if (i >= blockCount)
++            break;
++        if (i > sweep.batchStart[n]) {
++            n++;
++            sweep.batchStart[n] = i;
++        }
++    }
++    n++;
++    sweep.batchStart[n] = blockCount;
++    sweep.batchCount = n;
++    assert(n <= maxBatches);
++}
++
++static void Sweep_task(int id, int count, void *arg) {
++    (void)count;
++    Heap *heap = (Heap *)arg;
++    SweepWorker *sw = Sweep_worker(id);
++    word_t *blockMetaStart = heap->blockMetaStart;
++    for (;;) {
++        uint32_t b =
++            atomic_fetch_add_explicit(&sweepCursor, 1, memory_order_relaxed);
++        if (b >= sweep.batchCount)
++            break;
++        uint32_t start = sweep.batchStart[b];
++        uint32_t end = sweep.batchStart[b + 1];
++        SweepBatch *batch = &sweep.batches[b];
++        BlockList_Init(&batch->recycled, blockMetaStart);
++        BlockList_Init(&batch->freeRuns, blockMetaStart);
++        batch->recycledCount = 0;
++        batch->freeLines = 0;
++
++        BlockMeta *current = BlockMeta_GetFromIndex(blockMetaStart, start);
++        BlockMeta *limit = BlockMeta_GetFromIndex(blockMetaStart, end);
++        word_t *currentBlockStart = Block_GetStartFromIndex(heap->heapStart, start);
++        LineMeta *lineMetas = Line_getFromBlockIndex(heap->lineMetaStart, start);
++        while (current < limit) {
++            uint32_t size = 1;
++            assert(!BlockMeta_IsSuperblockMiddle(current));
++            if (BlockMeta_IsReserved(current)) {
++                // The empty emergency block stays out of the allocator while
++                // it is held.
++            } else if (BlockMeta_IsSimpleBlock(current)) {
++                if (Block_Sweep(current, currentBlockStart, lineMetas,
++                                &batch->recycled, &batch->recycledCount,
++                                &batch->freeLines))
++                    FreeRuns_Add(&batch->freeRuns, current, 1);
++            } else if (BlockMeta_IsSuperblockStart(current)) {
++                size = BlockMeta_SuperblockSize(current);
++                LargeAllocator_Sweep(&sw->large, current, currentBlockStart,
++                                     &batch->freeRuns, &sw->sweptFreeBytes);
++            } else {
++                assert(BlockMeta_IsFree(current));
++                FreeRuns_Add(&batch->freeRuns, current, 1);
++            }
++            assert(size > 0);
++            current += size;
++            currentBlockStart += WORDS_IN_BLOCK * size;
++            lineMetas += LINE_COUNT * size;
++        }
++        assert(current == limit);
++    }
++}
++
+ void Heap_Recycle(Heap *heap) {
+     Block_recycledFreeLines = 0;
+     LargeAllocator_sweptFreeBytes = 0;
+@@ -522,11 +694,6 @@ void Heap_Recycle(Heap *heap) {
+     BlockAllocator_Clear(&blockAllocator);
+     Allocator_ResetSharedRecycle(heap);
+ 
+-    BlockMeta *current = (BlockMeta *)heap->blockMetaStart;
+-    word_t *currentBlockStart = heap->heapStart;
+-    LineMeta *lineMetas = (LineMeta *)heap->lineMetaStart;
+-    word_t *end = heap->blockMetaEnd;
+-
+ #ifdef SCALANATIVE_MULTITHREADING_ENABLED
+     size_t targetCount = Heap_collectRecycleTargets();
+     size_t targetIndex = 0;
+@@ -538,30 +705,64 @@ void Heap_Recycle(Heap *heap) {
+ #define NextMutatorThread() mainThread
+ #endif
+ 
+-    while ((word_t *)current < end) {
+-        int size = 1;
+-
+-        assert(!BlockMeta_IsSuperblockMiddle(current));
+-        if (BlockMeta_IsReserved(current)) {
+-            // Keep the empty reserve out of the allocator while it is held.
+-            BlockAllocator_SweepDone(&blockAllocator);
+-        } else if (BlockMeta_IsSimpleBlock(current)) {
+-            Block_Recycle(&sharedRecycleAllocator, current, currentBlockStart,
+-                          lineMetas);
+-        } else if (BlockMeta_IsSuperblockStart(current)) {
+-            size = BlockMeta_SuperblockSize(current);
+-            MutatorThread *recycleBlocksTo = NextMutatorThread();
+-            LargeAllocator_Sweep(&recycleBlocksTo->largeAllocator, current,
+-                                 currentBlockStart);
+-        } else {
+-            assert(BlockMeta_IsFree(current));
+-            BlockAllocator_AddFreeBlocks(&blockAllocator, current, 1);
++    uint32_t blockCount = heap->blockCount;
++    int workers = (int)(blockCount / SWEEP_BLOCKS_PER_WORKER);
++    if (workers < 1)
++        workers = 1;
++    if (workers > GCWorkers_MaxCount())
++        workers = GCWorkers_MaxCount();
++    workers = GCWorkers_Prepare(workers);
++    uint32_t batchSize = blockCount / ((uint32_t)workers * 16);
++    if (batchSize < 16)
++        batchSize = 16;
++    if (batchSize > 512)
++        batchSize = 512;
++    Sweep_prepareWorkers(heap, workers);
++    Sweep_prepareBatches(heap, batchSize);
++    atomic_store_explicit(&sweepCursor, 0, memory_order_relaxed);
++    GCWorkers_Run(workers, Sweep_task, heap);
++
++    // Apply the batches in address order
++    Allocator *shared = &sharedRecycleAllocator;
++    for (uint32_t b = 0; b < sweep.batchCount; b++) {
++        SweepBatch *batch = &sweep.batches[b];
++        for (BlockMeta *run = batch->freeRuns.first; run != NULL;) {
++            // The block allocator reuses the run's next link, read it first
++            BlockMeta *next = BlockList_getNextBlock(heap->blockMetaStart, run);
++            BlockAllocator_AddFreeBlocks(&blockAllocator, run,
++                                         BlockMeta_SuperblockSize(run));
++            run = next;
++        }
++        if (batch->recycled.first != NULL) {
++            BlockList_AddBlocksLast(&shared->recycledBlocks,
++                                    batch->recycled.first,
++                                    batch->recycled.last);
++            atomic_fetch_add_explicit(&shared->recycledBlockCount,
++                                      batch->recycledCount,
++                                      memory_order_relaxed);
++        }
++        Block_recycledFreeLines += batch->freeLines;
++    }
++    // The free chunks go to the allocating threads round-robin, one chunk at a
++    // time as the sequential sweep handed out superblocks; merging a worker's
++    // lists whole would give everything to the collecting thread when one
++    // worker swept.
++    for (int i = 0; i < workers; i++) {
++        SweepWorker *sw = Sweep_worker(i);
++        LargeAllocator_sweptFreeBytes += sw->sweptFreeBytes;
++        for (int list = 0; list < FREE_LIST_COUNT; list++) {
++            for (Chunk *chunk = sw->large.freeLists[list].first; chunk != NULL;) {
++                Chunk *next = chunk->next;
++                MutatorThread *recycleBlocksTo = NextMutatorThread();
++                LargeAllocator_AddChunk(&recycleBlocksTo->largeAllocator, chunk,
++                                        chunk->size);
++                chunk = next;
++            }
+         }
+-        assert(size > 0);
+-        current += size;
+-        currentBlockStart += WORDS_IN_BLOCK * size;
+-        lineMetas += LINE_COUNT * size;
++        LargeAllocator_Clear(&sw->large);
+     }
++    GC_LOG_DEBUG("Swept %u blocks in %u batches on %d threads", blockCount,
++                 sweep.batchCount, workers);
+ 
+     // A new cycle: who allocates in it decides the next distribution.
+     MutatorThreads_foreach(mutatorThreads, node) {
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.c b/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.c
+index a6d9c84a8..0645b62f7 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.c
+@@ -7,6 +7,7 @@
+ #include "immix_commix/utils/MathUtils.h"
+ #include "immix_commix/Object.h"
+ #include "immix/State.h"
++#include "immix/Block.h"
+ #include "immix_commix/headers/ObjectHeader.h"
+ 
+ inline static int LargeAllocator_sizeToLinkedListIndex(size_t size) {
+@@ -198,7 +199,8 @@ void LargeAllocator_Clear(LargeAllocator *allocator) {
+ }
+ 
+ void LargeAllocator_Sweep(LargeAllocator *allocator, BlockMeta *blockMeta,
+-                          word_t *blockStart) {
++                          word_t *blockStart, BlockList *freeRuns,
++                          uint64_t *sweptFreeBytes) {
+     // Objects that are larger than a block
+     // are always allocated at the begining the smallest possible superblock.
+     // Any gaps at the end can be filled with large objects, that are smaller
+@@ -214,8 +216,7 @@ void LargeAllocator_Sweep(LargeAllocator *allocator, BlockMeta *blockMeta,
+     BlockMeta *lastBlock = blockMeta + superblockSize - 1;
+     if (superblockSize > 1 && !ObjectMeta_IsMarked(firstObjectMeta)) {
+         // release free superblock starting from the first object
+-        BlockAllocator_AddFreeBlocks(&blockAllocator, blockMeta,
+-                                     superblockSize - 1);
++        FreeRuns_Add(freeRuns, blockMeta, superblockSize - 1);
+ 
+         BlockMeta_SetFlag(lastBlock, block_superblock_start);
+         BlockMeta_SetSuperblockSize(lastBlock, 1);
+@@ -243,7 +244,7 @@ void LargeAllocator_Sweep(LargeAllocator *allocator, BlockMeta *blockMeta,
+                 size_t currentSize = (current - chunkStart) * WORD_SIZE;
+                 LargeAllocator_AddChunk(allocator, (Chunk *)chunkStart,
+                                         currentSize);
+-                LargeAllocator_sweptFreeBytes += currentSize;
++                *sweptFreeBytes += currentSize;
+                 chunkStart = NULL;
+             }
+         }
+@@ -255,11 +256,11 @@ void LargeAllocator_Sweep(LargeAllocator *allocator, BlockMeta *blockMeta,
+     if (chunkStart == lastBlockStart) {
+         // free chunk covers the entire last block, released it to the block
+         // allocator
+-        BlockAllocator_AddFreeBlocks(&blockAllocator, lastBlock, 1);
++        FreeRuns_Add(freeRuns, lastBlock, 1);
+     } else if (chunkStart != NULL) {
+         size_t currentSize = (current - chunkStart) * WORD_SIZE;
+         LargeAllocator_AddChunk(allocator, (Chunk *)chunkStart, currentSize);
+-        LargeAllocator_sweptFreeBytes += currentSize;
++        *sweptFreeBytes += currentSize;
+     }
+ }
+ 
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.h b/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.h
+index 6cc554ad2..d6713c321 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/LargeAllocator.h
+@@ -5,6 +5,7 @@
+ #include "shared/GCTypes.h"
+ #include "immix_commix/headers/ObjectHeader.h"
+ #include "BlockAllocator.h"
++#include "datastructures/BlockList.h"
+ #include "Heap.h"
+ 
+ /* Bytes of free chunks handed to the large allocators by the current sweep,
+@@ -42,8 +43,11 @@ bool LargeAllocator_ReserveRecycled(LargeAllocator *allocator, size_t size);
+ void LargeAllocator_Clear(LargeAllocator *allocator);
+ void LargeAllocator_AddChunk(LargeAllocator *allocator, Chunk *chunk,
+                              size_t total_block_size);
+-void LargeAllocator_Clear(LargeAllocator *allocator);
++// Sweeps a superblock after marking: free chunks inside it go to
++// `allocator`'s free lists (and are counted in *sweptFreeBytes), its free
++// blocks are appended to `freeRuns` (see FreeRuns_Add).
+ void LargeAllocator_Sweep(LargeAllocator *allocator, BlockMeta *blockMeta,
+-                          word_t *blockStart);
++                          word_t *blockStart, BlockList *freeRuns,
++                          uint64_t *sweptFreeBytes);
+ 
+ #endif // IMMIX_LARGEALLOCATOR_H
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+index d40b1e9d0..b925301c4 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
+@@ -1,8 +1,10 @@
+ #if defined(SCALANATIVE_GC_IMMIX)
+ #include <stdint.h>
+ #include <stdio.h>
++#include <inttypes.h>
+ #include <setjmp.h>
+ #include "Marker.h"
++#include "GCWorkers.h"
+ #include "immix_commix/Object.h"
+ #include "State.h"
+ #include "immix_commix/datastructures/Stack.h"
+@@ -605,6 +607,59 @@ static void EvacLog_dump(Heap *heap, uint64_t cycle) {
+ }
+ /* ---------------------------------------------------------------------- */
+ 
++/* ---- Root tasks ----------------------------------------------------------
++ * The roots, as tasks the GC workers claim through a counter (marking and
++ * the evacuation's root fixup): one per mutator stack, ranges of the module
++ * table, the custom roots.
++ */
++#define MARK_MODULES_PER_TASK 2048
++typedef enum { root_stack, root_modules, root_custom } RootTaskKind;
++typedef struct {
++    RootTaskKind kind;
++    void *from;
++    void *to;
++} RootTask;
++static RootTask *rootTasks = NULL;
++static int rootTaskCapacity = 0;
++static int rootTaskCount = 0;
++static _Alignas(128) atomic_int rootCursor = 0;
++
++static void RootTasks_add(RootTaskKind kind, void *from, void *to) {
++    if (rootTaskCount == rootTaskCapacity) {
++        int capacity = rootTaskCapacity == 0 ? 64 : rootTaskCapacity * 2;
++        RootTask *grown =
++            (RootTask *)realloc(rootTasks, (size_t)capacity * sizeof(RootTask));
++        if (grown == NULL) {
++            GC_LOG_ERROR("Out of memory: cannot allocate root tasks");
++            abort();
++        }
++        rootTasks = grown;
++        rootTaskCapacity = capacity;
++    }
++    rootTasks[rootTaskCount].kind = kind;
++    rootTasks[rootTaskCount].from = from;
++    rootTasks[rootTaskCount].to = to;
++    rootTaskCount++;
++}
++
++// The biggest roots first, so the last task claimed is a small one
++static void Marker_prepareRootTasks(void) {
++    rootTaskCount = 0;
++    MutatorThreads_foreach(mutatorThreads, node) {
++        RootTasks_add(root_stack, node->value, NULL);
++    }
++    word_t **modules = &__modules;
++    int nb_modules = __modules_size;
++    for (int i = 0; i < nb_modules; i += MARK_MODULES_PER_TASK) {
++        int end = i + MARK_MODULES_PER_TASK;
++        if (end > nb_modules)
++            end = nb_modules;
++        RootTasks_add(root_modules, modules + i, modules + end);
++    }
++    RootTasks_add(root_custom, customRoots, NULL);
++    atomic_store_explicit(&rootCursor, 0, memory_order_relaxed);
++}
++
+ #define LAST_FIELD_OFFSET -1
+ 
+ /* ---- Stage 2: real opportunistic evacuation (MOVES OBJECTS) --------------
+@@ -1069,86 +1124,267 @@ static inline void Evac_FixupOneObject(Heap *heap, Object *object) {
+     }
+ }
+ 
++/* ---- Parallel evacuation phases -------------------------------------------
++ * The copy, the heap fixup and the unmark of the source blocks run on the GC
++ * workers (GCWorkers.c) over ranges of EVAC_BATCH_BLOCKS blocks claimed
++ * through a counter; the root fixup runs over the root tasks. Every write of
++ * a phase is confined to the blocks (or roots) a worker claimed, except the
++ * copy's destination blocks, which each worker takes for itself from the
++ * block allocator (under its lock); the forwarding records a phase reads
++ * were all written by the phase before it.
++ */
++#define EVAC_BATCH_BLOCKS 16
++#define EVAC_BLOCKS_PER_WORKER 64
++
++typedef struct {
++    word_t *destCursor;
++    word_t *destBlockLimit;
++    uint64_t copiedBytes;
++} EvacWorker;
++
++#define EVAC_WORKER_STRIDE 128
++static_assert(sizeof(EvacWorker) <= EVAC_WORKER_STRIDE,
++              "EvacWorker must fit its stride");
++static char *evacWorkersRaw = NULL;
++static char *evacWorkersBase = NULL;
++static int evacWorkerCapacity = 0;
++
++static inline EvacWorker *Evac_worker(int id) {
++    return (EvacWorker *)(evacWorkersBase + (size_t)id * EVAC_WORKER_STRIDE);
++}
++
++static void Evac_prepareWorkers(int count) {
++    if (count > evacWorkerCapacity) {
++        size_t bytes = (size_t)count * EVAC_WORKER_STRIDE + EVAC_WORKER_STRIDE;
++        char *raw = (char *)malloc(bytes);
++        if (raw == NULL)
++            Heap_exitWithOutOfMemory("allocate evacuation workers");
++        free(evacWorkersRaw);
++        evacWorkersRaw = raw;
++        evacWorkersBase = (char *)(((uintptr_t)raw + EVAC_WORKER_STRIDE - 1) &
++                                   ~(uintptr_t)(EVAC_WORKER_STRIDE - 1));
++        evacWorkerCapacity = count;
++    }
++    memset(evacWorkersBase, 0, (size_t)count * EVAC_WORKER_STRIDE);
++}
++
++typedef enum {
++    evac_copy,
++    evac_fixup_roots,
++    evac_fixup_heap,
++    evac_unmark
++} EvacPhaseKind;
++
++static struct {
++    EvacPhaseKind kind;
++    Heap *heap;
++    uint32_t blockCount;       // blocks the phase walks
++    uint32_t scoredBlockCount; // blocks the candidate scoring covered
++    int workers;
++    bool poison;
++    word_t *traceObj;
++} evacPhase;
++static _Alignas(128) atomic_uint evacCursor = 0;
++
++// neededBlocks is an upfront ESTIMATE (totalLiveBytes/BLOCK_TOTAL_SIZE plus
++// a margin per worker), not an exact bound -- real per-destination-block
++// padding waste (never letting an object straddle two destination blocks)
++// scales with how many destination blocks actually get used. Under heavy
++// concurrent allocation that estimate was observed to run short -- a real,
++// reproduced bug (hit via a small heap + several contended threads). Objects
++// already forwarded this cycle are already committed, so this can't just
++// bail out like the upfront check can -- grow, the same way the upfront
++// reservation does, instead of treating a merely-approximate estimate being
++// short as a fatal condition.
++static BlockMeta *Evac_takeDestinationBlock(Heap *heap) {
++    BlockMeta *block = BlockAllocator_GetFreeBlock(&blockAllocator);
++    if (block != NULL)
++        return block;
++    // Held (recursively, Heap_TryGrow and GetFreeBlock take it too) across
++    // the growth and the take, or the other workers' takes could drain the
++    // new blocks in between.
++    BlockAllocator_Acquire(&blockAllocator);
++    block = BlockAllocator_GetFreeBlock(&blockAllocator);
++    if (block == NULL) {
++        uint32_t growBy = (uint32_t)evacPhase.workers + 1;
++        if (!Heap_isGrowingPossible(heap, growBy))
++            growBy = 1;
++        if (!Heap_isGrowingPossible(heap, growBy)) {
++            Heap_exitWithOutOfMemory(
++                "evacuation: destination blocks exhausted "
++                "mid-copy and heap cannot grow further");
++        }
++        Heap_Grow(heap, growBy);
++        block = BlockAllocator_GetFreeBlock(&blockAllocator);
++        if (block == NULL) {
++            // Heap_Grow just added blocks to the free list; this would mean
++            // growth itself is broken, not a sizing shortfall -- genuinely
++            // unrecoverable.
++            Heap_exitWithOutOfMemory("evacuation: grew heap but still no free "
++                                     "destination block (bug in Heap_Grow)");
++        }
++    }
++    BlockAllocator_Release(&blockAllocator);
++    return block;
++}
++
++// Copies every live object of candidate block `i` into this worker's
++// destination blocks, leaving a forwarding record in each source object.
++static void Evac_copyBlock(Heap *heap, EvacWorker *ew, uint32_t i) {
++    Bytemap *bytemap = heap->bytemap;
++    word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
++    word_t *blockEnd = blockStart + WORDS_IN_BLOCK;
++    for (word_t *addr = blockStart; addr < blockEnd;) {
++        ObjectMeta *srcMeta = Bytemap_Get(bytemap, addr);
++        if (ObjectMeta_IsMarked(srcMeta)) {
++            Object *object = (Object *)addr;
++            size_t size = Object_Size(object);
++
++            // Never let an object straddle two destination blocks --
++            // same invariant every other small-object allocation path
++            // in this collector relies on (Object_Mark's line-marking
++            // only looks at the object's own containing block).
++            if (ew->destCursor == NULL ||
++                (uint8_t *)ew->destCursor + size >
++                    (uint8_t *)ew->destBlockLimit) {
++                // Claiming destination blocks via BlockAllocator_GetFreeBlock
++                // (the SAME function every normal allocation uses to get a
++                // fresh block) is essential: writing directly into a raw
++                // address range would leave those blocks double-booked,
++                // still "free" in the allocator's own bookkeeping.
++                BlockMeta *destBlockMeta = Evac_takeDestinationBlock(heap);
++                word_t *newBlockStart = BlockMeta_GetBlockStart(
++                    heap->blockMetaStart, heap->heapStart, destBlockMeta);
++                ew->destCursor = newBlockStart;
++                ew->destBlockLimit = newBlockStart + WORDS_IN_BLOCK;
++            }
++
++            word_t *newAddr = ew->destCursor;
++            memcpy(newAddr, object, size);
++            ew->destCursor = (word_t *)((uint8_t *)ew->destCursor + size);
++            ew->copiedBytes += size;
++
++            ObjectMeta *newMeta = Bytemap_Get(bytemap, newAddr);
++            ObjectMeta_SetAllocated(newMeta);
++            Object_Mark(heap, (Object *)newAddr, newMeta);
++
++            Evac_SetForwarded(object, newAddr);
++            addr += size / sizeof(word_t);
++        } else {
++            addr += ALLOCATION_ALIGNMENT_WORDS;
++        }
++    }
++    // Deliberately NOT unmarking/clearing this block's metadata here --
++    // see the evac_unmark phase in Marker_Evacuate.
++}
++
++static void Evac_traceBlock(const char *what, uint32_t i) {
++    FILE *f = fopen(evacTraceFilePath, "a");
++    if (f != NULL) {
++        fprintf(f, "FixupHeapObjects-%s block=%u\n", what, i);
++        fclose(f);
++    }
++}
++
++// Rewrites every field of every currently-marked object in the blocks
++// [from, to): survivors that stayed in place (non-candidate blocks, still
++// marked), freshly-copied objects in the destination blocks (marked via
++// Object_Mark during the copy) and the objects of the superblocks starting
++// there. Evacuated SOURCE blocks are skipped via the same
++// Evac_IsCandidateBlock test the copy used, NOT BlockMeta_IsMarked alone:
++// unmarking/clearing a source block's metadata is deliberately DEFERRED
++// until after every fixup pass (the evac_unmark phase) so Evac_FixupSlot --
++// run via program-stack/module/custom-root fixup too, not just here -- can
++// still recognize a pointer into a source block as "points at a forwarded
++// object" while its bytemap still reads allocated/marked. Walking their
++// contents here would misinterpret every forwarded (tombstoned) object as
++// a live survivor and read its corrupted rtti.
++//
+ // scoredBlockCount is Marker_Evacuate's OWN snapshot of heap->blockCount
+-// taken at the start of this cycle, BEFORE any Heap_Grow call it makes
+-// (upfront destination-space reservation, or growing on demand mid-copy --
+-// see the comment where that happens). blockLiveBytes/blockPinned were
+-// sized to that snapshot (EvacLog_ensureCapacity/EvacPin_ensureCapacity,
+-// both called once per cycle from Marker_MarkRoots, before this function
+-// ever runs). Reading heap->blockCount directly here instead would include
+-// blocks added by a mid-cycle Heap_Grow -- genuinely new blocks the
+-// scoring pass never saw, so indexing blockLiveBytes[i] for one is a
+-// flat-out out-of-bounds read on a malloc'd array. That was a real,
+-// reproduced bug: non-deterministic SIGBUS/SIGSEGV at garbage (not
+-// null/sentinel) addresses under heavy concurrent allocation + a small
+-// heap, where Heap_Grow during evacuation is common. A block index at or
+-// past scoredBlockCount can never have been a candidate (it didn't exist
+-// when candidacy was scored), so it's never skipped here -- which is
+-// exactly right: on-demand-grown blocks are destination blocks for this
+-// very cycle's copies, and their freshly-copied, marked contents still
+-// need the same field fixups as any other block's.
+-static void Evac_FixupHeapObjects(Heap *heap, uint32_t scoredBlockCount) {
++// taken at the start of this cycle, BEFORE any Heap_Grow call it makes.
++// blockLiveBytes/blockPinned were sized to that snapshot (in
++// Marker_MarkRoots, before this function ever runs). Reading
++// heap->blockCount directly here instead would include blocks added by a
++// mid-cycle Heap_Grow -- genuinely new blocks the scoring pass never saw, so
++// indexing blockLiveBytes[i] for one is a flat-out out-of-bounds read on a
++// malloc'd array. That was a real, reproduced bug: non-deterministic
++// SIGBUS/SIGSEGV at garbage (not null/sentinel) addresses under heavy
++// concurrent allocation + a small heap, where Heap_Grow during evacuation
++// is common. A block index at or past scoredBlockCount can never have been
++// a candidate (it didn't exist when candidacy was scored), so it's never
++// skipped here -- which is exactly right: on-demand-grown blocks are
++// destination blocks for this very cycle's copies, and their
++// freshly-copied, marked contents still need the same field fixups as any
++// other block's.
++//
++// Large objects (superblocks) are never evacuation candidates themselves
++// (Evac_IsCandidateBlock already excludes BlockMeta_ContainsLargeObjects),
++// but a large live ObjectArray's own ELEMENTS can still reference smaller,
++// normally-evacuated objects -- a real, reproduced bug when they were
++// skipped: references inside e.g. a compiler's large symbol-table array
++// were silently left stale. A superblock's mark state lives on its first
++// object's ObjectMeta entry (see LargeAllocator_Sweep), not on BlockMeta
++// (whose own flags field instead encodes superblock-start/middle), so it is
++// checked separately. A superblock holds MORE than just the object at its
++// first block (see the layout comment in LargeAllocator_Sweep): a large
++// object can start at the very beginning of the first block, or at any
++// MIN_BLOCK_SIZE step of the LAST block except its first one (that is the
++// first object's tail). Missing the latter was a real, reproduced bug: a
++// plain 1024-element object array (8208 bytes) was allocated
++// mid-superblock, was never visited here, and kept pointing at objects
++// evacuation had moved. The superblock is handled where it starts; its
++// other blocks are skipped by whoever claims them.
++static void Evac_fixupBlocks(Heap *heap, uint32_t scoredBlockCount,
++                             uint32_t from, uint32_t to) {
+     Bytemap *bytemap = heap->bytemap;
+     // See EvacTrace_enabled's comment -- $SCALANATIVE_EVAC_TRACE_OBJ (hex),
+     // if set alongside $SCALANATIVE_EVAC_TRACE_FILE, additionally logs
+     // whether a SPECIFIC object address is ever visited by this loop (and
+     // which block-skip branch it would have hit, if any), complementing
+     // EvacTrace_log's per-slot VALUE tracing.
+-    word_t *traceObj = NULL;
+-    if (EvacTrace_enabled()) {
+-        const char *traceObjStr = getenv("SCALANATIVE_EVAC_TRACE_OBJ");
+-        if (traceObjStr != NULL)
+-            traceObj = (word_t *)strtoull(traceObjStr, NULL, 16);
+-    }
+-    for (uint32_t i = 0; i < heap->blockCount; i++) {
++    word_t *traceObj = evacPhase.traceObj;
++    for (uint32_t i = from; i < to; i++) {
+         BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+         word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
+         word_t *blockEnd = blockStart + WORDS_IN_BLOCK;
+-        bool blockContainsTraceObj =
+-            traceObj != NULL && (word_t *)traceObj >= blockStart &&
+-            (word_t *)traceObj < blockEnd;
+-        // Large objects (superblocks) are handled by the separate loop
+-        // below, NOT skipped outright -- see its own comment for why they
+-        // can't just be ignored like evacuated source blocks can.
+-        if (BlockMeta_ContainsLargeObjects(meta)) {
+-            if (blockContainsTraceObj) {
+-                FILE *f = fopen(evacTraceFilePath, "a");
+-                if (f != NULL) {
+-                    fprintf(f, "FixupHeapObjects-skip-large block=%u\n", i);
+-                    fclose(f);
++        bool blockContainsTraceObj = traceObj != NULL &&
++                                     traceObj >= blockStart &&
++                                     traceObj < blockEnd;
++        if (BlockMeta_IsSuperblockStart(meta)) {
++            const uint32_t superblockSize = BlockMeta_SuperblockSize(meta);
++            word_t *superblockEnd = blockStart + WORDS_IN_BLOCK * superblockSize;
++            word_t *lastBlockStart = superblockEnd - WORDS_IN_BLOCK;
++            if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, blockStart))) {
++                Evac_FixupOneObject(heap, (Object *)blockStart);
++            }
++            for (word_t *current =
++                     lastBlockStart + (MIN_BLOCK_SIZE / WORD_SIZE);
++                 current < superblockEnd;
++                 current += MIN_BLOCK_SIZE / WORD_SIZE) {
++                if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, current))) {
++                    Evac_FixupOneObject(heap, (Object *)current);
+                 }
+             }
+             continue;
+         }
++        if (BlockMeta_ContainsLargeObjects(meta)) {
++            if (blockContainsTraceObj)
++                Evac_traceBlock("skip-large", i);
++            continue;
++        }
+         if (!BlockMeta_IsMarked(meta)) {
+-            if (blockContainsTraceObj) {
+-                FILE *f = fopen(evacTraceFilePath, "a");
+-                if (f != NULL) {
+-                    fprintf(f, "FixupHeapObjects-skip-unmarked block=%u\n", i);
+-                    fclose(f);
+-                }
+-            }
++            if (blockContainsTraceObj)
++                Evac_traceBlock("skip-unmarked", i);
+             continue;
+         }
+         if (i < scoredBlockCount &&
+             Evac_IsCandidateBlock(meta, blockLiveBytes[i], i)) {
+-            if (blockContainsTraceObj) {
+-                FILE *f = fopen(evacTraceFilePath, "a");
+-                if (f != NULL) {
+-                    fprintf(f, "FixupHeapObjects-skip-candidate block=%u\n",
+-                            i);
+-                    fclose(f);
+-                }
+-            }
++            if (blockContainsTraceObj)
++                Evac_traceBlock("skip-candidate", i);
+             continue; // evacuated source block -- skip, see comment above
+         }
+-        if (blockContainsTraceObj) {
+-            FILE *f = fopen(evacTraceFilePath, "a");
+-            if (f != NULL) {
+-                fprintf(f, "FixupHeapObjects-scanning block=%u\n", i);
+-                fclose(f);
+-            }
+-        }
++        if (blockContainsTraceObj)
++            Evac_traceBlock("scanning", i);
+         for (word_t *addr = blockStart; addr < blockEnd;) {
+             ObjectMeta *objMeta = Bytemap_Get(bytemap, addr);
+             if (ObjectMeta_IsMarked(objMeta)) {
+@@ -1177,47 +1413,116 @@ static void Evac_FixupHeapObjects(Heap *heap, uint32_t scoredBlockCount) {
+             }
+         }
+     }
++}
+ 
+-    // Large objects (superblocks) are never evacuation candidates
+-    // themselves (Evac_IsCandidateBlock already excludes
+-    // BlockMeta_ContainsLargeObjects), but a large live ObjectArray's own
+-    // ELEMENTS can still reference smaller, normally-evacuated objects --
+-    // this was a real, reproduced bug: the loop above's own
+-    // BlockMeta_ContainsLargeObjects skip meant a large object's contents
+-    // were never visited at all, so references inside e.g. a compiler's
+-    // large symbol-table array were silently left stale (surfaced as
+-    // ClassCastExceptions reading the wrong object through a corrupted
+-    // slot). A superblock's mark state lives on its first object's
+-    // ObjectMeta entry (see LargeAllocator_Sweep), not on BlockMeta (whose
+-    // own flags field instead encodes superblock-start/middle), so it must
+-    // be checked separately from the simple-block loop above.
+-    // A superblock holds MORE than just the object at its first block (see the
+-    // layout comment in LargeAllocator_Sweep): a large object can start at
+-    // the very beginning of the first block, or at any MIN_BLOCK_SIZE step of
+-    // the LAST block except its first one (that is the first object's tail).
+-    // Missing the latter was a real, reproduced bug: a plain 1024-element
+-    // object array (8208 bytes) was allocated mid-superblock, was never
+-    // visited here, and kept pointing at objects evacuation had moved.
+-    for (uint32_t i = 0; i < heap->blockCount; i++) {
++// NOW it's safe to make an evacuated source block look fully dead: every
++// pointer that could reference one has already been rewritten by the fixup
++// phases. Block_Sweep (which runs right after Marker_Evacuate returns, via
++// Heap_Recycle) treats !BlockMeta_IsMarked as completely free.
++static void Evac_unmarkBlocks(Heap *heap, uint32_t from, uint32_t to) {
++    for (uint32_t i = from; i < to; i++) {
+         BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+-        if (!BlockMeta_IsSuperblockStart(meta))
++        if (!Evac_IsCandidateBlock(meta, blockLiveBytes[i], i))
+             continue;
+-        const uint32_t superblockSize = BlockMeta_SuperblockSize(meta);
+         word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
+-        word_t *blockEnd = blockStart + WORDS_IN_BLOCK * superblockSize;
+-        word_t *lastBlockStart = blockEnd - WORDS_IN_BLOCK;
+-        if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, blockStart))) {
+-            Evac_FixupOneObject(heap, (Object *)blockStart);
++        BlockMeta_Unmark(meta);
++        ObjectMeta_ClearBlockAt(Bytemap_Get(heap->bytemap, blockStart));
++        // Debug-only ($SCALANATIVE_EVAC_POISON, zero-cost when unset): the
++        // allocator zeroes memory when it hands it out, so scribbling over the
++        // evacuated source block here is safe, and turns any later use of a
++        // stale pointer into it (a reference nothing rewrote) into a loud
++        // crash instead of silently reading a tombstone.
++        if (evacPhase.poison)
++            memset(blockStart, 0xAB, BLOCK_TOTAL_SIZE);
++    }
++}
++
++static void Evac_fixupModulesRange(Heap *heap, word_t **from, word_t **to) {
++    for (word_t **module = from; module < to; module++) {
++        Evac_FixupSlot(heap, module);
++    }
++}
++
++static void Evac_task(int id, int count, void *arg) {
++    (void)count;
++    (void)arg;
++    Heap *heap = evacPhase.heap;
++    if (evacPhase.kind == evac_fixup_roots) {
++        for (;;) {
++            int t = atomic_fetch_add_explicit(&rootCursor, 1,
++                                              memory_order_relaxed);
++            if (t >= rootTaskCount)
++                return;
++            RootTask *task = &rootTasks[t];
++            switch (task->kind) {
++            case root_stack:
++                Evac_FixupProgramStack((MutatorThread *)task->from, heap);
++                break;
++            case root_modules:
++                Evac_fixupModulesRange(heap, (word_t **)task->from,
++                                       (word_t **)task->to);
++                break;
++            case root_custom:
++                Evac_FixupCustomRoots(heap, (GC_Roots *)task->from);
++                break;
++            }
+         }
+-        for (word_t *current = lastBlockStart + (MIN_BLOCK_SIZE / WORD_SIZE);
+-             current < blockEnd; current += MIN_BLOCK_SIZE / WORD_SIZE) {
+-            if (ObjectMeta_IsMarked(Bytemap_Get(bytemap, current))) {
+-                Evac_FixupOneObject(heap, (Object *)current);
++    }
++    EvacWorker *ew = Evac_worker(id);
++    uint32_t blockCount = evacPhase.blockCount;
++    for (;;) {
++        uint32_t from = atomic_fetch_add_explicit(&evacCursor, EVAC_BATCH_BLOCKS,
++                                                  memory_order_relaxed);
++        if (from >= blockCount)
++            break;
++        uint32_t to = from + EVAC_BATCH_BLOCKS;
++        if (to > blockCount)
++            to = blockCount;
++        switch (evacPhase.kind) {
++        case evac_copy:
++            for (uint32_t i = from; i < to; i++) {
++                if (evacCandidateBlocks[i])
++                    Evac_copyBlock(heap, ew, i);
+             }
++            break;
++        case evac_fixup_heap:
++            Evac_fixupBlocks(heap, evacPhase.scoredBlockCount, from, to);
++            break;
++        case evac_unmark:
++            Evac_unmarkBlocks(heap, from, to);
++            break;
++        case evac_fixup_roots:
++            break;
+         }
+     }
+ }
+ 
++// Runs one evacuation phase over the blocks [0, blockCount) (the scored
++// count: a phase that walks the whole heap passes heap->blockCount) or, for
++// the root fixup, over the root tasks.
++static void Evac_runPhase(Heap *heap, EvacPhaseKind kind, uint32_t blockCount,
++                          int workers) {
++    evacPhase.kind = kind;
++    evacPhase.heap = heap;
++    evacPhase.blockCount = blockCount;
++    if (EvacTrace_enabled())
++        workers = 1; // the trace file is appended to without a lock
++    workers = GCWorkers_Prepare(workers);
++    evacPhase.workers = workers;
++    atomic_store_explicit(&evacCursor, 0, memory_order_relaxed);
++    if (kind == evac_fixup_roots)
++        Marker_prepareRootTasks();
++    GCWorkers_Run(workers, Evac_task, heap);
++}
++
++static int Evac_workersFor(uint32_t items, uint32_t itemsPerWorker) {
++    int max = GCWorkers_MaxCount();
++    int n = (int)(items / itemsPerWorker);
++    if (n < 1)
++        n = 1;
++    return n < max ? n : max;
++}
++
+ static uint32_t validateScoredBlocks = 0;
+ 
+ // Debug-only helper for $SCALANATIVE_EVAC_VALIDATE_FILE: reports every
+@@ -1369,13 +1674,15 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+     if (candidateBlockCount == 0)
+         return;
+ 
+-    // Reserve destination space upfront so the copy loop below never needs
+-    // to trigger growth or (far worse) a recursive Heap_Collect mid-cycle.
+-    // Small safety margin for block-boundary rounding (objects here are a
+-    // handful of words each, per the stage-1 histogram -- waste is
+-    // negligible relative to the space being reclaimed).
+-    uint32_t neededBlocks =
+-        (uint32_t)(totalLiveBytes / BLOCK_TOTAL_SIZE) + 2;
++    // Reserve destination space upfront so the copy phase below rarely needs
++    // to grow the heap mid-cycle (never a recursive Heap_Collect). Small
++    // safety margin for block-boundary rounding (objects here are a handful
++    // of words each, per the stage-1 histogram -- waste is negligible
++    // relative to the space being reclaimed), one block per copying worker,
++    // which each leave their last destination block partly filled.
++    int copyWorkers = Evac_workersFor(candidateBlockCount, 8);
++    uint32_t neededBlocks = (uint32_t)(totalLiveBytes / BLOCK_TOTAL_SIZE) +
++                            2 + (uint32_t)copyWorkers;
+ 
+     // Evacuation is not free: besides the copy, the fixup pass revisits every
+     // live object in the heap, which costs about as much as marking it (~0.5s
+@@ -1439,94 +1746,23 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+         return;
+     }
+ 
+-    word_t *destCursor = NULL;
+-    word_t *destBlockLimit = NULL;
+     Bytemap *bytemap = heap->bytemap;
+-    for (uint32_t i = 0; i < blockCount; i++) {
+-        BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+-        if (!Evac_IsCandidateBlock(meta, blockLiveBytes[i], i))
+-            continue;
+-
+-        word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
+-        word_t *blockEnd = blockStart + WORDS_IN_BLOCK;
+-        for (word_t *addr = blockStart; addr < blockEnd;) {
+-            ObjectMeta *srcMeta = Bytemap_Get(bytemap, addr);
+-            if (ObjectMeta_IsMarked(srcMeta)) {
+-                Object *object = (Object *)addr;
+-                size_t size = Object_Size(object);
+-
+-                // Never let an object straddle two destination blocks --
+-                // same invariant every other small-object allocation path
+-                // in this collector relies on (Object_Mark's line-marking
+-                // only looks at the object's own containing block).
+-                if (destCursor == NULL ||
+-                    (uint8_t *)destCursor + size > (uint8_t *)destBlockLimit) {
+-                    BlockMeta *destBlockMeta =
+-                        BlockAllocator_GetFreeBlock(&blockAllocator);
+-                    if (destBlockMeta == NULL) {
+-                        // neededBlocks above is an upfront ESTIMATE
+-                        // (totalLiveBytes/BLOCK_TOTAL_SIZE + a flat
+-                        // constant margin), not an exact bound -- real
+-                        // per-destination-block padding waste (never
+-                        // letting an object straddle two destination
+-                        // blocks) scales with how many destination blocks
+-                        // actually get used, which scales with how many
+-                        // candidate blocks there are. Under heavy
+-                        // concurrent allocation (many threads churning the
+-                        // heap between cycles) that estimate was observed
+-                        // to run short -- a real, reproduced bug (hit via
+-                        // a small heap + several contended threads).
+-                        // Objects already forwarded this call are already
+-                        // committed, so this can't just bail out like the
+-                        // upfront check can -- grow by one more block, the
+-                        // same way the upfront reservation does, instead
+-                        // of treating a merely-approximate estimate being
+-                        // short as a fatal condition.
+-                        if (!Heap_isGrowingPossible(heap, 1)) {
+-                            Heap_exitWithOutOfMemory(
+-                                "evacuation: destination blocks exhausted "
+-                                "mid-copy and heap cannot grow further");
+-                        }
+-                        Heap_Grow(heap, 1);
+-                        destBlockMeta = BlockAllocator_GetFreeBlock(&blockAllocator);
+-                        if (destBlockMeta == NULL) {
+-                            // Heap_Grow just added blocks to the free list;
+-                            // this would mean growth itself is broken, not
+-                            // a sizing shortfall -- genuinely unrecoverable.
+-                            Heap_exitWithOutOfMemory(
+-                                "evacuation: grew heap but still no free "
+-                                "destination block (bug in Heap_Grow)");
+-                        }
+-                    }
+-                    word_t *newBlockStart = BlockMeta_GetBlockStart(
+-                        heap->blockMetaStart, heap->heapStart, destBlockMeta);
+-                    destCursor = newBlockStart;
+-                    destBlockLimit = newBlockStart + WORDS_IN_BLOCK;
+-                }
+-
+-                word_t *newAddr = destCursor;
+-                memcpy(newAddr, object, size);
+-                destCursor = (word_t *)((uint8_t *)destCursor + size);
+-
+-                ObjectMeta *newMeta = Bytemap_Get(bytemap, newAddr);
+-                ObjectMeta_SetAllocated(newMeta);
+-                Object_Mark(heap, (Object *)newAddr, newMeta);
+-
+-                Evac_SetForwarded(object, newAddr);
+-                addr += size / sizeof(word_t);
+-            } else {
+-                addr += ALLOCATION_ALIGNMENT_WORDS;
+-            }
+-        }
+-        // Deliberately NOT unmarking/clearing this block's metadata here --
+-        // see the big comment below, right before the loop that does it.
++    Evac_prepareWorkers(GCWorkers_MaxCount());
++    evacPhase.scoredBlockCount = blockCount;
++    Evac_runPhase(heap, evac_copy, blockCount, copyWorkers);
++    {
++        uint64_t copiedBytes = 0;
++        for (int i = 0; i < evacPhase.workers; i++)
++            copiedBytes += Evac_worker(i)->copiedBytes;
++        GC_LOG_DEBUG("Evacuation copied %llu bytes on %d threads",
++                     (unsigned long long)copiedBytes, evacPhase.workers);
+     }
+ 
+     // Rewrite every pointer that could reference an old, now-forwarded
+     // address: every root, then every field of every still-marked object
+     // (survivors-in-place and freshly-copied alike). This MUST run while
+     // every evacuated source block's bytemap still reads allocated/marked
+-    // (i.e. before the unmark/clear loop below) -- Evac_FixupSlot decides
++    // (i.e. before the unmark phase below) -- Evac_FixupSlot decides
+     // whether a slot's value could even possibly be a forwarded object by
+     // checking that address's OWN bytemap entry first (a cheap way to avoid
+     // dereferencing ->rtti on a value that isn't a real object pointer at
+@@ -1537,12 +1773,16 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+     // object was left stale, corrupting whatever read it later, e.g. a
+     // ClassCastException/SIGSEGV in CharsetEncoder.encodeLoopArray on an
+     // evacuated backing array).
+-    MutatorThreads_foreach(mutatorThreads, node) {
+-        Evac_FixupProgramStack(node->value, heap);
++    evacPhase.traceObj = NULL;
++    if (EvacTrace_enabled()) {
++        const char *traceObjStr = getenv("SCALANATIVE_EVAC_TRACE_OBJ");
++        if (traceObjStr != NULL)
++            evacPhase.traceObj = (word_t *)strtoull(traceObjStr, NULL, 16);
+     }
+-    Evac_FixupModules(heap);
+-    Evac_FixupCustomRoots(heap, customRoots);
+-    Evac_FixupHeapObjects(heap, blockCount);
++    Evac_runPhase(heap, evac_fixup_roots, 0, GCWorkers_MaxCount());
++    // Over every block there is now: the heap may have grown during the copy
++    Evac_runPhase(heap, evac_fixup_heap, heap->blockCount,
++                  Evac_workersFor(heap->blockCount, EVAC_BLOCKS_PER_WORKER));
+ 
+     // Debug-only: $SCALANATIVE_EVAC_VALIDATE_FILE (zero-cost when unset) --
+     // re-walks every live, non-candidate (survivor) object's fields right
+@@ -1595,66 +1835,278 @@ void Marker_Evacuate(Heap *heap, Stack *stack) {
+         }
+     }
+ 
+-    // NOW it's safe to make every evacuated source block look fully dead:
+-    // every pointer that could reference one has already been rewritten
+-    // above. Block_Recycle (which runs right after this whole function
+-    // returns, via Heap_Recycle) treats !BlockMeta_IsMarked as
+-    // Block_recycleUnmarkedBlock, adding it straight to the free list.
+-    for (uint32_t i = 0; i < blockCount; i++) {
+-        BlockMeta *meta = BlockMeta_GetFromIndex(heap->blockMetaStart, i);
+-        if (!Evac_IsCandidateBlock(meta, blockLiveBytes[i], i))
+-            continue;
+-        word_t *blockStart = heap->heapStart + (size_t)i * WORDS_IN_BLOCK;
+-        BlockMeta_Unmark(meta);
+-        ObjectMeta_ClearBlockAt(Bytemap_Get(bytemap, blockStart));
+-        // Debug-only ($SCALANATIVE_EVAC_POISON, zero-cost when unset): the
+-        // allocator zeroes memory when it hands it out, so scribbling over the
+-        // evacuated source block here is safe, and turns any later use of a
+-        // stale pointer into it (a reference nothing rewrote) into a loud
+-        // crash instead of silently reading a tombstone.
++    {
+         static int poisonOn = -1;
+         if (poisonOn < 0)
+             poisonOn = getenv("SCALANATIVE_EVAC_POISON") != NULL;
+-        if (poisonOn)
+-            memset(blockStart, 0xAB, BLOCK_TOTAL_SIZE);
++        evacPhase.poison = poisonOn != 0;
+     }
++    Evac_runPhase(heap, evac_unmark, blockCount,
++                  Evac_workersFor(candidateBlockCount, 32));
+ 
+     GC_LOG_INFO("Evacuation done");
+ }
+ /* ---------------------------------------------------------------------- */
+ 
+-static inline void Marker_markLockWords(Heap *heap, Stack *stack,
++/* ---- Marking ------------------------------------------------------------
++ * Stop-the-world, on up to GCWorkers_MaxCount() threads: the collecting
++ * thread and the GC worker pool (GCWorkers.c). Marking is idempotent, so as
++ * in Commix no mark byte needs synchronization: two workers that reach the
++ * same object at once both mark it and both scan it, which is harmless and
++ * rare (the allocated -> marked check and store are a few instructions
++ * apart). Work is kept in chunks of MARK_CHUNK_ITEMS entries that form each
++ * worker's stack (see MarkWorker): the worker keeps one full chunk and one
++ * empty chunk besides the current one and exchanges whole chunks with the
++ * shared list only beyond that or when it has nothing left, so the shared
++ * list (a spinlock) is touched once per hundreds of objects. Roots are
++ * split into tasks (one per mutator stack, ranges of the module table, the
++ * custom roots) claimed through a counter. A worker that runs out of work
++ * leaves `markActive`; one that takes a shared chunk joins again before
++ * taking it, so `markActive == 0` means no work exists anywhere. Large
++ * arrays are scanned in windows of MARK_RANGE_WORDS entries queued as
++ * tagged chunk entries (objects are 16-byte aligned, the low bits are
++ * free), so one huge array does not serialize the phase. What a worker
++ * accumulates besides marks (weak references found, the evacuation
++ * live-byte tally) is merged by the collecting thread afterwards. The
++ * debug dumps (histogram, graph, trace) use globals and force one worker.
++ */
++
++#define MARK_CHUNK_ITEMS 256
++#define MARK_RANGE_WORDS 512
++#define MARK_ENTRY_TAG_MASK ((word_t)0x3)
++#define MARK_ENTRY_REFS ((word_t)0x1)  // MARK_RANGE_WORDS references
++#define MARK_ENTRY_WORDS ((word_t)0x2) // MARK_RANGE_WORDS words, scanned conservatively
++// Heap blocks per marking thread: a smaller heap wakes fewer threads
++#define MARK_BLOCKS_PER_WORKER 32
++typedef struct MarkChunk {
++    struct MarkChunk *next;
++    uint32_t size;
++    word_t *items[MARK_CHUNK_ITEMS];
++} MarkChunk;
++
++typedef struct {
++    // The local stack: pushes and pops at the top of `cur`, the full chunk
++    // under it in `spare`, older ones in the shared list. `empty` is kept so
++    // that a stack oscillating around a chunk boundary never touches the
++    // shared pool. Depth-first order as with a plain stack: a just-discovered
++    // object is scanned next, while its header is still in the cache.
++    MarkChunk *cur;
++    MarkChunk *spare;
++    MarkChunk *empty;
++    Stack weakRefs;
++    // Per-block live bytes this worker marked (worker 0 tallies straight into
++    // blockLiveBytes); only when evacuation tracking is on
++    uint32_t *liveBytes;
++    uint32_t liveBytesCapacity;
++    uint64_t marked;
++    bool initialized;
++} MarkWorker;
++
++// 128 bytes apart so that no two workers share a cache line
++#define MARK_WORKER_STRIDE 128
++static_assert(sizeof(MarkWorker) <= MARK_WORKER_STRIDE,
++              "MarkWorker must fit its stride");
++static char *markWorkersRaw = NULL;
++static char *markWorkersBase = NULL;
++static int markWorkerCapacity = 0;
++static int markWorkerCount = 1;
++static inline MarkWorker *MarkWorker_at(int id) {
++    return (MarkWorker *)(markWorkersBase + (size_t)id * MARK_WORKER_STRIDE);
++}
++
++static atomic_flag markPoolLock = ATOMIC_FLAG_INIT;
++static MarkChunk *markPoolFull = NULL;
++static MarkChunk *markPoolEmpty = NULL;
++static _Alignas(128) atomic_uint markPoolFullCount = 0;
++static _Alignas(128) atomic_int markActive = 0;
++
++
++static inline void cpu_relax(void) {
++#if defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#elif defined(__aarch64__) || defined(__arm64__)
++    __asm__ __volatile__("yield");
++#endif
++}
++
++static inline void MarkPool_lock(void) {
++    while (atomic_flag_test_and_set_explicit(&markPoolLock,
++                                             memory_order_acquire))
++        cpu_relax();
++}
++
++static inline void MarkPool_unlock(void) {
++    atomic_flag_clear_explicit(&markPoolLock, memory_order_release);
++}
++
++static MarkChunk *MarkPool_takeEmpty(void) {
++    MarkPool_lock();
++    MarkChunk *chunk = markPoolEmpty;
++    if (chunk != NULL)
++        markPoolEmpty = chunk->next;
++    MarkPool_unlock();
++    if (chunk == NULL) {
++        chunk = (MarkChunk *)malloc(sizeof(MarkChunk));
++        if (chunk == NULL) {
++            GC_LOG_ERROR("Out of memory: cannot allocate a mark chunk");
++            abort();
++        }
++    }
++    chunk->size = 0;
++    chunk->next = NULL;
++    return chunk;
++}
++
++static void MarkPool_giveEmpty(MarkChunk *chunk) {
++    assert(chunk->size == 0);
++    MarkPool_lock();
++    chunk->next = markPoolEmpty;
++    markPoolEmpty = chunk;
++    MarkPool_unlock();
++}
++
++static void MarkPool_giveFull(MarkChunk *chunk) {
++    assert(chunk->size > 0);
++    MarkPool_lock();
++    chunk->next = markPoolFull;
++    markPoolFull = chunk;
++    atomic_fetch_add_explicit(&markPoolFullCount, 1, memory_order_release);
++    MarkPool_unlock();
++}
++
++static MarkChunk *MarkPool_takeFull(void) {
++    if (atomic_load_explicit(&markPoolFullCount, memory_order_acquire) == 0)
++        return NULL;
++    MarkPool_lock();
++    MarkChunk *chunk = markPoolFull;
++    if (chunk != NULL) {
++        markPoolFull = chunk->next;
++        atomic_fetch_sub_explicit(&markPoolFullCount, 1, memory_order_release);
++    }
++    MarkPool_unlock();
++    return chunk;
++}
++
++// The current chunk is full: the older full chunk (the spare) goes to the
++// shared list and this one becomes the spare; a worker that has no spare
++// still shares when the shared list is short, so idle workers get work soon.
++NOINLINE static void MarkWorker_curFull(MarkWorker *w) {
++    MarkChunk *full = w->cur;
++    if (w->spare != NULL) {
++        MarkPool_giveFull(w->spare);
++        w->spare = full;
++    } else if (markWorkerCount > 1 &&
++               atomic_load_explicit(&markPoolFullCount,
++                                    memory_order_relaxed) <
++                   (unsigned)markWorkerCount) {
++        MarkPool_giveFull(full);
++    } else {
++        w->spare = full;
++    }
++    if (w->empty != NULL) {
++        w->cur = w->empty;
++        w->empty = NULL;
++    } else {
++        w->cur = MarkPool_takeEmpty();
++    }
++}
++
++static inline void MarkWorker_push(MarkWorker *w, word_t *entry) {
++    MarkChunk *cur = w->cur;
++    if (UNLIKELY(cur->size == MARK_CHUNK_ITEMS)) {
++        MarkWorker_curFull(w);
++        cur = w->cur;
++    }
++    cur->items[cur->size++] = entry;
++}
++
++// Replaces the empty current chunk with `next`, keeping the empty one
++static inline void MarkWorker_switchTo(MarkWorker *w, MarkChunk *next) {
++    assert(w->cur->size == 0);
++    if (w->empty == NULL)
++        w->empty = w->cur;
++    else
++        MarkPool_giveEmpty(w->cur);
++    w->cur = next;
++}
++
++// The current chunk is empty: the spare, then the shared list
++NOINLINE static bool MarkWorker_refill(MarkWorker *w) {
++    MarkChunk *next = w->spare;
++    if (next != NULL) {
++        w->spare = NULL;
++    } else {
++        next = MarkPool_takeFull();
++        if (next == NULL)
++            return false;
++    }
++    MarkWorker_switchTo(w, next);
++    return true;
++}
++
++static inline word_t *MarkWorker_pop(MarkWorker *w) {
++    MarkChunk *cur = w->cur;
++    if (UNLIKELY(cur->size == 0)) {
++        if (!MarkWorker_refill(w))
++            return NULL;
++        cur = w->cur;
++    }
++    return cur->items[--cur->size];
++}
++
++static inline void Marker_markLockWords(MarkWorker *w, Heap *heap,
+                                         Object *object);
+-static void Marker_markRange(Heap *heap, Stack *stack, word_t **from,
++static void Marker_markRange(MarkWorker *w, Heap *heap, word_t **from,
+                              word_t **to, const size_t stride);
++static void Marker_markConservative(MarkWorker *w, Heap *heap,
++                                    word_t *address);
++
++// The per-block live-byte tally and forwardability pin of the evacuation
++// (see EvacLog_* above), for this worker's own tally.
++static inline void Marker_recordLive(MarkWorker *w, Heap *heap,
++                                     Object *object) {
++    uint32_t blockIndex =
++        Block_GetBlockIndexForWord(heap->heapStart, (word_t *)object);
++    size_t size = Object_Size(object);
++    if (blockIndex < w->liveBytesCapacity)
++        w->liveBytes[blockIndex] += (uint32_t)size;
++    if (!Evac_CanForward(size))
++        EvacPin_record(heap, object);
++}
+ 
+-void Marker_markObject(Heap *heap, Stack *stack, Bytemap *bytemap,
+-                       Object *object, ObjectMeta *objectMeta) {
+-    assert(ObjectMeta_IsAllocated(objectMeta));
++static inline void Marker_markObject(MarkWorker *w, Heap *heap,
++                                     Object *object, ObjectMeta *objectMeta) {
++    // Another worker may have marked it since the caller looked
++    assert(ObjectMeta_IsAllocated(objectMeta) ||
++           ObjectMeta_IsMarked(objectMeta));
+     assert(Object_Rtti(object) != NULL);
+ 
+-    // The lock-word scan below can itself discover further objects (a
+-    // monitor object) whose edges must be attributed to THIS object, not
+-    // to whoever discovered `object` -- save/restore around it so the
+-    // caller's own field-iteration context is unchanged on return (see
+-    // "Debug-only live-heap object graph dump" comment above). Note: the
+-    // edge/root itself is recorded by the caller (Marker_markField /
+-    // Marker_markConservative), not here -- this function only runs on an
+-    // object's FIRST discovery per cycle (mark-once), but a graph edge
+-    // must be recorded on EVERY discovery, including from an already-
+-    // marked object, to correctly capture sharing.
+-    Object *graphDumpSavedParent = graphDumpCurrentParent;
+-    graphDumpCurrentParent = object;
+-    Marker_markLockWords(heap, stack, object);
+-    graphDumpCurrentParent = graphDumpSavedParent;
++    if (graphDumpFile != NULL) {
++        // The lock-word scan below can itself discover further objects (a
++        // monitor object) whose edges must be attributed to THIS object, not
++        // to whoever discovered `object` -- save/restore around it so the
++        // caller's own field-iteration context is unchanged on return (see
++        // "Debug-only live-heap object graph dump" comment above). Note: the
++        // edge/root itself is recorded by the caller (Marker_markField /
++        // Marker_markConservative), not here -- this function only runs on
++        // an object's FIRST discovery per cycle (mark-once), but a graph edge
++        // must be recorded on EVERY discovery, including from an already-
++        // marked object, to correctly capture sharing.
++        Object *graphDumpSavedParent = graphDumpCurrentParent;
++        graphDumpCurrentParent = object;
++        Marker_markLockWords(w, heap, object);
++        graphDumpCurrentParent = graphDumpSavedParent;
++    } else {
++        Marker_markLockWords(w, heap, object);
++    }
+     if (Object_IsWeakReference(object)) {
+         // Added to the WeakReference stack for additional later visit
+-        Stack_Push(&weakRefStack, object);
++        Stack_Push(&w->weakRefs, object);
+     }
+ 
+     assert(Object_Size(object) != 0);
+     Object_Mark(heap, object, objectMeta);
+-    Stack_Push(stack, object);
++    MarkWorker_push(w, (word_t *)object);
+ }
+ 
+ // Mirrors nir.Type.Smi/PtrTag's bit layout (see their doc comments) - kept
+@@ -1662,11 +2114,7 @@ void Marker_markObject(Heap *heap, Stack *stack, Bytemap *bytemap,
+ #define SMI_TAG_MASK (((word_t)1) << 63)
+ #define PTR_TAG_MASK ((word_t)0x7)
+ 
+-// Defined later in this file; forward-declared so Marker_markField (which
+-// needs it for the PtrTag case below) can call it.
+-void Marker_markConservative(Heap *heap, Stack *stack, word_t *address);
+-
+-static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
++static inline void Marker_markField(MarkWorker *w, Heap *heap, Field_t field) {
+     const word_t asWord = (word_t)field;
+ 
+     if ((asWord & SMI_TAG_MASK) != 0) {
+@@ -1684,7 +2132,7 @@ static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
+         // interior-pointer target alive (e.g. a Ptr into an Array's data).
+         word_t *untagged = (word_t *)(asWord & ~PTR_TAG_MASK);
+         if (Heap_IsWordInHeap(heap, untagged)) {
+-            Marker_markConservative(heap, stack, untagged);
++            Marker_markConservative(w, heap, untagged);
+         }
+         return;
+     }
+@@ -1697,12 +2145,11 @@ static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
+         // just whichever parent discovered it first -- see
+         // GraphDump_resolveConservative's comment for why the mark-once
+         // gate below can't be reused as-is for this.
+-        if (graphDumpFile != NULL &&
+-            (ObjectMeta_IsAllocated(fieldMeta) || ObjectMeta_IsMarked(fieldMeta)))
++        if (graphDumpFile != NULL && (ObjectMeta_IsAllocated(fieldMeta) ||
++                                      ObjectMeta_IsMarked(fieldMeta)))
+             GraphDump_recordDiscovery((Object *)field);
+         if (ObjectMeta_IsAllocated(fieldMeta)) {
+-            Object *object = (Object *)field;
+-            Marker_markObject(heap, stack, heap->bytemap, object, fieldMeta);
++            Marker_markObject(w, heap, (Object *)field, fieldMeta);
+         }
+     }
+ }
+@@ -1710,21 +2157,25 @@ static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
+ /* If compiling with enabled lock words check if object monitor is inflated and
+  * can be marked. Otherwise, in singlethreaded mode this funciton is no-op
+  */
+-static inline void Marker_markLockWords(Heap *heap, Stack *stack,
++static inline void Marker_markLockWords(MarkWorker *w, Heap *heap,
+                                         Object *object) {
+ #ifdef USES_LOCKWORD
+     if (object != NULL) {
+         Field_t rttiLock = Object_Rtti(object)->rt.lockWord;
+         if (Field_isInflatedLock(rttiLock)) {
+-            Marker_markField(heap, stack, Field_allignedLockRef(rttiLock));
++            Marker_markField(w, heap, Field_allignedLockRef(rttiLock));
+         }
+ 
+         Field_t objectLock = object->lockWord;
+         if (Field_isInflatedLock(objectLock)) {
+             Field_t field = Field_allignedLockRef(objectLock);
+-            Marker_markField(heap, stack, field);
++            Marker_markField(w, heap, field);
+         }
+     }
++#else
++    (void)w;
++    (void)heap;
++    (void)object;
+ #endif
+ }
+ 
+@@ -1790,7 +2241,8 @@ static void Evac_PinConservative(Heap *heap, word_t *address) {
+     }
+ }
+ 
+-void Marker_markConservative(Heap *heap, Stack *stack, word_t *address) {
++static void Marker_markConservative(MarkWorker *w, Heap *heap,
++                                    word_t *address) {
+     assert(Heap_IsWordInHeap(heap, address));
+     if (g_evacTrackingOn)
+         Evac_PinConservative(heap, address);
+@@ -1801,96 +2253,116 @@ void Marker_markConservative(Heap *heap, Stack *stack, word_t *address) {
+         if (dumpObj != NULL)
+             GraphDump_recordDiscovery(dumpObj);
+     }
+-    Bytemap *bytemap = heap->bytemap;
+     Object *object = Object_GetUnmarkedObject(heap, address);
+     if (object != NULL) {
+-        ObjectMeta *objectMeta = Bytemap_Get(bytemap, (word_t *)object);
++        ObjectMeta *objectMeta = Bytemap_Get(heap->bytemap, (word_t *)object);
+         if (ObjectMeta_IsAllocated(objectMeta)) {
+-            Marker_markObject(heap, stack, bytemap, object, objectMeta);
++            Marker_markObject(w, heap, object, objectMeta);
+         }
+     }
+ }
+ 
+-void Marker_Mark(Heap *heap, Stack *stack) {
+-    Bytemap *bytemap = heap->bytemap;
++static inline void Marker_scanRefs(MarkWorker *w, Heap *heap, word_t **fields,
++                                   size_t count) {
++    for (size_t i = 0; i < count; i++) {
++        Marker_markField(w, heap, fields[i]);
++    }
++}
++
+ #ifdef SCALINO_HEAP_HISTOGRAM
+-    int histogramOn = Histogram_enabled();
+-    if (histogramOn)
+-        Histogram_reset();
+-#endif // SCALINO_HEAP_HISTOGRAM
+-    int evacLogOn = EvacLog_enabled();
+-    // The real evacuation phase (Marker_Evacuate, runs after this function
+-    // returns, from Heap_Collect) needs the SAME per-block live-byte tally
+-    // regardless of whether the separate debug logger is on -- track it
+-    // whenever either is enabled, not just when logging is. Reset already
+-    // happened in Marker_MarkRoots (before root scanning, which can pin
+-    // objects before this function is ever called) -- do NOT reset again
+-    // here, that would wipe out pins already recorded during root scanning.
+-    int trackLiveBytes = g_evacTrackingOn;
+-    int graphDumpOn = graphDumpFile != NULL;
+-    while (!Stack_IsEmpty(stack)) {
+-        Object *object = Stack_Pop(stack);
+-        const int objectId = Object_Rtti(object)->rt.id;
++static int g_histogramOn = 0;
++#endif
++
++// Scans the fields of one marked object, marking what they reference.
++static void Marker_scanObject(MarkWorker *w, Heap *heap, Object *object) {
++    const int objectId = Object_Rtti(object)->rt.id;
+ #ifdef SCALINO_HEAP_HISTOGRAM
+-        if (histogramOn)
+-            Histogram_record(object);
++    if (g_histogramOn)
++        Histogram_record(object);
+ #endif // SCALINO_HEAP_HISTOGRAM
+-        if (graphDumpOn) {
+-            GraphDump_recordObject(object);
+-            graphDumpCurrentParent = object;
+-        }
+-        if (trackLiveBytes)
+-            EvacLog_recordLiveObject(heap, object);
+-        if (Object_IsArray(object)) {
+-            ArrayHeader *arrayHeader = (ArrayHeader *)object;
+-            if (objectId == __object_array_id) {
+-                const size_t length = arrayHeader->length;
+-                word_t **fields = (word_t **)Array_Values(arrayHeader);
+-                for (int i = 0; i < length; i++) {
+-                    Marker_markField(heap, stack, fields[i]);
+-                }
+-            } else if (objectId == __blob_array_id) {
+-                int8_t *start = (int8_t *)Array_Values(arrayHeader);
+-                size_t bytesLength = BlobArray_ScannableLimit(arrayHeader);
+-                size_t wordsLength =
+-                    (bytesLength + sizeof(word_t) - 1) / sizeof(word_t);
+-                int8_t *end = start + wordsLength * sizeof(word_t);
+-                Marker_markRange(heap, stack, (word_t **)start, (word_t **)end,
+-                                 sizeof(word_t));
++    if (graphDumpFile != NULL) {
++        GraphDump_recordObject(object);
++        graphDumpCurrentParent = object;
++    }
++    if (g_evacTrackingOn)
++        Marker_recordLive(w, heap, object);
++    w->marked++;
++    if (Object_IsArray(object)) {
++        ArrayHeader *arrayHeader = (ArrayHeader *)object;
++        if (objectId == __object_array_id) {
++            const size_t length = (size_t)arrayHeader->length;
++            word_t **fields = (word_t **)Array_Values(arrayHeader);
++            if (markWorkerCount > 1 && length >= 2 * MARK_RANGE_WORDS) {
++                // Scan the first window and the tail here, queue the full
++                // windows in between for any worker
++                size_t k = MARK_RANGE_WORDS;
++                for (; k + MARK_RANGE_WORDS <= length; k += MARK_RANGE_WORDS)
++                    MarkWorker_push(
++                        w, (word_t *)((word_t)(fields + k) | MARK_ENTRY_REFS));
++                Marker_scanRefs(w, heap, fields, MARK_RANGE_WORDS);
++                Marker_scanRefs(w, heap, fields + k, length - k);
++            } else {
++                Marker_scanRefs(w, heap, fields, length);
+             }
+-            // non-object arrays do not contain pointers
+-        } else {
+-            int32_t *refFieldOffsets = Object_Rtti(object)->refFieldOffsets;
+-            for (int i = 0; refFieldOffsets[i] != LAST_FIELD_OFFSET; i++) {
+-                size_t fieldOffset = (size_t)refFieldOffsets[i];
+-                Field_t *fieldRef = (Field_t *)((int8_t *)object + fieldOffset);
+-                if (Object_IsReferantOfWeakReference(object, fieldOffset))
+-                    continue;
+-                Marker_markField(heap, stack, *fieldRef);
++        } else if (objectId == __blob_array_id) {
++            word_t **words = (word_t **)Array_Values(arrayHeader);
++            size_t bytesLength = BlobArray_ScannableLimit(arrayHeader);
++            size_t wordsLength =
++                (bytesLength + sizeof(word_t) - 1) / sizeof(word_t);
++            if (markWorkerCount > 1 && wordsLength >= 2 * MARK_RANGE_WORDS) {
++                size_t k = MARK_RANGE_WORDS;
++                for (; k + MARK_RANGE_WORDS <= wordsLength;
++                     k += MARK_RANGE_WORDS)
++                    MarkWorker_push(
++                        w, (word_t *)((word_t)(words + k) | MARK_ENTRY_WORDS));
++                Marker_markRange(w, heap, words, words + MARK_RANGE_WORDS,
++                                 sizeof(word_t));
++                Marker_markRange(w, heap, words + k, words + wordsLength,
++                                 sizeof(word_t));
++            } else {
++                Marker_markRange(w, heap, words, words + wordsLength,
++                                 sizeof(word_t));
+             }
+-            if (objectId == __boxed_ptr_id) {
+-                // Boxed ptr always has a single field
+-                word_t *rawPtr = object->fields[0];
+-                if (Heap_IsWordInHeap(heap, rawPtr)) {
+-                    Marker_markConservative(heap, stack, rawPtr);
+-                }
++        }
++        // non-object arrays do not contain pointers
++    } else {
++        int32_t *refFieldOffsets = Object_Rtti(object)->refFieldOffsets;
++        for (int i = 0; refFieldOffsets[i] != LAST_FIELD_OFFSET; i++) {
++            size_t fieldOffset = (size_t)refFieldOffsets[i];
++            Field_t *fieldRef = (Field_t *)((int8_t *)object + fieldOffset);
++            if (Object_IsReferantOfWeakReference(object, fieldOffset))
++                continue;
++            Marker_markField(w, heap, *fieldRef);
++        }
++        if (objectId == __boxed_ptr_id) {
++            // Boxed ptr always has a single field
++            word_t *rawPtr = object->fields[0];
++            if (Heap_IsWordInHeap(heap, rawPtr)) {
++                Marker_markConservative(w, heap, rawPtr);
+             }
+         }
+     }
+-#ifdef SCALINO_HEAP_HISTOGRAM
+-    if (histogramOn)
+-        Histogram_dump(heap);
+-#endif // SCALINO_HEAP_HISTOGRAM
+-    if (graphDumpOn)
+-        GraphDump_end();
+-    if (evacLogOn) {
+-        static uint64_t evacLogCycle = 0;
+-        EvacLog_dump(heap, evacLogCycle);
+-        evacLogCycle++;
++}
++
++// Marks until this worker has no entry left anywhere it can reach
++static void Marker_drain(MarkWorker *w, Heap *heap) {
++    word_t *entry;
++    while ((entry = MarkWorker_pop(w)) != NULL) {
++        word_t tag = (word_t)entry & MARK_ENTRY_TAG_MASK;
++        if (LIKELY(tag == 0)) {
++            Marker_scanObject(w, heap, (Object *)entry);
++        } else {
++            word_t **window = (word_t **)((word_t)entry & ~MARK_ENTRY_TAG_MASK);
++            if (tag == MARK_ENTRY_REFS)
++                Marker_scanRefs(w, heap, window, MARK_RANGE_WORDS);
++            else
++                Marker_markRange(w, heap, window, window + MARK_RANGE_WORDS,
++                                 sizeof(word_t));
++        }
+     }
+ }
+ 
+-NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
++NO_SANITIZE static void Marker_markRange(MarkWorker *w, Heap *heap,
+                                          word_t **from, word_t **to,
+                                          const size_t stride) {
+     assert(from != NULL);
+@@ -1922,13 +2394,13 @@ NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
+             }
+         }
+         if (Heap_IsWordInHeap(heap, addr)) {
+-            Marker_markConservative(heap, stack, addr);
++            Marker_markConservative(w, heap, addr);
+         }
+     }
+ }
+ 
+-NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+-                                         Stack *stack) {
++NO_SANITIZE static void Marker_markProgramStack(MarkWorker *w, Heap *heap,
++                                                MutatorThread *thread) {
+     word_t **stackBottom = MutatorThread_getStackBottom(thread);
+     word_t **stackTop = NULL;
+     do {
+@@ -1959,7 +2431,7 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+             word_t **signalHandlerStack =
+                 (word_t **)thread->threadInfo->signalHandlerStack;
+             Marker_markRange(
+-                heap, stack, signalHandlerStack,
++                w, heap, signalHandlerStack,
+                 (word_t **)((char *)signalHandlerStack +
+                             thread->threadInfo->signalHandlerStackSize),
+                 sizeof(word_t));
+@@ -1970,7 +2442,7 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+     int nRanges = threadStackScanableRanges(stackTop, stackBottom,
+                                             thread->threadInfo, ranges);
+     for (int i = 0; i < nRanges; i++)
+-        Marker_markRange(heap, stack, (word_t **)ranges[i].from,
++        Marker_markRange(w, heap, (word_t **)ranges[i].from,
+                          (word_t **)ranges[i].to, sizeof(word_t));
+ 
+     // Mark registers buffer
+@@ -1981,31 +2453,175 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+ #else
+         sizeof(word_t);
+ #endif
+-    Marker_markRange(heap, stack, (word_t **)&thread->registersBuffer,
++    Marker_markRange(w, heap, (word_t **)&thread->registersBuffer,
+                      (word_t **)(&thread->registersBuffer + 1),
+                      registerBufferStride);
+ }
+ 
+-void Marker_markModules(Heap *heap, Stack *stack) {
+-    word_t **modules = &__modules;
+-    int nb_modules = __modules_size;
+-    Bytemap *bytemap = heap->bytemap;
+-    for (int i = 0; i < nb_modules; i++) {
+-        Object *object = (Object *)modules[i];
+-        Marker_markField(heap, stack, (Field_t)object);
++static void Marker_markModules(MarkWorker *w, Heap *heap, word_t **from,
++                               word_t **to) {
++    for (word_t **module = from; module < to; module++) {
++        Marker_markField(w, heap, (Field_t)*module);
+     }
+ }
+ 
+-void Marker_markCustomRoots(Heap *heap, Stack *stack, GC_Roots *roots) {
++static void Marker_markCustomRoots(MarkWorker *w, Heap *heap,
++                                   GC_Roots *roots) {
+     mutex_lock(&roots->modificationLock);
+     for (GC_Root *it = roots->head; it != NULL; it = it->next) {
+-        Marker_markRange(heap, stack, (word_t **)it->range.address_low,
++        Marker_markRange(w, heap, (word_t **)it->range.address_low,
+                          (word_t **)it->range.address_high, sizeof(word_t));
+     }
+     mutex_unlock(&roots->modificationLock);
+ }
+ 
++static void Marker_prepareWorkers(int count) {
++    if (count > markWorkerCapacity) {
++        size_t bytes = (size_t)count * MARK_WORKER_STRIDE + MARK_WORKER_STRIDE;
++        char *raw = (char *)malloc(bytes);
++        if (raw == NULL) {
++            GC_LOG_ERROR("Out of memory: cannot allocate mark workers");
++            abort();
++        }
++        char *base = (char *)(((uintptr_t)raw + MARK_WORKER_STRIDE - 1) &
++                              ~(uintptr_t)(MARK_WORKER_STRIDE - 1));
++        memset(base, 0, (size_t)count * MARK_WORKER_STRIDE);
++        if (markWorkersBase != NULL)
++            memcpy(base, markWorkersBase,
++                   (size_t)markWorkerCapacity * MARK_WORKER_STRIDE);
++        free(markWorkersRaw);
++        markWorkersRaw = raw;
++        markWorkersBase = base;
++        markWorkerCapacity = count;
++    }
++    for (int i = 0; i < count; i++) {
++        MarkWorker *w = MarkWorker_at(i);
++        if (!w->initialized) {
++            w->cur = MarkPool_takeEmpty();
++            w->spare = NULL;
++            w->empty = NULL;
++            Stack_Init(&w->weakRefs, 4096);
++            w->liveBytes = NULL;
++            w->liveBytesCapacity = 0;
++            w->initialized = true;
++        }
++        assert(w->cur->size == 0 && w->spare == NULL);
++        w->weakRefs.current = 0;
++        w->marked = 0;
++        if (!g_evacTrackingOn) {
++            w->liveBytesCapacity = 0;
++        } else if (i == 0) {
++            w->liveBytes = blockLiveBytes;
++            w->liveBytesCapacity = blockLiveBytesCapacity;
++        } else {
++            if (w->liveBytesCapacity < blockLiveBytesCapacity) {
++                uint32_t *grown = (uint32_t *)realloc(
++                    w->liveBytes,
++                    (size_t)blockLiveBytesCapacity * sizeof(uint32_t));
++                if (grown == NULL) {
++                    GC_LOG_ERROR("Out of memory: cannot allocate a live tally");
++                    abort();
++                }
++                w->liveBytes = grown;
++                w->liveBytesCapacity = blockLiveBytesCapacity;
++            }
++            memset(w->liveBytes, 0,
++                   (size_t)w->liveBytesCapacity * sizeof(uint32_t));
++        }
++    }
++}
++
++// Merges what the workers accumulated into the global state
++static void Marker_finishWorkers(int count, Heap *heap) {
++    uint64_t marked = 0;
++    for (int i = 0; i < count; i++) {
++        MarkWorker *w = MarkWorker_at(i);
++        assert(w->cur->size == 0 && w->spare == NULL);
++        while (!Stack_IsEmpty(&w->weakRefs))
++            Stack_Push(&weakRefStack, Stack_Pop(&w->weakRefs));
++        if (i > 0 && g_evacTrackingOn) {
++            uint32_t limit = heap->blockCount < w->liveBytesCapacity
++                                 ? heap->blockCount
++                                 : w->liveBytesCapacity;
++            for (uint32_t b = 0; b < limit; b++)
++                blockLiveBytes[b] += w->liveBytes[b];
++        }
++        marked += w->marked;
++    }
++    assert(markPoolFull == NULL);
++    assert(atomic_load(&markPoolFullCount) == 0);
++    GC_LOG_DEBUG("Marked %" PRIu64 " objects on %d threads", marked, count);
++}
++
++static void Marker_task(int id, int count, void *arg) {
++    (void)count;
++    Heap *heap = (Heap *)arg;
++    MarkWorker *w = MarkWorker_at(id);
++    for (;;) {
++        int t = atomic_fetch_add_explicit(&rootCursor, 1, memory_order_relaxed);
++        if (t >= rootTaskCount)
++            break;
++        RootTask *task = &rootTasks[t];
++        switch (task->kind) {
++        case root_stack:
++            Marker_markProgramStack(w, heap, (MutatorThread *)task->from);
++            break;
++        case root_modules:
++            Marker_markModules(w, heap, (word_t **)task->from,
++                               (word_t **)task->to);
++            break;
++        case root_custom:
++            Marker_markCustomRoots(w, heap, (GC_Roots *)task->from);
++            break;
++        }
++    }
++    for (;;) {
++        Marker_drain(w, heap);
++        atomic_fetch_sub_explicit(&markActive, 1, memory_order_seq_cst);
++        int spins = 0;
++        for (;;) {
++            if (atomic_load_explicit(&markPoolFullCount,
++                                     memory_order_acquire) > 0) {
++                atomic_fetch_add_explicit(&markActive, 1,
++                                          memory_order_seq_cst);
++                MarkChunk *chunk = MarkPool_takeFull();
++                if (chunk != NULL) {
++                    MarkWorker_switchTo(w, chunk);
++                    break;
++                }
++                atomic_fetch_sub_explicit(&markActive, 1,
++                                          memory_order_seq_cst);
++            }
++            if (atomic_load_explicit(&markActive, memory_order_seq_cst) == 0)
++                return;
++            if (++spins < 256) {
++                cpu_relax();
++            } else {
++                thread_yield();
++                spins = 0;
++            }
++        }
++    }
++}
++
++static int Marker_workerCount(Heap *heap) {
++    int max = GCWorkers_MaxCount();
++    if (max <= 1)
++        return 1;
++    bool debugHooks = graphDumpFile != NULL || EvacTrace_enabled();
++#ifdef SCALINO_HEAP_HISTOGRAM
++    debugHooks = debugHooks || Histogram_enabled();
++#endif
++    if (debugHooks)
++        return 1;
++    int byHeap = (int)(heap->blockCount / MARK_BLOCKS_PER_WORKER);
++    if (byHeap < 1)
++        byHeap = 1;
++    return byHeap < max ? byHeap : max;
++}
++
+ void Marker_MarkRoots(Heap *heap, Stack *stack) {
++    (void)stack; // the mark work lives in chunks now, see above
+     atomic_thread_fence(memory_order_seq_cst);
+ 
+     // Must run before ANY root scanning below (stack/module/custom-root
+@@ -2015,29 +2631,43 @@ void Marker_MarkRoots(Heap *heap, Stack *stack) {
+     // (file not yet open) or misattributed to a stale parent from the
+     // previous cycle.
+     GraphDump_begin();
++#ifdef SCALINO_HEAP_HISTOGRAM
++    g_histogramOn = Histogram_enabled();
++    if (g_histogramOn)
++        Histogram_reset();
++#endif // SCALINO_HEAP_HISTOGRAM
+ 
+-    // PINNING setup must happen HERE, before any root scanning, not inside
+-    // Marker_Mark below: conservative discovery of an object can happen
+-    // during program-stack/custom-root scanning (both conservative range
+-    // scans), which runs BEFORE Marker_Mark's own loop even starts. Setting
+-    // this later would silently miss every conservative root -- exactly
+-    // the case that produced a real, reproduced memory-corruption bug (see
+-    // "PINNING" in the Stage 2 section below) when this was originally
+-    // (incorrectly) gated inside Marker_Mark only.
++    // PINNING setup must happen HERE, before any root scanning: conservative
++    // discovery of an object can happen during program-stack/custom-root
++    // scanning (both conservative range scans). Setting this later would
++    // silently miss every conservative root -- exactly the case that
++    // produced a real, reproduced memory-corruption bug (see "PINNING" in
++    // the Stage 2 section above).
+     g_evacTrackingOn = EvacLog_enabled() || Evac_enabled();
+     if (g_evacTrackingOn) {
+         EvacLog_reset(heap->blockCount);
+         EvacPin_reset(heap->blockCount);
+     }
+ 
+-    MutatorThreadNode *head = mutatorThreads;
+-    MutatorThreads_foreach(mutatorThreads, node) {
+-        MutatorThread *thread = node->value;
+-        Marker_markProgramStack(thread, heap, stack);
++    int workers = GCWorkers_Prepare(Marker_workerCount(heap));
++    markWorkerCount = workers;
++    Marker_prepareWorkers(workers);
++    Marker_prepareRootTasks();
++    atomic_store_explicit(&markActive, workers, memory_order_seq_cst);
++    GCWorkers_Run(workers, Marker_task, heap);
++    Marker_finishWorkers(workers, heap);
++
++#ifdef SCALINO_HEAP_HISTOGRAM
++    if (g_histogramOn)
++        Histogram_dump(heap);
++#endif // SCALINO_HEAP_HISTOGRAM
++    if (graphDumpFile != NULL)
++        GraphDump_end();
++    if (EvacLog_enabled()) {
++        static uint64_t evacLogCycle = 0;
++        EvacLog_dump(heap, evacLogCycle);
++        evacLogCycle++;
+     }
+-    Marker_markModules(heap, stack);
+-    Marker_markCustomRoots(heap, stack, customRoots);
+-    Marker_Mark(heap, stack);
+ }
+ 
+ #endif
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
+index f2e006444..8f59ee9a9 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
++++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.h
+@@ -5,7 +5,6 @@
+ #include "immix_commix/datastructures/Stack.h"
+ 
+ void Marker_MarkRoots(Heap *heap, Stack *stack);
+-void Marker_Mark(Heap *heap, Stack *stack);
+ void Marker_Evacuate(Heap *heap, Stack *stack);
+ uint64_t Marker_LiveBytes(Heap *heap);
+ int Marker_EvacEnabled(void);

@@ -2556,3 +2556,86 @@ Not done: the ~50ms of opening and listing the NIR jars would need the listing o
 Scalino's `DirectCodeGen` did not know about it: `mangledName` gave every extern sig the bare C name, and it declares by mangled-name string (`globalsByName`, to merge overloaded externs), so the redirect wrapper and the native function it calls were one symbol, the call to the native function resolved to the wrapper, and the wrapper recursed until the stack was gone. CI at `d1aed8f` never finished (a bootstrap hang fixed by patch 0014), so nothing flagged it. `DirectCodeGen.mangledName` now excludes redirects, like `AbstractCodeGen.mangled`.
 
 How it was isolated, for the next time a binary built by the new toolchain misbehaves: the link finished and the program crashed when run (a leftover binary from an older toolchain had suggested otherwise); reversing patches one at a time and then all but 0014 left the crash in place, so it predated them; and `--native-direct-codegen=false` made it vanish.
+
+## Immix: the stop-the-world phases run on every core (patch 0030, 2026-11-14)
+
+Immix stops every mutator and then marked, swept and evacuated on the one thread that triggered the collection: a
+linkdriver with 8 Lower/codegen threads paused them all to do the whole collection alone. Commix is the concurrent
+collector and has different goals (it trades throughput for pause time); Immix stays stop-the-world, it just stops
+being single-threaded while the world is stopped. The one earlier attempt at this made collections slower, so the
+rule here was: no lock, atomic or shared write per object, and no thread woken for work it cannot amortize.
+
+**Workers** (`gc/immix/GCWorkers.c`). `GC_NPROCS` (the name commix uses) threads take part in a phase, the
+collecting mutator as worker 0 and the rest from a pool of plain pthreads created on first use, parked on a
+condition variable between phases and never registered as mutators (the synchronizer does not know them, they
+block every signal, they never allocate). Default `min(processors, 8)`. A phase is `GCWorkers_Prepare(n)` then
+`GCWorkers_Run(n, task, arg)`; the leader spins a little before blocking on the completion count. Each phase
+scales its thread count with the heap (marking: 1 per 32 blocks = 1MB, sweeping: 1 per 64) so a 4MB heap does not
+wake eight threads for a millisecond of work. `GC_NPROCS=1` and builds without multithreading run the same code
+inline, on the collecting thread.
+
+**Marking** (end of `Marker.c`). Mark bytes (ObjectMeta, LineMeta, BlockMeta) are written with plain stores, as
+commix does: marking is idempotent, two workers reaching one object at once both mark and scan it, which is harmless
+and rare (the allocated-check and the store are a few instructions apart). Work lives in chunks of 256 entries that
+form each worker's stack; the worker keeps one full chunk and one empty chunk besides the current one, and
+exchanges whole chunks with a shared list (a spinlock) only beyond that or when it runs dry, so the shared list
+costs one lock per hundreds of objects. The first version used separate `in` and `out` chunks and swapped them;
+that scans a just-discovered child up to 256 pops later instead of next, when its header is still in L1, and cost
+30% on one thread against the old stack. Popping and pushing at the top of one chunk (depth-first, as before)
+brought `GC_NPROCS=1` back to the old marker's time. Roots are tasks claimed through a counter: one per mutator
+stack, the module table in ranges of 2048, the custom roots. Arrays of 1024 references or more are scanned in
+windows of 512 queued as tagged entries (objects are 16-byte aligned, the low two bits are free: 1 = references,
+2 = words scanned conservatively), so one huge array does not serialize the phase. Termination: a worker leaves
+`markActive` only after its chunks are empty and a shared take returned nothing, and re-enters it before taking a
+shared chunk, so `markActive == 0` means no work exists anywhere. Per-worker weak-reference stacks and
+evacuation live-byte tallies are merged by the leader after the phase. The histogram, graph dump and evacuation
+trace use globals and force one worker.
+
+**Sweeping** (`Heap_Recycle`). The leader cuts the heap into batches of 16-512 blocks, moving a boundary that
+falls inside a superblock to the superblock's end (reading only the flags at the boundaries, so it is cheap), and
+workers claim batches through a counter. A batch records what it finds on its own: its blocks with free lines (an
+intrusive `BlockList`), its runs of free blocks (another `BlockList` of run starts, the run length in the first
+block's superblock-size field; `FreeRuns_Add` merges adjacent runs), its free-line count; free chunks of
+superblocks go to the worker's own large allocator. The leader then applies the batches in address order through
+the unchanged `BlockAllocator_AddFreeBlocks`, so free extents coalesce exactly as in the sequential sweep and the
+recycle pool gets the blocks in the same order; the workers' large-allocator free lists are appended to the
+recycle targets round-robin.
+
+**Evacuation.** The copy (per candidate block, each worker filling its own destination blocks), the root fixup
+(the root tasks again), the heap fixup (per block, superblocks handled where they start) and the unmark of the
+source blocks each run as a phase over ranges of 16 blocks. The one bug found by the stress test: a worker that
+had to grow the heap for a destination block took the block after growing without a lock, and the other workers'
+takes drained the new blocks first ("grew heap but still no free destination block"); growth and take now happen
+under the block allocator's recursive mutex, which `Heap_TryGrow` already uses.
+
+**Review.** An independent review of the concurrency found two issues, both fixed. After `fork()` the child's pool
+still held the parent's last dispatch, which a newly created pool thread could replay, decrementing a later run's
+completion count early. Pool threads now start from the generation recorded when the leader created them. (The
+first version of that fix read the generation when the thread first ran instead, which races with a dispatch made
+before the new thread is scheduled: the thread then sleeps through the run and marking never terminates. The
+stress test hung once in 15 runs on it, a collection that grew the pool from 4 to 8 threads.) And the sweep handed
+each worker's large free chunks to one thread, so with a single worker they all went to the collecting thread;
+they are dealt to the allocating threads one chunk at a time again, as before.
+
+**Measured** on the 10-core M2 Pro. Synthetic live set of 300MB of small objects (`gclive`), mark per collection:
+old 165ms, new with 1 thread 160-177ms, 2: 60ms, 4: 33ms, 8: 33ms; sweep 2.2 -> 0.6ms; the evacuation phases
+222 -> 59ms. The linkdriver linking the http4s ember server (cold, debug mode, 23 collections, 3 interleaved
+rounds): GC pause total 6.4-6.7s -> 2.5-2.7s, longest pause 755-911ms -> 270-418ms, link `Total` 12.5-14.0s ->
+9.0-9.5s (-30%). `GC_NPROCS=1` matches the old collector (6.1-8.1s pauses, same link time). Marking the
+linkdriver's heap scales less than the synthetic one and saturates early: 2 threads 3.5s of pauses, 4 to 10
+threads all 2.3-2.8s (two rounds each, within the noise). A compiler's heap is long chains (`List`,
+`UnrolledBuffer`) that only reveal the next object once the current one is scanned, so part of the work is a
+serial sequence of cache misses whatever the thread count; and the linkdriver's LLVM threads keep running
+native code (`@blocking`) through the pause, so GC threads beyond a few compete with them for the cores.
+
+**Correctness.** A stress program (6-8 mutator threads, `ConcurrentHashMap`, `IdentityHashMap`, bounded linked
+lists verified every 5000 steps, a 1M-slot reference array, 70KB byte arrays, `StringBuilder`, weak references)
+under `GC_INITIAL_HEAP_SIZE=1M`, with and without `SCALANATIVE_EVAC_ENABLE=1 SCALANATIVE_EVAC_POISON=1`, 2 to 8
+GC threads: 70 runs, every output identical to the single-threaded one; `SCALANATIVE_EVAC_VALIDATE_FILE` reports
+no stale reference after a parallel evacuation; `tests/escape-analysis/run.sh` passes; a
+`--native-multithreading=false` build runs the same collector inline.
+
+Not done: a prefetch queue in the marker (Cher/Garner: pop into a small FIFO, prefetch the header, scan on exit)
+would overlap the misses of those serial chains and help every thread count; evacuation's candidate scoring is
+still sequential (one pass over block metadata, cheap); Windows is only syntax-checked (`GCWorkers.c` uses
+`SRWLOCK`/`CONDITION_VARIABLE`); the default cap of 8 threads is a guess for bigger machines.
