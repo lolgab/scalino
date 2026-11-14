@@ -1,7 +1,7 @@
 // `scalino sysroot build <triple>`: assembles a cross-compilation sysroot on the
 // user's machine from upstream packages (scalino publishes none): musl (Debian
 // 13's musl-dev) and gnu (Debian 11's glibc), both with Debian 12's prebuilt
-// compiler-rt, all from .debs; apple (Darwin headers from Zig's source tarball +
+// compiler-rt (and zlib: Alpine's for musl, Debian 11's for gnu), from .debs and .apks; apple (Darwin headers from Zig's source tarball +
 // a generated libSystem stub) and windows (llvm-mingw's data dirs). Nothing is
 // compiled. Versions and checksums come from versions.env (via
 // BuildInfo.sysrootPins).
@@ -119,9 +119,11 @@ object SysrootBuild:
   def build(triple: String, force: Boolean): Path =
     if !Buildable.contains(triple) then die(s"sysroot build: unknown target '$triple', one of: ${Buildable.mkString(", ")}")
     val dest = Sysroot.cacheRoot.resolve(triple)
-    if Files.isDirectory(dest) && !force then
+    if Files.isDirectory(dest) && Sysroot.complete(triple, dest) && !force then
       println(s"sysroot $triple already installed at $dest (--force to rebuild)")
       return dest
+    if Files.isDirectory(dest) && !Sysroot.complete(triple, dest) then
+      println(s"sysroot $triple at $dest predates zlib support -- rebuilding it")
     Files.createDirectories(Sysroot.cacheRoot)
     val work = Files.createTempDirectory(Sysroot.cacheRoot, s".build-$triple-")
     try
@@ -153,6 +155,15 @@ object SysrootBuild:
     addLicense(out, dir.resolve("usr/share/doc/libclang-rt-14-dev/copyright"), "debian-libclang-rt-14-dev-copyright")
     ver
 
+  /** zlib's license, which is the notice at the top of zlib.h (the Alpine packages carry no separate file). */
+  private def addZlibLicense(out: Path, header: Path, work: Path): Unit =
+    val text = new String(Files.readAllBytes(header), UTF_8)
+    val end = text.indexOf("*/")
+    if end < 0 then die(s"sysroot build: no license notice at the top of $header")
+    val f = work.resolve("zlib-LICENSE")
+    Files.write(f, (text.substring(0, end).stripPrefix("/*").trim + "\n").getBytes(UTF_8))
+    addLicense(out, f, "zlib-LICENSE")
+
   // ---- musl ----------------------------------------------------------------
 
   private def buildMusl(triple: String, arch: String, work: Path, out: Path): Unit =
@@ -162,6 +173,8 @@ object SysrootBuild:
     unpackDeb(download(s"$snapshot/m/musl/$deb", deb, pin(s"MUSL_DEV_${debArch.toUpperCase}_SHA256")), out)
     val rtVer = installCompilerRt(arch, work, out)
     addLicense(out, out.resolve("usr/share/doc/musl-dev/copyright"), "debian-musl-dev-copyright")
+    // zlib (javalib's java.util.zip, `@link("z")`): musl has none. Alpine's static build, not Debian's, whose
+    // libz.a calls glibc's fortified functions (__snprintf_chk...). Installed after the flattening below.
     // Debian keeps musl in multiarch subdirs, which clang only searches for gnu
     // triples: flatten to usr/include and usr/lib.
     for sub <- List("usr/include", "usr/lib") do
@@ -171,12 +184,23 @@ object SysrootBuild:
         Files.delete(multiarch)
     // musl-gcc wrapper, docs: the link never reads them.
     for d <- List("usr/bin", "usr/share") do rm(out.resolve(d))
+    val zver = pin("ZLIB_ALPINE_VERSION")
+    val zex = Files.createDirectories(work.resolve("zlib-apk"))
+    for (pkg, k) <- List("zlib-dev" -> "DEV", "zlib-static" -> "STATIC") do
+      val apk = download(s"https://dl-cdn.alpinelinux.org/alpine/${pin("OPENSSL_ALPINE_BRANCH")}/main/$arch/$pkg-$zver.apk",
+        s"$pkg-$zver-$arch.apk", pin(s"ZLIB_ALPINE_${k}_${arch.toUpperCase}_SHA256"))
+      tar("-xzf", apk.toString, "-C", zex.toString)
+    // no libz.so: the link is static, and a shared library there would be preferred
+    for f <- List("include/zlib.h", "include/zconf.h", "lib/libz.a") do copy(zex.resolve("usr").resolve(f), out.resolve("usr").resolve(f))
+    addZlibLicense(out, out.resolve("usr/include/zlib.h"), work)
     writeReadme(out, triple,
       s"""Components (Debian 13 packages from snapshot.debian.org, files moved from the multiarch
          |directories to usr/include and usr/lib, otherwise unmodified):
          |  musl-dev $ver   musl libc (MIT; a few files under other permissive licences, see
          |                  debian-musl-dev-copyright), linked statically into binaries built against it.
          |                  Source: https://musl.libc.org, https://tracker.debian.org/pkg/musl
+         |zlib-dev, zlib-static $zver (Alpine ${pin("OPENSSL_ALPINE_BRANCH")})  zlib.h, zconf.h and libz.a built for musl (java.util.zip): zlib
+         |                  license, see zlib-LICENSE. Source: https://zlib.net, https://pkgs.alpinelinux.org/package/${pin("OPENSSL_ALPINE_BRANCH")}/main/$arch/zlib
          |libclang-rt-14-dev $rtVer  compiler-rt builtins and crtbegin/crtend (resource/): Apache-2.0 with LLVM
          |                  Exceptions, see debian-libclang-rt-14-dev-copyright. Source: https://github.com/llvm/llvm-project""".stripMargin)
 
@@ -195,6 +219,15 @@ object SysrootBuild:
     for (f, dir, sha) <- debs do unpackDeb(download(s"$dir/$f", f, sha), out)
 
     val rtVer = installCompilerRt(arch, work, out)
+
+    // zlib (javalib's java.util.zip, `@link("z")`): Debian 11's, whose libz.a calls the same glibc as libc6 above.
+    // Only the header and the static library, not the libz.so symlink: the binaries gain no runtime dependency.
+    val zver = pin("ZLIB_DEBIAN_VERSION")
+    val zdeb = s"zlib1g-dev_${zver}_$debArch.deb"
+    val zdir = work.resolve("deb-zlib")
+    unpackDeb(download(s"$base/z/zlib/$zdeb", zdeb, pin(s"ZLIB_DEBIAN_${key}_SHA256")), zdir)
+    for f <- List("usr/include/zlib.h", "usr/include/zconf.h", s"usr/lib/$arch-linux-gnu/libz.a") do copy(zdir.resolve(f), out.resolve(f))
+    addLicense(out, zdir.resolve("usr/share/doc/zlib1g-dev/copyright"), "debian-zlib1g-dev-copyright")
 
     // Debian's dev symlinks are absolute (/lib/...): make them relative so they
     // resolve inside the sysroot.
@@ -215,6 +248,8 @@ object SysrootBuild:
          |                                         licences, see debian-*-copyright). Binaries built against this
          |                                         link it dynamically.
          |  linux-libc-dev $linux Linux kernel UAPI headers, GPL-2.0 WITH Linux-syscall-note.
+         |  zlib1g-dev $zver  zlib.h, zconf.h and the static libz.a (java.util.zip), linked into binaries:
+         |                                         zlib license, see debian-zlib1g-dev-copyright.
          |Corresponding source, as the LGPL asks for (written offer; valid for as long as these are served):
          |  https://archive.debian.org/debian/pool/main/g/glibc/$dsc
          |  https://archive.debian.org/debian/pool/main/g/glibc/  (glibc_2.31.orig.tar.xz, glibc_$glibc.debian.tar.xz)

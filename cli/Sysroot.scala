@@ -43,8 +43,13 @@ object Sysroot:
   private def looksLikeSysroot(d: Path): Boolean =
     Files.isDirectory(d.resolve("usr")) || Files.isDirectory(d.resolve("generic-w64-mingw32"))
 
+  /** Whether an installed sysroot has everything this scalino links against. Linux ones built before zlib was added
+   *  (java.util.zip's `@link("z")`) lack `zlib.h`: such a sysroot is rebuilt by `SysrootBuild.build` instead of used. */
+  def complete(triple: String, d: Path): Boolean =
+    !triple.contains("linux") || Files.exists(d.resolve("usr/include/zlib.h"))
+
   def find(triple: String): Option[Path] =
-    roots.map(_.resolve(triple)).find(looksLikeSysroot)
+    roots.map(_.resolve(triple)).find(d => looksLikeSysroot(d) && complete(triple, d))
 
   /** `--native-sysroot <triple>=<dir>` entries for `triples`: what the user
    *  gave, else what's installed, else what `SysrootBuild` assembles on the

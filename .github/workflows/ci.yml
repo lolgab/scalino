@@ -467,6 +467,17 @@ jobs:
             echo "$t: $out"
             [[ "$out" == *"ello"* ]] || { echo "unexpected output from $t binary"; exit 1; }
           done
+          # java.util.zip needs zlib in the Linux sysroots (tests/cross/Zip.scala): Hello above never links it
+          ./dist/scalino package tests/cross/Zip.scala --native-mode release-fast \
+            --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu \
+            -o cross-out/zip
+          for t in musl gnu; do
+            out="$(cross-out/zip-x86_64-unknown-linux-$t)"
+            echo "$t: $out"
+            [[ "$out" == *"zip ok"* ]] || { echo "unexpected output from the $t zip binary"; exit 1; }
+          done
+          check zip-aarch64-unknown-linux-musl 'ELF 64-bit.*aarch64'
+          check zip-aarch64-unknown-linux-gnu  'ELF 64-bit.*aarch64'
 
   # scalino-lsp for Windows: needs the LSP's NIR (lsp job) and the scalino CLI that builds the mingw sysroots (dotc job).
   windows-lsp:
