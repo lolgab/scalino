@@ -801,13 +801,11 @@ object ScalinoCli:
 
   private def excludedArtifacts: List[String] =
     val v = BuildInfo.nativeBinaryVersion
+    // The `_2.13` runtime jars come in through `for3Use2_13` dependencies (e.g.
+    // `portable-scala-reflect_native0.5_2.13`); their C/C++ sources clash with ours just the same.
+    val runtimeLibs = List("nativelib", "javalib", "auxlib", "posixlib", "clib", "windowslib")
+    runtimeLibs.flatMap(lib => List(s"org.scala-native:${lib}_native${v}_3", s"org.scala-native:${lib}_native${v}_2.13")) :::
     List(
-      s"org.scala-native:nativelib_native${v}_3",
-      s"org.scala-native:javalib_native${v}_3",
-      s"org.scala-native:auxlib_native${v}_3",
-      s"org.scala-native:posixlib_native${v}_3",
-      s"org.scala-native:clib_native${v}_3",
-      s"org.scala-native:windowslib_native${v}_3",
       s"org.scala-native:scala3lib_native${v}_3",
       s"org.scala-native:scalalib_native${v}_2.13",
       "org.scala-lang:scala3-library_3",
@@ -832,7 +830,9 @@ object ScalinoCli:
           System.err.println(Color.warn(
             s"scalino: warning: ${deps.mkString(", ")} not covered by $LockFileName -- run `scalino lock` to update it"))
         Files.createDirectories(cacheDir)
-        val key = sanitizeKey(((if jsPlatform then List("platform=js") else Nil) ::: deps.sorted ::: repositories.sorted).mkString(","))
+        // The exclusion list is part of the key: a classpath cached under an older list is stale.
+        val platformKey = if jsPlatform then List("platform=js") else List(s"exclude=${hashKey(excludedArtifacts.mkString(","))}")
+        val key = sanitizeKey((platformKey ::: deps.sorted ::: repositories.sorted).mkString(","))
         val cacheFile = cacheDir.resolve(s"deps-$key.cp")
         val cached = Option.when(Files.exists(cacheFile))(readFile(cacheFile)).filter(cachedClasspathStillValid)
         cached.getOrElse {
@@ -1190,7 +1190,9 @@ object ScalinoCli:
     if deps.nonEmpty then
       try
         Files.createDirectories(cacheDir)
-        val key = sanitizeKey(((if jsPlatform then List("platform=js") else Nil) ::: deps.sorted ::: repositories.sorted).mkString(","))
+        // The exclusion list is part of the key: a classpath cached under an older list is stale.
+        val platformKey = if jsPlatform then List("platform=js") else List(s"exclude=${hashKey(excludedArtifacts.mkString(","))}")
+        val key = sanitizeKey((platformKey ::: deps.sorted ::: repositories.sorted).mkString(","))
         val marker = cacheDir.resolve(s"deps-$key.sources-fetched")
         if !offlineMode && !Files.exists(marker) then
           val cs = tool("scalino-cs")
