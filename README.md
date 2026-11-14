@@ -103,6 +103,7 @@ scalino run examples/ --main-class Hello                                    # a 
 scalino run examples/Hello.scala -w                                         # watch mode
 scalino test                                                                # munit/utest/scalatest/zio-test
 scalino package examples/Hello.scala -o hello && ./hello
+scalino package . --main-class Server,Worker -o bin/                        # one binary per main, each with its own link cache
 ```
 
 | command | does |

@@ -656,7 +656,8 @@ object ScalinoCli:
         directiveValues(line, "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
         directiveValues(line, "test.dep", "test.deps", "test.dependency", "test.dependencies").foreach(vs => testDeps = testDeps ++ vs)
         directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
-        directiveValues(line, "mainClass").foreach(_.headOption.foreach(v => mainClass = Some(v)))
+        // several (`//> using mainClass A B`): `scalino package` links one binary each
+        directiveValues(line, "mainClass").foreach(vs => if vs.nonEmpty then mainClass = Some(vs.mkString(",")))
         directiveValues(line, "options", "option", "scalacOption", "scalacOptions").foreach(vs => options = options ++ vs)
         directiveValues(line, "test.scalacOption", "test.scalacOptions").foreach(vs => testOptions = testOptions ++ vs)
         directiveValues(line, "testFramework", "test.framework").foreach(_.headOption.foreach(v => testFramework = Some(v)))
@@ -1348,8 +1349,12 @@ object ScalinoCli:
       candidates match
         case List(one) => one
         case Nil => fail("no entry point found (looked for a compiled `public static void main(String[])`) -- pass --main-class")
-        case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one")
+        case many => fail(s"multiple possible entry points found (${many.sorted.mkString(", ")}) -- pass --main-class to pick one (`package` takes several: --main-class ${many.sorted.mkString(",")})")
     }
+
+  /** `explicit` as given to `--main-class`/`//> using mainClass`, possibly a comma-separated list. */
+  def splitMainClasses(explicit: Option[String]): List[String] =
+    explicit.toList.flatMap(_.split(",")).map(_.trim).filter(_.nonEmpty).distinct
 
   // `scalino test`: bridges sbt's test-interface (`sbt.testing.Framework`, which munit, utest,
   // scalatest and zio-test's native ports implement) without a JVM, reflection or sbt/ComRunner.
@@ -1824,11 +1829,6 @@ object ScalinoCli:
   // (e.g. "lib/foo.jar") so dist/ stays relocatable -- resolve to absolute.
   def resolveCp(raw: String): String = raw.split(CP_SEP).map(e => s"$dist/$e").mkString(CP_SEP)
 
-  /** Compiles `sources`, detects the entry point from the compiled classfiles (or takes
-   *  `explicitMainClass`, see `detectMainClass`), links, and copies the binary to
-   *  `outFor(mainClass)`. Compilation targets one persistent mainClass-independent dir (the entry
-   *  point isn't known until compiled; `compileToClasses` is incremental); only linking, whose
-   *  C-object cache wants a stable path, is keyed by mainClass. Returns the resolved mainClass. */
   /** javaBase/pluginJar/compileCp for a scalino-dotc invocation, shared by `buildBinary` and
    *  `handleSetupIde` so the IDE type-checks against the same classpath/flags as a build.
    *  `nativelibsCp` is returned undropped since `buildBinary` needs it unmodified for linking. */
@@ -2296,7 +2296,35 @@ object ScalinoCli:
   def checkBinaryOutPath(out: Path): Unit =
     if Files.isDirectory(out) then fail(s"output path '$out' is a directory")
 
+  /** Compiles `sources`, detects the entry point from the compiled classfiles (or takes
+   *  `explicitMainClass`, see `detectMainClass`), links, and copies the binary to
+   *  `outFor(mainClass)`. Compilation targets one persistent mainClass-independent dir (the entry
+   *  point isn't known until compiled; `compileToClasses` is incremental); only linking, whose
+   *  C-object cache wants a stable path, is keyed by mainClass. Returns the resolved mainClass. */
   def buildBinary(
+    sources: List[Path],
+    explicitMainClass: Option[String],
+    extraClasspath: String,
+    outFor: String => Path,
+    extraOptions: List[String] = Nil,
+    extraCompileOnlyClasspath: String = "",
+    logLevel: String = "info",
+    incremental: Boolean = true,
+    nativeOpts: NativeOpts = NativeOpts(),
+    longRunning: Boolean = false,
+    excludeFromLink: Set[String] = Set.empty,
+    outForTriple: (String, String) => Path = (_, _) => Paths.get("unused")
+  ): String =
+    if splitMainClasses(explicitMainClass).size > 1 then
+      fail(s"several main classes given (${explicitMainClass.get}): only `scalino package` builds more than one binary")
+    buildBinaries(sources, explicitMainClass, extraClasspath, outFor, extraOptions, extraCompileOnlyClasspath, logLevel,
+      incremental, nativeOpts, longRunning, excludeFromLink, outForTriple).head
+
+  /** `buildBinary` for one or more main classes (`explicitMainClass` may be a comma-separated list):
+   *  one compile, then one scalino-linkdriver process links them all, each in its own
+   *  `.scalino-build/<mainClass>/link`, so switching between them or adding one keeps every
+   *  main class's incremental state. Returns the resolved main classes. */
+  def buildBinaries(
     sources: List[Path],
     explicitMainClass: Option[String],
     extraClasspath: String,
@@ -2311,19 +2339,24 @@ object ScalinoCli:
     // Where each cross target's binary goes; required when
     // `nativeOpts.targetTriples` is non-empty (`outFor` serves the host build).
     outForTriple: (String, String) => Path = (_, _) => Paths.get("unused")
-  ): String =
+  ): List[String] =
     val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental)
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
 
-    val mainClass = detectMainClass(compiledDir, explicitMainClass)
+    val mainClasses = splitMainClasses(explicitMainClass) match
+      case Nil => List(detectMainClass(compiledDir, None))
+      case some => some
     // Same check as handleRunOrCompile's, for the default name (no -o) that
     // is only known now -- still before the (slow) link step.
-    if nativeOpts.targetTriples.isEmpty then checkBinaryOutPath(outFor(mainClass))
-    else nativeOpts.targetTriples.foreach(t => checkBinaryOutPath(outForTriple(mainClass, t)))
-    val linkDir = Paths.get(".scalino-build").resolve(mainClass).resolve("link")
+    for mainClass <- mainClasses do
+      if nativeOpts.targetTriples.isEmpty then checkBinaryOutPath(outFor(mainClass))
+      else nativeOpts.targetTriples.foreach(t => checkBinaryOutPath(outForTriple(mainClass, t)))
+    def linkDirFor(mainClass: String): Path = Paths.get(".scalino-build").resolve(mainClass).resolve("link")
+    // `{main}`: scalino-linkdriver's placeholder for each main class's own work dir
+    val linkDirArg = if mainClasses.size == 1 then linkDirFor(mainClasses.head).toString else linkDirFor("{main}").toString
     val classesDir =
       if excludeFromLink.isEmpty then compiledDir
-      else filteredLinkClasses(compiledDir, Paths.get(".scalino-build").resolve(mainClass).resolve("link-classes"), excludeFromLink)
+      else filteredLinkClasses(compiledDir, Paths.get(".scalino-build").resolve(mainClasses.head).resolve("link-classes"), excludeFromLink)
 
     val linkCp =
       if extraClasspath.isEmpty then s"$classesDir$CP_SEP${cc.nativelibsCp}"
@@ -2356,11 +2389,11 @@ object ScalinoCli:
       nativeOpts.cppCompile.flatMap(v => List("--cpp-compile", v)) ++
       nativeOpts.prune.flatMap(v => List("--prune", v))
 
-    val linkCmd = List(s"$dist/scalino-linkdriver", linkCp, linkDir.toString, mainClass, clang, clangpp, logLevel) ++ nativeFlags
+    val linkCmd = List(s"$dist/scalino-linkdriver", linkCp, linkDirArg, mainClasses.mkString(","), clang, clangpp, logLevel) ++ nativeFlags
     val linkExit = if longRunning then linkIncremental(linkCmd) else runInherited(linkCmd)
     if linkExit != 0 then fail("linking failed")
 
-    def collect(dir: Path, out: Path): Unit =
+    def collect(mainClass: String, dir: Path, out: Path): Unit =
       val candidates = List(mainClass, mainClass.toLowerCase).flatMap(n => List(n, n + ".exe")).map(dir.resolve)
       val actual = candidates.find(Files.exists(_)).getOrElse(fail(s"expected linked binary at ${candidates.head}, not found"))
       Files.createDirectories(Option(out.getParent).getOrElse(Paths.get(".")))
@@ -2379,9 +2412,11 @@ object ScalinoCli:
       catch case e: BuildFailed =>
         Files.deleteIfExists(out)
         throw e
-    if nativeOpts.targetTriples.isEmpty then collect(linkDir, outFor(mainClass))
-    else nativeOpts.targetTriples.foreach(t => collect(linkDir.resolve(t), outForTriple(mainClass, t)))
-    mainClass
+    for mainClass <- mainClasses do
+      val linkDir = linkDirFor(mainClass)
+      if nativeOpts.targetTriples.isEmpty then collect(mainClass, linkDir, outFor(mainClass))
+      else nativeOpts.targetTriples.foreach(t => collect(mainClass, linkDir.resolve(t), outForTriple(mainClass, t)))
+    mainClasses
 
   // Scala.js: `//> using platform js` / `--js`. Same front half as a native build (directives,
   // dependency resolution with `_sjs1_3` artifacts, incremental compile), but dotc runs with
@@ -2624,6 +2659,7 @@ object ScalinoCli:
     val extraClasspath = (List(resolveJsDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
+    if splitMainClasses(explicitMainClass).size > 1 then fail(s"several main classes given (${explicitMainClass.get}): not supported for Scala.js")
     val options = directives.options ++ o.cliOptions
     val jsOpts = resolveJsOpts(directives, o)
     def link(progArgs: List[String]) = buildJs(expanded, progArgs, explicitMainClass, extraClasspath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts, o.watch)
@@ -2855,7 +2891,8 @@ object ScalinoCli:
     println(s"scalino ${BuildInfo.scalinoVersion} -- Scala ${BuildInfo.scalaVersion}, Scala Native ${BuildInfo.nativeVersion}, Scala.js ${BuildInfo.scalaJsVersion}")
 
   private def oMain: String =
-    s"""|  --main-class <name>        explicit entry point (skips auto-detection)
+    s"""|  --main-class <name>        explicit entry point (skips auto-detection); repeatable or
+       |                             comma-separated for `package`: one binary per main class
        |""".stripMargin
 
   private def oDeps: String =
@@ -3398,7 +3435,8 @@ object ScalinoCli:
       if inProgArgs then o = o.copy(progArgs = o.progArgs :+ args(i))
       else args(i) match
         case "--" => inProgArgs = true
-        case "--main-class" => o = o.copy(mainClassOpt = Some(args(i + 1))); i += 1
+        // repeatable, or comma-separated: `scalino package` links one binary per main class
+        case "--main-class" => o = o.copy(mainClassOpt = Some(o.mainClassOpt.fold(args(i + 1))(_ + "," + args(i + 1)))); i += 1
         case "-o" | "--output" => o = o.copy(out = Some(args(i + 1))); i += 1
         case "-w" | "--watch" => o = o.copy(watch = true)
         case "--watching" | "--watching-path" => o = o.copy(cliWatchingPaths = o.cliWatchingPaths :+ args(i + 1)); i += 1
@@ -3574,16 +3612,20 @@ object ScalinoCli:
         catch case e: java.io.IOException => fail(s"packaging failed: ${e.getMessage}")
         0
       case "package" =>
-        def outPathFor(mc: String): Path = Paths.get(o.out.getOrElse(mc.substring(mc.lastIndexOf('.') + 1)))
+        // Several main classes: one binary each, named after it, in `-o`'s directory (default: here).
+        val several = splitMainClasses(explicitMainClass).size > 1
+        def outPathFor(mc: String): Path =
+          val name = mc.substring(mc.lastIndexOf('.') + 1)
+          if several then Paths.get(o.out.getOrElse(".")).resolve(name) else Paths.get(o.out.getOrElse(name))
         // One cross target: -o as given. Several: `<out>-<triple>`.
         def outPathForTriple(mc: String, t: String): Path =
           val base = outPathFor(mc)
           val named = if nativeOpts.targetTriples.size == 1 then base else base.resolveSibling(s"${base.getFileName}-$t")
           // Windows binaries only run with .exe
           if t.contains("windows") && !named.getFileName.toString.endsWith(".exe") then named.resolveSibling(s"${named.getFileName}.exe") else named
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch, outForTriple = outPathForTriple)
-        val outPaths =
-          if nativeOpts.targetTriples.isEmpty then List(outPathFor(mainClass)) else nativeOpts.targetTriples.map(outPathForTriple(mainClass, _))
+        val mainClasses = buildBinaries(expanded, explicitMainClass, extraClasspath, outPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, nativeOpts, o.watch, outForTriple = outPathForTriple)
+        val outPaths = mainClasses.flatMap(mainClass =>
+          if nativeOpts.targetTriples.isEmpty then List(outPathFor(mainClass)) else nativeOpts.targetTriples.map(outPathForTriple(mainClass, _)))
         if !o.quiet then
           for outPath <- outPaths do
             val shown = if outPath.isAbsolute || outPath.startsWith("..") then outPath.toString else "./" + outPath
@@ -3654,9 +3696,12 @@ object ScalinoCli:
     if mode == "package" then
       val packagesOnly = o.formats.nonEmpty && o.formats != List("binary")
       o.out.map(Paths.get(_)).foreach { out =>
-        if packagesOnly then
+        // Several main classes make -o the directory their binaries go to. They can also come from
+        // `//> using mainClass`, not parsed yet: then a directory is left to buildBinaries' own check.
+        val severalMains = splitMainClasses(o.mainClassOpt).size > 1
+        if packagesOnly || severalMains then
           if Files.exists(out) && !Files.isDirectory(out) then die(s"output path '$out' is not a directory")
-        else if Files.isDirectory(out) then die(s"output path '$out' is a directory")
+        else if Files.isDirectory(out) && o.mainClassOpt.isDefined then die(s"output path '$out' is a directory")
       }
     o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
     val allExpanded = expandSources(o.sources)

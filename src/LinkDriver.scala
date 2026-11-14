@@ -72,8 +72,10 @@ object LinkDriver:
       |
       |arguments:
       |  classpath    NIR classes dirs and jars, separated by the OS path separator
-      |  workDir      directory for the build output and caches
-      |  mainClass    entry point, also the output binary's name
+      |  workDir      directory for the build output and caches; `{main}` in it is
+      |               replaced by the main class (required with several of them)
+      |  mainClass    entry point, also the output binary's name; several, separated
+      |               by commas, link one binary each in this one process
       |  clang        path to clang
       |  clang++      path to clang++
       |  log level    quiet, info (default) or verbose
@@ -166,8 +168,16 @@ object LinkDriver:
     // File.pathSeparator, not ":": a hardcoded ":" splits Windows paths at the drive letter
     // ("C:\..."), giving garbage entries and "Discovered 0 classes".
     val cp = args(0).split(java.io.File.pathSeparator).toSeq.map(s => Paths.get(s))
-    val workDir = Paths.get(args(1))
-    val mainClass = args(2)
+    // Several main classes share this process: one parse of the classpath's
+    // NIR, and in --long-running mode each keeps its own incremental Reach and
+    // Interflow (patches/scala-native-0029), each in its own work dir.
+    val mainClasses = args(2).split(",").toList.map(_.trim).filter(_.nonEmpty).distinct
+    if mainClasses.isEmpty then fail("no main class given")
+    if mainClasses.size > 1 && !args(1).contains("{main}") then
+      fail(s"several main classes need a work dir with `{main}` in it, got '${args(1)}'")
+    def workDirFor(mainClass: String): Path = Paths.get(args(1).replace("{main}", mainClass))
+    val workDir = workDirFor(mainClasses.head)
+    val mainClass = mainClasses.head
     val logLevel = if args.length > 5 then args(5) else "info"
     if !Set("quiet", "info", "verbose").contains(logLevel) then
       fail(s"unknown log level '$logLevel' (expected quiet, info or verbose); flags go after it")
@@ -301,7 +311,7 @@ object LinkDriver:
       val sysrootAbs = Paths.get(d).toAbsolutePath
       List(s"--sysroot=$sysrootAbs", "-stdlib=libc++", "--unwindlib=libunwind", "-static") ++ compilerRtFlags(sysrootAbs, targetDir)
 
-    def forTriple(t: String): Config =
+    def forTriple(config: Config, workDir: Path, t: String): Config =
       val withDir = config.withBaseDir(workDir.resolve(t))
       if isHostTarget(t) then withDir.withCompilerConfig(_.withTargetTriple(Some(t)))
       else
@@ -367,8 +377,19 @@ object LinkDriver:
             .withCppOptions(cDefines ++ cppFlags ++ opts.cppCompile)
             .withCOptions(cDefines ++ addonCompile ++ opts.cCompile ++ (if opts.heapHistogram then Seq("-DSCALINO_HEAP_HISTOGRAM") else Seq.empty))
         )
-    val configs: List[Config] =
-      if opts.targetTriples.isEmpty then List(config) else opts.targetTriples.distinct.map(forTriple)
+    val configs: List[Config] = mainClasses.flatMap { m =>
+      val dir = workDirFor(m)
+      val forMain =
+        if m == mainClass then config
+        else config.withBaseDir(dir).withModuleName(m).withMainClass(Some(m))
+      if opts.targetTriples.isEmpty then List(forMain) else opts.targetTriples.distinct.map(forTriple(forMain, dir, _))
+    }
+    // SCALINO_LOWER_CACHE keeps one slot per process (patches/scala-native-0029): with several main
+    // classes each link would drop the previous one's cache, all cost and no reuse. Set before any link.
+    if mainClasses.size > 1 then
+      if sys.env.get("SCALINO_LOWER_CACHE").exists(v => v.nonEmpty && v != "0") && logLevel != "quiet" then
+        System.err.println("scalino-linkdriver: SCALINO_LOWER_CACHE ignored, several main classes share this process")
+      System.setProperty("scalino.lowerCache", "0")
 
     if opts.longRunning then
       // Same protocol as scala-js-cli's `--longRunning` (scala-js-cli#64): one Scope and process

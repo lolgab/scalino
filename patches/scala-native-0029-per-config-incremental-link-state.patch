@@ -1,0 +1,91 @@
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala b/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala
+index 10b7e1cc1..1a4ccd046 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/LowerCache.scala
+@@ -66,7 +66,13 @@ private[scalanative] object LowerCache {
+   final val EnvName = "SCALINO_LOWER_CACHE"
+ 
+   /** 0 off, 1 on, 2 verify */
+-  val mode: Int = sys.env.get(EnvName) match {
++  /** Overrides `EnvName` when set (same values). scalino-linkdriver sets it to
++   *  0 when one process links several configs: this cache has a single slot,
++   *  so each config would drop the previous one's on every link.
++   */
++  final val PropName = "scalino.lowerCache"
++
++  val mode: Int = sys.props.get(PropName).orElse(sys.env.get(EnvName)) match {
+     case Some("verify")              => 2
+     case None | Some("") | Some("0") => 0
+     case Some(_)                     => 1
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+index bf1f11bb9..ba0eea3e6 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
+@@ -386,21 +386,24 @@ object Interflow {
+   /** Persisted across calls so scalino's `--long-running` LinkDriver
+    *  (patches/scala-native-0047/0048/0049) can hand an optimize pass the
+    *  SAME `Interflow` instance it built last time instead of a fresh one --
+-   *  see `Interflow.incrementalReprocess`. Process-global for the same
+-   *  reason `Link.previousReach` is: one scalino-linkdriver process links
+-   *  exactly one `mainClass`/config.
++   *  see `Interflow.incrementalReprocess`. Keyed by work dir like
++   *  `Link.previousReach`: each config's `Interflow` is paired with the
++   *  analysis of that config's `Reach` (`incrementalReprocess` compares
++   *  their `infos` by identity).
+    */
+-  private var previousInterflow: Option[Interflow] = None
++  private val previousInterflow =
++    mutable.HashMap.empty[java.nio.file.Path, Interflow]
+ 
+   def optimize(config: build.Config, analysis: ReachabilityAnalysis.Result)(
+       implicit ec: ExecutionContext
+   ): Future[Seq[nir.Defn]] = {
+     previousInterflow
++      .get(config.workDir)
+       .flatMap(_.incrementalReprocess(config, analysis))
+       .getOrElse {
+         val interflow = new Interflow(config)(analysis)
+         interflow.visitEntries()
+-        previousInterflow = Some(interflow)
++        previousInterflow(config.workDir) = interflow
+         interflow
+           .visitLoop()
+           .map(_ => interflow.result())
+diff --git a/tools/src/main/scala/scala/scalanative/linker/Link.scala b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+index e912ed59e..956016a11 100644
+--- a/tools/src/main/scala/scala/scalanative/linker/Link.scala
++++ b/tools/src/main/scala/scala/scalanative/linker/Link.scala
+@@ -11,10 +11,14 @@ object Link {
+    *  `Reach.incrementalReprocess`, which is the only thing that actually
+    *  reads this. A one-shot (non-long-running) process only ever calls
+    *  `apply` once, so this is dead weight for it, not a behavior change.
+-   *  Process-global like `ClassPath`'s own registry, for the same reason:
+-   *  one scalino-linkdriver process links exactly one `mainClass`/config.
++   *  Process-global like `ClassPath`'s own registry. One slot per work dir:
++   *  one scalino-linkdriver process may link several configs (one per main
++   *  class and target triple), and each keeps its own `Reach`, which only
++   *  ever diffs against its own snapshot (`rawLoaded`), so they never see
++   *  each other's changes.
+    */
+-  private var previousReach: Option[Reach] = None
++  private val previousReach =
++    scala.collection.mutable.HashMap.empty[java.nio.file.Path, Reach]
+ 
+   /** Load all clases and methods reachable from the entry points. */
+   def apply(config: build.Config, entries: collection.Seq[nir.Global])(implicit
+@@ -22,13 +26,14 @@ object Link {
+   ): ReachabilityAnalysis = {
+     val loader = ClassLoader.fromDisk(config)
+     previousReach
++      .get(config.workDir)
+       .flatMap(_.incrementalReprocess(config, entries, loader))
+       .getOrElse {
+         ReachHint.prefetch(config, loader)
+         val reach = new Reach(config, entries, loader)
+         reach.process()
+         reach.processDelayed()
+-        previousReach = Some(reach)
++        previousReach(config.workDir) = reach
+         val result = reach.result()
+         if (result.isSuccessful) ReachHint.save(config, reach.rawLoaded.keys)
+         result
