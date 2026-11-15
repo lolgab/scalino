@@ -322,6 +322,12 @@ jobs:
         shell: bash
         run: ./tests/native-compat/run.sh dist/scalino
 
+      - name: Smoke test -- javalib file descriptor leaks
+        # ZipFile constructors that throw, walkFileTree stopped early, and test discovery with a
+        # resource directory on the classpath must not leak descriptors. See tests/zip-fd/run.sh.
+        shell: bash
+        run: ./tests/zip-fd/run.sh dist/scalino
+
       - name: Smoke test -- real macro
         # Known-failing, not a regression: jsoniter-scala's derivation macro hits an open
         # interpreter gap (general quote-pattern matching; docs/findings.md "Remaining work" #1).
