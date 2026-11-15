@@ -2195,12 +2195,11 @@ object ScalinoCli:
       embedResources = directives.nativeEmbedResources.getOrElse(false) || o.cliEmbedResources,
       // Default-on, same opt-out shape as directCodegen above.
       multithreading = o.cliNativeMultithreading.orElse(directives.nativeMultithreading).getOrElse(true),
-      // Default-on except on Windows (DirectCodeGen.Capability.wholeBuildGatesOk gates it out:
-      // WindowsCompat is unported); `--native-direct-codegen=false` or the directive wins over the
-      // OS default. The OS is the target's with `--native-target-triple`, else the host's.
+      // Default-on everywhere, Windows (gnu ABI) included; `--native-direct-codegen=false` or the
+      // directive opts out.
       directCodegen = o.cliNativeDirectCodegen
         .orElse(directives.nativeDirectCodegen)
-        .getOrElse(!windowsTarget),
+        .getOrElse(true),
       // Default-on everywhere except Windows (untested there), with an explicit
       // opt-out via the directive or `--native-compact-headers=false`. Only
       // takes effect for 64-bit targets linked with the immix GC (see

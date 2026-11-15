@@ -1,0 +1,131 @@
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+index 4949b6dc4..ddc3931fb 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+@@ -191,13 +191,19 @@ private[codegen] object DirectCodeGen {
+      */
+     def wholeBuildGatesOk(config: build.Config, platform: PlatformInfo): Boolean =
+       platform.useOpaquePointers &&
+-        !platform.targetsWindows
++        (!platform.targetsWindows || targetsWindowsGnu(config))
++
++    // The MinGW (gnu) ABI only: it is WindowsGnuCompat's shape of exception handling, ported in
++    // DirectCodeGen (C++ landingpad, __gxx_personality_seh0, dllexport). The MSVC ABI (WindowsCompat's
++    // catchswitch/cleanuppad funclets) stays on the textual backend.
++    private def targetsWindowsGnu(config: build.Config): Boolean =
++      config.compilerConfig.configuredOrDetectedTriple.env.startsWith("gnu")
+       // Phase 3 lifted the three build-wide gates that used to live here:
+       // multithreading (GC yield-point traps, see genOp's GCYield special
+       // case + globalValueFor's thread-local handling), debug info (see
+       // `debugInfo`/DIBuilder below), and C++ exceptions (see
+-      // buildLandingPad's usingCppExceptions branch). Windows stays
+-      // permanently out of scope (WindowsCompat/WindowsGnuCompat unported).
++      // buildLandingPad's usingCppExceptions branch). Windows (gnu ABI) was
++      // lifted afterwards, see targetsWindowsGnu.
+ 
+     /** Per-definition capability check -- this is what makes the backend
+      *  cover real programs: one method using an unsupported feature no
+@@ -309,14 +315,21 @@ private[direct] final class DirectCodeGen(
+   // against the scalanative.ExceptionWrapper RTTI). All declared directly by
+   // hardcoded name, bypassing `env`/`globalValueFor`, exactly like
+   // UnixCompat.genPrelude does.
+-  private val usingCppExceptions = config.usingCppExceptions
++  // Windows (gnu) always catches scalanative.ExceptionWrapper like the C++ interop shape, whatever
++  // config.usingCppExceptions says: WindowsGnuCompat has no ScalaNative catch-all landingpad.
++  private val usingCppExceptions = config.usingCppExceptions || platform.targetsWindows
+   private lazy val excRecTy: LLVMTypeRef =
+     llvmType(nir.Type.StructValue(Seq(nir.Type.Ptr, nir.Type.Int)))
+   private lazy val personalityFn: LLVMValueRef = {
+     val fnTy = Zone.acquire { implicit z =>
+       C.LLVMFunctionType(llvmType(nir.Type.Int), alloc[LLVMTypeRef](0), 0.toUInt, 1)
+     }
+-    val name = if (usingCppExceptions) "__gxx_personality_v0" else "scalanative_personality"
++    val name =
++      if (platform.targetsWindows) {
++        // WindowsGnuCompat.osPersonalityType
++        if (config.compilerConfig.is32BitPlatform) "__gxx_personality_v0" else "__gxx_personality_seh0"
++      } else if (usingCppExceptions) "__gxx_personality_v0"
++      else "scalanative_personality"
+     Zone.acquire(implicit z => C.LLVMAddFunction(module, toCString(name), fnTy))
+   }
+   private lazy val scalanativeCatchFnTy: LLVMTypeRef =
+@@ -891,6 +904,11 @@ private[direct] final class DirectCodeGen(
+     // contains an invoke) -- LLVM allows a personality on a function with no
+     // landingpads at all.
+     C.LLVMSetPersonalityFn(fn, personalityFn)
++    // Same as AbstractCodeGen.genFunctionDefn: only extern (C ABI) signatures are exported from a DLL/exe
++    if (platform.targetsWindows && defn.attrs.isExtern) {
++      val nir.Global.Member(_, sig) = defn.name: @unchecked
++      if (sig.isExtern) C.LLVMSetDLLStorageClass(fn, LLVMDLLExportStorageClass)
++    }
+     val diScope: LLVMMetadataRef =
+       if (debugInfoEnabled) {
+         val sp = diSubprogramFor(defn, mangledName(defn.name))
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
+index c122cbd2a..666d68c38 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGenDispatch.scala
+@@ -6,6 +6,8 @@ package direct
+ import java.nio.file.Path
+ 
+ import scala.scalanative.build
++import scala.scalanative.unsafe._
++import scala.scalanative.unsigned._
+ 
+ // Native-hosted `tools` build: the real dispatch. See tools/jvm's
+ // counterpart (same relative path/object name, picked per-platform exactly
+@@ -13,6 +15,12 @@ import scala.scalanative.build
+ private[codegen] object DirectCodeGenDispatch {
+   private val warnedUnavailable = new java.util.concurrent.atomic.AtomicBoolean(false)
+ 
++  private def linkedLLVMMajorVersion(): Int = Zone.acquire { implicit z =>
++    val v = alloc[CUnsignedInt](3)
++    LLVMCApi.Core.LLVMGetVersion(v, v + 1, v + 2)
++    (!v).toInt
++  }
++
+   /** Cheap, synchronous classification -- see DirectCodeGen.plan's own doc
+    *  comment for why CodeGen.scala needs this decided before scheduling any
+    *  Future work.
+@@ -21,14 +29,16 @@ private[codegen] object DirectCodeGenDispatch {
+       platform: PlatformInfo
+   ): DirectCodeGenPlan = {
+     val minVersion = build.Discover.MinimumSupportedLLVMDirectCodeGenVersion
+-    build.Discover.discoverLibLLVM()(config.compilerConfig) match {
+-      case Some(info) if info.majorVersion >= minVersion =>
++    // The LLVM this binary linked, not whatever llvm-config is on the PATH: the codegen calls into
++    // the former, and a Windows host has no llvm-config at all.
++    linkedLLVMMajorVersion() match {
++      case major if major >= minVersion =>
+         DirectCodeGen.plan(config, defns)
+       case _ =>
+         if (warnedUnavailable.compareAndSet(false, true)) {
+           config.logger.warn(
+             s"useLLVMDirectCodeGen requested but no compatible libLLVM " +
+-              s"(via llvm-config, >= $minVersion) was discoverable; " +
++              s"(>= $minVersion) was linked into this binary; " +
+               "falling back to .ll + clang for the whole build."
+           )
+         }
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
+index 20193064c..4469f8cb0 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
+@@ -76,6 +76,8 @@ private[direct] object LLVMCApi {
+   final val LLVMExternalLinkage = 0
+   final val LLVMAppendingLinkage = 7
+   final val LLVMPrivateLinkage = 9
++  // llvm-c/Core.h's LLVMDLLStorageClass: Default=0, DLLImport=1, DLLExport=2
++  final val LLVMDLLExportStorageClass = 2
+ 
+   // llvm-c/Core.h: LLVMVisibility
+   final val LLVMDefaultVisibility = 0
+@@ -210,6 +212,8 @@ private[direct] object LLVMCApi {
+       extern
+     def LLVMSetLinkage(global: LLVMValueRef, linkage: CInt): Unit = extern
+     def LLVMSetVisibility(global: LLVMValueRef, visibility: CInt): Unit = extern
++    def LLVMSetDLLStorageClass(global: LLVMValueRef, cls: CInt): Unit = extern
++    def LLVMGetVersion(major: Ptr[CUnsignedInt], minor: Ptr[CUnsignedInt], patch: Ptr[CUnsignedInt]): Unit = extern
+     def LLVMAddFunction(
+         m: LLVMModuleRef,
+         name: CString,

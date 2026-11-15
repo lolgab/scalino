@@ -35,7 +35,7 @@ object LinkDriver:
     // Defaults here must match cli/ScalinoCli.scala's NativeOpts: a flag the
     // CLI turns on by default must not need passing to scalino-linkdriver.
     multithreading: Boolean = true,
-    // None: on, except when targeting Windows (see `windowsTarget`)
+    // None: on
     directCodegen: Option[Boolean] = None,
     // None: on, except when targeting Windows (see `windowsTarget`)
     compactHeaders: Option[Boolean] = None,
@@ -56,8 +56,8 @@ object LinkDriver:
   )
 
   /** Windows is gated on the target when cross-compiling, else on the host
-   *  (same rule as cli/ScalinoCli.scala's resolveNativeOpts). Direct codegen
-   *  and compact headers default off there. */
+   *  (same rule as cli/ScalinoCli.scala's resolveNativeOpts). Compact headers
+   *  default off there. */
   def windowsTarget(o: Opts): Boolean =
     if o.targetTriples.nonEmpty then o.targetTriples.exists(t => t.contains("windows") || t.contains("mingw"))
     else sys.props.getOrElse("os.name", "").toLowerCase.startsWith("windows")
@@ -125,7 +125,7 @@ object LinkDriver:
       |  --target-triple <triple>      (repeatable) cross-compile
       |  --sysroot <triple>=<dir>      --lib-addon <triple>=<dir>      --ld-path <path>
       |  --[no-]multithreading         default: on
-      |  --[no-]direct-codegen         default: on (off when targeting Windows)
+      |  --[no-]direct-codegen         default: on
       |  --[no-]compact-headers        default: on (off when targeting Windows)
       |  --[no-]compact-byte-arrays    default: on unless a layout-dependent library is on the classpath
       |  --[no-]incremental-compilation  default: on
@@ -271,7 +271,7 @@ object LinkDriver:
           .withBuildTarget(target)
           .withEmbedResources(opts.embedResources)
           .withMultithreading(if opts.multithreading then Some(true) else None)
-          .withLLVMDirectCodeGen(opts.directCodegen.getOrElse(!windowsTarget(opts)))
+          .withLLVMDirectCodeGen(opts.directCodegen.getOrElse(true))
           .withCompactHeaders(opts.compactHeaders.getOrElse(!windowsTarget(opts)))
           .withCompactByteArrays(compactByteArrays)
           .withGCStwSweep(opts.gcStwSweep)
