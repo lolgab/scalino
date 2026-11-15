@@ -1,0 +1,51 @@
+diff --git a/javalib/src/main/scala/java/util/zip/ZipFile.scala b/javalib/src/main/scala/java/util/zip/ZipFile.scala
+index 794013872..be2c60982 100644
+--- a/javalib/src/main/scala/java/util/zip/ZipFile.scala
++++ b/javalib/src/main/scala/java/util/zip/ZipFile.scala
+@@ -69,7 +69,19 @@ class ZipFile(file: File, mode: Int, charset: Charset) extends Closeable {
+ 
+   private val mEntries = new ju.LinkedHashMap[String, ZipEntry](64)
+ 
+-  readCentralDir()
++  /* A constructor that throws gives the caller no ZipFile to close(), so the
++   * RandomAccessFile opened above would stay open until (if ever) finalize()
++   * runs. Opening a directory or a non-zip file once per class looked up on a
++   * classpath used to exhaust the process's file descriptors.
++   */
++  try readCentralDir()
++  catch {
++    case t: Throwable =>
++      try mRaf.close()
++      catch { case _: Throwable => () }
++      mRaf = null
++      throw t
++  }
+ 
+   override protected def finalize(): Unit =
+     close()
+diff --git a/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala b/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala
+index ebaa7b452..55355c86c 100644
+--- a/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala
++++ b/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala
+@@ -320,8 +320,8 @@ private final class WalkContext(
+           hasNextImpl()
+ 
+         case FileVisitResult.TERMINATE =>
+-          walkContextHasNext = false
+-          walkContextHasNext
++          close() // the directory streams of the levels still open
++          false
+       }
+     }
+ 
+@@ -522,7 +522,9 @@ private final class FileTreeWalker(
+   def walk(): Unit = {
+     val spliter = this.spliterator()
+ 
+-    while (spliter.tryAdvance(p => ())) {} // loop to invoke side effects
++    // loop to invoke side effects; a throwing visitor must not leave directory streams open
++    try while (spliter.tryAdvance(p => ())) {}
++    finally close()
+   }
+ 
+   /* Porcelain Support methods

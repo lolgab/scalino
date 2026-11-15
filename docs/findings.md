@@ -2671,3 +2671,10 @@ hardware prefetcher already follows, and a chain (`List`) only reveals the next 
 is scanned, which no software prefetch can shorten. The gain is for heaps whose references no longer follow
 memory order: long-running processes (watch mode, the LSP), anything after an evacuation. Stress loop (60 runs,
 1-8 GC threads, evacuation and poison) and the evacuation validator stay clean.
+
+## javalib file-descriptor leaks (patch 0035, 2026-11-15)
+
+- `java.util.zip.ZipFile`'s constructor opened a `RandomAccessFile` and then read the central directory; when that threw (a directory, a file that is not a zip) nobody held a `ZipFile` to `close()`, so the descriptor stayed open until a finalizer that never ran in time. `ScalinoCli.readClassFromJar` did this once per class looked up on a classpath that has a resource directory: ~450 tests reached ~10,235 open descriptors, past macOS `OPEN_MAX` (10240), and every later `posix_spawn` failed with `Could not adddup2 pipe file descriptor 0 [res=9, errno=9]` (`posix_spawn_file_actions_adddup2` rejects descriptors >= `OPEN_MAX`). 0.0.30 and 0.0.31 have it; f332aed worked around it in the CLI. Patch 0035 closes the file when the constructor throws.
+- `Files.walkFileTree` leaked the directory streams of the levels still open when a visitor returned `TERMINATE` (`WalkContext.hasNext` only flipped a flag) or threw. `FileTreeWalker.walk()` now closes the context in a `finally`, and `TERMINATE` closes it. Not what broke the test run.
+- `Files.walk`/`Files.list` hand back a stream whose `onClose` closes the directory: stopping iteration early without closing the stream leaks, exactly as on the JDK, so that is left alone.
+- `tests/zip-fd/run.sh`: 40,000 failed `ZipFile` constructors and 22,000 aborted `walkFileTree` calls must leave `/dev/fd` unchanged and a spawn must work; `tests/zip-fd/discovery.sh` runs `scalino test` with 400 test classes and a resource directory under `ulimit -n 300`.
