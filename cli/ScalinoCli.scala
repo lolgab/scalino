@@ -1496,12 +1496,17 @@ object ScalinoCli:
     entries.flatMap(f => if f.isDirectory then walkClassFiles(f.toPath) else if f.getName.endsWith(".class") then List(f.toPath) else Nil)
 
   def readClassFromJar(jarPath: String, internalDottedName: String): Option[Array[Byte]] =
-    try
-      val zf = new java.util.zip.ZipFile(jarPath)
+    // Resource directories are on the classpath too. Opening one as a zip fails, and javalib's ZipFile
+    // leaks the descriptor it opened: one per class looked up, until spawning clang fails with EBADF
+    // (macOS rejects descriptors past OPEN_MAX in posix_spawn_file_actions_adddup2).
+    if !new java.io.File(jarPath).isFile then None
+    else
       try
-        Option(zf.getEntry(internalDottedName.replace('.', '/') + ".class")).map(e => readAllBytes(zf.getInputStream(e)))
-      finally zf.close()
-    catch case _: Exception => None
+        val zf = new java.util.zip.ZipFile(jarPath)
+        try
+          Option(zf.getEntry(internalDottedName.replace('.', '/') + ".class")).map(e => readAllBytes(zf.getInputStream(e)))
+        finally zf.close()
+      catch case _: Exception => None
 
   /** NIR equivalent of `analyzeClassFile`: the same `ClassInfo`, from a `Defn.Class`/`Defn.Module`'s
    *  `parent`/`traits` fields plus a same-file scan for a public no-arg constructor (`isCtor`,
