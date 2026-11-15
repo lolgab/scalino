@@ -82,8 +82,9 @@ if wants linkdriver; then
       mv "$file.part" "$file"
     fi
     echo "$3  $file" | shasum -a 256 -c - >&2
-    # only the static archives: a .dll.a import library next to them would win a -l lookup
-    tar -tf "$file" | grep -E "^$MSYS2_ENV/(lib/lib($1|LLVM).*[^.]\.a|lib/libzstd\.a|share/licenses/.*)$" | grep -v '\.dll\.a$' > "$file.members" || true
+    # only the static archives: a .dll.a import library next to them would win a -l lookup;
+    # no directory entries either, GNU tar would then report the files below them as not found
+    tar -tf "$file" | grep -E "^$MSYS2_ENV/(lib/lib($1|LLVM).*[^.]\.a|lib/libzstd\.a|share/licenses/.*)$" | grep -v -e '\.dll\.a$' -e '/$' > "$file.members" || true
     tar -xf "$file" -C "$MSYS2_DIR" -T "$file.members"
   }
   v="LLVM_MSYS2_${ARCH_UC}_SHA256"; msys2_fetch llvm "$LLVM_MSYS2_VERSION" "${!v}"
