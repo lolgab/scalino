@@ -53,6 +53,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Add swap and log memory/disk (Linux)
+        # The linux-x86_64 leg's runner was killed ("received a shutdown signal") three times
+        # in a row right at the final native link. Swap absorbs a memory spike there; the
+        # background log shows what the runner was doing when it died.
+        if: startsWith(matrix.target, 'linux')
+        shell: bash
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=12288
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -m; df -h / /mnt
+          nohup ./build/ci-memlog.sh >&2 &
+
       - uses: ./.github/actions/setup-build-deps
 
       - name: Build toolchain
