@@ -8,15 +8,16 @@ import java.net.{ConnectException, InetAddress, InetSocketAddress, ServerSocket,
   val server = new ServerSocket(0, 50, lo)
   val port = server.getLocalPort()
   var serverError: Throwable = null
-  val serverThread = new Thread(() =>
-    try
-      val peer = server.accept()
+  val serverThread = new Thread(new Runnable:
+    def run(): Unit =
       try
-        peer.getOutputStream().write("hello".getBytes("UTF-8"))
-        peer.getOutputStream().flush()
-        peer.getInputStream().read() // hold the connection until the client has read
-      finally peer.close()
-    catch case e: Throwable => serverError = e
+        val peer = server.accept()
+        try
+          peer.getOutputStream().write("hello".getBytes("UTF-8"))
+          peer.getOutputStream().flush()
+          peer.getInputStream().read() // hold the connection until the client has read
+        finally peer.close()
+      catch case e: Throwable => serverError = e
   )
   serverThread.start()
 
