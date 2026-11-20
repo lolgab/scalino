@@ -1,0 +1,70 @@
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+index ddc3931..0249b8c 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
+@@ -1418,6 +1418,39 @@ private[direct] final class DirectCodeGen(
+     }
+   }
+ 
++  // The `"frame-pointer"` attribute clang would set from the compile options:
++  // they reach clang for the C runtime and `.ll` partitions after its default
++  // `-fomit-frame-pointer` (LLVM.compileFile), so `--compile
++  // -fno-omit-frame-pointer` (scalino: `--native-compile`) keeps frame pointers
++  // in the whole program, e.g. for frame-pointer based profilers. The last
++  // flag wins, as in clang; without any, nothing is set (omitted).
++  private lazy val framePointerMode: Option[String] = {
++    var keep: Option[Boolean] = None
++    var omitLeaf = false
++    config.compilerConfig.compileOptions.foreach {
++      case "-fno-omit-frame-pointer"     => keep = Some(true)
++      case "-fomit-frame-pointer"        => keep = Some(false)
++      case "-momit-leaf-frame-pointer"   => omitLeaf = true
++      case "-mno-omit-leaf-frame-pointer" => omitLeaf = false
++      case _                             => ()
++    }
++    keep.collect { case true => if (omitLeaf) "non-leaf" else "all" }
++  }
++
++  private def markFunctionsFramePointer(mode: String): Unit = {
++    val ctx = C.LLVMGetModuleContext(module)
++    val attr = Zone.acquire { implicit z =>
++      val k = "frame-pointer"
++      C.LLVMCreateStringAttribute(ctx, toCString(k), k.length.toUInt, toCString(mode), mode.length.toUInt)
++    }
++    var fn = C.LLVMGetFirstFunction(module)
++    while (fn != null) {
++      if (C.LLVMIsDeclaration(fn) == 0)
++        C.LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, attr)
++      fn = C.LLVMGetNextFunction(fn)
++    }
++  }
++
+   private def emitObjectFile(objPath: Path): Unit = {
+     DirectCodeGen.ensureTargetsInitialized()
+ 
+@@ -1464,6 +1497,7 @@ private[direct] final class DirectCodeGen(
+         // already-loaded object field 2-3 times over compiled to exactly
+         // that many redundant loads instead of being collapsed to one.
+         if (config.mode == build.Mode.ReleaseSize) markFunctionsForSize()
++        framePointerMode.foreach(markFunctionsFramePointer)
+         val passOptions = P.LLVMCreatePassBuilderOptions()
+         try {
+           val err = P.LLVMRunPasses(module, toCString(passPipelineFor(config.mode)), tm, passOptions)
+diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
+index 4469f8c..4d6bccb 100644
+--- a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
++++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
+@@ -230,6 +230,13 @@ private[direct] object LLVMCApi {
+         kindId: CUnsignedInt,
+         value: CUnsignedLongLong
+     ): LLVMAttributeRef = extern
++    def LLVMCreateStringAttribute(
++        ctx: LLVMContextRef,
++        k: CString,
++        kLength: CUnsignedInt,
++        v: CString,
++        vLength: CUnsignedInt
++    ): LLVMAttributeRef = extern
+     def LLVMAddAttributeAtIndex(
+         fn: LLVMValueRef,
+         idx: CUnsignedInt,

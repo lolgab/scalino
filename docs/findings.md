@@ -2738,3 +2738,32 @@ Step 2 of `docs/ideas/02-compile-perf-gap.md`. A profile of `scalino-dotc` compi
 The output tree (86 `.tasty`, 884 `.nir`, 424 `.class`) is byte-identical. In the new binary's profile `loadModule` and the check are gone, and `_tlv_get_addr` fell from 3.6% to 1.1%. The gain is below the 17% sample share because the inlined code still costs something. Also, the committed PGO profile no longer matches the changed functions: the new link reported 9177 "hash mismatch" warnings vs 7163, covering every recursive method and module accessor. Refreshing `pgo/` should recover part of that. Microbenchmarks (`tests/runtime-fastpaths/`): 400M module accesses 1008 -> 390ms release-fast (8.5 -> 2.1s debug); `fib(30)`x20 124 -> 78ms release-fast (229 -> 163ms debug).
 
 Tests: `tests/runtime-fastpaths/run.sh` (module-init race, failing ctor, cyclic init, overflow on the main thread / inside `synchronized` / on 8 threads at once; debug, release-fast, compact headers off). `tests/native`, `tests/native-compat` and `tests/escape-analysis` also pass with the new linkdriver. Not checked: Linux, x86_64, Windows (the VEH path goes through the same `setPendingStackOverflow`), and the text-IR (`--no-direct-codegen`) JVM link.
+
+## Frame pointers on request, and an inclusive profile of the macro interpreter (patch 0039, 2026-11-20)
+
+Release `scalino-dotc` has no frame records: direct codegen sets no `frame-pointer` attribute, and the C runtime gets `-fomit-frame-pointer` (`LLVM.compileFile`). So `/usr/bin/sample` printed nonsense parents (`getClass` "called from" `_pthread_cond_wait`). Patch 0039 makes direct codegen honor `-f[no-]omit-frame-pointer` / `-m[no-]omit-leaf-frame-pointer` from `compileOptions` (last flag wins, as in clang) and set the `"frame-pointer"` function attribute. The option already reached clang for the C runtime and `.ll` partitions after the default `-fomit-frame-pointer`, and it is part of the config hash. So the existing plumbing is enough: LinkDriver `--compile -fno-omit-frame-pointer`, scalino `--native-compile -fno-omit-frame-pointer` / `//> using nativeCompile`. The `-fomit-frame-pointer` default stays: upstream added it with delimited continuations (#3286), and `delimcc.c` has to rebase saved frame pointers after relocating a stack fragment.
+
+Cost on ape (dotc linked without PGO from the same NIR, 5 interleaved runs): median 7.29s off vs 7.42s on (+2%), byte-identical output. Profiling link:
+
+```
+env SCALANATIVE_EVAC_ENABLE=1 <linkdriver> "$NIR_OUT:$(cat .build-work/selfhost/nativelibs.cp)" <out> dotty.tools.dotc.Main \
+  /usr/bin/clang /usr/bin/clang++ info --mode release-fast --lto none --multithreading \
+  --no-incremental-compilation --embed-resources --compile -fno-omit-frame-pointer
+```
+
+**Macro thread on ape** (`sample` 8s at 1ms, 2246 busy samples ≈ 2.6s). Each sample is bucketed by the frame right below the deepest `quoted.Interpreter` frame, i.e. what the interpreter spends its time calling:
+
+| callee (caller) | share |
+|---|---|
+| `immutable.HashMap.updated` + `Map4.updated` (`bindThis`: binds `this` for every base class of the receiver on each user-method call) | 13.2% |
+| `AbstractIterator.find` (`interpretCases`, inclusive: case matching) | 20% incl. |
+| `GC_alloc_small` | 4.9% |
+| `String.equals` (`interpretQuotesApi` 45, `interpretStdlibIntrinsic` 18) | 4.1% |
+| `Tree.symbol` (`interpretTree0`) | 4.0% |
+| `Set.from` (a literal `Set(...)` rebuilt per call in `interpretBoxingIntrinsic`, and in the `Interpreter` constructor) | 3.7% |
+| `scalanative_throw` (`interpretTree0`: `LabeledReturn`/`InterpretedThrow`, i.e. labeled-block returns from the pattern matcher) + `ClassNotFoundException` (`interpretQuotesApi`) | 4.1% |
+| `Types.allMembers` (`interpretQuotesApi` `methodMember(name)`: scans all members, then filters by name) | 3.3% |
+| `fullNameString` (`interpretTree`, `interpretStaticCall`) | 2.3% |
+| `toTermName`/`toTypeName` (`isStdlibCollectionCompanion` resolving names per call) | 1.8% |
+
+The interpreter's own frames (`interpretTree0`, `Call0.unapply`, `interpretStdlibIntrinsic`) self-time is only ~4%. The cost is in what it calls per step: environment maps, rebuilt constant sets, name lookups, exceptions used for control flow.
