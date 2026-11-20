@@ -2767,3 +2767,17 @@ env SCALANATIVE_EVAC_ENABLE=1 <linkdriver> "$NIR_OUT:$(cat .build-work/selfhost/
 | `toTermName`/`toTypeName` (`isStdlibCollectionCompanion` resolving names per call) | 1.8% |
 
 The interpreter's own frames (`interpretTree0`, `Call0.unapply`, `interpretStdlibIntrinsic`) self-time is only ~4%. The cost is in what it calls per step: environment maps, rebuilt constant sets, name lookups, exceptions used for control flow.
+
+## Macro interpreter: per-call work moved out of the hot path (patch scala3-0046, 2026-11-20)
+
+These are the cheap fixes from the frame-pointer profile above, all in `quoted/Interpreter.scala`:
+
+- `bindThis` bound `this` under every base class of the receiver, one `immutable.HashMap.updated` each, on every interpreted method call (13% of the macro thread). `Env` is now a `ThisEnv` when a receiver is bound: the explicit map plus a list of `(class, receiver)`. A lookup checks the map first, then the oldest receiver whose class derives from the key. This is the answer the old fill-gaps-only fold gave: an earlier or explicit binding was never overwritten. Every `Env` operation in the interpreter and the Splicer is `updated` or a fold over it, and `ThisEnv` overrides `updated`/`removed`/`get`, so the bindings survive. Iteration only sees explicit entries; it is used to collect `Type` bindings and in error messages.
+- `quotesApiNames` (160 strings) and `primitiveOpNames` were instance fields, rebuilt for every `Interpreter`, i.e. every splice. They moved to the companion, as did six `Set(...)` literals that were rebuilt on every call (`interpretBoxingIntrinsic` and others).
+- `isStdlibCollectionCompanion` resolves its factory symbols once per `Interpreter`, not by name on every collection call.
+- `Symbol.fieldMembers`/`methodMember(name)`/`methodMembers` share a per-expansion memo of `allMembers` (a derivation asks once per field).
+- The `ClassNotFoundException` that `Class.forName` probes get is stackless.
+
+**Checking equivalence.** I compared old against new on the JVM, which is quicker than relinking. `build/02a` gives the patched compiler as JVM classes; the generated `MiniPhaseOverrides.scala` must be compiled into an overlay in front of them, because 02a builds against a dummy and dotc then fails with "MiniPhaseOverrides has no entry". Only `Interpreter.scala` is recompiled into a second overlay. Ape, `examples/{interpreter-regressions,upickle-enum-writer-bug}` and every `interpreter/test-fixtures` case compile to byte-identical output. The exception is `i8746`, whose expansion embeds an `ExprImpl@<identity hash>` string. Natively, ape's output is byte-identical, `interpreter-regressions`, `upickle-enum-writer-bug` and `macro-hello` (jsoniter) compile, link and run, and `tests/dotc-daemon/run.sh` passes.
+
+**Result** (release-fast + PGO, both with patches 0037-0038, interleaved): ape full compile median 6.96s -> 6.54s (-6% wall, -8% CPU: 8.3 -> 7.6s user); the 7 `derives` files 6.18s -> 5.75s. Macro thread busy samples 2315 -> 1804 (-22%).

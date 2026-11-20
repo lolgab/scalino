@@ -3,7 +3,8 @@
 **Status (2026-11-20):** step C1+C2 (track C) is implemented as patches `scala-native-0037` (inline
 `loadModule` fast path) and `0038` (stack-overflow check polls a global count). ape full compile
 7.58s -> 7.04s (-7%), output identical. See docs/findings.md "Module loads and stack-overflow polls
-inlined".
+inlined". Frame-pointer profiling (patch 0039) and the first interpreter fixes (scala3-0046: ape
+6.96s -> 6.54s, macro thread -22%) followed the same day.
 
 ## Summary
 

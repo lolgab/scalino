@@ -1,0 +1,286 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index cca42f7..ca1f52c 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -2469,13 +2469,19 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       else if moduleClass.is(Module) then moduleClass.moduleClass
+       else moduleClass.info.classSymbol
+     cls.exists && (
+-      cls.derivesFrom(requiredClass("scala.collection.IterableFactory")) ||
+-      cls.derivesFrom(requiredClass("scala.collection.MapFactory")) ||
+-      cls == requiredModule("scala.Array").moduleClass ||
+-      cls == requiredModule("scala.collection.immutable.ArraySeq").moduleClass ||
+-      cls == requiredModule("scala.collection.mutable.ArraySeq").moduleClass
++      cls.derivesFrom(iterableFactoryClass) ||
++      cls.derivesFrom(mapFactoryClass) ||
++      arrayCompanionClasses.contains(cls)
+     )
+ 
++  // Looked up by name once per Interpreter rather than on every collection call.
++  private lazy val iterableFactoryClass: Symbol = requiredClass("scala.collection.IterableFactory")
++  private lazy val mapFactoryClass: Symbol = requiredClass("scala.collection.MapFactory")
++  private lazy val arrayCompanionClasses: List[Symbol] = List(
++    requiredModule("scala.Array").moduleClass,
++    requiredModule("scala.collection.immutable.ArraySeq").moduleClass,
++    requiredModule("scala.collection.mutable.ArraySeq").moduleClass)
++
+   private def interpretCollectionFactory(moduleClass: Symbol, fn: Symbol, args: => List[Object])(using Env): Option[Object] =
+     if !isStdlibCollectionCompanion(moduleClass) then None
+     else interpretCollectionFactory0(moduleClass, fn, args)
+@@ -2582,7 +2588,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         args match
+           case v :: Nil => buildFrom(name, forceIterable(v))
+           // `Array.from(xs)(using ClassTag)`
+-          case v :: _ if Set("Array", "ArraySeq").contains(name.stripSuffix("$")) => buildFrom(name, forceIterable(v))
++          case v :: _ if arrayFactoryNames.contains(name.stripSuffix("$")) => buildFrom(name, forceIterable(v))
+           case _ => None
+       case _ => None
+ 
+@@ -2627,7 +2633,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    */
+   private def interpretBoxingIntrinsic(fn: Symbol, args: => List[Object]): Option[Object] =
+     val ownerName = fn.owner.name.toString.stripSuffix("$")
+-    val isBoxCompanion = Set("Int", "Boolean", "Long", "Double", "Float", "Byte", "Short", "Char", "Unit").contains(ownerName)
++    val isBoxCompanion = boxCompanionNames.contains(ownerName)
+     if isBoxCompanion && (fn.name.toString.startsWith("box") || fn.name.toString.startsWith("unbox")) then args.headOption
+     else None
+ 
+@@ -2787,7 +2793,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // static parsing methods -- no Scala source ever, but exercised by
+     // e.g. ip4s's own literal-validation macros hand-parsing numbers at
+     // macro-expansion time.
+-    else if fn.owner.is(JavaDefined) && Set("Integer", "Long").contains(fn.owner.name.toString.stripSuffix("$")) then
++    else if fn.owner.is(JavaDefined) && integerLongNames.contains(fn.owner.name.toString.stripSuffix("$")) then
+       // A `Long` static can receive an `Integer`-boxed argument (a widened
+       // Int literal/expression): widen the numeric operands the Long
+       // overloads take (never a radix, which stays an Int).
+@@ -3249,14 +3255,59 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `outerEnv`'s capture reflects the actually-intended lexical target,
+       // so it wins; this class's own identity only fills keys nothing
+       // outer already claimed.
+-      val withThis = cls.asClass.baseClasses.foldLeft(withOwner)((e, base) => if e.contains(base) then e else e.updated(base, value))
++      //
++      // Recorded lazily (`ThisEnv`) rather than as one entry per base class: the eager fold
++      // was an immutable-map update per base class on every interpreted call.
++      val withThis: Env = withOwner match
++        case e: ThisEnv => new ThisEnv(e.m, (cls, value) :: e.thisBinds)
++        case e => new ThisEnv(e, (cls, value) :: Nil)
+       // Also the type parameters of its parents: `object D extends TableDispatch[Op]` runs
+       // `TableDispatch`'s own methods, whose quotes mention `T` -- which must read as `Op`.
+       inheritedTypeParamBindings(cls).foldLeft(withThis)((e, tb) => if e.contains(tb._1) then e else e.updated(tb._1, tb._2))
+     else withOwner
+ 
++  /** Thrown for every `Class.forName` probe (e.g. `ClassValueCompat`'s feature test); only its
++   *  type is ever looked at, so skip filling in the host stack trace.
++   */
++  private def classNotFound(name: String): ClassNotFoundException =
++    new ClassNotFoundException(name) with scala.util.control.NoStackTrace
++
++  /** An `Env` that also answers `this` lookups for every base class of the receivers bound by
++   *  `bindThis`, without one entry per base class. `thisBinds` holds `(class, receiver)`, newest
++   *  first. Lookups give the same answer as the eager fill-gaps-only fold this replaces: an
++   *  entry of `m` wins (bound before the receiver, or explicitly after it), else the OLDEST
++   *  receiver whose class derives from the key.
++   */
++  private final class ThisEnv(val m: Map[Symbol, Object], val thisBinds: List[(Symbol, Object)])
++      extends scala.collection.immutable.AbstractMap[Symbol, Object]:
++    def get(key: Symbol): Option[Object] =
++      val v = m.get(key)
++      if v.isDefined || !key.isClass then v
++      else
++        var found: Option[Object] = None
++        var bs = thisBinds
++        while bs.nonEmpty do
++          if bs.head._1.derivesFrom(key) then found = Some(bs.head._2)
++          bs = bs.tail
++        found
++    def iterator: Iterator[(Symbol, Object)] = m.iterator
++    def updated[V1 >: Object](key: Symbol, value: V1): Map[Symbol, V1] =
++      new ThisEnv(m.updated(key, value.asInstanceOf[Object]), thisBinds)
++    def removed(key: Symbol): Map[Symbol, Object] = new ThisEnv(m.removed(key), thisBinds)
++
+   private val inheritedTypeParamCache = mutable.Map.empty[Symbol, List[(Symbol, Type)]]
+ 
++  /** The symbols of `allMembers` of `s`'s this-type (or named type), memoized for this
++   *  macro expansion: `Symbol.methodMember(name)`, `fieldMembers` etc. each scan them, and a
++   *  derivation calls them once per field.
++   */
++  private val allMemberSymbolsCache = mutable.HashMap.empty[Symbol, List[Symbol]]
++  private def allMemberSymbols(s: Symbol)(using Context): List[Symbol] =
++    allMemberSymbolsCache.getOrElseUpdate(s, {
++      val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
++      prefix.allMembers.iterator.map(_.symbol).toList
++    })
++
+   /** `parent type parameter -> the concrete argument` pairs for `cls`'s parents, e.g.
+    *  `T -> Op` for `class C extends TableDispatch[Op]`. Only fully concrete arguments.
+    */
+@@ -3377,7 +3428,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // retained Scala source -- same story as `BitSet` above. Seen via
+     // hearth's `loader.scala` (per-classloader `ServiceLoader` caches),
+     // reached through every Scala 3 chimney 2.x derivation.
+-    else if fn.owner.is(JavaDefined) && Set("WeakHashMap", "HashMap", "IdentityHashMap", "LinkedHashMap", "ConcurrentHashMap").contains(fn.owner.name.toString) then
++    else if fn.owner.is(JavaDefined) && javaMapClassNames.contains(fn.owner.name.toString) then
+       def mk(n: Option[Int]): java.util.Map[Object, Object] = (fn.owner.name.toString, n) match
+         case ("WeakHashMap", None) => new java.util.WeakHashMap[Object, Object]()
+         case ("WeakHashMap", Some(c)) => new java.util.WeakHashMap[Object, Object](c)
+@@ -3395,7 +3446,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case _ => None
+     // `java.util.concurrent.atomic.*`: real JDK classes, used by hearth's
+     // micro-fp (`MIO`, `Log`, `MLocal`, `DirectStyle`) for counters/flags.
+-    else if fn.owner.is(JavaDefined) && Set("AtomicLong", "AtomicInteger", "AtomicBoolean", "AtomicReference").contains(fn.owner.name.toString) then
++    else if fn.owner.is(JavaDefined) && atomicClassNames.contains(fn.owner.name.toString) then
+       val initial = rawArgs.filterNot(_.isEmpty).map(interpretTree)
+       (fn.owner.name.toString, initial) match
+         case ("AtomicLong", Nil) => Some(new java.util.concurrent.atomic.AtomicLong())
+@@ -4715,8 +4766,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         args.headOption.collect { case s: Symbol => s.primaryConstructor }
+       case ("fieldMembers" | "memberFields") if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+-          val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+-          prefix.allMembers.iterator.map(_.symbol).filter(sym => sym.isTerm && !sym.is(Method)).toList
++          allMemberSymbols(s).filter(sym => sym.isTerm && !sym.is(Method))
+         }
+       case "methodMember" if ownerName == "SymbolMethods" =>
+         // "Get named non-private methods declared or inherited" -- unlike
+@@ -4726,15 +4776,13 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // already use for the non-method equivalent).
+         args match
+           case (s: Symbol) :: (name: String) :: Nil =>
+-            val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+-            Some(prefix.allMembers.iterator.map(_.symbol).filter(sym =>
+-              sym.isTerm && sym.is(Method) && !sym.isConstructor && !sym.is(Private) && sym.name.toString == name).toList)
++            Some(allMemberSymbols(s).filter(sym =>
++              sym.isTerm && sym.is(Method) && !sym.isConstructor && !sym.is(Private) && sym.name.toString == name))
+           case _ => None
+       case ("methodMembers" | "memberMethods") if ownerName == "SymbolMethods" =>
+         args.headOption.collect { case s: Symbol =>
+-          val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+-          prefix.allMembers.iterator.map(_.symbol).filter(sym =>
+-            sym.isTerm && sym.is(Method) && !sym.isConstructor && !sym.is(Private)).toList
++          allMemberSymbols(s).filter(sym =>
++            sym.isTerm && sym.is(Method) && !sym.isConstructor && !sym.is(Private))
+         }
+       case "declaredMethod" if ownerName == "SymbolMethods" =>
+         args match
+@@ -5108,7 +5156,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         args.headOption.collect { case l: LambdaType => l.paramInfos }
+       case "resType" if ownerName == "LambdaTypeMethods" =>
+         args.headOption.collect { case l: LambdaType => l.resType }
+-      case "param" if Set("MethodTypeMethods", "PolyTypeMethods", "TypeLambdaMethods").contains(ownerName) =>
++      case "param" if lambdaTypeMethodsOwners.contains(ownerName) =>
+         args match
+           case (l: LambdaType) :: (i: Integer) :: Nil => Some(l.paramRefs(i))
+           case _ => None
+@@ -5254,8 +5302,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // call `apply` on. Those are already loaded in this very process.
+         if name.startsWith("scala.") && name.endsWith("$") then
+           try Some(Class.forName(name))
+-          catch case _: ClassNotFoundException | _: LinkageError => throw new ClassNotFoundException(name)
+-        else throw new ClassNotFoundException(name)
++          catch case _: ClassNotFoundException | _: LinkageError => throw classNotFound(name)
++        else throw classNotFound(name)
+       case name if ownerStripped == "Math" =>
+         args.map {
+           case i: Integer => i.intValue
+@@ -5468,38 +5516,6 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     ownerName.endsWith("Methods") || ownerName.stripSuffix("$") == "Math" || ownerName == "PrinterModule" ||
+     ownerName == "reflectModule" || ownerName == "FlagsModule" || ownerName == "defnModule"
+ 
+-  /** The method names `interpretQuotesApi`'s cases test as literals (generated from its source;
+-   *  keep in step when adding a case).
+-   */
+-  private val quotesApiNames: Set[String] = Set(
+-    "&", "<:<", "=:=", "annotations", "appliedTo", "appliedToArgs",
+-    "appliedToArgss", "appliedToNone", "appliedToType", "appliedToTypes", "apply", "asExpr",
+-    "asExprOf", "asTerm", "asType", "baseClasses", "baseType", "betaReduce",
+-    "body", "byteWrapper", "caseFields", "changeOwner", "charWrapper", "children",
+-    "classSymbol", "companionClass", "companionModule", "constructor", "copy", "current",
+-    "dealias", "dealiasKeepOpaques", "declarations", "declaredMethod", "derivesFrom", "doubleWrapper",
+-    "empty", "end", "endColumn", "endLine", "erasedArgs", "error",
+-    "errorAndAbort", "exists", "explanation", "fieldMembers", "flags", "floatWrapper",
+-    "forName", "fullName", "getAnnotation", "getBoolean", "getFileName", "getJPath",
+-    "hasAnnotation", "hasErasedArgs", "hi", "info", "intWrapper", "is",
+-    "isAliasType", "isClassConstructor", "isClassDef", "isContextFunctionType", "isDefDef", "isDependentFunctionType",
+-    "isErased", "isErasedFunctionType", "isExprOf", "isFunctionType", "isGiven", "isImplicit",
+-    "isNoSymbol", "isSingleton", "isTerm", "isTupleN", "isType", "isTypeDef",
+-    "isTypeParam", "jpath", "leadingTypeParams", "longWrapper", "low", "lower",
+-    "memberFields", "memberMethods", "memberType", "methodMember", "methodMembers", "moduleClass",
+-    "name", "newBind", "newBuilder", "newMethod", "newVal", "noSymbol",
+-    "of", "ofMacroExpansion", "overloaded", "param", "paramNames", "paramSymss",
+-    "paramTypes", "paramVariance", "params", "paramss", "parents", "path",
+-    "pos", "primaryConstructor", "reflect", "requiredClass", "requiredMethod", "requiredModule",
+-    "resType", "returnTpt", "rhs", "seal", "search", "searchIgnoring",
+-    "select", "shortWrapper", "show", "signature", "simplified", "sourceCode",
+-    "sourceFile", "spliceOwner", "start", "startColumn", "startLine", "substituteTypes",
+-    "symbol", "term", "termParamss", "termRef", "termSymbol", "toString",
+-    "tpe", "tpt", "trailingParamss", "translucentSuperType", "tree", "typeArgs",
+-    "typeConstructorOf", "typeRef", "typeSymbol", "underlying", "underlyingArgument", "unique",
+-    "unpickleExprV2", "unpickleTypeV2", "upper", "value", "valueOrAbort", "warning",
+-    "widen", "widenByName", "widenTermRefByName", "|"
+-  )
+ 
+   /** `quotes.reflect.*Module#apply`/`#copy` for the tree and TypeRepr
+    *  constructors not covered by a dedicated case in `interpretQuotesApi`;
+@@ -7009,9 +7025,6 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     cls == defn.IntClass || cls == defn.LongClass || cls == defn.FloatClass || cls == defn.DoubleClass ||
+     cls == defn.BooleanClass
+ 
+-  private val primitiveOpNames: Set[TermName] =
+-    Set("+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "unary_-", "unary_!",
+-      "&&", "||", "&", "|", "^", "<<", ">>", ">>>", "unary_~").map(termName)
+ 
+   private def interpretPrimitiveOp(op: String, x: Object, args: List[Object]): Object =
+     if op == "unary_-" then
+@@ -7227,6 +7240,51 @@ object NonFatalInterpretedException:
+   def unapply(ex: Throwable): Option[Throwable] = scala.util.control.NonFatal.unapply(ex)
+ 
+ object Interpreter:
++  /** The method names `interpretQuotesApi`'s cases test as literals (generated from its source;
++   *  keep in step when adding a case).
++   */
++  private val quotesApiNames: Set[String] = Set(
++    "&", "<:<", "=:=", "annotations", "appliedTo", "appliedToArgs",
++    "appliedToArgss", "appliedToNone", "appliedToType", "appliedToTypes", "apply", "asExpr",
++    "asExprOf", "asTerm", "asType", "baseClasses", "baseType", "betaReduce",
++    "body", "byteWrapper", "caseFields", "changeOwner", "charWrapper", "children",
++    "classSymbol", "companionClass", "companionModule", "constructor", "copy", "current",
++    "dealias", "dealiasKeepOpaques", "declarations", "declaredMethod", "derivesFrom", "doubleWrapper",
++    "empty", "end", "endColumn", "endLine", "erasedArgs", "error",
++    "errorAndAbort", "exists", "explanation", "fieldMembers", "flags", "floatWrapper",
++    "forName", "fullName", "getAnnotation", "getBoolean", "getFileName", "getJPath",
++    "hasAnnotation", "hasErasedArgs", "hi", "info", "intWrapper", "is",
++    "isAliasType", "isClassConstructor", "isClassDef", "isContextFunctionType", "isDefDef", "isDependentFunctionType",
++    "isErased", "isErasedFunctionType", "isExprOf", "isFunctionType", "isGiven", "isImplicit",
++    "isNoSymbol", "isSingleton", "isTerm", "isTupleN", "isType", "isTypeDef",
++    "isTypeParam", "jpath", "leadingTypeParams", "longWrapper", "low", "lower",
++    "memberFields", "memberMethods", "memberType", "methodMember", "methodMembers", "moduleClass",
++    "name", "newBind", "newBuilder", "newMethod", "newVal", "noSymbol",
++    "of", "ofMacroExpansion", "overloaded", "param", "paramNames", "paramSymss",
++    "paramTypes", "paramVariance", "params", "paramss", "parents", "path",
++    "pos", "primaryConstructor", "reflect", "requiredClass", "requiredMethod", "requiredModule",
++    "resType", "returnTpt", "rhs", "seal", "search", "searchIgnoring",
++    "select", "shortWrapper", "show", "signature", "simplified", "sourceCode",
++    "sourceFile", "spliceOwner", "start", "startColumn", "startLine", "substituteTypes",
++    "symbol", "term", "termParamss", "termRef", "termSymbol", "toString",
++    "tpe", "tpt", "trailingParamss", "translucentSuperType", "tree", "typeArgs",
++    "typeConstructorOf", "typeRef", "typeSymbol", "underlying", "underlyingArgument", "unique",
++    "unpickleExprV2", "unpickleTypeV2", "upper", "value", "valueOrAbort", "warning",
++    "widen", "widenByName", "widenTermRefByName", "|"
++  )
++
++  private val primitiveOpNames: Set[TermName] =
++    Set("+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "unary_-", "unary_!",
++      "&&", "||", "&", "|", "^", "<<", ">>", ">>>", "unary_~").map(termName)
++
++  // Name sets the intrinsic dispatch tests against, built once rather than on every call.
++  private val arrayFactoryNames: Set[String] = Set("Array", "ArraySeq")
++  private val boxCompanionNames: Set[String] = Set("Int", "Boolean", "Long", "Double", "Float", "Byte", "Short", "Char", "Unit")
++  private val integerLongNames: Set[String] = Set("Integer", "Long")
++  private val javaMapClassNames: Set[String] = Set("WeakHashMap", "HashMap", "IdentityHashMap", "LinkedHashMap", "ConcurrentHashMap")
++  private val atomicClassNames: Set[String] = Set("AtomicLong", "AtomicInteger", "AtomicBoolean", "AtomicReference")
++  private val lambdaTypeMethodsOwners: Set[String] = Set("MethodTypeMethods", "PolyTypeMethods", "TypeLambdaMethods")
++
+   // Cached once, not re-queried on every recursive interpretation step: `sys.env`
+   // rebuilds a whole `Map` from the process environment on every call, and while
+   // that's cheap enough on a real JVM (`System.getenv()` returns an already-parsed,
