@@ -2719,3 +2719,22 @@ Small edits get 2-3x faster. A large closure is about 10% *slower* with the daem
 Tests: `tests/dotc-daemon/run.sh` (edit sequence under verify: rename, delete, top-level defs, error then fix, same-project macro, enum/sealed, a `--no-daemon` build in between, `run`, `$(scalino ...)` not waiting, `daemon stop`), added to ci.yml. Also checked by hand: ape under verify (8 edits), Scala.js, `-w`, and that the daemon survives SIGINT/SIGHUP. Not checked: Linux, Windows (spawned without `sh`, so a console Ctrl+C reaches it), x86_64.
 
 The incremental closure also got a fix that affects cold builds: names a changed file no longer declares (a renamed class) now invalidate the files that mention them, as names of removed files already did.
+
+## Module loads and stack-overflow polls inlined (patches 0037-0038, 2026-11-20)
+
+Step 2 of `docs/ideas/02-compile-perf-gap.md`. A profile of `scalino-dotc` compiling `~/scala/ape` put ~17% of busy samples on both the main and macro threads in three runtime symbols: `__scalanative_loadModule` (7.9%), `scalanative_StackOverflowGuards_check` (5.9%) and `_tlv_get_addr` (3.6%). All three are calls that are out of line because the C runtime is not LTO'd into the program on macOS/arm64 (`build/00-env.sh`).
+
+- **0037** (`codegen/Generate.scala`, multithreaded module accessors): the accessor does the acquire load of the module slot and the null / tag-bit / class checks itself (class id `& 0xffff` with compact headers, the rtti pointer otherwise), and calls `__scalanative_loadModule` only when the module is uninitialized, under construction (tagged context) or failed (an `ExceptionInInitializerError` in the slot).
+- **0038** (`codegen/Lower.scala`, `stackOverflowGuards.c`): self-recursive methods used to call `scalanative_StackOverflowGuards_check`, which reads the thread-local pending flag (a `_tlv_get_addr` call on Darwin). Now C keeps a global `_Atomic int32_t scalanative_StackOverflowGuards_pendingCount` in step with every thread's flag (`setPendingStackOverflow`, also cleared in `close()`). Generated code does a monotonic load of it plus a branch, and calls the C check only when it is non-zero. A thread raises the count in its own signal handler (or VEH), so it always sees its own overflow; another thread's overflow only sends this one through the slow path. The poll is emitted after the stack-slot allocas so they stay in the entry block.
+
+**Results** (macOS arm64, release-fast + committed PGO; both dotc binaries linked by `build/03` from the same NIR, `LINKDRIVER=` old vs new):
+
+| ape, interleaved | old | new |
+|---|---|---|
+| full 30 files (5 runs, median) | 7.58s wall / 9.0s user | 7.04s / 8.5s (-7%) |
+| 23 files without `derives` (4 runs) | 1.38s | 1.29s (-6.5%) |
+| 7 `derives` files (4 runs) | 6.65-6.78s | 6.23-6.32s (-6.5%) |
+
+The output tree (86 `.tasty`, 884 `.nir`, 424 `.class`) is byte-identical. In the new binary's profile `loadModule` and the check are gone, and `_tlv_get_addr` fell from 3.6% to 1.1%. The gain is below the 17% sample share because the inlined code still costs something. Also, the committed PGO profile no longer matches the changed functions: the new link reported 9177 "hash mismatch" warnings vs 7163, covering every recursive method and module accessor. Refreshing `pgo/` should recover part of that. Microbenchmarks (`tests/runtime-fastpaths/`): 400M module accesses 1008 -> 390ms release-fast (8.5 -> 2.1s debug); `fib(30)`x20 124 -> 78ms release-fast (229 -> 163ms debug).
+
+Tests: `tests/runtime-fastpaths/run.sh` (module-init race, failing ctor, cyclic init, overflow on the main thread / inside `synchronized` / on 8 threads at once; debug, release-fast, compact headers off). `tests/native`, `tests/native-compat` and `tests/escape-analysis` also pass with the new linkdriver. Not checked: Linux, x86_64, Windows (the VEH path goes through the same `setPendingStackOverflow`), and the text-IR (`--no-direct-codegen`) JVM link.

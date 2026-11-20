@@ -1,0 +1,163 @@
+diff --git a/nativelib/src/main/resources/scala-native/stackOverflowGuards.c b/nativelib/src/main/resources/scala-native/stackOverflowGuards.c
+index 8925b88..37458d7 100644
+--- a/nativelib/src/main/resources/scala-native/stackOverflowGuards.c
++++ b/nativelib/src/main/resources/scala-native/stackOverflowGuards.c
+@@ -20,9 +20,26 @@
+ #include <stdint.h>
+ #include <assert.h>
+ #include <string.h>
++#include <stdatomic.h>
+ 
+ __attribute((noreturn)) extern void scalanative_throwStackOverflowError();
+ 
++/* Number of threads whose pendingStackOverflowException is set. Generated code
++ * polls this global at the entry of self-recursive methods (codegen/Lower.scala)
++ * and calls scalanative_StackOverflowGuards_check only when it is non-zero: the
++ * thread-local flag costs a call on Darwin (_tlv_get_addr). A thread observes
++ * its own update (it raises the flag in its own signal handler), so a non-zero
++ * count from another thread only sends this one through the slow path. */
++_Atomic int32_t scalanative_StackOverflowGuards_pendingCount = 0;
++
++static inline void setPendingStackOverflow(bool pending) {
++    if (currentThreadInfo.pendingStackOverflowException != pending) {
++        currentThreadInfo.pendingStackOverflowException = pending;
++        atomic_fetch_add_explicit(&scalanative_StackOverflowGuards_pendingCount,
++                                  pending ? 1 : -1, memory_order_relaxed);
++    }
++}
++
+ size_t scalanative_StackOverflowGuards_size() {
+     return stackGuardPages() * resolvePageSize();
+ }
+@@ -36,7 +53,7 @@ static LONG WINAPI stackOverflowHandler(PEXCEPTION_POINTERS ex) {
+          * has already committed the guarantee pages, so CONTINUE_EXECUTION
+          * lets the faulting access succeed; StackOverflowGuards_check throws
+          * on the next polled method entry with a normal call stack. */
+-        currentThreadInfo.pendingStackOverflowException = true;
++        setPendingStackOverflow(true);
+         return EXCEPTION_CONTINUE_EXECUTION;
+     default:
+         return EXCEPTION_CONTINUE_SEARCH;
+@@ -52,7 +69,7 @@ void scalanative_StackOverflowGuards_setup(bool isMainThread) {
+     currentThreadInfo.stackGuardPage =
+         (void *)((uintptr_t)currentThreadInfo.stackTop +
+                  stackOverflowStackSize);
+-    currentThreadInfo.pendingStackOverflowException = false;
++    setPendingStackOverflow(false);
+ 
+     if (!SetThreadStackGuarantee(&stackOverflowStackSize)) {
+         fprintf(stderr,
+@@ -66,7 +83,7 @@ void scalanative_StackOverflowGuards_reset() {
+     int dummy;
+     void *curStackTop = &dummy;
+     ThreadInfo info = currentThreadInfo;
+-    currentThreadInfo.pendingStackOverflowException = false;
++    setPendingStackOverflow(false);
+     if (inStackPageBound(info.stackGuardPage, curStackTop))
+         return; // still unwinding
+     _resetstkoflw();
+@@ -215,7 +232,7 @@ static void stackOverflowHandler(int sig, siginfo_t *info, void *context) {
+                 }
+             }
+             // Let the exception be thrown after polling
+-            currentThreadInfo.pendingStackOverflowException = true;
++            setPendingStackOverflow(true);
+             return;
+         } else if (isInRange(faultAddr, threadInfo.stackGuardPage,
+                              (void *)(char *)threadInfo.stackTop -
+@@ -339,7 +356,7 @@ void scalanative_StackOverflowGuards_reset() {
+     int dummy;
+     void *curStackTop = &dummy;
+     ThreadInfo info = currentThreadInfo;
+-    currentThreadInfo.pendingStackOverflowException = false;
++    setPendingStackOverflow(false);
+     if (inStackPageBound(info.stackGuardPage, curStackTop))
+         return; // still unwinding
+     protectStackGuardPage();
+@@ -349,12 +366,14 @@ void scalanative_StackOverflowGuards_reset() {
+ 
+ void scalanative_StackOverflowGuards_check() {
+     if (currentThreadInfo.pendingStackOverflowException) {
+-        currentThreadInfo.pendingStackOverflowException = false;
++        setPendingStackOverflow(false);
+         scalanative_throwStackOverflowError();
+     }
+ }
+ 
+ void scalanative_StackOverflowGuards_close() {
++    // A thread exiting with a pending overflow must not leave the count raised.
++    setPendingStackOverflow(false);
+ #ifdef _WIN32
+ // noop
+ #else
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+index ed3fa53..89bcb5d 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
+@@ -290,15 +290,6 @@ private[scalanative] object Lower {
+         }
+       )
+ 
+-      // Stack checks can throw too; use the entry cleanup handler when present.
+-      // On Windows the VEH only sets a pending flag; this poll throws so
+-      // synchronized/finally cleanup runs outside the vectored-handler context.
+-      if (shouldGenerateStackOverflowChecks(defn)) {
+-        ScopedVar.scoped(unwindHandler := getUnwindHandler(nir.Next.None)(defn.pos)) {
+-          buf.call(CheckStackOverflowGuardsSig, CheckStackOverflowGuards, Nil, unwind)(defn.pos, nir.ScopeId.TopLevel)
+-        }
+-      }
+-
+       stackObjectSlots.clear()
+       stackObjectBytes.clear()
+       insts.foreach {
+@@ -319,6 +310,32 @@ private[scalanative] object Lower {
+         case _ => ()
+       }
+ 
++      // Stack checks can throw too; use the entry cleanup handler when present.
++      // On Windows the VEH only sets a pending flag; this poll throws so
++      // synchronized/finally cleanup runs outside the vectored-handler context.
++      // The per-thread flag lives in C thread-local storage (a call on Darwin),
++      // so first poll the global count of threads with a pending overflow and
++      // call into C only when it is non-zero. Emitted after the stack slots so
++      // their allocas stay in the entry block.
++      if (shouldGenerateStackOverflowChecks(defn)) {
++        implicit val pos: nir.SourcePosition = defn.pos
++        implicit val scopeId: nir.ScopeId = nir.ScopeId.TopLevel
++        ScopedVar.scoped(unwindHandler := getUnwindHandler(nir.Next.None)(defn.pos)) {
++          val pendingCount = buf.let(
++            nir.Op.Load(nir.Type.Int, StackOverflowPendingCount, Some(nir.MemoryOrder.Monotonic)),
++            nir.Next.None
++          )
++          val isPending = buf.comp(nir.Comp.Ine, nir.Type.Int, pendingCount, nir.Val.Int(0), nir.Next.None)
++          val pendingL = fresh()
++          val continueL = fresh()
++          buf.branch(isPending, nir.Next(pendingL), nir.Next(continueL))
++          buf.label(pendingL)
++          buf.call(CheckStackOverflowGuardsSig, CheckStackOverflowGuards, Nil, unwind)
++          buf.jump(nir.Next(continueL))
++          buf.label(continueL)
++        }
++      }
++
+       val nir.Inst.Label(firstLabel, _) = insts.head: @unchecked
+       currentBlock = currentDefnGraph.get.find(firstLabel)
+       val labelPositions = insts
+@@ -3199,6 +3216,9 @@ private[scalanative] object Lower {
+   val CheckStackOverflowGuardsName = Extern("scalanative_StackOverflowGuards_check")
+   val CheckStackOverflowGuards = nir.Val.Global(CheckStackOverflowGuardsName, nir.Type.Ptr)
+   val CheckStackOverflowGuardsSig = nir.Type.Function(Nil, nir.Type.Unit)
++  // Number of threads with a pending StackOverflowError (stackOverflowGuards.c)
++  val StackOverflowPendingCountName = Extern("scalanative_StackOverflowGuards_pendingCount")
++  val StackOverflowPendingCount = nir.Val.Global(StackOverflowPendingCountName, nir.Type.Ptr)
+ 
+   val injects: Seq[nir.Defn] = {
+     implicit val pos = nir.SourcePosition.NoPosition
+@@ -3212,6 +3232,7 @@ private[scalanative] object Lower {
+     buf += externDecl(ExceptionOnCatchName, ExceptionOnCatchSig)
+     buf += externDecl(TraitDispatchSlowpathName, TraitDispatchSlowpathSig)
+     buf += externDecl(CheckStackOverflowGuardsName, CheckStackOverflowGuardsSig)
++    buf += nir.Defn.Var(nir.Attrs.None.withIsExtern(true), StackOverflowPendingCountName, nir.Type.Int, nir.Val.Int(0))
+     buf += externDecl(EnterManagedName, EnterManagedSig)
+     buf += externDecl(LeaveManagedName, LeaveManagedSig)
+     buf += externDecl(LeaveManagedAndThrowName, LeaveManagedAndThrowSig)
