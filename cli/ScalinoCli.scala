@@ -1630,7 +1630,7 @@ object ScalinoCli:
       Files.write(probeSrc, probeSourceFor(frameworkFqcns).getBytes("UTF-8"))
       val probeClasses = scratch.resolve("classes")
       val ccWithUserClasses = cc.copy(compileCp = s"$userClassesDir$CP_SEP${cc.compileCp}")
-      compileToClasses(List(probeSrc), probeClasses, ccWithUserClasses)
+      compileToClasses(List(probeSrc), probeClasses, ccWithUserClasses, daemon = false)
       val linkDir = scratch.resolve("link")
       val linkCp = s"$probeClasses$CP_SEP$userClassesDir$CP_SEP${cc.nativelibsCp}$CP_SEP$testClasspath"
       val (clang, clangpp) = hostClangs(NativeOpts())
@@ -2005,14 +2005,17 @@ object ScalinoCli:
 
   /** The scalino-dotc compile step, shared by `buildBinary` and `scalino test` (which compiles once
    *  to scan classfiles for test discovery before a mainClass exists). Incremental by default;
-   *  `incremental = false` always recompiles fully (`--no-incremental`). */
+   *  `incremental = false` always recompiles fully (`--no-incremental`). `daemon`: compile through the
+   *  warm `scalino-dotc --daemon` (cli/DotcDaemon.scala) unless it's turned off; false for one-off
+   *  probe compiles, which would only start a daemon nobody reuses. */
   def compileToClasses(
     sources: List[Path],
     classesDir: Path,
     cc: CompileClasspath,
     extraOptions: List[String] = Nil,
     incremental: Boolean = true,
-    js: Boolean = false
+    js: Boolean = false,
+    daemon: Boolean = true
   ): Unit =
     val manifestPath = manifestPathFor(classesDir)
     val fingerprint = computeFingerprint(cc, extraOptions)
@@ -2041,9 +2044,12 @@ object ScalinoCli:
         // name -> declaring file(s), recomputed from the current sources every run; stands in for
         // dotc's symbol table: any textual mention of a name is an edge to its declarer.
         val nameToFile = curDeclared.toList.flatMap { case (p, names) => names.map(_ -> p) }.groupMap(_._1)(_._2)
-        // Names that vanished with their declaring file still invalidate their referrers (dotc then
-        // reports a real "not found").
-        val removedNames = removed.values.flatMap(_.declaredNames).toSet
+        // Names that vanished, with their declaring file or from a file that still exists (a renamed
+        // class), still invalidate their referrers: dotc then reports a real "not found" instead of
+        // the referrer keeping a stale reference to outputs that were purged.
+        val curNames = curDeclared.values.flatten.toSet
+        val vanishedNames = changed.flatMap(p => m.files.get(p.toString).toList.flatMap(_.declaredNames)).filterNot(curNames)
+        val removedNames = removed.values.flatMap(_.declaredNames).toSet ++ vanishedNames
         val allKnownNames = nameToFile.keySet ++ removedNames
 
         // Tokenize each text once and intersect with the known names, rather than one regex per name
@@ -2082,8 +2088,7 @@ object ScalinoCli:
       // classesDir on the compile classpath (harmless on a full rebuild, it's emptied above) lets
       // scalino-dotc resolve symbols of files not recompiled this round from their .tasty/.class.
       val compileCp = s"$classesDir$CP_SEP${cc.compileCp}"
-      val compileCmd = List(
-        tool("scalino-dotc"),
+      val compileOptions = List(
         "-javabootclasspath", cc.javaBase,
         "-classpath", compileCp,
       ) ++ (
@@ -2097,9 +2102,23 @@ object ScalinoCli:
         "-Xearly-tasty-output", classesDir.toString
       ) ++ extraOptions ++ List(
         "-color:never", "-d", classesDir.toString
-      ) ++ toCompile.map(_.toString)
+      )
+      val files = toCompile.map(_.toString)
+      // Sources whose outputs were purged above: the daemon drops their symbols from its warm state.
+      val staleSources = if fullRebuild then Nil else files ++ removedRecords.map(_._1)
 
-      val (compileExit, compileOut) = runCaptureAll(compileCmd)
+      val viaDaemon =
+        if !daemon || DotcDaemon.mode == DotcDaemon.Mode.Off then None
+        else
+          val snapshot = Option.when(DotcDaemon.mode == DotcDaemon.Mode.Verify)(snapshotDir(classesDir))
+          DotcDaemon.compile(classesDir, compileOptions, files, staleSources, fullRebuild).map { result =>
+            snapshot.foreach(snap => verifyDaemonCompile(snap, classesDir, compileOptions, files, result._1))
+            result
+          }
+      val (compileExit, compileOut) = viaDaemon.getOrElse {
+        DotcDaemon.forgetGeneration(classesDir)
+        runCaptureAll(tool("scalino-dotc") :: compileOptions ++ files)
+      }
       Diagnostics.render(compileOut).foreach(System.err.println)
       if compileExit != 0 then
         System.err.println(Color.gray(s"Error compiling project (${if js then jsBuildLabel else buildLabel})"))
@@ -2120,6 +2139,67 @@ object ScalinoCli:
       saveManifest(manifestPath, IncrManifest(fingerprint, newFiles))
     else
       Files.deleteIfExists(manifestPath)
+
+  /** A copy of `dir` in a temp directory, for SCALINO_DOTC_DAEMON=verify. */
+  private def snapshotDir(dir: Path): Path =
+    val snap = Files.createTempDirectory("scalino-daemon-verify")
+    if Files.isDirectory(dir) then
+      val s = Files.walk(dir)
+      try
+        s.iterator.asScala.foreach { p =>
+          val target = snap.resolve(dir.relativize(p).toString)
+          if Files.isDirectory(p) then Files.createDirectories(target)
+          else Files.copy(p, target)
+        }
+      finally s.close()
+    snap
+
+  /** Same definitions and instructions, possibly different source positions (`show` omits them). */
+  private def sameNirIgnoringPositions(a: Path, b: Path): Boolean =
+    val (da, db) = (readNirDefns(a), readNirDefns(b))
+    da.nonEmpty && da.map(_.show) == db.map(_.show)
+
+  /** SCALINO_DOTC_DAEMON=verify: compiles `files` again with a cold scalino-dotc, into the snapshot
+   *  of `classesDir` taken before the daemon compile, and fails naming the outputs that differ
+   *  (scalino-dotc's output is deterministic). `.tasty` files only have to exist on both sides: the
+   *  pickler shares a type it meets twice by object identity, and a warm compiler can hold two equal
+   *  instances of a type (one from an earlier run) where a cold one has one, so the same trees may be
+   *  laid out with a different set of shared references. */
+  private def verifyDaemonCompile(snapshot: Path, classesDir: Path, options: List[String], files: List[String], daemonExit: Int): Unit =
+    val coldOptions = options.map(o => if o == classesDir.toString then snapshot.toString else o)
+      .map(o => if o.startsWith(s"$classesDir$CP_SEP") then snapshot.toString + o.stripPrefix(classesDir.toString) else o)
+    val (coldExit, coldOut) = runCaptureAll(tool("scalino-dotc") :: coldOptions ++ files)
+    val positionOnly = scala.collection.mutable.ListBuffer.empty[String]
+    def listFiles(root: Path): Set[String] =
+      val s = Files.walk(root)
+      try s.iterator.asScala.filter(Files.isRegularFile(_)).map(p => root.relativize(p).toString).toSet
+      finally s.close()
+    val problems =
+      if (coldExit == 0) != (daemonExit == 0) then List(s"exit code: daemon $daemonExit, cold $coldExit\n$coldOut")
+      else if daemonExit != 0 then Nil
+      else
+        val cold = listFiles(snapshot)
+        val warm = listFiles(classesDir)
+        (cold ++ warm).toList.sorted.flatMap { f =>
+          if !warm(f) then List(s"missing: $f")
+          else if !cold(f) then List(s"extra: $f")
+          else if f.endsWith(".tasty") then Nil
+          else if java.util.Arrays.equals(Files.readAllBytes(snapshot.resolve(f)), Files.readAllBytes(classesDir.resolve(f))) then Nil
+          else if f.endsWith(".nir") && sameNirIgnoringPositions(snapshot.resolve(f), classesDir.resolve(f)) then
+            positionOnly += f
+            Nil
+          else List(s"differs: $f")
+        }
+    if problems.nonEmpty then
+      System.err.println(Color.error(s"scalino: SCALINO_DOTC_DAEMON=verify: the daemon's compile differs from a cold one (kept in $snapshot):"))
+      problems.take(20).foreach(p => System.err.println(s"  $p"))
+      fail("dotc daemon verification failed")
+    deleteRecursively(snapshot)
+    // A known difference (docs/findings.md "dotc daemon"): source positions inside library macro
+    // expansions can keep the column of an earlier run's expansion, since dotc positions span-less
+    // trees in place and the daemon reuses those trees across runs.
+    val note = if positionOnly.isEmpty then "" else s", ${positionOnly.size} differing only in source positions: ${positionOnly.take(3).mkString(", ")}"
+    System.err.println(Color.gray(s"Verified the dotc daemon's compile against a cold one (${files.size} files$note)"))
 
   /** Scala Native build settings from `//> using native*` directives and/or `--native-*` flags,
    *  forwarded to dist/scalino-linkdriver as flag-style argv (LinkDriver.scala's parser). There is
@@ -2777,7 +2857,7 @@ object ScalinoCli:
       val probeSrc = scratch.resolve("ScalinoCliProbeMain.scala")
       Files.write(probeSrc, probeSourceFor(frameworkFqcns).getBytes("UTF-8"))
       val probeClasses = scratch.resolve("classes")
-      compileToClasses(List(probeSrc), probeClasses, cc.copy(compileCp = s"$userClassesDir$CP_SEP${cc.compileCp}"), Nil, true, js = true)
+      compileToClasses(List(probeSrc), probeClasses, cc.copy(compileCp = s"$userClassesDir$CP_SEP${cc.compileCp}"), Nil, true, js = true, daemon = false)
       val jsFile = linkJs("ScalinoCliProbeMain", scratch.resolve("link"),
         probeClasses.toString :: userClassesDir.toString :: testClasspath.split(CP_SEP).filter(_.nonEmpty).toList,
         Nil, logLevel, JsOpts(sourceMaps = false))
@@ -3039,6 +3119,9 @@ object ScalinoCli:
 
   private def oNoInc: String =
     s"""|  --no-incremental           always fully recompile (skip the incremental-compile cache)
+       |  --no-daemon                compile with a fresh scalino-dotc instead of the background one
+       |                             that keeps the compiler warm between builds (also
+       |                             SCALINO_DOTC_DAEMON=0; off by default when $$CI is set)
        |""".stripMargin
 
   private def oOffline: String =
@@ -3332,6 +3415,7 @@ object ScalinoCli:
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
          |  scalino sysroot build <triple>...      set up the sysroot for cross-compiling to <triple> (see --native-target-triple)
          |  scalino clean                         delete the .scalino-build directory
+         |  scalino daemon [status|stop]          list or stop the background compilers (see --no-daemon)
          |  scalino version                        print version info
          |  scalino --help                         this message
          |  scalino <command> --help               help for one command
@@ -3348,7 +3432,7 @@ object ScalinoCli:
          |$completionsNote""".stripMargin, out))
 
   val HelpCommands: Set[String] =
-    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "sysroot", "version")
+    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "sysroot", "daemon", "version")
 
   /** `scalino <command> --help`: usage plus only the options/notes that apply to
    *  that command. */
@@ -3389,6 +3473,20 @@ object ScalinoCli:
         head("scalino completions <bash|zsh|fish>", "Print a shell completion script to stdout.") + completionsNote
       case "clean" =>
         head("scalino clean", "Delete the .scalino-build directory.")
+      case "daemon" =>
+        head("scalino daemon [status|stop]", "List or stop the background scalino-dotc compilers.") +
+          s"""|Builds compile through a background scalino-dotc (one per build directory) that
+              |keeps the compiler and the loaded dependencies warm, so a small edit recompiles
+              |in a fraction of the cold time. Each exits after 15 minutes without a build
+              |($$SCALINO_DOTC_DAEMON_IDLE seconds), at most 3 run at once
+              |($$SCALINO_DOTC_DAEMON_MAX), and one using more than 4096 MB is restarted
+              |($$SCALINO_DOTC_DAEMON_MAX_RSS_MB). Off with --no-daemon or SCALINO_DOTC_DAEMON=0,
+              |and by default when $$CI is set; SCALINO_DOTC_DAEMON=verify also compiles cold
+              |and fails on any difference.
+              |
+              |  scalino daemon [status]   the running daemons: pid, memory, compiles, build directory
+              |  scalino daemon stop       stop them all
+              |""".stripMargin
       case "sysroot" =>
         head("scalino sysroot <build|list|path> ...", "Manage the sysroots used to cross-compile (`--native-target-triple`).") +
           s"""|  scalino sysroot build <triple>... [--force] [--with <lib>]
@@ -3504,6 +3602,7 @@ object ScalinoCli:
         case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
         case "--test-only" => o = o.copy(testOnly = Some(args(i + 1))); i += 1
         case "--no-incremental" => o = o.copy(noIncremental = true)
+        case "--no-daemon" => DotcDaemon.mode = DotcDaemon.Mode.Off
         case "--offline" => offlineMode = true
         case "--js" => o = o.copy(cliPlatform = Some("js"))
         case "--native" => o = o.copy(cliPlatform = Some("native"))
@@ -3991,7 +4090,7 @@ object ScalinoCli:
   // `Sysroot.Supported`) and `sysroot`'s sub-arguments. Prints to stdout, like cargo/rustup
   // (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
 
-  private val completionSubcommands = "run compile package test setup-ide lock clean sysroot version completions"
+  private val completionSubcommands = "run compile package test setup-ide lock clean sysroot daemon version completions"
   private val completionSysrootActions = "build list path"
   // Closed value sets of the Scala.js options (scala-cli's spellings, see resolveJsOpts/platformName)
   private val completionJsModuleKinds = "commonjs common esmodule es nomodule none"
@@ -4005,7 +4104,7 @@ object ScalinoCli:
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
-    "--color --test-framework --test-only --no-incremental --offline --native-mode --native-gc --native-lto " +
+    "--color --test-framework --test-only --no-incremental --no-daemon --offline --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --post-link --run-env --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
@@ -4180,12 +4279,13 @@ object ScalinoCli:
   def handleClean(args: Array[String]): Unit =
     if args.nonEmpty then die(s"clean: unexpected argument '${args(0)}'")
     val buildDir = Paths.get(".scalino-build")
+    DotcDaemon.stopUnder(buildDir)
     if Files.exists(buildDir) then
       deleteRecursively(buildDir)
 
   // Boolean flags are also accepted before the sub-command (`scalino -w compile`, mill/bun-style)
   // and hoisted after it. Value-taking flags aren't: their value looks like the sub-command.
-  private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental", "--offline")
+  private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental", "--no-daemon", "--offline")
   private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock")
 
   def hoistLeadingFlags(args: Array[String]): Array[String] =
@@ -4228,6 +4328,7 @@ object ScalinoCli:
       case "completions" => handleCompletions(args.drop(1))
       case "clean" => handleClean(args.drop(1))
       case "sysroot" => Sysroot.handle(args.drop(1))
+      case "daemon" => DotcDaemon.handle(args.drop(1))
       case "lock" => handleLock(args.drop(1))
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
         handleRunOrCompile("run", args) // implicit `run`, e.g. `scalino Foo.scala`

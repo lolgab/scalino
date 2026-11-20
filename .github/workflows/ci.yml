@@ -316,6 +316,12 @@ jobs:
         shell: bash
         run: ./tests/lower-cache/run.sh dist/scalino
 
+      - name: Smoke test -- dotc daemon (SCALINO_DOTC_DAEMON=verify)
+        # Edit sequence through the background scalino-dotc, every compile compared with a cold one.
+        # The daemon is off by default under CI; the script turns it on. See tests/dotc-daemon/run.sh.
+        shell: bash
+        run: ./tests/dotc-daemon/run.sh dist/scalino
+
       - name: Smoke test -- libraries built with Scala Native 0.5.12
         # snunit 0.13.0 from Maven Central references posixlib externs by their 0.5.12 link names.
         # See tests/native-compat/run.sh.

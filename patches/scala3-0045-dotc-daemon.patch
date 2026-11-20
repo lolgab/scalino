@@ -1,0 +1,306 @@
+diff --git a/compiler/src/dotty/tools/dotc/Main.scala b/compiler/src/dotty/tools/dotc/Main.scala
+index 3288fded..2e95c514 100644
+--- a/compiler/src/dotty/tools/dotc/Main.scala
++++ b/compiler/src/dotty/tools/dotc/Main.scala
+@@ -1,5 +1,10 @@
+ package dotty.tools
+ package dotc
+ 
+-/** Main class of the `dotc` batch compiler. */
+-object Main extends Driver
++/** Main class of the `dotc` batch compiler. `--daemon` as the first argument starts scalino's
++ *  compile server instead (`ScalinoDaemon`). */
++object Main extends Driver {
++  override def main(args: Array[String]): Unit =
++    if args.nonEmpty && args(0) == "--daemon" then ScalinoDaemon.run(args.drop(1))
++    else super.main(args)
++}
+diff --git a/compiler/src/dotty/tools/dotc/ScalinoDaemon.scala b/compiler/src/dotty/tools/dotc/ScalinoDaemon.scala
+new file mode 100644
+index 00000000..612bd7e7
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/ScalinoDaemon.scala
+@@ -0,0 +1,283 @@
++package dotty.tools
++package dotc
++
++import core.Contexts.*
++import core.Decorators.*
++import core.Flags.*
++import core.Names.*
++import core.Periods.*
++import core.NameOps.*
++import core.Symbols.*
++import core.SymDenotations.ClassDenotation
++import reporting.{ConsoleReporter, Reporter}
++import io.AbstractFile
++
++import java.io.{BufferedReader, ByteArrayOutputStream, InputStreamReader, OutputStreamWriter, PrintStream, PrintWriter}
++import java.net.{InetAddress, InetSocketAddress, ServerSocket, Socket, SocketTimeoutException}
++import java.nio.charset.StandardCharsets.UTF_8
++import java.nio.file.{Files, Path, Paths, StandardCopyOption}
++import scala.collection.mutable
++
++/** `scalino-dotc --daemon`: a compile server that keeps one `ContextBase` (loaded library symbols,
++ *  their phase-transformed denotations, the macro interpreter's caches) across compiles of one
++ *  project, so a small edit doesn't pay for reloading the classpath's TASTy every time
++ *  (docs/ideas/01-dotc-daemon.md). Driven by cli/ScalinoCli.scala's `DotcDaemon` over loopback TCP.
++ *
++ *  Usage: `scalino-dotc --daemon --state-file <path> [--idle-seconds <n>]`. The daemon binds an
++ *  ephemeral loopback port and writes `<port> <token>` to the state file (private through its parent
++ *  directory, which the client creates with owner-only permissions); a client must send the token
++ *  as its first line.
++ *  One connection, one request:
++ *
++ *  {{{
++ *  <token>
++ *  COMPILE <prevGen> <newGen> <nOptions> <nFiles> <nStale>
++ *  <option>  x nOptions   compiler options (everything but the source files)
++ *  <file>    x nFiles     sources to compile
++ *  <path>    x nStale     sources whose previous outputs the client purged (recompiled or removed)
++ *  }}}
++ *
++ *  answered with the compiler's output lines, then `SCALINO_COMPILE_DONE <exitCode>` (3 when the
++ *  compiler threw: the client then logs the output and compiles cold instead). `STATUS` and
++ *  `STOP` are the other requests.
++ *
++ *  Correctness rules: the warm `ContextBase` is dropped (the next compile starts cold, in this process)
++ *  when the options change, when `prevGen` isn't the `newGen` of this daemon's last successful
++ *  compile (someone else wrote the output directory, or the client did a full rebuild), and after
++ *  any compile that reported errors or threw. Before a warm compile, project symbols whose source is
++ *  recompiled or removed, or whose `.tasty` the client deleted from the output directory, are
++ *  unlinked from their packages, and the edited sources are evicted from the base's
++ *  `files`/`sources` memo tables (otherwise the old text would be compiled again).
++ */
++object ScalinoDaemon:
++
++  private final class State:
++    var rootCtx: Context | Null = null
++    var compiler: Compiler | Null = null
++    var options: List[String] = Nil
++    /** Run id of the last compile: invalidation must look at symbols as of that run, not as of the
++     *  root context's (the first) run, or bringing their denotations "forward" asserts. */
++    var lastRunId: RunId = NoRunId
++    var lastGen: String = ""
++    var runs = 0
++    var warmRuns = 0
++
++  private object driver extends Driver:
++    def setupFor(args: Array[String], rootCtx: Context): Option[(List[AbstractFile], Context)] = setup(args, rootCtx)
++
++    /** `Driver.doCompile`'s body on a caller-owned `Compiler`: `Compiler.nextRunId` is per instance,
++     *  so a fresh `Compiler` on a reused base would hand out run ids the base has already seen. */
++    def compileWith(compiler: Compiler, files: List[AbstractFile])(using Context): RunId =
++      val run = compiler.newRun
++      run.compile(files)
++      finish(compiler, run)
++      // `finish` starts further runs for suspended units (macros defined in the same sources), so
++      // the last run is not necessarily `run`. Taking an id skips one, which is harmless.
++      compiler.nextRunId - 1
++
++  def run(args: Array[String]): Unit =
++    var stateFile: Path | Null = null
++    var idleSeconds = 15 * 60
++    var i = 0
++    while i < args.length do
++      args(i) match
++        case "--state-file" => stateFile = Paths.get(args(i + 1)); i += 1
++        case "--idle-seconds" => idleSeconds = args(i + 1).toInt; i += 1
++        case other => System.err.println(s"scalino-dotc --daemon: unknown argument $other"); sys.exit(2)
++      i += 1
++    if stateFile == null then
++      System.err.println("scalino-dotc --daemon: --state-file is required"); sys.exit(2)
++    val statePath = stateFile.nn
++
++    val server = new ServerSocket()
++    server.bind(new InetSocketAddress(InetAddress.getLoopbackAddress, 0), 8)
++    if idleSeconds > 0 then server.setSoTimeout(idleSeconds * 1000)
++    val token = newToken()
++    val stateLine = s"${server.getLocalPort} $token"
++    // Written to a sibling and renamed: the client polls for this file and must never see half of it.
++    val tmp = statePath.resolveSibling(statePath.getFileName.toString + s".${token.take(8)}.tmp")
++    Files.write(tmp, stateLine.getBytes(UTF_8))
++    Files.move(tmp, statePath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
++
++    val state = new State
++    var stop = false
++    try
++      while !stop do
++        val socket =
++          try server.accept()
++          catch case _: SocketTimeoutException => null
++        if socket == null then stop = true // idle timeout
++        else
++          try stop = serve(socket, token, state)
++          catch case e: Exception => System.err.println(s"scalino-dotc --daemon: ${e}")
++          finally socket.close()
++    finally
++      server.close()
++      // Only our own state file: a newer daemon may already have replaced it.
++      try
++        if Files.exists(statePath) && new String(Files.readAllBytes(statePath), UTF_8).trim == stateLine then
++          Files.delete(statePath)
++      catch case _: Exception => ()
++    sys.exit(0)
++
++  private def newToken(): String =
++    val bytes = new Array[Byte](24)
++    val urandom = Paths.get("/dev/urandom")
++    if Files.isReadable(urandom) then
++      val in = Files.newInputStream(urandom)
++      try in.read(bytes) finally in.close()
++    else
++      // Windows: no /dev/urandom and no SecureRandom in this javalib (UUID.randomUUID needs it too).
++      // Weaker, but the port is loopback-only and the state file sits in the user's private directory.
++      val seed = System.nanoTime() * 0x9E3779B97F4A7C15L ^ System.currentTimeMillis() ^
++        (System.identityHashCode(new Object).toLong << 32)
++      new java.util.Random(seed).nextBytes(bytes)
++    bytes.map(b => f"${b & 0xff}%02x").mkString
++
++  /** Serves one connection; true when the daemon should exit. */
++  private def serve(socket: Socket, token: String, state: State): Boolean =
++    val in = new BufferedReader(new InputStreamReader(socket.getInputStream, UTF_8))
++    val out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream, UTF_8), false)
++    if in.readLine() != token then false
++    else
++      val header = in.readLine()
++      if header == null then false
++      else header.split(' ').toList match
++        case "STOP" :: Nil =>
++          out.println("SCALINO_STOPPING"); out.flush(); true
++        case "STATUS" :: Nil =>
++          val warm = if state.rootCtx == null then "cold" else "warm"
++          out.println(s"SCALINO_STATUS runs=${state.runs} warmRuns=${state.warmRuns} base=$warm")
++          out.flush(); false
++        case "COMPILE" :: prevGen :: newGen :: nOpts :: nFiles :: nStale :: Nil =>
++          def lines(n: String) = List.fill(n.toInt)(in.readLine())
++          val options = lines(nOpts)
++          val files = lines(nFiles)
++          val stale = lines(nStale)
++          val (exit, output) = compile(state, prevGen, newGen, options, files, stale)
++          output.linesIterator.foreach(out.println)
++          out.println(s"SCALINO_COMPILE_DONE $exit")
++          out.flush()
++          false
++        case _ =>
++          out.println("SCALINO_COMPILE_DONE 2"); out.flush(); false
++
++  private def reset(state: State): Unit =
++    state.rootCtx = null
++    state.compiler = null
++    state.lastGen = ""
++
++  private def compile(state: State, prevGen: String, newGen: String, options: List[String],
++      files: List[String], stale: List[String]): (Int, String) =
++    if state.rootCtx != null && (options != state.options || prevGen != state.lastGen) then reset(state)
++    val warm = state.rootCtx != null
++    if !warm then
++      state.rootCtx = (new ContextBase).initialCtx
++      state.compiler = new Compiler
++      state.options = options
++
++    val buf = new ByteArrayOutputStream
++    val ps = new PrintStream(buf, true, "UTF-8")
++    val pw = new PrintWriter(new OutputStreamWriter(ps, UTF_8), true)
++    val reporter = new ConsoleReporter(null, pw, pw)
++    var ok = false
++    var crashed = false
++    try
++      Console.withOut(ps) {
++        Console.withErr(ps) {
++          val root = state.rootCtx.nn.fresh.setReporter(reporter)
++          if warm then
++            invalidate(options, files ++ stale)(using root.fresh.setPeriod(Period(state.lastRunId, FirstPhaseId)))
++          driver.setupFor((options ++ files).toArray, root) match
++            case Some((sources, ctx)) =>
++              if sources.nonEmpty then state.lastRunId = driver.compileWith(state.compiler.nn, sources)(using ctx)
++              ok = !ctx.reporter.hasErrors
++            case None =>
++              ok = !reporter.hasErrors
++        }
++      }
++    catch
++      case e: Throwable =>
++        val sw = new java.io.StringWriter
++        e.printStackTrace(new PrintWriter(sw))
++        pw.println(s"scalino-dotc --daemon: exception while compiling: $sw")
++        crashed = true
++    pw.flush()
++    state.runs += 1
++    if warm then state.warmRuns += 1
++    // A failed or aborted run may leave half-entered symbols behind: start the next one cold.
++    if ok then state.lastGen = newGen else reset(state)
++    // 3: the daemon itself failed, not the program; the client then compiles cold.
++    (if ok then 0 else if crashed then 3 else 1, buf.toString("UTF-8"))
++
++  /** Unlinks the project's top-level symbols that this compile replaces or that no longer exist,
++   *  and forgets the memoized text of the edited sources. */
++  private def invalidate(options: List[String], sourcePaths: List[String])(using Context): Unit =
++    def norm(p: String): String =
++      try Paths.get(p).toAbsolutePath.normalize.toString catch case _: Exception => p
++
++    val edited = sourcePaths.map(norm).toSet
++    for (path, file) <- ctx.base.files.iterator.toList if edited(norm(path)) do
++      ctx.base.files.remove(path)
++      ctx.base.sources.remove(file)
++
++    val outDir = options.indexOf("-d") match
++      case -1 => None
++      case i if i + 1 < options.length => Some(Paths.get(options(i + 1)).toAbsolutePath.normalize)
++      case _ => None
++    outDir.filter(Files.isDirectory(_)).foreach { out =>
++      val outPrefix = out.toString + java.io.File.separator
++      def isStale(cls: ClassSymbol): Boolean =
++        val info = cls.compUnitInfo
++        val file = if info == null then null else info.associatedFile
++        if file == null then false
++        else
++          val p = norm(file.path)
++          edited(p) || (p.startsWith(outPrefix) && !Files.exists(Paths.get(p)))
++
++      // Every package that holds project symbols has a directory in the output: the compile that
++      // entered them wrote their outputs there, and the client never deletes directories.
++      val stream = Files.walk(out)
++      val dirs = try stream.filter(Files.isDirectory(_)).toArray.toList.map(_.asInstanceOf[Path]) finally stream.close()
++      for dir <- dirs do
++        val segments = out.relativize(dir).toString.split(java.util.regex.Pattern.quote(java.io.File.separator)).filter(_.nonEmpty).toList
++        packageClass(segments).foreach { pkg =>
++          val denot = pkg.classDenot
++          val scope = denot.unforcedDecls.openForMutations
++          val gone = mutable.Set.empty[Name]
++          for sym <- scope.toList do
++            sym match
++              case cls: ClassSymbol if !cls.lastKnownDenotation.flagsUNSAFE.is(Package) && isStale(cls) =>
++                scope.unlink(sym, sym.lastKnownDenotation.name)
++                gone += sym.lastKnownDenotation.name
++              case _ =>
++          // A module's term symbol goes with its module class (`Foo` with `Foo$`).
++          if gone.nonEmpty then
++            for sym <- scope.toList do
++              // Only `lastKnownDenotation` (also above: `sym.flagsUNSAFE` goes through the implicit
++              // `toDenot`): `sym.denot` brings the symbol forward to this run, which throws for the
++              // local classes earlier runs lifted into the package (`$anon`).
++              val last = sym.lastKnownDenotation
++              val name = last.name
++              if last.isTerm && last.flagsUNSAFE.is(Module) && !last.flagsUNSAFE.is(Package)
++                && gone(name.toTermName.moduleClassName) then
++                scope.unlink(sym, name)
++          // Not `invalidateMemberCachesFor(sym)`: it reads `sym.name`, which forces the symbol.
++          if gone.nonEmpty then denot.invalidateMemberCaches()
++        }
++    }
++
++  /** The package class at `segments` below the root (the empty package for none), if this base has
++   *  already entered it. Never forces a package that was not looked at: it can hold no stale symbol. */
++  private def packageClass(segments: List[String])(using Context): Option[ClassSymbol] =
++    if segments.isEmpty then Some(defn.EmptyPackageClass)
++    else
++      var owner: ClassSymbol = defn.RootClass
++      var ok = true
++      for seg <- segments if ok do
++        val sym = owner.unforcedDecls.lookup(seg.toTermName)
++        // The last known denotation, not `exists`, which would force a stale symbol; packages
++        // themselves are valid forever.
++        if sym != NoSymbol && sym.lastKnownDenotation.flagsUNSAFE.is(Package) then owner = sym.moduleClass.asClass
++        else ok = false
++      if ok then Some(owner) else None

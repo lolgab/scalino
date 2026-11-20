@@ -78,7 +78,7 @@ COMPILE_CP="$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_
   -Xplugin:"$PLUGIN_JAR" -Xplugin-require:scalanative \
   -Yretain-trees \
   -d "$CLASSES_DIR" \
-  "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$ROOT/cli/SysrootBuild.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
+  "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$ROOT/cli/SysrootBuild.scala" "$ROOT/cli/DotcDaemon.scala" "$SRC_DIR/BuildInfo.scala" "$SELFEXE"
 
 LINK_CP="$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_NATIVE_CP"
 # --mode release-size: v0.0.1 shipped the default debug mode. -Xss64m is cheap insurance; see

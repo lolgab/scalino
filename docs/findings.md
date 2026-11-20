@@ -2685,3 +2685,37 @@ memory order: long-running processes (watch mode, the LSP), anything after an ev
 - `DirectCodeGenDispatch.plan` asked `llvm-config` (on the PATH of the machine linking) for the LLVM version. A Windows host has none, so the whole build would have fallen back to `.ll` + clang with a warning. It now asks the LLVM linked into the binary (`LLVMGetVersion`), which is the one the codegen calls anyway, on every OS.
 - The Windows linkdriver links MSYS2's static LLVM (`build/13-cross-link-toolchain.sh`, `LLVM_MSYS2_*` in versions.env) instead of abort stubs, and `cli/ScalinoCli.scala` / `LinkDriver.scala` default direct codegen to on there.
 - Checked on macOS arm64 with a linkdriver built from the patched tools: `scalino package --native-target-triple x86_64-pc-windows-gnu` links `Hello` with 230 direct objects and 2 `-fallback.ll` partitions (macOS: 4), PE32+ output. Not run on Windows locally: ci.yml's `windows` job does that.
+
+## dotc daemon: a warm scalino-dotc between builds (patch scala3-0045, 2026-11-20)
+
+Plan and measurements: docs/ideas/01-dotc-daemon.md. `scalino-dotc --daemon` (`dotc/ScalinoDaemon.scala`, entered through `Main`) keeps one `ContextBase` and one `Compiler` across compiles of one classes directory. The CLI (`cli/DotcDaemon.scala`) spawns it detached, one per classes directory, reaches it over loopback TCP with a token from a private state directory, and uses it for `-w` and for separate commands alike. `--no-daemon`/`SCALINO_DOTC_DAEMON=0` turn it off, and it is off by default when `$CI` is set. `scalino daemon status|stop` manages it.
+
+**Measured on `~/scala/ape` (30 files, http4s/upickle/porcupine), `scalino compile .` after appending a comment, median of 3-4, macOS arm64, loaded machine:**
+
+| edited file | closure | `--no-daemon` | daemon (EVAC on, the default) | daemon, EVAC off |
+|---|---|---|---|---|
+| `Main.scala` | 1 | 0.67s | 0.22s | |
+| `util/Logger.scala` | 4 | 0.67s | 0.26s | |
+| `http/Routes.scala` (upickle `derives`) | 2 | 1.84s | 1.00s | |
+| `http/Views.scala` | 4 | 1.97s | 1.22s | 1.10s |
+| `domain/EnergyBalance.scala` | 22 | 7.74s | 8.21-8.43s | 6.88s |
+
+Small edits get 2-3x faster. A large closure is about 10% *slower* with the daemon's default `SCALANATIVE_EVAC_ENABLE=1`, because evacuation runs over a live heap that holds the warm state. Without EVAC the daemon wins there too, but its RSS grows from 0.66 to 3.8 GB in 12 compiles (EVAC: 0.55 to 1.6 GB). dotc's multi-run state only grows (`uniques` and similar), so the CLI stops a daemon above `SCALINO_DOTC_DAEMON_MAX_RSS_MB` (4096) after its compile, and the next compile starts a fresh one. The default is EVAC on; `SCALANATIVE_EVAC_ENABLE=0` in the environment of the `scalino` that spawns the daemon trades memory for speed.
+
+**Correctness rules** (ScalinoDaemon's doc comment): the warm state is dropped when the options change, when the output directory's generation file (`<classes>.dotc-gen`) doesn't match the daemon's last successful compile (any compile that bypasses the daemon deletes it), and after any compile with errors. Before a warm compile, the daemon unlinks the top-level classes and modules whose source is recompiled or removed, or whose `.tasty` the CLI purged. It also evicts the edited sources from `ContextBase.files`/`sources`, which memoize a source's *text* by path: without that, an edit compiles the old text. If the compiler throws inside the daemon, the client gets exit code 3, logs the trace and compiles cold.
+
+**Traps found on the way:**
+- `Compiler.nextRunId` is per `Compiler` instance, so the daemon keeps one per base.
+- Invalidation must run at the period of the *last* run. `Driver.finish` starts extra runs for suspended units (macros defined in the same sources), so the daemon takes `compiler.nextRunId - 1`.
+- Unlinking must never force a symbol. `sym.flagsUNSAFE`, `exists`, `name` and `isTerm` all go through `toDenot` and bring the symbol forward. That throws `StaleSymbol` for the local classes (`$anon`, lambdas) that earlier runs lifted into the package scope, so everything goes through `lastKnownDenotation`.
+- `ProcessHandle.current()` throws in this javalib, and `UUID.randomUUID` does not link (no `SecureRandom`). The token comes from `/dev/urandom`, with a weaker fallback on Windows.
+
+**What `SCALINO_DOTC_DAEMON=verify` compares**, and the two known differences from a cold compile:
+- `.nir`/`.sjsir`/`.class` byte for byte, plus the set of files. `.tasty` files only have to exist on both sides: the pickler shares types by object identity, and a warm base can hold two equal `TermRef`s where a cold one has one, which changes `SHAREDtype` layout and the UUID but not the meaning.
+- **Open: source positions in library macro expansions.** Compiling `db/BuildingRepo.scala` of ape a second time in the same base changes 16 position columns in `BuildingRepo$.nir`: porcupine's `sql` interpolator expansion moves from column 45 to 21 on the same line. `show` of the NIR is identical. `Positioned.withSpan` sets the span of a span-less (synthetic) tree *in place*, and some synthetic tree is reused across runs. Not chased further. Verify accepts position-only `.nir` differences and reports them. Repro: in one daemon, compile all of ape twice, then compare `db/BuildingRepo$.nir` with a cold compile (the scratch `apewarm.py` driver).
+
+**Correction to the plan:** its "0.6s regex scan in the CLI per build" was measured with a debug-mode `dist/scalino` (12.5 MB). The release-size CLI's no-op `compile` on ape takes 0.10s.
+
+Tests: `tests/dotc-daemon/run.sh` (edit sequence under verify: rename, delete, top-level defs, error then fix, same-project macro, enum/sealed, a `--no-daemon` build in between, `run`, `$(scalino ...)` not waiting, `daemon stop`), added to ci.yml. Also checked by hand: ape under verify (8 edits), Scala.js, `-w`, and that the daemon survives SIGINT/SIGHUP. Not checked: Linux, Windows (spawned without `sh`, so a console Ctrl+C reaches it), x86_64.
+
+The incremental closure also got a fix that affects cold builds: names a changed file no longer declares (a renamed class) now invalidate the files that mention them, as names of removed files already did.

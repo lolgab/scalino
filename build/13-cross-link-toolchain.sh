@@ -148,7 +148,7 @@ if wants cli; then
     -classpath "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_NATIVE_CP" \
     -Xplugin:"$(cat "$WORK/nscplugin.jar.txt")" -Xplugin-require:scalanative \
     -Yretain-trees -d "$CLASSES_DIR" \
-    "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$ROOT/cli/SysrootBuild.scala" \
+    "$ROOT/cli/ScalinoCli.scala" "$ROOT/cli/Packaging.scala" "$ROOT/cli/Sysroot.scala" "$ROOT/cli/SysrootBuild.scala" "$ROOT/cli/DotcDaemon.scala" \
     "$CROSS_WORK/BuildInfo.scala" "$SELFEXE"
   cross_link cli "$(to_native_path "$CLASSES_DIR")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$NIR_NATIVE_CP" ScalinoCli \
     --mode "$([[ "$MODE" == debug ]] && echo debug || echo release-size)" --multithreading --no-incremental-compilation

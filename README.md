@@ -152,6 +152,13 @@ scalino package . --main-class Server,Worker -o bin/                        # on
 - **Incremental builds:** unchanged sources are reused from the last build
   (`--no-incremental` turns this off). Resolved classpaths and build output are
   cached in `.scalino-build/`.
+- **Warm compiler:** builds compile through a background `scalino-dotc` that
+  keeps the compiler and the loaded dependencies in memory between builds, both
+  under `-w` and across separate commands, so a small edit recompiles in a
+  fraction of the cold time. There is one per build directory. Each exits after
+  15 idle minutes, and at most 3 run at once. `scalino daemon status` lists them
+  and `scalino daemon stop` stops them. `--no-daemon` or `SCALINO_DOTC_DAEMON=0`
+  turns it off, and it is off by default when `$CI` is set.
 - **Post-link hook and run environment:** `--post-link <cmd>` (`//> using postLink <cmd>`)
   runs a command on the linked binary, and `--run-env KEY=VALUE`
   (`//> using runEnv KEY=VALUE`) adds environment variables for the program
