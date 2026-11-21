@@ -394,6 +394,14 @@ jobs:
         shell: bash
         run: ./tests/js/run.sh dist/scalino
 
+      - name: Smoke test -- publish-local / publish
+        if: matrix.test == 'js'
+        # A Native and a Scala.js library published to ~/.ivy2/local and consumed by another project,
+        # --m2, a signed publish to a directory, and Maven Central against a local mock of the
+        # Central Portal API (needs gpg and python3, both on the runner). See tests/publish/run.sh.
+        shell: bash
+        run: ./tests/publish/run.sh dist/scalino
+
       - name: Smoke test -- stack-allocated objects (escape analysis)
         if: matrix.test == 'escape'
         # Every release mode stack-allocates objects the escape analysis

@@ -69,3 +69,81 @@ New file `cli/Publish.scala` (compiled into the CLI by build/07), entry points
   the last release (see "Decisions").
 - Real Central upload can't be tested without publishing for real; covered against a
   mock server that checks the request shape (auth header, multipart field, query).
+
+## Done (2026-11-21)
+
+Implemented as planned, in `cli/Publish.scala`. Wired into `cli/ScalinoCli.scala`: dispatch
+(`publish-local`, `publish local`, `publish`), `compileForPublish`, per-command help, completions,
+and `publish.*` keys exempted from the unsupported-directive warning. Also added to
+build/07 and build/13, plus README "Publishing libraries", docs/findings.md, tests/publish/ and a
+CI step on the `js` smoke leg.
+
+### Decisions (Lorenzo's to revisit)
+
+- **Central publishing type defaults to AUTOMATIC.** `scalino publish` releases once the portal
+  validates the bundle, like sbt's `sonaRelease` and scala-cli's `publish`. `--manual-release` gives
+  USER_MANAGED (the portal's own default). Publishing to Central can't be undone, so this is worth a
+  second look.
+- **Scala Native runtime version in POMs** is the release before this toolchain's snapshot
+  (`0.5.13-SNAPSHOT` -> `0.5.12`), overridable with `SCALINO_PUBLISH_NATIVE_VERSION`. This is a
+  heuristic. `scala3lib_native0.5_3:3.10.0+0.5.12` may not exist on Central. sbt consumers would
+  evict it in favour of their own, but a strict resolver could complain. A pinned
+  "last released Scala Native" value in versions.env might be cleaner.
+- **Default organization**: `io.github.<owner>` from a GitHub `origin` remote (as scala-cli does),
+  else `default` for publish-local; `publish` fails without one. Default name = directory name,
+  default publish-local version `0.1.0-SNAPSHOT`.
+- **No `.class` in the jar** (no JVM backend). Untested with sbt consumers.
+- **Snapshots to Central** use plain `-SNAPSHOT` file names (non-timestamped, as sbt does) and an
+  artifact-level `maven-metadata.xml`. The portal docs don't say whether timestamped names or
+  version-level metadata are required. Unverified against the real snapshots repository.
+- **Signers**: `gpg` and `none` only. scala-cli's `bouncycastle` needs a JVM. `publish.secretKey`
+  (armored, or base64 of armored, default `$PGP_SECRET`) is imported into a throwaway GNUPGHOME
+  in /tmp.
+- One platform per invocation (`--js` for Scala.js). A `//> using platform native js` project
+  publishes only the first platform listed. Run publish twice for both.
+
+### Verification
+
+Toolchain: worktree `dist/` = symlinks to the main checkout's dist (dotc, linkdriver, jslink, cs,
+lib) plus a real `dist/scalino`, built with `bash build/07-build-scalino.sh` (`OK:
+.../08-publish/dist/scalino`) under the heavy-build lock. `.build-work/*.cp` copied from main.
+
+```
+$ tests/publish/run.sh dist/scalino
+== publish-local (Scala Native) into ~/.ivy2/local
+== a second project depends on it
+== publish-local --js, consumed with --js
+== publish-local --m2-home, consumed through -r
+== publish to a directory, signed with PGP_SECRET
+== publish to Central (mock Portal API)
+== --manual-release, then a FAILED deployment
+== -SNAPSHOT goes to the snapshots repository by PUT
+== Central needs the POM metadata
+OK
+```
+
+What it checks: the library (with an `inline` method and a `fansi` dependency) is published to the
+real `~/.ivy2/local` under a random org (removed at exit). A second project with only
+`//> using dep <org>::greeter::0.1.0` runs and prints `hello, world 42` on Native and on Scala.js
+(node). It also checks: md5/sha1 against `md5`/`shasum`; jar entries (`.tasty`, `.nir`/`.sjsir`,
+resources, manifest); byte-identical jars on republish; POM fields (license URL, scm, developer
+email, versionScheme, no SNAPSHOT deps); `--m2-home` consumed with `-r file://`; gpg signatures
+(`gpg --verify`) for a directory publish and for the Central bundle; the upload request (path,
+`publishingType`, `bundle` field, `Authorization: Bearer base64(user:token)`); status polling; the
+portal's FAILED errors shown and a non-zero exit; snapshot PUTs with Basic auth; and the
+missing-metadata error for Central.
+
+Checked by hand: `--gpg-key <fpr>` with `GNUPGHOME` set (user-keyring path); `computeVersion
+git:dynver` (`1.4.0` on the tag, `1.4.0+1-cf72ef35-SNAPSHOT` past it); GitHub-remote defaults
+(`io.github.someone`, url/scm from `git@github.com:SomeOne/cool-lib.git`); `--dummy`;
+`publish local` alias; `publish --help`.
+
+### Not done / remaining
+
+- No real upload to Central (would publish for real). Only the mock is covered. The first real
+  publish should use `--manual-release` and be inspected in the portal.
+- No scaladoc: the javadoc jar is manifest-only (Central accepts it).
+- sbt/Mill consumption of a scalino-published jar is untested.
+- `publish.checksums`, `publish.classifier`, extra artifacts, and `publish.ci.*` beyond
+  key-for-key overriding are not supported.
+- tests/publish needs `gpg` and `python3` (present on the GitHub Linux/macOS runners).

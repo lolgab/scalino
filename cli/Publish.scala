@@ -550,9 +550,13 @@ object Publish:
    *  user's keyring is never touched. */
   final class Signer(keyId: Option[String], secretKey: Option[String], passphrase: Option[String], options: List[String]):
     private val gpg = ScalinoCli.findOnPathOpt("gpg").getOrElse(fail("signing needs gpg on the PATH (or --signer none)"))
-    private val work = Files.createTempDirectory("scalino-sign")
+    // gpg-agent's socket lives in GNUPGHOME on macOS, and a socket path is limited to ~104 bytes:
+    // macOS's per-user $TMPDIR (/var/folders/...) plus a random name is already too long.
+    private val work =
+      val tmp = Paths.get("/tmp")
+      if !ScalinoCli.isWindows && Files.isDirectory(tmp) then Files.createTempDirectory(tmp, "sg") else Files.createTempDirectory("sg")
     private val home: Option[Path] = secretKey.map { key =>
-      val h = Files.createDirectories(work.resolve("gnupg"))
+      val h = Files.createDirectories(work.resolve("g"))
       setOwnerOnly(h, dir = true)
       val armored =
         if key.contains("-----BEGIN PGP") then key

@@ -2794,3 +2794,30 @@ Checked on the JVM against 0046: ape (970 files), `examples/{interpreter-regress
 **Result** (release-fast + PGO, 5 interleaved runs, machine swapping): ape full compile median 6.44s -> 6.22s (-3.4% wall), CPU 7.61s -> 7.28s (-4%).
 
 **Tried after 0047, no measurable effect, not kept:** caching each `Ident`'s `desugarIdent` result per tree (to stop rebuilding a `Select` + `TermRef` and recomputing its denotation on every evaluation) made the macro thread ~2% slower: the `IdentityHashMap` lookup costs as much as the desugaring, and `Select.denot` did not drop. Memoizing by-name parameter flags and parameter symbols, binding parameters with a loop instead of `zip`/tuples, and an allocation-free `ownerNames` came out at -1% macro-thread samples over 3 profiled runs each, inside the run-to-run noise. What is left on the macro thread after 0047 (allocation, `Tree.symbol`, persistent-map `Env` updates, string-match dispatch in the intrinsic tables) is spread too thin for local fixes; the next step would be structural, e.g. pre-resolving each tree once into an interpreter-specific node.
+
+## `scalino publish-local` / `scalino publish` (cli/Publish.scala, 2026-11-21)
+
+Libraries built by scalino can now be depended on by other projects. `publish-local` writes the
+ivy layout sbt's `publishLocal` writes (`jars/ srcs/ docs/ poms/ ivys/ivy.xml`, each with `.md5` and
+`.sha1`) into `~/.ivy2/local`, coursier's default `ivy2Local` repository, so a consumer's plain
+`//> using dep org::name::version` resolves it. `publish` uploads one signed bundle to the Sonatype
+Central Portal (`/api/v1/publisher/upload`, then `/status` until `PUBLISHING`/`VALIDATED`/`FAILED`).
+
+- **The main jar has no `.class` files.** The reduced dotc has no JVM backend, so the jar is the
+  `.tasty` (from `-Xearly-tasty-output`) plus `.nir` or `.sjsir`. A consumer's scalino-dotc compiles
+  against it, inline methods and all (tasty-only classpath entries are what Zinc pipelining uses
+  too). Scala Native's linker needs only the `.nir`, and Scala.js's only the `.sjsir`. Not yet tried
+  from sbt.
+- **Runtime-library versions in the POM.** sbt-scala-native lists `nativelib`, `javalib`,
+  `scala3lib`, etc. in every POM. Here they would be `0.5.13-SNAPSHOT`, which is built from main
+  and exists only in this machine's ivy cache, so the POM uses the release before it (`0.5.12`;
+  `SCALINO_PUBLISH_NATIVE_VERSION` overrides). scalino's own consumers exclude these modules
+  anyway (`excludedArtifacts`).
+- **No `MessageDigest`, `java.text` or `java.time` in this javalib.** SHA-1 is hand-rolled in
+  Publish.scala, next to `Packaging.md5Hex`. Timestamps use a days-to-civil conversion.
+  `java.util.zip.ZipOutputStream` exists, but jars are written by a small zip writer (CRC32 + raw
+  `Deflater`) with fixed timestamps and sorted entries, so republishing the same sources gives
+  byte-identical jars (checked in tests/publish/run.sh).
+- **gpg on macOS and long temp paths.** gpg-agent puts its socket in `GNUPGHOME`, and a Unix socket
+  path is limited to ~104 bytes. With a throwaway home under macOS's `$TMPDIR` (`/var/folders/...`)
+  the import failed with "can't connect to the gpg-agent: File name too long", so it lives in `/tmp`.

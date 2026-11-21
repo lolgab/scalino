@@ -123,6 +123,7 @@ scalino package . --main-class Server,Worker -o bin/                        # on
 | `test` | compile main + test scope, run the tests |
 | `setup-ide` | write the LSP config ([Editor support](#editor-support)) |
 | `lock` | write `scalino.lock.json` ([Hermetic builds](#hermetic--nix-builds)) |
+| `publish-local`, `publish` | publish a library to `~/.ivy2/local` or Maven Central ([Publishing libraries](#publishing-libraries)) |
 | `sysroot build` | set up a cross-compilation sysroot ([Cross-compilation](#cross-compilation)) |
 | `clean`, `version`, `completions` | what they say |
 
@@ -342,6 +343,52 @@ The package metadata comes from these directives:
 (see `scalino package --help`). With [cross-compilation](#cross-compilation)
 one machine can build every target into the same output dir; you can also build
 each OS/arch on its own CI runner. Run `--format brew` last either way.
+
+## Publishing libraries
+
+`scalino publish-local` publishes the library in the current directory to
+`~/.ivy2/local`, where any other scalino project (or sbt, Mill, scala-cli)
+resolves it with no extra repository. `scalino publish` sends it to Maven
+Central through the Sonatype Central Portal. Both read scala-cli's
+`//> using publish.*` directives:
+
+```scala
+//> using publish.organization io.github.me
+//> using publish.name mylib
+//> using publish.version 1.2.3          // or: publish.computeVersion git:tag
+//> using publish.description "What it does"
+//> using publish.url https://github.com/me/mylib
+//> using publish.license Apache-2.0
+//> using publish.versionControl github:me/mylib
+//> using publish.developer "me|My Name|https://github.com/me"
+```
+
+```sh
+scalino publish-local                   # -> mylib_native0.5_3; --js for mylib_sjs1_3
+# in another project:  //> using dep io.github.me::mylib::1.2.3
+
+SONATYPE_USERNAME=... SONATYPE_PASSWORD=... scalino publish   # signs with gpg
+```
+
+The main jar holds the `.tasty` plus the `.nir` (Scala Native) or `.sjsir`
+(Scala.js) that dotc wrote, and the resource directories. It has no `.class`
+files, since there is no JVM backend. A sources jar, an empty javadoc jar and
+the POM go with it. The POM lists the platform runtime libraries as sbt does,
+at the last released Scala Native version.
+
+| target | how |
+|---|---|
+| `publish-local` | ivy layout in `~/.ivy2/local` (`--ivy2-home`); `--m2` for `~/.m2/repository` |
+| `publish` (`-R central`, default) | one signed bundle to the Central Portal, published once it validates (`--manual-release`: you publish it from the portal); `-SNAPSHOT` versions go to Central's snapshots repository |
+| `publish -R https://...` | Maven deploy by HTTP PUT (`--user`/`--password`) |
+| `publish -R <dir>` | Maven layout written to a directory |
+
+Credentials and keys take scala-cli's `env:NAME` / `file:path` / `value:text`
+forms. They default to `$SONATYPE_USERNAME`/`$SONATYPE_PASSWORD` (the portal's
+user token) and to `$PGP_SECRET`/`$PGP_PASSPHRASE`. A `$PGP_SECRET` key is
+imported into a temporary GNUPGHOME, so your keyring is left alone; `--gpg-key`
+signs with a key from your keyring instead. `--dummy` builds and signs
+everything but uploads nothing. See `scalino publish --help`.
 
 ## Cross-compilation
 
