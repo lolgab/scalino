@@ -3167,8 +3167,8 @@ object ScalinoCli:
        |  --secret-key <secret>      armored secret key, or its base64 (default $$PGP_SECRET), imported
        |                             into a throwaway GNUPGHOME; --secret-key-password <secret>
        |                             (default $$PGP_PASSPHRASE)
-       |  --auto-release             publish the Central deployment as soon as it validates (default:
-       |                             it waits, validated, for you to publish it from the portal)
+       |  --manual-release           leave the Central deployment validated, for publishing from
+       |                             the portal (default: published automatically once validated)
        |  --dummy                    build and sign everything, upload nothing
        |""".stripMargin)
 
@@ -4200,7 +4200,7 @@ object ScalinoCli:
     "--formats --package-name --package-version " +
     "--organization --name --module-name --project-version --compute-version --url --license --vcs --description --developer " +
     "--version-scheme --publish-repository --gpg-key --gpg-option --secret-key --secret-key-password --signer --user --password " +
-    "--sources --doc --ivy2-home --m2 --m2-home --dummy --auto-release -h --help"
+    "--sources --doc --ivy2-home --m2 --m2-home --dummy --manual-release -h --help"
 
   private def bashCompletion: String =
     s"""_scalino() {
