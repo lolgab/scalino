@@ -133,7 +133,7 @@ MOCK_PID=$!
 mkdir -p "$WORK/mock"
 for _ in $(seq 50); do [[ -s "$WORK/port" ]] && break; sleep 0.1; done
 export SCALINO_CENTRAL_URL="http://127.0.0.1:$(cat "$WORK/port")" SCALINO_CENTRAL_POLL_MS=50
-SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . > "$WORK/out" 2>&1 || { cat "$WORK/out" >&2; fail "publish to central"; }
+SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . --auto-release > "$WORK/out" 2>&1 || { cat "$WORK/out" >&2; fail "publish to central"; }
 grep -q "Published $ORG:$NATIVE:0.1.0 to Maven Central" "$WORK/out" || fail "no success line: $(cat "$WORK/out")"
 python3 - "$WORK/mock/requests.jsonl" <<'EOF' || fail "upload request"
 import json, sys
@@ -154,10 +154,10 @@ done
 mkdir "$WORK/b" && (cd "$WORK/b" && unzip -q "$WORK/mock/bundle.zip")
 gpg --homedir "$GNUPG" --verify "$WORK/b/$DIR/$NATIVE-0.1.0.jar.asc" "$WORK/b/$DIR/$NATIVE-0.1.0.jar" 2>&1 | grep -q 'Good signature' || fail "bundle signature"
 
-echo "== --manual-release, then a FAILED deployment"
+echo "== without --auto-release the deployment is USER_MANAGED, then a FAILED deployment"
 : > "$WORK/mock/requests.jsonl"
-SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . --manual-release -q > /dev/null 2>&1 || true
-grep -q '"publishingType": \["USER_MANAGED"\]' "$WORK/mock/requests.jsonl" || fail "--manual-release is not USER_MANAGED"
+SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . -q > /dev/null 2>&1 || true
+grep -q '"publishingType": \["USER_MANAGED"\]' "$WORK/mock/requests.jsonl" || fail "the default is not USER_MANAGED"
 kill "$MOCK_PID"; wait "$MOCK_PID" 2>/dev/null || true
 rm -f "$WORK/port"
 MOCK_FAIL=1 python3 "$ROOT/tests/publish/mock_central.py" "$WORK/mock" > "$WORK/port" &

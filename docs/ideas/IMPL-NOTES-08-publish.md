@@ -80,10 +80,10 @@ CI step on the `js` smoke leg.
 
 ### Decisions (Lorenzo's to revisit)
 
-- **Central publishing type defaults to AUTOMATIC.** `scalino publish` releases once the portal
-  validates the bundle, like sbt's `sonaRelease` and scala-cli's `publish`. `--manual-release` gives
-  USER_MANAGED (the portal's own default). Publishing to Central can't be undone, so this is worth a
-  second look.
+- **Central publishing type defaults to USER_MANAGED** (Lorenzo's call, 2026-11-21; the first cut
+  defaulted to AUTOMATIC): the deployment waits, validated, to be published from the portal, since a
+  Central release can't be undone. This is also the portal's own default. `--auto-release` gives
+  AUTOMATIC (sbt's `sonaRelease`).
 - **Scala Native runtime version in POMs** is the release before this toolchain's snapshot
   (`0.5.13-SNAPSHOT` -> `0.5.12`), overridable with `SCALINO_PUBLISH_NATIVE_VERSION`. This is a
   heuristic. `scala3lib_native0.5_3:3.10.0+0.5.12` may not exist on Central. sbt consumers would
@@ -116,7 +116,7 @@ $ tests/publish/run.sh dist/scalino
 == publish-local --m2-home, consumed through -r
 == publish to a directory, signed with PGP_SECRET
 == publish to Central (mock Portal API)
-== --manual-release, then a FAILED deployment
+== without --auto-release the deployment is USER_MANAGED, then a FAILED deployment
 == -SNAPSHOT goes to the snapshots repository by PUT
 == Central needs the POM metadata
 OK
@@ -141,7 +141,7 @@ git:dynver` (`1.4.0` on the tag, `1.4.0+1-cf72ef35-SNAPSHOT` past it); GitHub-re
 ### Not done / remaining
 
 - No real upload to Central (would publish for real). Only the mock is covered. The first real
-  publish should use `--manual-release` and be inspected in the portal.
+  publish should be inspected in the portal before publishing it there (the default).
 - No scaladoc: the javadoc jar is manifest-only (Central accepts it).
 - sbt/Mill consumption of a scalino-published jar is untested.
 - `publish.checksums`, `publish.classifier`, extra artifacts, and `publish.ci.*` beyond

@@ -379,7 +379,7 @@ at the last released Scala Native version.
 | target | how |
 |---|---|
 | `publish-local` | ivy layout in `~/.ivy2/local` (`--ivy2-home`); `--m2` for `~/.m2/repository` |
-| `publish` (`-R central`, default) | one signed bundle to the Central Portal, published once it validates (`--manual-release`: you publish it from the portal); `-SNAPSHOT` versions go to Central's snapshots repository |
+| `publish` (`-R central`, default) | one signed bundle to the Central Portal, left validated for you to publish from the portal (`--auto-release`: published as soon as it validates); `-SNAPSHOT` versions go to Central's snapshots repository |
 | `publish -R https://...` | Maven deploy by HTTP PUT (`--user`/`--password`) |
 | `publish -R <dir>` | Maven layout written to a directory |
 

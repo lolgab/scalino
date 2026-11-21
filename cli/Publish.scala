@@ -95,7 +95,7 @@ object Publish:
     m2: Boolean = false,
     m2Home: Option[String] = None,
     dummy: Boolean = false,
-    manualRelease: Boolean = false
+    autoRelease: Boolean = false
   )
 
   private def boolValue(flag: String, v: String): Boolean = v.toLowerCase match
@@ -146,7 +146,7 @@ object Publish:
         case "--m2" => f = f.copy(m2 = true)
         case "--m2-home" => f = f.copy(m2Home = Some(value(a)), m2 = true)
         case "--dummy" => f = f.copy(dummy = true)
-        case "--manual-release" => f = f.copy(manualRelease = true)
+        case "--auto-release" => f = f.copy(autoRelease = true)
         case _ => rest += a
       i += 1
     (f, rest.toArray)
@@ -740,8 +740,9 @@ object Publish:
     Option(System.getenv("SCALINO_CENTRAL_URL")).filter(_.nonEmpty).getOrElse("https://central.sonatype.com").stripSuffix("/")
 
   /** Sonatype Central Portal: the bundle goes up in one request, then the deployment is polled until
-   *  it is validated (USER_MANAGED, `--manual-release`: publish it from the portal) or publishing
-   *  (AUTOMATIC: on Maven Central within ~30 minutes), or failed, with the portal's reasons. */
+   *  it is validated (USER_MANAGED, the default: publish it from the portal) or publishing
+   *  (AUTOMATIC, `--auto-release`: on Maven Central within ~30 minutes), or failed, with the
+   *  portal's reasons. Manual by default: a release on Central can't be taken back. */
   def uploadCentral(bundle: Path, m: Meta, auth: String, automatic: Boolean, quiet: Boolean): Unit =
     val base = centralBaseUrl
     val tpe = if automatic then "AUTOMATIC" else "USER_MANAGED"
@@ -896,7 +897,7 @@ object Publish:
         if flags.dummy then println(s"Dummy run: wrote ${bundle.toAbsolutePath.normalize}, nothing uploaded")
         else
           val (u, p) = credentials()
-          uploadCentral(bundle.toAbsolutePath, meta, bearerAuth(u, p), automatic = !flags.manualRelease, o.quiet)
+          uploadCentral(bundle.toAbsolutePath, meta, bearerAuth(u, p), automatic = flags.autoRelease, o.quiet)
       else if isCentral || repo.startsWith("http://") || repo.startsWith("https://") then
         val url = if isCentral then s"$centralBaseUrl/repository/maven-snapshots" else repo
         if flags.dummy then
