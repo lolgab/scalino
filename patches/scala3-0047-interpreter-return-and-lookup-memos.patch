@@ -1,0 +1,235 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index ca1f52c..2b118a1 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -223,7 +223,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // used bare as `adjustedBound min (until - lo)`).
+         case v: LocalDef if v.ddef.termParamss.isEmpty =>
+           // A `return` in a local def exits that def (not the enclosing method).
+-          try interpretTree(v.ddef.rhs)(using v.closureEnv)
++          try returnedValue(interpretTree(methodBody(v.ddef))(using v.closureEnv))
+           catch case LabeledReturn(label, value) if label == v.ddef.symbol => value
+         case v => v
+ 
+@@ -271,8 +271,12 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       if asBoolean(interpretTree(cond)) then interpretTree(thenp) else interpretTree(elsep)
+ 
+     case WhileDo(cond, body) =>
+-      while asBoolean(interpretTree(cond)) do interpretTree(body)
+-      interpretUnit()
++      var returned: Object = null
++      while returned == null && asBoolean(interpretTree(cond)) do
++        interpretTree(body) match
++          case r: ReturnValue => returned = r
++          case _ =>
++      if returned != null then returned else interpretUnit()
+ 
+     case Try(expr, cases, finalizer) =>
+       try
+@@ -301,7 +305,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+ 
+     case Return(expr, from) =>
+       val value = if expr.isEmpty then interpretUnit() else interpretTree(expr)
+-      throw LabeledReturn(from.symbol, value)
++      if safeReturns.contains(tree) then new ReturnValue(value)
++      else throw LabeledReturn(from.symbol, value)
+ 
+     case Match(selector, cases) =>
+       val scrutinee = interpretTree(selector)
+@@ -536,7 +541,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         val withTypeParams = ddef.leadingTypeParams.map(_.symbol).zip(typeArgs).foldLeft(closureEnv)((e, pv) => e.updated(pv._1, pv._2))
+         val callEnv = bindNonErased(params, rawArgs).foldLeft(withTypeParams)((e, pv) => e.updated(pv._1, pv._2))
+         // A `return` in a local def exits that def (not the enclosing method).
+-        try interpretTree(ddef.rhs)(using callEnv)
++        try returnedValue(interpretTree(methodBody(ddef))(using callEnv))
+         catch case LabeledReturn(label, value) if label == ddef.symbol => value
+       else if (env.contains(fn.symbol))
+         // `fn.symbol` is a local `val`/parameter bound to an already-
+@@ -694,7 +699,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // The block's FINAL environment, for local `lazy val` initializers (which
+     // may reference siblings defined after them); set once the fold is done.
+     var lazyEnv: Option[Env] = None
+-    val newEnv = stats.foldLeft(env)((accEnv, stat) => stat match
++    // A `return` statement (see `ReturnValue`): skip the rest of the block.
++    var returned: Object = null
++    val newEnv = stats.foldLeft(env)((accEnv, stat) => if returned != null then accEnv else stat match
+       // A local `lazy val` (`lazy val sharedTypes = expensiveOrFailing()`): its
+       // initializer runs on first read only, and only once -- evaluating it
+       // here eagerly (as for a plain `val`) runs code, possibly throwing, that
+@@ -747,7 +754,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case stat =>
+         // Any other statement (If/Match/Apply/... used for its side effect,
+         // result discarded) -- just interpret it in place.
+-        interpretTree(stat)(using accEnv)
++        interpretTree(stat)(using accEnv) match
++          case r: ReturnValue => returned = r
++          case _ =>
+         accEnv
+     )
+     // Every local `def` in this block can see every OTHER local def in the
+@@ -766,7 +775,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // which point this whole block has run this far regardless.
+     localDefs.foreach(_.closureEnv = newEnv)
+     lazyEnv = Some(newEnv)
+-    interpretTree(expr)(using newEnv)
++    if returned != null then returned else interpretTree(expr)(using newEnv)
+   }
+ 
+   /** `Tuple\d+`, without `String#matches` compiling a regex on every call. */
+@@ -806,6 +815,47 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case _ =>
+           try apply(x) catch case _: MatchError => NoMatch
+ 
++  /** The value of a `return` in `safeReturns`, passed back up as an ordinary result: `Block`
++   *  skips its remaining statements, `WhileDo` stops, `If`/`Match`/`Labeled`/... hand it on, and
++   *  the call of its method unwraps it (`returnedValue`). Other `return`s still throw
++   *  `LabeledReturn`, which natively unwinds every interpreter frame in between (`sizeCompare`'s
++   *  `while (...) { if (...) return 1; ... }` is called thousands of times per derivation).
++   */
++  private final class ReturnValue(val value: Object)
++
++  /** `return`s whose path up to the body of the method they return from has only nodes that
++   *  hand a `ReturnValue` on: no call, closure, `val`, `try` or condition in between.
++   */
++  private val safeReturns = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap[Tree, java.lang.Boolean])
++  private val scannedMethods = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap[DefDef, java.lang.Boolean])
++
++  /** `ddef.rhs`, once its `safeReturns` are recorded. Its result must go through `returnedValue`. */
++  private def methodBody(ddef: DefDef): Tree =
++    if scannedMethods.add(ddef) then collectSafeReturns(ddef.rhs, ddef.symbol)
++    ddef.rhs
++
++  private def collectSafeReturns(tree: Tree, method: Symbol): Unit = tree match
++    case Return(_, from) => if from.symbol == method then safeReturns.add(tree)
++    case Block(stats, expr) =>
++      stats.foreach {
++        case _: MemberDef | _: Import =>
++        case stat => collectSafeReturns(stat, method)
++      }
++      collectSafeReturns(expr, method)
++    case If(_, thenp, elsep) =>
++      collectSafeReturns(thenp, method)
++      collectSafeReturns(elsep, method)
++    case WhileDo(_, body) => collectSafeReturns(body, method)
++    case Match(_, cases) => cases.foreach(c => collectSafeReturns(c.body, method))
++    case Inlined(_, _, expansion) => collectSafeReturns(expansion, method)
++    case Typed(expr, _) => collectSafeReturns(expr, method)
++    case Labeled(_, expr) => collectSafeReturns(expr, method)
++    case _ =>
++
++  private def returnedValue(result: Object): Object = result match
++    case r: ReturnValue => r.value
++    case _ => result
++
+   private def applyIfMatched(f: Function1[Object, Object], x: Object): Object = f match
+     case f: InterpretedFn1 => f.applyIfMatched(x)
+     case _ => try f(x) catch case _: MatchError => NoMatch
+@@ -935,7 +985,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // `quotes.reflect`'s own members and the Scala standard library.
+       def matchConcreteUnapply(qual: Tree): Option[Object => Option[List[Object]]] =
+         val sym = qual.symbol
+-        val curatedOwner = !sym.exists || { val o = sym.maybeOwner; !o.exists || o.name.toString.stripSuffix("$") == "reflectModule" || o.showFullName.startsWith("scala.") || sym.showFullName.startsWith("scala.") || sym.maybeOwner.maybeOwner.name.toString == "scala" || o.showFullName == "scala" || o.name.toString.endsWith("TypeTestModule") }
++        val curatedOwner = !sym.exists || { val o = sym.maybeOwner; !o.exists || o.name.toString.stripSuffix("$") == "reflectModule" || fullNameOf(o).startsWith("scala.") || fullNameOf(sym).startsWith("scala.") || sym.maybeOwner.maybeOwner.name.toString == "scala" || fullNameOf(o) == "scala" || o.name.toString.endsWith("TypeTestModule") }
+         if !curatedOwner then None else matchConcreteUnapply0(qual)
+       def matchConcreteUnapply0(qual: Tree): Option[Object => Option[List[Object]]] =
+           qual.symbol.name.toString.stripSuffix("$") match
+@@ -2509,14 +2559,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case "List" => Some(source.toList)
+         case "Vector" => Some(source.toVector)
+         case "Seq" | "IndexedSeq" => Some(source.toSeq)
+-        case "Set" if moduleClass.showFullName.startsWith("scala.collection.mutable.") => Some(mutable.Set.from(source))
++        case "Set" if fullNameOf(moduleClass).startsWith("scala.collection.mutable.") => Some(mutable.Set.from(source))
+         case "Set" => Some(source.toSet)
+-        case "Map" if moduleClass.showFullName.startsWith("scala.collection.mutable.") => Some(mutable.Map.from(source.map(_.asInstanceOf[(Object, Object)])))
++        case "Map" if fullNameOf(moduleClass).startsWith("scala.collection.mutable.") => Some(mutable.Map.from(source.map(_.asInstanceOf[(Object, Object)])))
+         case "Map" => Some(source.map(_.asInstanceOf[(Object, Object)]).toMap)
+         case "ListMap" => Some(scala.collection.immutable.ListMap.from(source.map(asObjectPair)))
+         case "Array" => Some(source.toArray)
+         case "ArraySeq" =>
+-          if moduleClass.showFullName.startsWith("scala.collection.mutable.") then Some(scala.collection.mutable.ArraySeq.make(source.toArray))
++          if fullNameOf(moduleClass).startsWith("scala.collection.mutable.") then Some(scala.collection.mutable.ArraySeq.make(source.toArray))
+           else Some(scala.collection.immutable.ArraySeq.unsafeWrapArray(source.toArray))
+         case _ => None
+     // `moduleClass.name` alone can't tell `scala.collection.mutable.Map`/
+@@ -2527,7 +2577,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // `mutable.Map.empty` (e.g. `groupBy`'s own real accumulator) hands
+     // back something that crashes the moment real code calls a mutation
+     // method (`addOne`/`+=`) on it, since it isn't actually `Growable`.
+-    val isMutableModule = moduleClass.showFullName.startsWith("scala.collection.mutable.")
++    val isMutableModule = fullNameOf(moduleClass).startsWith("scala.collection.mutable.")
+     (moduleClass.name.toString.stripSuffix("$"), fn.name.toString) match
+       case ("List", "apply") => Some(elems.toList)
+       case ("List", "empty") => Some(Nil)
+@@ -2901,7 +2951,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // crash seen via `List#partition`'s `super.partition(p)` re-resolving
+     // straight back to `List#partition` itself instead of `SeqOps`'s
+     // generic default).
+-    val dispatchFn0 = if staticDispatch then fn else if concreteCls.exists && concreteCls.isClass then fn.overridingSymbol(concreteCls.asClass).orElse(fn) else fn
++    val dispatchFn0 = if staticDispatch then fn else if concreteCls.exists && concreteCls.isClass then overridingOrSelf(fn, concreteCls.asClass) else fn
+     // An abstract `def` implemented by a `val` of some superclass (`protected
+     // def XMacroSettings` in `trait Definitions`, `protected val
+     // XMacroSettings` in `DefinitionsPlatform`): `overridingSymbol` doesn't
+@@ -3207,7 +3257,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // node wrapping the body to catch it (that wrapping is a later-phase
+     // lowering detail, not present in this pre-lowering retained tree), so
+     // the method's own call frame has to be the catch point.
+-    try interpretTree(ddef.rhs)(using withThis)
++    try returnedValue(interpretTree(methodBody(ddef))(using withThis))
+     catch case LabeledReturn(label, value) if label == ddef.symbol => value
+ 
+   /** Binds `this` for `owner`'s body -- and, if `value` is one of our own
+@@ -3302,6 +3352,20 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    *  derivation calls them once per field.
+    */
+   private val allMemberSymbolsCache = mutable.HashMap.empty[Symbol, List[Symbol]]
++
++  /** `showFullName`, memoized for this macro expansion: the pattern matcher and the collection
++   *  intrinsics test owner names on every extractor call and `new`.
++   */
++  private val fullNameCache = mutable.HashMap.empty[Symbol, String]
++  private def fullNameOf(s: Symbol)(using Context): String =
++    fullNameCache.getOrElseUpdate(s, s.showFullName)
++
++  /** `fn.overridingSymbol(cls).orElse(fn)` per `(fn, receiver class)`, for this macro
++   *  expansion: virtual dispatch of every interpreted instance call.
++   */
++  private val overridingCache = mutable.HashMap.empty[(Symbol, Symbol), Symbol]
++  private def overridingOrSelf(fn: Symbol, cls: ClassSymbol)(using Context): Symbol =
++    overridingCache.getOrElseUpdate((fn, cls), fn.overridingSymbol(cls).orElse(fn))
+   private def allMemberSymbols(s: Symbol)(using Context): List[Symbol] =
+     allMemberSymbolsCache.getOrElseUpdate(s, {
+       val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+@@ -3458,7 +3522,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case ("AtomicReference", Nil) => Some(new java.util.concurrent.atomic.AtomicReference[Object]())
+         case ("AtomicReference", v :: Nil) => Some(new java.util.concurrent.atomic.AtomicReference[Object](v))
+         case _ => None
+-    else fn.owner.showFullName match
++    else fullNameOf(fn.owner) match
+       case "scala.collection.mutable.HashMap" | "scala.collection.mutable.Map" =>
+         Some(mutable.HashMap.empty[Object, Object])
+       case "scala.collection.mutable.ArrayBuffer" | "scala.collection.mutable.Buffer" =>
+@@ -3879,7 +3943,15 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     case Call(fn, _) => fn.symbol.isConstructor && fn.symbol.owner != defn.ObjectClass
+     case _ => false
+ 
++  /** `moduleSuperCtorCall` per class, for this macro expansion: it searches the whole
++   *  compilation-unit tree of the top-level class, on every `new` and module access.
++   */
++  private val moduleSuperCtorCallCache = mutable.HashMap.empty[Symbol, Option[Tree]]
++
+   private def moduleSuperCtorCall(moduleClass: Symbol)(using Context): Option[Tree] =
++    moduleSuperCtorCallCache.getOrElseUpdate(moduleClass, moduleSuperCtorCall0(moduleClass))
++
++  private def moduleSuperCtorCall0(moduleClass: Symbol)(using Context): Option[Tree] =
+     // `ClassSymbol#rootTree` only ever returns a real tree for a TOP-LEVEL
+     // class (its own doc comment says so outright; a `TreeProvider` is only
+     // ever wired up for those during TASTy loading) -- for a synthetic LOCAL
+@@ -5918,7 +5990,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         // class -- references `SeqOps.this`). Binding only the concrete
+         // class leaves every ancestor `This` unresolved.
+         val withParams = bindThis(params.zip(args).foldLeft(emptyEnv)((e, pv) => e.updated(pv._1, pv._2)), inst.cls, inst)
+-        interpretTree(ddef.rhs)(using withParams)
++        returnedValue(interpretTree(methodBody(ddef))(using withParams))
+       case _ => throw new StopInterpretation(em"Interpreter (own implementation): cannot call $methodName directly on ${inst.toString}", pos)
+ 
+   /** JVM binary name of a class symbol (`a.b.Outer$Inner`), as written in
