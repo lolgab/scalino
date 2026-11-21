@@ -7,6 +7,15 @@ inlined". Frame-pointer profiling (patch 0039) and the first interpreter fixes (
 6.96s -> 6.54s, macro thread -22%) followed the same day, then scala3-0047 (`return` without
 exceptions, lookup memos: 6.44s -> 6.22s).
 
+**Status (2026-11-21), step 7:** scala3-0048 fixes a 0046 regression: chimney 2 / hearth (wes)
+failed with "`this` of trait TypeConstructors ... is not bound", because `withOuterInstance` copied
+an outer env through `ThisEnv.iterator`, which omits the lazily bound base classes. scala3-0049 cuts
+macro-thread allocation per ape compile from ~1190 MB to ~745 MB (-38%, warm JVM, deterministic):
+intrinsic dispatch without `orElse` closures, memoized base-class scans, an allocation-light `Call`
+extractor, hoisted `TreeTypeMap` substitution lists, `SCALINO_OUTER_DIAG` read once. Both are
+checked on the JVM only (byte-identical ape, wes, examples, interpreter fixtures), not relinked or
+timed natively. Details and what was ruled out under step 7 below.
+
 ## Summary
 
 The "33s vs 10.5s" gap on `~/scala/ape` is out of date. A clean compile with today's `dist/scalino-dotc`
@@ -197,6 +206,30 @@ recompile 22 files, and idea 01. Revisit splice caching only if B stalls above ~
    identical `.tasty` output for ape, `examples/interpreter-regressions`, and the chimney2/jsoniter
    fixtures.
 7. Follow-ups from step 2's profile: the `Call` memo, `Env` frames, exception sites, the getenv hygiene.
+   **Done 2026-11-21 (scala3-0048, scala3-0049), JVM-verified only:**
+   - *Profiling.* A fresh frame-pointer dotc link was killed by memory pressure (other links running),
+     and no native relink was done after that. Sources used instead: non-FP `sample` leaf self-time of
+     the 0047 release dotc, caller stacks from the 0046 FP dotc, and JFR allocation samples
+     (`jdk.ObjectAllocationSample`) of the macro thread on a warm JVM. JFR CPU samples are misleading
+     here: `interpretQuotesApi`/`interpretStdlibIntrinsic` exceed HotSpot's huge-method limit and run
+     interpreted unless `-XX:-DontCompileHugeMethods` is set.
+   - *Metric.* Wall/CPU on a loaded machine swung ±50%. Bytes allocated by the macro thread
+     (`com.sun.management.ThreadMXBean.getThreadAllocatedBytes`, warm iterations) are deterministic
+     to <1% and track the native hot spots (`memset` + `GC_alloc_small` ≈ 13% of macro-thread samples).
+   - *`Call` memo.* Not a memo: `Call.unapply` now walks the spine without per-level `Some`/tuple/
+     `reverse`. A per-tree cache was already measured as a loss (the `desugarIdent` cache after 0047).
+   - *`Env` frames.* A link-per-binding env over the receiver's outer `HashMap` raised allocation
+     (807 vs 770 MB): `env.iterator` (type-binding scans on every call with type arguments) has to
+     rebuild the map. Slot-indexed frames would need those scans gone first; not attempted.
+   - *Exception sites.* None left on the hot path after 0047: no unwind frames in the native leaf profile.
+   - *getenv.* `SCALINO_OUTER_DIAG` (7 sites, incl. per-`unpickleTypeV2`) is read once.
+   - *Gate.* JVM bootstrap compiler + overlay (Interpreter/Splicer), byte-identical output on ape,
+     wes, examples/{interpreter-regressions, macro-hello (jsoniter), upickle-enum-writer-bug} and
+     interpreter/test-fixtures. wes was missing from earlier gates, which is how 0046's regression
+     shipped. Known noise: i8746 embeds an identity hash; wes's `APULoadStore$.nir` is
+     nondeterministic run to run with the same compiler (field order, cause not investigated).
+   - *Open.* Native relink + timing of 0048/0049. `dist/scalino-dotc` as of 2026-11-21 11:17 is
+     an unoptimized 90MB build (ape 34s vs 7.1s for the 0047 release link) and needs a release relink.
 8. Regenerate patches after every batch (vendor is disposable) and update `docs/findings.md`.
 
 ## Effort estimate and risks
