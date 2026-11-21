@@ -18,10 +18,10 @@ index 2e95c514..60a17ec0 100644
  }
 diff --git a/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala b/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
 new file mode 100644
-index 00000000..c070757d
+index 00000000..e0855fde
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,268 @@
 +package dotty.tools
 +package dotc
 +
@@ -170,7 +170,8 @@ index 00000000..c070757d
 +    if tastyFiles.isEmpty then
 +      System.err.println(s"scalino-dotc --interpret: no .tasty files in $classesDir")
 +      sys.exit(2)
-+    sys.exit(interpret(mainClass, options ++ List("-from-tasty", "-Yretain-trees"), tastyFiles.toList, progArgs.drop(1)))
++    // -color:never: our own messages print symbols with `show`
++    sys.exit(interpret(mainClass, options ++ List("-from-tasty", "-Yretain-trees", "-color:never"), tastyFiles.toList, progArgs.drop(1)))
 +
 +  /** The run itself; returns the exit status. */
 +  def interpret(mainClass: String, options: List[String], tastyFiles: List[String], progArgs: Array[String]): Int =
@@ -291,10 +292,10 @@ index 00000000..c070757d
 +    , true)
 diff --git a/compiler/src/dotty/tools/dotc/ScalinoRepl.scala b/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
 new file mode 100644
-index 00000000..7ef9ed83
+index 00000000..abfd4d1c
 --- /dev/null
 +++ b/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,361 @@
 +package dotty.tools
 +package dotc
 +
@@ -636,9 +637,13 @@ index 00000000..7ef9ed83
 +  def render(value: Object): String =
 +    val s = value match
 +      case null => "null"
-+      case a: Array[?] => a.map(x => render(x.asInstanceOf[Object])).mkString("Array(", ", ", ")")
-+      case s: String => s
++      // boxes before the array test: on this toolchain a small boxed Int is a tagged pointer,
++      // which an `Array[?]` type test dereferences (SIGSEGV), while a class test is tag-aware
++      case n: Number => n.toString
 +      case c: Character => c.toString
++      case b: java.lang.Boolean => b.toString
++      case s: String => s
++      case a: Array[?] => a.map(x => render(x.asInstanceOf[Object])).mkString("Array(", ", ", ")")
 +      case other => String.valueOf(other)
 +    if s.length > MaxValueLength then s.take(MaxValueLength) + " ... large output truncated, print value to show all"
 +    else s
@@ -742,7 +747,7 @@ index 5187f88f..1e76c758 100644
    def numericConversion(x: Object, name: String): Option[Object] =
      val n: Number | Null = x match
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 2b118a14..4cef2864 100644
+index 2b118a14..16280e9d 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -94,14 +94,14 @@ import dotty.tools.dotc.core.CyclicReference
@@ -1047,7 +1052,7 @@ index 2b118a14..4cef2864 100644
 +      case (b: mutable.StringBuilder, "underlying", Nil) => Some(b.underlying)
 +      // A host collection's `copyToArray` body reads its private storage (`ArrayBuffer#array`),
 +      // which no reflection can reach here: call the host method (reached through `sorted`).
-+      case (it: IterableOnce[?], "copyToArray", (a: Array[?]) :: rest) if !it.isInstanceOf[InterpretedInstance] =>
++      case (it: IterableOnce[?], "copyToArray", a :: rest) if a != null && a.getClass.isArray =>
 +        val xs = a.asInstanceOf[Array[Any]]
 +        rest match
 +          case Nil => Some(Int.box(it.iterator.copyToArray(xs)))
@@ -1071,11 +1076,21 @@ index 2b118a14..4cef2864 100644
          java.lang.reflect.Array.set(a, i.intValue, v); Some(().asInstanceOf[Object])
        case (a, "length", Nil) if a.getClass.isArray => Some(Int.box(java.lang.reflect.Array.getLength(a)))
 +      // `Array#clone`'s library body is `throw new Error()` (arrays are intrinsic).
-+      case (a: Array[?], "clone", Nil) => Some(a.clone().asInstanceOf[Object])
++      case (a, "clone", Nil) if a != null && a.getClass.isArray => Some(a.asInstanceOf[Array[?]].clone().asInstanceOf[Object])
        case (a: Array[Object] @unchecked, "update", (i: Integer) :: v :: Nil) =>
          a(i) = v; Some(().asInstanceOf[Object])
        case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
-@@ -7225,7 +7406,9 @@ case class ModuleValue(moduleClass: Symbol)
+@@ -7122,6 +7303,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case "==" => Boolean.box(a == b)
+         case "!=" => Boolean.box(a != b)
+         case _ => throw new StopInterpretation(em"Interpreter (own implementation): unsupported primitive op $op on Boolean", pos)
++    // `1 + "s"`: a number's `+(String)` is string concatenation
++    else if op == "+" && args.headOption.exists(_.isInstanceOf[String]) then
++      String.valueOf(x) + args.head
+     else
+       val y = args.head
+       def asD(o: Object): Double = o match
+@@ -7225,7 +7409,9 @@ case class ModuleValue(moduleClass: Symbol)
  final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Object])(using Context):
    val fields: mutable.Map[String, Object] = mutable.Map.empty
    private val clsName: String = cls.name.toString
@@ -1086,7 +1101,7 @@ index 2b118a14..4cef2864 100644
    // A real `case class` gets compiler-generated structural `equals`/
    // `hashCode` (every constructor param compared); a plain class doesn't,
    // keeping ordinary reference identity -- match that distinction here
-@@ -7247,6 +7430,17 @@ final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Objec
+@@ -7247,6 +7433,17 @@ final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Objec
      if cls.is(Case) then cls.hashCode + fields.iterator.map((k, v) => k.hashCode ^ (if v == null then 0 else v.hashCode)).sum
      else super.hashCode()
  
@@ -1104,7 +1119,7 @@ index 2b118a14..4cef2864 100644
  /** A local `lazy val` slot: `thunk` runs on first read, and its result is cached. */
  final class LocalLazyVal(thunk: () => Object):
    private var cached: Object = null
-@@ -7308,10 +7502,21 @@ final case class LabeledReturn(label: Symbol, value: Object) extends Exception(n
+@@ -7308,10 +7505,21 @@ final case class LabeledReturn(label: Symbol, value: Object) extends Exception(n
   */
  final case class InterpretedThrow(value: Object) extends Exception(null, null, false, false)
  
