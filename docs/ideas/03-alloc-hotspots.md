@@ -410,3 +410,27 @@ last worker to leave `markActive` wakes all of them.
 - Left alone: the collector's safepoint wait (`Synchronizer.c`) yields so that mutators can run to
   their safepoints, and `GCWorkers_Run`'s 2000-yield wait is short in practice because helpers
   finish with the leader.
+
+### Follow-up: remaining items (2026-11-21)
+
+- **Link memory (no change).** The GC debug log of a native ape link shows 56-85% of heap lines
+  in use at every collection and only 2-5% of blocks free. The heap (9.3GB at the end) is about
+  1.4x the line-level live set (4.3GB), so growth follows real live data (Interflow keeps every
+  optimized method until codegen), not policy slack. A different growth rule would not help;
+  lowering the peak means streaming optimized methods to codegen, which is a separate redesign.
+- **`.ll` fallback without `llvm-config` (already fixed).** Since patch 0036 the direct-codegen
+  dispatch checks the LLVM linked into the binary (`LLVMGetVersion`), not `llvm-config` on PATH.
+  With `PATH=/usr/bin:/bin`, the current dist still produces direct-codegen objects. The brew
+  0.0.31 message predates that.
+- **P6, stale `currentSize` (patch 0042).** The cache key `blocks.##` only changes when a block is
+  added, but a revisit replaces `b.end` in place, so `callerTooBig` could see a stale, smaller
+  caller. The size is now summed on each call (O(blocks), as the hash was). Output changes as
+  expected: JVM ape link 24,472,104 -> 24,446,744 bytes (-0.1%); a control overlay of the same
+  sources without P6 reproduces the baseline sha1, so P6 is the only difference. Optimizing time
+  is unchanged. dotc links in debug mode, so P6 barely touches it (+208 bytes).
+  Validation with the dist rebuilt on 0040-0042: `pos-differential.sh` on every 4th
+  tests/pos file (883) is identical to the previous dotc, tests/escape-analysis, the poisoned
+  example (`sum=1412`), tests/runtime-fastpaths, tests/lower-cache (every step byte-identical to a
+  fresh link) and examples/interflow-phi-alias all pass.
+- **P8 and P2 (not done).** After 0040 they would save a few percent of Interflow at most, and
+  copy-on-write instances (P2) would mean rewriting Eval's in-place stores. Not worth the risk.

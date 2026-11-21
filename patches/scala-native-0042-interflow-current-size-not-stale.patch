@@ -1,0 +1,38 @@
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
+index 2d95186d1..1b3011d39 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
+@@ -41,23 +41,17 @@ private[interflow] final class MergeProcessor(
+   val blocks = mutable.LongMap.empty[MergeBlock]
+   val todo = new MergeProcessor.Worklist(insts, labelOffsets)
+ 
+-  object currentSize extends Function0[Int] { // context-cached function
+-    var lastBlocksHash: Int = _
+-    var lastSize: Int = _
+-    def apply(): Int = {
+-      // `blocks.##` boxes every key (MurmurHash3.mapHash): compute it once,
+-      // not twice (blocks does not change in between).
+-      val hash = blocks.##
+-      if (hash == lastBlocksHash) lastSize
+-      else {
+-        val size = blocks.values.iterator.map { b =>
+-          if (b.end == null) 0 else b.end.emit.size
+-        }.sum
+-        lastSize = size
+-        lastBlocksHash = hash
+-        size
+-      }
++  // Instructions emitted so far by the visited blocks. Summed on every call:
++  // it was cached on `blocks.##`, which only changes when a block is added,
++  // while a revisit replaces `b.end` (and its emit buffer) in place, so the
++  // cached size went stale and inlining saw a caller smaller than it was.
++  // The sum is O(blocks), as was the hash.
++  def currentSize(): Int = {
++    var size = 0
++    blocks.foreachValue { b =>
++      if (b.end != null) size += b.end.emit.size
+     }
++    size
+   }
+ 
+   def findMergeBlock(id: nir.Local): MergeBlock = {
