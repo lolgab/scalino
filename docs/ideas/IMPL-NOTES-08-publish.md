@@ -82,8 +82,8 @@ CI step on the `js` smoke leg.
 
 - **Central publishing type defaults to AUTOMATIC.** `scalino publish` releases once the portal
   validates the bundle, like sbt's `sonaRelease` and scala-cli's `publish`. `--manual-release` gives
-  USER_MANAGED (the portal's own default). Publishing to Central can't be undone, so this is worth a
-  second look.
+  USER_MANAGED (the portal's own default). Confirmed by Lorenzo 2026-11-21, after briefly
+  flipping it to manual (bee9dce, reverted).
 - **Scala Native runtime version in POMs** is the release before this toolchain's snapshot
   (`0.5.13-SNAPSHOT` -> `0.5.12`), overridable with `SCALINO_PUBLISH_NATIVE_VERSION`. This is a
   heuristic. `scala3lib_native0.5_3:3.10.0+0.5.12` may not exist on Central. sbt consumers would
