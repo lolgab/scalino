@@ -1,0 +1,1128 @@
+diff --git a/compiler/src/dotty/tools/dotc/Main.scala b/compiler/src/dotty/tools/dotc/Main.scala
+index 2e95c514..60a17ec0 100644
+--- a/compiler/src/dotty/tools/dotc/Main.scala
++++ b/compiler/src/dotty/tools/dotc/Main.scala
+@@ -2,9 +2,12 @@ package dotty.tools
+ package dotc
+ 
+ /** Main class of the `dotc` batch compiler. `--daemon` as the first argument starts scalino's
+- *  compile server instead (`ScalinoDaemon`). */
++ *  compile server instead (`ScalinoDaemon`), `--interpret` runs a compiled program through the
++ *  tree interpreter (`ScalinoInterpret`) and `--repl` starts the REPL (`ScalinoRepl`). */
+ object Main extends Driver {
+   override def main(args: Array[String]): Unit =
+     if args.nonEmpty && args(0) == "--daemon" then ScalinoDaemon.run(args.drop(1))
++    else if args.nonEmpty && args(0) == "--interpret" then ScalinoInterpret.run(args.drop(1))
++    else if args.nonEmpty && args(0) == "--repl" then ScalinoRepl.run(args.drop(1))
+     else super.main(args)
+ }
+diff --git a/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala b/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
+new file mode 100644
+index 00000000..c070757d
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
+@@ -0,0 +1,267 @@
++package dotty.tools
++package dotc
++
++import ast.tpd
++import core.Contexts.*
++import core.Decorators.*
++import core.Flags.*
++import core.Names.*
++import core.Phases.Phase
++import core.StdNames.nme
++import core.Symbols.*
++import core.Types.*
++import fromtasty.{ReadTasty, TASTYCompiler}
++import quoted.{Interpreter, InterpretedInstance, InterpretedThrow, ProgramExit}
++import reporting.{ConsoleReporter, Reporter}
++import transform.{Inlining, PostInlining}
++
++import java.io.{OutputStream, PrintStream}
++import java.nio.file.{Files, Path, Paths}
++import scala.collection.mutable
++
++/** `scalino-dotc --interpret`: runs a compiled program by interpreting its TASTy with the macro
++ *  interpreter (`quoted.Interpreter`) instead of linking a native binary (`scalino run --interpret`).
++ *
++ *  Usage: `scalino-dotc --interpret [--fallback-exit] <mainClass> <classesDir> <compiler options> [-- <program args>]`.
++ *  `classesDir` holds the program's `.tasty` (the CLI's normal compile output); the options are the
++ *  ones it was compiled with (classpath, `-Yretain-trees`, the javalib TASTy setting).
++ *
++ *  The program's own classes go through a `-from-tasty` run that stops after `postInlining`, so
++ *  inline calls and macros are expanded exactly as for a native build; every symbol's `defTree`
++ *  (and each top-level class's root tree) then points at that expanded tree, which is what the
++ *  interpreter runs. Library code is interpreted from its own TASTy, as for macros.
++ *
++ *  Exit status: the program's (0, `sys.exit(n)`, 1 for an uncaught exception), 2 for a usage or
++ *  compile error, and, with `--fallback-exit`, `FallbackExit` when the program can't be interpreted
++ *  and the caller should link it instead (without it: an error, exit 1): code that needs the native runtime (`@extern`, `scala.scalanative.unsafe`,
++ *  threads) found before running, or an interpreter gap hit before the program wrote any output.
++ *  A gap hit after output is reported as an error (exit 1): running it again would repeat side effects.
++ */
++object ScalinoInterpret:
++
++  val FallbackExit = 3
++
++  /** The trees `postInlining` left for each compilation unit's classes, installed as the symbols'
++   *  `defTree`s; also collects the units for `unsupportedFeature`. */
++  private final class InstallTrees(units: mutable.ListBuffer[tpd.Tree]) extends Phase:
++    def phaseName: String = "scalinoInstallTrees"
++    /** This phase's context: the interpreter runs in it, after `postInlining`'s denotations. */
++    var lastCtx: Context | Null = null
++    protected def run(using Context): Unit =
++      val tree = ctx.compilationUnit.tpdTree
++      units += tree
++      install(tree)
++      lastCtx = ctx
++
++  /** Points every definition in `tree` (a whole compilation unit) at its own subtree. */
++  def install(tree: tpd.Tree)(using Context): Unit =
++    val traverser = new tpd.TreeTraverser:
++      def traverse(t: tpd.Tree)(using Context): Unit =
++        t match
++          case t: tpd.MemberDef if t.symbol.exists =>
++            t.symbol.defTree = t
++            // A top-level class's root tree is what the interpreter searches for members
++            // without a `defTree` of their own (`Interpreter#resolveExternalDefTree`).
++            if t.symbol.isClass && t.symbol.owner.is(Package) then
++              t.symbol.asClass.rootTreeOrProvider = tree
++          case _ =>
++        traverseChildren(t)
++    traverser.traverse(tree)
++
++  private final class InterpretCompiler(units: mutable.ListBuffer[tpd.Tree]) extends TASTYCompiler:
++    val installTrees = new InstallTrees(units)
++    override def phases: List[List[Phase]] =
++      List(List(new ReadTasty), List(new Inlining), List(new PostInlining), List(installTrees))
++
++  private object driver extends Driver:
++    def setupFor(args: Array[String], rootCtx: Context): Option[(List[io.AbstractFile], Context)] = setup(args, rootCtx)
++    def compileWith(compiler: Compiler, files: List[io.AbstractFile])(using Context): Reporter = doCompile(compiler, files)
++
++  /** Packages whose code only runs natively: anything reaching them falls back to linking. */
++  private val nativeOnlyPrefixes = List(
++    "scala.scalanative.unsafe", "scala.scalanative.unsigned", "scala.scalanative.runtime",
++    "scala.scalanative.posix", "scala.scalanative.libc", "scala.scalanative.windows",
++    "scala.scalanative.meta", "scala.scalanative.libc",
++  )
++  /** Concurrency the interpreter can't model (it is single-threaded, with no scheduler). */
++  private val threadPrefixes = List(
++    "java.lang.Thread", "java.util.concurrent.", "java.util.Timer",
++    "scala.concurrent.Future", "scala.concurrent.Promise", "scala.concurrent.Await",
++    "scala.concurrent.ExecutionContext", "scala.concurrent.blocking", "scala.concurrent.impl.",
++  )
++
++  /** A reason the program's own code can't be interpreted, or None. Checked before running so the
++   *  caller can fall back to linking without the program having started. */
++  def unsupportedFeature(units: List[tpd.Tree])(using Context): Option[String] =
++    var found: Option[String] = None
++    val externAnnot = getClassIfDefined("scala.scalanative.unsafe.extern")
++    def check(sym: Symbol, pos: util.SrcPos): Unit =
++      if found.isEmpty && sym.exists then
++        val name = sym.fullName.toString.replace("$.", ".").stripSuffix("$")
++        def at = s"${pos.sourcePos.source.name}:${pos.sourcePos.line + 1}"
++        if nativeOnlyPrefixes.exists(p => name == p || name.startsWith(p + ".")) then
++          found = Some(s"uses native-only `$name` ($at)")
++        else if threadPrefixes.exists(name.startsWith) then
++          found = Some(s"uses threads/concurrency (`$name`, $at)")
++        else if externAnnot.exists && sym.hasAnnotation(externAnnot) then
++          found = Some(s"calls an @extern definition `$name` ($at)")
++    val traverser = new tpd.TreeTraverser:
++      def traverse(t: tpd.Tree)(using Context): Unit =
++        if found.isEmpty then
++          t match
++            case _: tpd.Import => // names only: what the program does with them is checked where it does it
++            case t: (tpd.RefTree | tpd.New) => check(t.symbol, t.srcPos)
++              t match
++                case t: tpd.New => check(t.tpe.typeSymbol, t.srcPos)
++                case _ =>
++            case t: tpd.MemberDef if t.symbol.exists && externAnnot.exists && t.symbol.owner.hasAnnotation(externAnnot) =>
++              found = Some(s"defines @extern `${t.symbol.owner.fullName}`")
++            case _ =>
++          if !t.isInstanceOf[tpd.Import] then traverseChildren(t)
++    units.foreach(traverser.traverse)
++    found
++
++  /** `--fallback-exit` given: the caller links the program when this exits with `FallbackExit`. */
++  private var canFallBack = false
++
++  /** Status for "can't interpret this": `FallbackExit` when the caller falls back, else an error. */
++  private def cannotInterpret(err: PrintStream): Int =
++    if canFallBack then FallbackExit
++    else
++      err.println("scalino: run it without --interpret")
++      1
++
++  def run(args0: Array[String]): Unit =
++    canFallBack = args0.headOption.contains("--fallback-exit")
++    val args = if canFallBack then args0.drop(1) else args0
++    val (head, progArgs) = args.span(_ != "--")
++    if head.length < 2 then
++      System.err.println("usage: scalino-dotc --interpret [--fallback-exit] <mainClass> <classesDir> <compiler options> [-- <program args>]")
++      sys.exit(2)
++    val mainClass = head(0)
++    val classesDir = Paths.get(head(1))
++    val options = head.drop(2).toList
++    val tastyFiles = mutable.ListBuffer.empty[String]
++    Files.walk(classesDir).forEach(p => if p.toString.endsWith(".tasty") then tastyFiles += p.toString)
++    if tastyFiles.isEmpty then
++      System.err.println(s"scalino-dotc --interpret: no .tasty files in $classesDir")
++      sys.exit(2)
++    sys.exit(interpret(mainClass, options ++ List("-from-tasty", "-Yretain-trees"), tastyFiles.toList, progArgs.drop(1)))
++
++  /** The run itself; returns the exit status. */
++  def interpret(mainClass: String, options: List[String], tastyFiles: List[String], progArgs: Array[String]): Int =
++    val rootCtx = (new ContextBase).initialCtx
++    driver.setupFor((options ++ tastyFiles).toArray, rootCtx) match
++      case None => 2
++      case Some((files, ctx0)) =>
++        val units = mutable.ListBuffer.empty[tpd.Tree]
++        val compiler = new InterpretCompiler(units)
++        given Context = ctx0
++        val reporter = driver.compileWith(compiler, files)
++        if reporter.hasErrors || compiler.installTrees.lastCtx == null then 2
++        else
++          given Context = compiler.installTrees.lastCtx.nn.fresh.setCompilationUnit(NoCompilationUnit)
++          unsupportedFeature(units.toList) match
++            case Some(reason) =>
++              System.err.println(s"scalino: can't interpret this program: it $reason")
++              cannotInterpret(System.err)
++            case None => runMain(mainClass, progArgs)
++
++  /** Finds `mainClass`'s `main(Array[String])` and interprets it. */
++  def runMain(mainClass: String, progArgs: Array[String])(using Context): Int =
++    // Classes of the empty package aren't reachable through `staticRef` from the root.
++    val dot = mainClass.lastIndexOf('.')
++    val owner =
++      if dot < 0 then defn.EmptyPackageClass
++      else getPackageClassIfDefined(mainClass.substring(0, dot))
++    val simple = mainClass.substring(dot + 1)
++    def member(name: Name): Symbol = if owner.exists then owner.info.decl(name).symbol else NoSymbol
++    val moduleCls = member(simple.toTermName).moduleClass
++    def mainIn(cls: Symbol): Symbol =
++      if !cls.exists then NoSymbol
++      else cls.info.decl(nme.main).alternatives.map(_.symbol).find(isMainMethod).getOrElse(NoSymbol)
++    // `@main def f` generates a class `f` with a static `main`; an object's `main` is in its module class.
++    val cls = member(simple.toTypeName)
++    val mainSym = mainIn(cls).orElse(mainIn(moduleCls))
++    if !mainSym.exists then
++      System.err.println(s"scalino-dotc --interpret: no main(Array[String]) method in $mainClass")
++      return 2
++    val out = new OutputTracker(System.out)
++    val err = new OutputTracker(System.err)
++    val interpreter = new Interpreter(mainSym.srcPos, null)
++    val savedOut = System.out
++    val savedErr = System.err
++    System.setOut(out.stream)
++    System.setErr(err.stream)
++    try
++      Console.withOut(out.stream) {
++        Console.withErr(err.stream) {
++          interpreter.runMain(mainSym, progArgs)
++        }
++      }
++      0
++    catch
++      case ProgramExit(status) => status
++      case e: Interpreter.StopInterpretation =>
++        val wrote = out.wrote || err.wrote
++        out.stream.flush()
++        val pos = e.pos.sourcePos
++        val where = if pos.exists then s" (${pos.source.name}:${pos.line + 1})" else ""
++        savedErr.println(s"scalino: can't interpret this program$where: ${e.msg.message}")
++        for sym <- interpreter.stopStack.take(if sys.env.contains("SCALINO_INTERP_TRACE") then 60 else 8) do
++          savedErr.println(s"  in ${sym.showLocated}")
++        if wrote then
++          savedErr.println("scalino: it already wrote output, so it is not rerun natively -- run it without --interpret")
++          1
++        else cannotInterpret(savedErr)
++      case e @ InterpretedThrow(value) =>
++        out.stream.flush()
++        savedErr.println(s"Exception in thread \"main\" ${describeException(value)}")
++        printStack(interpreter, e, savedErr)
++        1
++      case e: StackOverflowError =>
++        out.stream.flush()
++        savedErr.println("Exception in thread \"main\" java.lang.StackOverflowError (interpreted)")
++        1
++      case e: Throwable if !e.isInstanceOf[scala.util.control.ControlThrowable] =>
++        out.stream.flush()
++        savedErr.println(s"Exception in thread \"main\" $e")
++        printStack(interpreter, e, savedErr)
++        if sys.env.contains("SCALINO_INTERP_TRACE") then e.printStackTrace(savedErr)
++        1
++    finally
++      InterpretedInstance.render = null
++      out.stream.flush()
++      err.stream.flush()
++      System.setOut(savedOut)
++      System.setErr(savedErr)
++
++  /** The interpreted frames `e` unwound, JVM-trace style (no line numbers: the interpreter keeps
++   *  only the methods). */
++  private def printStack(interpreter: Interpreter, e: Throwable, err: PrintStream)(using Context): Unit =
++    if interpreter.lastThrown eq e then
++      for sym <- interpreter.lastThrowStack do
++        err.println(s"\tat ${sym.owner.fullName.toString.stripSuffix("$")}.${sym.name} (${sym.source.name})")
++
++  private def isMainMethod(sym: Symbol)(using Context): Boolean =
++    sym.info.stripPoly match
++      case mt: MethodType =>
++        mt.paramInfos match
++          case List(p) => p.derivesFrom(defn.ArrayClass) && mt.resultType.isRef(defn.UnitClass)
++          case _ => false
++      case _ => false
++
++  /** `java.lang.RuntimeException: msg`-style text for an exception value (an interpreted one's
++   *  `toString` runs through `InterpretedInstance.render`). */
++  def describeException(value: Object): String = String.valueOf(value)
++
++  /** Wraps a stream and remembers whether anything was written to it. */
++  private final class OutputTracker(underlying: PrintStream):
++    var wrote = false
++    val stream: PrintStream = new PrintStream(new OutputStream:
++      override def write(b: Int): Unit = { wrote = true; underlying.write(b) }
++      override def write(b: Array[Byte], off: Int, len: Int): Unit =
++        if len > 0 then wrote = true
++        underlying.write(b, off, len)
++      override def flush(): Unit = underlying.flush()
++    , true)
+diff --git a/compiler/src/dotty/tools/dotc/ScalinoRepl.scala b/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
+new file mode 100644
+index 00000000..7ef9ed83
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
+@@ -0,0 +1,357 @@
++package dotty.tools
++package dotc
++
++import ast.{tpd, untpd}
++import core.Contexts.*
++import core.Decorators.*
++import core.NameOps.*
++import core.Flags.*
++import core.Phases.Phase
++import core.StdNames.nme
++import core.Symbols.*
++import core.Types.*
++import parsing.Parsers
++import quoted.{Interpreter, InterpretedThrow, ProgramExit}
++import reporting.{ConsoleReporter, Diagnostic, Reporter, StoreReporter}
++import transform.{Inlining, PostInlining, PostTyper}
++import typer.TyperPhase
++import util.SourceFile
++
++import java.io.{BufferedReader, InputStreamReader, PrintStream, PrintWriter}
++import java.nio.charset.StandardCharsets.UTF_8
++import java.nio.file.{Files, Paths}
++import scala.collection.mutable
++
++/** `scalino-dotc --repl`: a Scala 3 REPL whose inputs run on the tree interpreter
++ *  (`quoted.Interpreter`), so no JVM and no linking (`scalino repl`).
++ *
++ *  Usage: `scalino-dotc --repl [--interactive] [--init-script <code>] [--quit-after-init] <compiler options>`.
++ *  `--interactive` (stdin is a terminal) prints the welcome banner. The options carry the
++ *  classpath (the project's classes and dependencies) and the javalib TASTy setting.
++ *
++ *  Each input is compiled in one long-lived context (one `Run` per input, so the symbols of
++ *  earlier inputs stay entered, as in `ScalinoDaemon`) as
++ *
++ *  {{{
++ *  import rs$line1.{*, given}; ...; object rs$lineN {
++ *  <input, each expression statement `e` as `val resK = e`>
++ *  }
++ *  }}}
++ *
++ *  through the frontend, `postTyper`, `inlining` and `postInlining`; then the wrapper's statements
++ *  are interpreted in order, sharing one `Interpreter.Session` (the state of every object) with all
++ *  earlier inputs, and its new definitions are printed like the stock REPL does.
++ */
++object ScalinoRepl:
++
++  private final class InstallTrees extends Phase:
++    def phaseName: String = "scalinoInstallTrees"
++    var units: List[tpd.Tree] = Nil
++    var lastCtx: Context | Null = null
++    protected def run(using Context): Unit =
++      val tree = ctx.compilationUnit.tpdTree
++      ScalinoInterpret.install(tree)
++      units = units :+ tree
++      lastCtx = ctx
++
++  private final class ReplCompiler extends Compiler:
++    /** The last run's (a phase instance serves one run only). */
++    var installTrees = new InstallTrees
++    override def phases: List[List[Phase]] =
++      installTrees = new InstallTrees
++      List(List(new parsing.Parser), List(new TyperPhase), List(new PostTyper), List(new Inlining), List(new PostInlining), List(installTrees))
++
++  private object driver extends Driver:
++    override protected def sourcesRequired: Boolean = false
++    def setupFor(args: Array[String], rootCtx: Context): Option[(List[io.AbstractFile], Context)] = setup(args, rootCtx)
++
++  /** Everything that `:reset` drops. */
++  private final class State(val rootCtx: Context):
++    val compiler = new ReplCompiler
++    val session = new Interpreter.Session
++    /** Top-level imports every later input starts with: the earlier wrappers' members and the
++     *  user's own imports, in input order (a later one shadows an earlier one). */
++    val preamble = mutable.ArrayBuffer.empty[String]
++    var line = 0
++    var resCount = 0
++
++  private val Prompt = "scala> "
++  private val Continue = "     | "
++  /** Longest rendered value, as in the stock REPL. */
++  private val MaxValueLength = 1000
++
++  def run(args: Array[String]): Unit =
++    var initScript: String | Null = null
++    var quitAfterInit = false
++    var interactive = false
++    var rest = args.toList
++    var more = true
++    while more do
++      rest match
++        case "--init-script" :: code :: tail => initScript = code; rest = tail
++        case "--quit-after-init" :: tail => quitAfterInit = true; rest = tail
++        // stdin is a terminal (the caller knows: this javalib has no `System.console`)
++        case "--interactive" :: tail => interactive = true; rest = tail
++        case _ => more = false
++    // E230: the wrappers' `$` names, which are ours
++    val options = rest ++ List("-Yretain-trees", "-color:never", "-Wconf:id=E230:s")
++    def newState(): State =
++      driver.setupFor(options.toArray, (new ContextBase).initialCtx) match
++        case Some((_, ctx)) => State(ctx)
++        case None => sys.exit(2)
++    var state = newState()
++    val in = new BufferedReader(new InputStreamReader(System.in, UTF_8))
++    val out = System.out
++    if interactive then
++      out.println(s"Welcome to Scala ${config.Properties.simpleVersionString} (scalino, interpreted: no JVM, no linking).")
++      out.println("Type in expressions for evaluation. Or try :help.")
++      out.println()
++    if initScript != null then evalInput(state, initScript.nn, out)
++    var done = quitAfterInit
++    while !done do
++      readInput(state, in, out, interactive) match
++        case None => done = true
++        case Some(input) =>
++          val trimmed = input.trim
++          if trimmed.isEmpty then ()
++          else if trimmed.startsWith(":") then
++            val (cmd, arg) = trimmed.span(!_.isWhitespace) match { case (c, a) => (c, a.trim) }
++            cmd match
++              case ":quit" | ":q" | ":exit" => done = true
++              case ":help" | ":h" => printHelp(out)
++              case ":reset" =>
++                state = newState()
++                out.println("Resetting REPL state.")
++              case ":imports" =>
++                state.preamble.filterNot(_.startsWith("import rs$line")).foreach(out.println)
++              case ":type" | ":t" =>
++                if arg.isEmpty then out.println(":type <expression>") else typeOf(state, arg, out)
++              case ":load" =>
++                val p = Paths.get(arg)
++                if arg.isEmpty || !Files.isRegularFile(p) then out.println(s"File '$arg' does not exist.")
++                else evalInput(state, new String(Files.readAllBytes(p), UTF_8), out)
++              case _ => out.println(s"Unknown command: \"$cmd\", run \":help\" for a list of commands")
++          else
++            try evalInput(state, input, out)
++            catch case ProgramExit(status) =>
++              out.flush()
++              sys.exit(status)
++    if interactive then out.println()
++    sys.exit(0)
++
++  private def printHelp(out: PrintStream): Unit =
++    out.println(
++      """The REPL has several commands available:
++        |
++        |:help                    print this summary
++        |:load <path>             interpret lines in a file
++        |:quit                    exit the REPL
++        |:type <expression>       evaluate the type of the given expression
++        |:imports                 show import history
++        |:reset                   reset the REPL to its initial state, forgetting all session entries
++        |
++        |Inputs are interpreted (scalino-dotc's tree interpreter), not linked: code that needs the
++        |native runtime (@extern, scala.scalanative.unsafe, threads) is not supported here.""".stripMargin)
++
++  /** One complete input, reading continuation lines while the parser reports it unfinished;
++   *  None at end of input. */
++  private def readInput(state: State, in: BufferedReader, out: PrintStream, interactive: Boolean): Option[String] =
++    // Prompts only for a terminal: piped input gets just the results.
++    def prompt(p: String): Unit = if interactive then { out.print(p); out.flush() }
++    prompt(Prompt)
++    val first = in.readLine()
++    if first == null then None
++    else if first.trim.startsWith(":") then Some(first)
++    else
++      val buf = new StringBuilder(first)
++      var more = isIncomplete(state, buf.toString)
++      var eof = false
++      while more && !eof do
++        prompt(Continue)
++        val next = in.readLine()
++        if next == null then eof = true
++        else
++          buf.append('\n').append(next)
++          // an empty line ends an unfinishable input too, as in the stock REPL after two of them
++          more = next.trim.nonEmpty && isIncomplete(state, buf.toString)
++      Some(buf.toString)
++
++  /** Does `code` end inside an unfinished construct (an open brace, a dangling operator)? */
++  private def isIncomplete(state: State, code: String): Boolean =
++    given Context = state.rootCtx.fresh.setReporter(new StoreReporter(null))
++    val source = SourceFile.virtual("<console>", code, maybeIncomplete = true)
++    val parser = new Parsers.Parser(source)
++    parser.blockStatSeq()
++    ctx.reporter.allErrors.exists(_.pos.span.end >= code.length) || code.trim.endsWith("=")
++
++  /** Parses `code` into its top-level statements (None on a syntax error, reported). */
++  private def parseStats(state: State, code: String, out: PrintStream): Option[List[untpd.Tree]] =
++    val reporter = newReporter(out)
++    given Context = state.rootCtx.fresh.setReporter(reporter)
++    val source = SourceFile.virtual("<console>", code)
++    val stats = new Parsers.Parser(source).blockStatSeq()
++    if reporter.hasErrors then None else Some(stats)
++
++  private def newReporter(out: PrintStream): ConsoleReporter =
++    val w = new PrintWriter(out, true)
++    new ConsoleReporter(null, w, w)
++
++  private def isExpression(t: untpd.Tree)(using Context): Boolean = t match
++    case _: untpd.MemberDef | _: untpd.Import | _: untpd.Export | _: untpd.PackageDef => false
++    case _: untpd.PatDef => false
++    case _ => t.isTerm
++
++  /** Compiles one wrapper object; its typed body statements and the context to interpret them
++   *  in, or None after reporting compile errors. */
++  private def compileWrapper(state: State, wrapperName: String, body: String, out: PrintStream): Option[(Symbol, List[tpd.Tree], Context)] =
++    val header = (state.preamble :+ s"object $wrapperName {").mkString("; ")
++    val text = header + "\n" + body + "\n}\n"
++    val reporter = newReporter(out)
++    val ctx0 = state.rootCtx.fresh.setReporter(reporter)
++    val compiler = state.compiler
++    try
++      val run = compiler.newRun(using ctx0)
++      run.compileSources(List(SourceFile.virtual(s"$wrapperName.scala", text)))
++      reporter.flush()(using ctx0)
++    catch case e: Exception =>
++      out.println(s"error: the compiler crashed on this input: $e")
++      return None
++    if reporter.hasErrors || compiler.installTrees.lastCtx == null then None
++    else
++      given ctx: Context = compiler.installTrees.lastCtx.nn.fresh.setCompilationUnit(NoCompilationUnit)
++      val wrapper = defn.EmptyPackageClass.info.decl(wrapperName.toTermName).symbol.moduleClass
++      val stats = compiler.installTrees.units.flatMap(templateStats(_, wrapper))
++      Some((wrapper, stats, ctx))
++
++  /** The body statements of `wrapper`'s template inside a compiled unit. */
++  private def templateStats(unit: tpd.Tree, wrapper: Symbol)(using Context): List[tpd.Tree] = unit match
++    case tpd.PackageDef(_, stats) => stats.flatMap(templateStats(_, wrapper))
++    case td: tpd.TypeDef if td.symbol == wrapper =>
++      td.rhs match
++        case t: tpd.Template => t.body
++        case _ => Nil
++    case _ => Nil
++
++  /** Compiles, runs and prints one input. */
++  private def evalInput(state: State, code: String, out: PrintStream): Unit =
++    parseStats(state, code, out) match
++      case None =>
++      case Some(stats) =>
++        state.line += 1
++        val wrapperName = s"rs$$line${state.line}"
++        // Each expression statement becomes `val resK = <expr>` (its source text, untouched).
++        val resNames = mutable.Map.empty[String, Int]
++        var nextRes = state.resCount
++        val body = new StringBuilder
++        var last = 0
++        given Context = state.rootCtx
++        for stat <- stats do
++          val span = stat.span
++          if isExpression(stat) && span.exists then
++            body.append(code.substring(last, span.start))
++            val name = s"res$nextRes"
++            resNames(name) = nextRes
++            nextRes += 1
++            body.append(s"val $name = ").append(code.substring(span.start, span.end))
++            last = span.end
++        body.append(code.substring(last))
++        compileWrapper(state, wrapperName, body.toString, out) match
++          case None =>
++          case Some((wrapper, typedStats, ctx1)) =>
++            given Context = ctx1
++            val interpreter = new Interpreter(wrapper.srcPos, null, state.session)
++            var usedRes = state.resCount
++            var failed = false
++            val imports = mutable.ArrayBuffer.empty[String]
++            for stat <- typedStats if !failed do
++              stat match
++                case imp: tpd.Import => imports += s"import ${imp.show.stripPrefix("import ")}"
++                case _ =>
++              val value =
++                try Right(interpreter.evalStatement(stat, wrapper))
++                catch
++                  case e: ProgramExit => throw e
++                  case e: Interpreter.StopInterpretation =>
++                    out.println(s"-- can't interpret: ${e.msg.message}")
++                    for sym <- interpreter.stopStack.take(8) do out.println(s"  in ${sym.showLocated}")
++                    Left(())
++                  case e @ InterpretedThrow(v) =>
++                    out.println(ScalinoInterpret.describeException(v))
++                    for sym <- if interpreter.lastThrown eq e then interpreter.lastThrowStack else Nil do
++                      out.println(s"  at ${sym.owner.fullName.toString.stripSuffix("$")}.${sym.name}")
++                    Left(())
++                  case e: StackOverflowError =>
++                    out.println("java.lang.StackOverflowError")
++                    Left(())
++                  case e: Throwable if !e.isInstanceOf[scala.util.control.ControlThrowable] =>
++                    out.println(e.toString)
++                    for sym <- if interpreter.lastThrown eq e then interpreter.lastThrowStack else Nil do
++                      out.println(s"  at ${sym.owner.fullName.toString.stripSuffix("$")}.${sym.name}")
++                    Left(())
++              value match
++                case Left(_) => failed = true
++                case Right(v) => show(stat, v, resNames, out).foreach { r => usedRes = usedRes max (r + 1) }
++            out.flush()
++            state.resCount = usedRes
++            // Later inputs see this one's definitions (also after a failure part-way: what ran stays run).
++            state.preamble ++= imports
++            state.preamble += s"import $wrapperName.{*, given}"
++
++  /** Prints what one statement defined; the `resK` number it used, if any. */
++  private def show(stat: tpd.Tree, value: Object, resNames: collection.Map[String, Int], out: PrintStream)(using Context): Option[Int] =
++    stat match
++      case vdef: tpd.ValDef if !vdef.symbol.is(Synthetic) =>
++        val sym = vdef.symbol
++        val name = sym.name.toString
++        val res = resNames.get(name)
++        val tpe = sym.info.widenExpr
++        // an expression of type Unit shows nothing, and leaves its `resK` to the next one
++        if res.isDefined && tpe.widenDealias.isRef(defn.UnitClass) then None
++        else
++          if sym.is(Lazy) then out.println(s"lazy val $name: ${showType(tpe)}")
++          else out.println(s"${if sym.is(Mutable) then "var" else "val"} $name: ${showType(tpe)} = ${render(value)}")
++          res
++      case ddef: tpd.DefDef if !ddef.symbol.isOneOf(Synthetic | Accessor) && !ddef.symbol.isConstructor =>
++        out.println(stripWrappers(ddef.symbol.showDcl))
++        None
++      case tdef: tpd.TypeDef if !tdef.symbol.is(Synthetic) =>
++        val sym = tdef.symbol
++        val kind =
++          if sym.is(ModuleClass) then "object"
++          else if sym.is(Trait) then "trait"
++          else if sym.is(Case) then "case class"
++          else if sym.isClass then "class"
++          else if sym.isOpaqueAlias then "opaque type"
++          else "type"
++        val name = if sym.is(ModuleClass) then sym.name.stripModuleClassSuffix else sym.name
++        out.println(s"// defined $kind $name")
++        None
++      case _ => None
++
++  private val WrapperPrefix = java.util.regex.Pattern.compile("rs\\$line\\d+\\.")
++
++  /** Types as the user wrote them: without the `rs$lineN.` prefix of the wrapper objects. */
++  private def stripWrappers(s: String): String = WrapperPrefix.matcher(s).replaceAll("")
++
++  private def showType(t: Type)(using Context): String = stripWrappers(t.show)
++
++  /** A value as the stock REPL prints it (`Array(1, 2)`, at most `MaxValueLength` characters). */
++  def render(value: Object): String =
++    val s = value match
++      case null => "null"
++      case a: Array[?] => a.map(x => render(x.asInstanceOf[Object])).mkString("Array(", ", ", ")")
++      case s: String => s
++      case c: Character => c.toString
++      case other => String.valueOf(other)
++    if s.length > MaxValueLength then s.take(MaxValueLength) + " ... large output truncated, print value to show all"
++    else s
++
++  /** `:type <expr>`: compiles the expression without running it. */
++  private def typeOf(state: State, expr: String, out: PrintStream): Unit =
++    state.line += 1
++    compileWrapper(state, s"rs$$line${state.line}", s"def typeOf = $expr", out) match
++      case None =>
++      case Some((_, stats, ctx1)) =>
++        given Context = ctx1
++        stats.collectFirst { case d: tpd.DefDef if d.name.toString == "typeOf" => d.symbol.info.finalResultType.widenExpr }
++          .foreach(t => out.println(showType(t)))
+diff --git a/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
+index 5187f88f..1e76c758 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/HostValueCalls.scala
+@@ -117,6 +117,84 @@ object HostValueCalls:
+       case (sb: java.lang.StringBuffer) :: Nil => Some(new String(sb))
+       case _ => None
+ 
++  private def num(o: Object): Number = o match
++    case n: Number => n
++    case c: Character => Integer.valueOf(c.charValue.toInt)
++  private def dbl(o: Object): Double = num(o).doubleValue
++  private def flt(o: Object): Float = num(o).floatValue
++  private def lng(o: Object): Long = num(o).longValue
++
++  /** `java.lang.Math.<name>` with the declared parameter types `params` (`"Int"`, `"Long"`,
++   *  `"Float"`, `"Double"`): picks the overload the call site resolved to. */
++  def math(name: String, params: List[String], args: List[Object]): Option[Object] =
++    def d(r: Double): Object = java.lang.Double.valueOf(r)
++    def f(r: Float): Object = java.lang.Float.valueOf(r)
++    def l(r: Long): Object = java.lang.Long.valueOf(r)
++    def i(r: Int): Object = Integer.valueOf(r)
++    (name, params, args) match
++      case ("abs", List("Int"), a :: Nil) => Some(i(Math.abs(int(a))))
++      case ("abs", List("Long"), a :: Nil) => Some(l(Math.abs(lng(a))))
++      case ("abs", List("Float"), a :: Nil) => Some(f(Math.abs(flt(a))))
++      case ("abs", List("Double"), a :: Nil) => Some(d(Math.abs(dbl(a))))
++      case ("max", List("Int", _), a :: b :: Nil) => Some(i(Math.max(int(a), int(b))))
++      case ("max", List("Long", _), a :: b :: Nil) => Some(l(Math.max(lng(a), lng(b))))
++      case ("max", List("Float", _), a :: b :: Nil) => Some(f(Math.max(flt(a), flt(b))))
++      case ("max", List("Double", _), a :: b :: Nil) => Some(d(Math.max(dbl(a), dbl(b))))
++      case ("min", List("Int", _), a :: b :: Nil) => Some(i(Math.min(int(a), int(b))))
++      case ("min", List("Long", _), a :: b :: Nil) => Some(l(Math.min(lng(a), lng(b))))
++      case ("min", List("Float", _), a :: b :: Nil) => Some(f(Math.min(flt(a), flt(b))))
++      case ("min", List("Double", _), a :: b :: Nil) => Some(d(Math.min(dbl(a), dbl(b))))
++      case ("round", List("Float"), a :: Nil) => Some(i(Math.round(flt(a))))
++      case ("round", List("Double"), a :: Nil) => Some(l(Math.round(dbl(a))))
++      case ("signum", List("Float"), a :: Nil) => Some(f(Math.signum(flt(a))))
++      case ("signum", List("Double"), a :: Nil) => Some(d(Math.signum(dbl(a))))
++      case ("floorDiv", List("Int", "Int"), a :: b :: Nil) => Some(i(Math.floorDiv(int(a), int(b))))
++      case ("floorDiv", List("Long", _), a :: b :: Nil) => Some(l(Math.floorDiv(lng(a), lng(b))))
++      case ("floorMod", List("Int", "Int"), a :: b :: Nil) => Some(i(Math.floorMod(int(a), int(b))))
++      case ("floorMod", List("Long", "Long"), a :: b :: Nil) => Some(l(Math.floorMod(lng(a), lng(b))))
++      case ("floorMod", List("Long", "Int"), a :: b :: Nil) => Some(i(Math.floorMod(lng(a), int(b))))
++      case ("addExact", List("Int", _), a :: b :: Nil) => Some(i(Math.addExact(int(a), int(b))))
++      case ("addExact", List("Long", _), a :: b :: Nil) => Some(l(Math.addExact(lng(a), lng(b))))
++      case ("multiplyExact", List("Int", "Int"), a :: b :: Nil) => Some(i(Math.multiplyExact(int(a), int(b))))
++      case ("multiplyExact", List("Long", _), a :: b :: Nil) => Some(l(Math.multiplyExact(lng(a), lng(b))))
++      case ("subtractExact", List("Int", _), a :: b :: Nil) => Some(i(Math.subtractExact(int(a), int(b))))
++      case ("subtractExact", List("Long", _), a :: b :: Nil) => Some(l(Math.subtractExact(lng(a), lng(b))))
++      case ("toIntExact", _, a :: Nil) => Some(i(Math.toIntExact(lng(a))))
++      case ("random", Nil, Nil) => Some(d(Math.random()))
++      case ("pow", _, a :: b :: Nil) => Some(d(Math.pow(dbl(a), dbl(b))))
++      case ("atan2", _, a :: b :: Nil) => Some(d(Math.atan2(dbl(a), dbl(b))))
++      case ("hypot", _, a :: b :: Nil) => Some(d(Math.hypot(dbl(a), dbl(b))))
++      case ("IEEEremainder", _, a :: b :: Nil) => Some(d(Math.IEEEremainder(dbl(a), dbl(b))))
++      case ("copySign", List("Double", _), a :: b :: Nil) => Some(d(Math.copySign(dbl(a), dbl(b))))
++      case (n, List("Double"), a :: Nil) =>
++        val x = dbl(a)
++        val r: Option[Double] = n match
++          case "sqrt" => Some(Math.sqrt(x))
++          case "cbrt" => Some(Math.cbrt(x))
++          case "floor" => Some(Math.floor(x))
++          case "ceil" => Some(Math.ceil(x))
++          case "rint" => Some(Math.rint(x))
++          case "exp" => Some(Math.exp(x))
++          case "expm1" => Some(Math.expm1(x))
++          case "log" => Some(Math.log(x))
++          case "log10" => Some(Math.log10(x))
++          case "log1p" => Some(Math.log1p(x))
++          case "sin" => Some(Math.sin(x))
++          case "cos" => Some(Math.cos(x))
++          case "tan" => Some(Math.tan(x))
++          case "asin" => Some(Math.asin(x))
++          case "acos" => Some(Math.acos(x))
++          case "atan" => Some(Math.atan(x))
++          case "sinh" => Some(Math.sinh(x))
++          case "cosh" => Some(Math.cosh(x))
++          case "tanh" => Some(Math.tanh(x))
++          case "toRadians" => Some(Math.toRadians(x))
++          case "toDegrees" => Some(Math.toDegrees(x))
++          case "ulp" => Some(Math.ulp(x))
++          case _ => None
++        r.map(d)
++      case _ => None
++
+   /** `x.toByte`/`toShort`/`toChar`/`toInt`/`toLong`/`toFloat`/`toDouble` on any boxed numeric or `Char`. */
+   def numericConversion(x: Object, name: String): Option[Object] =
+     val n: Number | Null = x match
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 2b118a14..4cef2864 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -94,14 +94,14 @@ import dotty.tools.dotc.core.CyclicReference
+  *    but prints `List` instead of the expected fully-applied type-lambda
+  *    signature).
+  */
+-class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
++class Interpreter(pos: SrcPos, classLoader0: ClassLoader, session: Interpreter.Session = new Interpreter.Session)(using Context):
+ 
+   /** State of mutable fields (`var`s) of `object`s: a `ModuleValue` carries no
+    *  field store of its own (it is rebuilt on every access), so writes such as
+    *  `MIO.timeoutDeadlineNanos = Long.MaxValue` are recorded here, keyed by
+    *  module class and field name, and later reads consult it first.
+    */
+-  private val moduleVars: mutable.Map[(Symbol, String), Object] = mutable.Map.empty
++  private val moduleVars: mutable.Map[(Symbol, String), Object] = session.moduleVars
+ 
+   import Interpreter.*
+   import tpd.*
+@@ -139,7 +139,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    *  `uri"..."` literal macro (which validates the literal via cats-parse's
+    *  real parser-simplification machinery at macro-expansion time).
+    */
+-  private val staticFieldCache = mutable.Map[Symbol, Object]()
++  private val staticFieldCache = session.staticFieldCache
+ 
+   /** Returns the result of interpreting the code in the tree.
+    *  Return Some of the result or None if the result type is not consistent with the expected type.
+@@ -172,6 +172,102 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case _ =>
+         throw new StopInterpretation(em"Cannot interpret `transform` of macro annotation ${annotTree.show}: no retained body", pos)
+ 
++  /** `main(args)` of a whole program (`scalino-dotc --interpret`, `ScalinoInterpret`): `mainMethod`
++   *  is an object's `main` or the static one `@main` generates. A program exception escapes as
++   *  itself, or as `InterpretedThrow` when it is an interpreted (user-defined) exception class.
++   */
++  final def runMain(mainMethod: Symbol, args: Array[String]): Unit =
++    given Env = emptyEnv
++    programMode = true
++    InterpretedInstance.render = renderInstance
++    resolveExternalDefTree(mainMethod) match
++      case ddef: DefDef if !ddef.rhs.isEmpty =>
++        val owner = mainMethod.owner
++        val receiver = if owner.is(ModuleClass) then Some(interpretModuleAccess(owner.sourceModule)) else None
++        callUserDefDef(receiver, ddef, List(args), Nil)
++      case _ =>
++        throw new StopInterpretation(em"no retained body for ${mainMethod.showLocated}", pos)
++
++  /** Set by `runMain`/the REPL: a whole program runs, so `programRuntimeCall`'s stand-ins for the
++   *  host runtime apply. */
++  var programMode = false
++
++  /** The interpreted `toString` of `inst` (`InterpretedInstance.render`). */
++  final def renderInstance(inst: InterpretedInstance): String =
++    val m = inst.cls.info.member(nme.toString_).suchThat(s => s.is(Method) && s.info.firstParamTypes.isEmpty).symbol
++    val body =
++      if m.exists && m.owner != defn.AnyClass && m.owner != defn.ObjectClass then resolveExternalDefTree(m)
++      else EmptyTree
++    val throwable = if inst.cls.derivesFrom(defn.ThrowableClass) then throwableCall(inst, "toString", Nil) else None
++    throwable.map(String.valueOf).getOrElse:
++      body match
++        case ddef: DefDef if !ddef.rhs.isEmpty => String.valueOf(callUserDefDef(Some(inst), ddef, Nil)(using emptyEnv))
++        case _ => s"${inst.cls.fullName}@${Integer.toHexString(System.identityHashCode(inst))}"
++
++  /** `Throwable`'s methods on an interpreted exception (its message/cause come from the parent
++   *  constructor call, see `bindSuperCtorFields`); None when the class overrides the method. */
++  private def throwableCall(inst: InterpretedInstance, name: String, args: List[Object]): Option[Object] =
++    val overridden =
++      val m = inst.cls.info.member(name.toTermName).symbol
++      m.exists && !m.owner.is(JavaDefined)
++    if overridden then None
++    else
++      def message: Object =
++        val m = inst.fields.getOrElse(ThrowableMessageField, null)
++        if m == null then inst.fields.get(ThrowableCauseField).map(String.valueOf).orNull else m
++      (name, args) match
++        case ("getMessage" | "getLocalizedMessage", Nil) => Some(message)
++        case ("getCause", Nil) => Some(inst.fields.getOrElse(ThrowableCauseField, null))
++        case ("toString", Nil) =>
++          val m = message
++          Some(inst.cls.fullName.toString + (if m == null then "" else s": $m"))
++        case ("initCause", c :: Nil) => inst.fields(ThrowableCauseField) = c; Some(inst)
++        case ("getStackTrace", Nil) => Some(new Array[Object](0))
++        case ("setStackTrace", _ :: Nil) | ("addSuppressed", _ :: Nil) => Some(interpretUnit())
++        case ("fillInStackTrace", Nil) => Some(inst)
++        case ("getSuppressed", Nil) => Some(new Array[Object](0))
++        case ("printStackTrace", Nil) => System.err.println(inst.toString); Some(interpretUnit())
++        case _ => None
++
++  /** Calls into the parts of the Scala runtime whose bodies need the host (thread-locals, the
++   *  process): `Console`'s streams are its `DynamicVariable`s, read on the host instead; `StdIn`
++   *  reads the host's stdin; `sys.exit` ends the program (`ProgramExit`). Only in `programMode`.
++   */
++  private def programRuntimeCall(fn: Symbol, args: => List[Object]): Option[Object] =
++    if !programMode then None
++    else
++      val owner = fn.owner.fullName.toString.stripSuffix("$")
++      (owner, fn.name.toString) match
++        case ("scala.Console", "out") => Some(Console.out)
++        case ("scala.Console", "err") => Some(Console.err)
++        case ("scala.Console", "in") => Some(Console.in)
++        case ("scala.Console", "flush") => Console.flush(); Some(interpretUnit())
++        case ("scala.io.StdIn", "readLine") if args.isEmpty => Some(scala.io.StdIn.readLine())
++        case ("scala.io.StdIn", "readInt") => Some(Int.box(scala.io.StdIn.readInt()))
++        case ("scala.io.StdIn", "readLong") => Some(Long.box(scala.io.StdIn.readLong()))
++        case ("scala.io.StdIn", "readDouble") => Some(Double.box(scala.io.StdIn.readDouble()))
++        case ("scala.io.StdIn", "readBoolean") => Some(Boolean.box(scala.io.StdIn.readBoolean()))
++        case ("scala.io.StdIn", "readChar") => Some(Char.box(scala.io.StdIn.readChar()))
++        case ("scala.sys.package", "exit") =>
++          throw ProgramExit(args match { case (n: Integer) :: Nil => n.intValue; case _ => 0 })
++        case ("java.lang.System", "exit") =>
++          throw ProgramExit(args match { case (n: Integer) :: Nil => n.intValue; case _ => 0 })
++        case _ => None
++
++  /** Evaluates one top-level statement or expression (the REPL, `ScalinoRepl`): `this` of the
++   *  enclosing wrapper object is bound to its module value.
++   */
++  final def evalStatement(tree: Tree, wrapper: Symbol): Object =
++    programMode = true
++    InterpretedInstance.render = renderInstance
++    tree match
++      // an object's `val`/`var`: initialised now, in statement order, and kept in the session
++      case vdef: ValDef if !vdef.symbol.is(Lazy) => interpretStaticFieldAccess(vdef.symbol)
++      case _: MemberDef | _: Import => interpretUnit()
++      case _ =>
++        val module = interpretModuleAccess(wrapper.sourceModule)(using emptyEnv)
++        interpretTree(tree)(using bindThis(emptyEnv, wrapper, module))
++
+   /** Returns the result of interpreting the code in the tree.
+    *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
+    */
+@@ -2468,7 +2564,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+ 
+   private def interpretStaticCall(moduleClass: Symbol, fn: Symbol, rawArgs: List[Tree], typeArgs: List[Type] = Nil)(using Env): Object =
+     lazy val args = evalNonErased(rawArgs, fn)
+-    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
++    programRuntimeCall(fn, args).orElse(interpretCollectionFactory(moduleClass, fn, args)).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
+       resolveExternalDefTree(fn) match
+         // `moduleClass` (not `None`) as the receiver: a top-level object's
+         // own method can still reference `this` internally (e.g. to call a
+@@ -2839,6 +2935,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case ("isHighSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isHighSurrogate(c.charValue)))
+         case ("isLowSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isLowSurrogate(c.charValue)))
+         case _ => None
++    // `java.lang.Math`/`StrictMath`: host natives, by name and the overload's declared parameter types.
++    else if fn.owner.is(JavaDefined) && (fn.owner.name.toString.stripSuffix("$") == "Math" || fn.owner.name.toString.stripSuffix("$") == "StrictMath") then
++      HostValueCalls.math(fn.name.toString, fn.info.paramInfoss.flatten.map(_.typeSymbol.name.toString), args)
+     // A handful of common `java.lang.{Integer,Long}` real JDK-native
+     // static parsing methods -- no Scala source ever, but exercised by
+     // e.g. ip4s's own literal-validation macros hand-parsing numbers at
+@@ -2920,7 +3019,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         srcPos)
+     lazy val args = evalNonErased(rawArgs, fn)
+     val collectionFactory = receiver match
+-      case ModuleValue(cls) => interpretCollectionFactory(cls, fn, args)
++      case ModuleValue(cls) => programRuntimeCall(fn, args).orElse(interpretCollectionFactory(cls, fn, args))
+       case _ => None
+     val concreteCls = receiverConcreteClass(receiver)
+     // `fn` is whatever symbol the call site's *static* type resolved to
+@@ -3191,6 +3290,12 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+    *  (only for diagnostics: "Unexpected tree" errors list the top frames).
+    */
+   private var defStack: List[Symbol] = Nil
++  /** The interpreted call stack (innermost first) where the first `StopInterpretation` was raised. */
++  var stopStack: List[Symbol] = Nil
++  /** The last exception that unwound an interpreted call, and the interpreted stack it was thrown
++   *  from (innermost first): the stack trace of an uncaught program exception. */
++  var lastThrown: Throwable | Null = null
++  var lastThrowStack: List[Symbol] = Nil
+   private var reportedStackOverflow = false
+   /** Type arguments of the instance call being dispatched (read by `interpretQuotesApi`). */
+   private var currentTypeArgs: List[Type] = Nil
+@@ -3202,6 +3307,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     if debugFn != null && ddef.symbol.name.toString == debugFn then debugWindow = true
+     try callUserDefDef0(receiver, ddef, args, typeArgs)
+     catch
++      case e: StopInterpretation =>
++        if stopStack.isEmpty then stopStack = defStack
++        throw e
++      case e: Throwable if !e.isInstanceOf[scala.util.control.ControlThrowable] && !e.isInstanceOf[LabeledReturn] =>
++        if e ne lastThrown then
++          lastThrown = e
++          lastThrowStack = defStack
++        throw e
+       case so: StackOverflowError =>
+         if !reportedStackOverflow then
+           reportedStackOverflow = true
+@@ -3458,18 +3571,45 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+     // handling, same story as `WeakReference` above. Curated by name as
+     // specific ones get exercised, not exhaustive over every JDK exception.
+     else if fn.owner.is(JavaDefined) && fn.owner.derivesFrom(defn.ThrowableClass) then
+-      def messageArg: Option[String] = rawArgs.filterNot(_.isEmpty).map(interpretTree).headOption.map(String.valueOf)
+-      fn.owner.name.toString match
+-        case "UnsupportedOperationException" => Some(new UnsupportedOperationException(messageArg.orNull))
+-        case "IllegalArgumentException" => Some(new IllegalArgumentException(messageArg.orNull))
+-        case "IllegalStateException" => Some(new IllegalStateException(messageArg.orNull))
+-        case "NoSuchElementException" => Some(new NoSuchElementException(messageArg.orNull))
+-        case "RuntimeException" => Some(new RuntimeException(messageArg.orNull))
++      val argValues = rawArgs.filterNot(_.isEmpty).map(interpretTree)
++      val messageArg: Option[String] = argValues.collectFirst { case m: String => m }
++      val causeArg: Option[Throwable] = argValues.collectFirst { case c: Throwable => c }
++      def m: String | Null = messageArg.orNull
++      val made: Option[Throwable] = fn.owner.name.toString match
++        case "UnsupportedOperationException" => Some(new UnsupportedOperationException(m))
++        case "IllegalArgumentException" => Some(new IllegalArgumentException(m))
++        case "IllegalStateException" => Some(new IllegalStateException(m))
++        case "NoSuchElementException" => Some(new NoSuchElementException(m))
++        case "RuntimeException" => Some(new RuntimeException(m))
+         // Seen via cats-parse's own `DropRightIterator` (a real, genuinely-
+         // thrown-in-normal-control-flow exception, not just an "unreachable"
+         // fallback), reached through http4s's `uri"..."` literal macro.
+-        case "IndexOutOfBoundsException" => Some(new IndexOutOfBoundsException(messageArg.orNull))
++        case "IndexOutOfBoundsException" => Some(new IndexOutOfBoundsException(m))
++        // Whole programs (`ScalinoInterpret`) throw the common rest of `java.lang`/`java.util`/`java.io` too.
++        case "Exception" => Some(new Exception(m))
++        case "Throwable" => Some(new Throwable(m))
++        case "Error" => Some(new Error(m))
++        case "AssertionError" => Some(new AssertionError(m))
++        case "NullPointerException" => Some(new NullPointerException(m))
++        case "ArithmeticException" => Some(new ArithmeticException(m))
++        case "ClassCastException" => Some(new ClassCastException(m))
++        case "NumberFormatException" => Some(new NumberFormatException(m))
++        case "ArrayIndexOutOfBoundsException" => Some(new ArrayIndexOutOfBoundsException(m))
++        case "StringIndexOutOfBoundsException" => Some(new StringIndexOutOfBoundsException(m))
++        case "NegativeArraySizeException" => Some(new NegativeArraySizeException(m))
++        case "ConcurrentModificationException" => Some(new java.util.ConcurrentModificationException(m))
++        case "InterruptedException" => Some(new InterruptedException(m))
++        case "IOException" => Some(new java.io.IOException(m))
++        case "UncheckedIOException" => causeArg.collect { case c: java.io.IOException => new java.io.UncheckedIOException(m, c) }
++        case "FileNotFoundException" => Some(new java.io.FileNotFoundException(m))
++        case "EOFException" => Some(new java.io.EOFException(m))
++        case "StackOverflowError" => Some(new StackOverflowError(m))
++        case "OutOfMemoryError" => Some(new OutOfMemoryError(m))
+         case _ => None
++      made.map { e =>
++        causeArg.foreach(c => if e.getCause == null then e.initCause(c))
++        e
++      }
+     // `java.lang.StringBuilder`: a real JDK class, no retained Scala source
+     // -- checked by `JavaDefined` (like `WeakReference` above), BEFORE the
+     // bare-name `"StringBuilder"` case below (which builds a
+@@ -3711,9 +3851,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+           // run any statements after it (rare for a trivial forwarding aux
+           // constructor, but not disallowed) against that instance's `this`.
+           ddef.rhs match
+-            case Block((delegate @ Call(callee, _)) :: rest, _) if callee.symbol.isConstructor =>
++            case Block((delegate @ Call(callee, _)) :: rest, expr) if callee.symbol.isConstructor =>
+               val instance = interpretTree(delegate)(using withParams)
+-              rest.foreach(interpretTree(_)(using bindThis(withParams, fn.owner, instance)))
++              // a block, not statement by statement: the body may declare locals
++              // (`val hi = ...` in javalib's `BigInteger(sign, lVal)`)
++              interpretBlock(rest, expr)(using bindThis(withParams, fn.owner, instance))
+               instance
+             case _ => notInterpretable(fn)
+         case _ => notInterpretable(fn)
+@@ -3861,14 +4003,25 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+                   Console.err.println(s"[anonSuperCtor] superParams=$superParams superRawArgs=$superRawArgs superBound=$superBound")
+                 superBound.foreach((p, v) => instance.fields.getOrElseUpdate(p.name.toString, v))
+                 val parentCls = superFn.symbol.owner
+-                if depth < 16 && ancestorExposesParamFields then
++                // A JDK exception class as the parent (`class E(m: String) extends Exception(m)`):
++                // its message and cause, for `throwableCall`.
++                if parentCls.is(JavaDefined) && parentCls.derivesFrom(defn.ThrowableClass) then
++                  superBound.map(_._2).foreach {
++                    case m: String => instance.fields.getOrElseUpdate(ThrowableMessageField, m)
++                    case c: Throwable => instance.fields.getOrElseUpdate(ThrowableCauseField, c)
++                    case c: InterpretedInstance if c.cls.derivesFrom(defn.ThrowableClass) => instance.fields.getOrElseUpdate(ThrowableCauseField, c)
++                    case _ =>
++                  }
++                if depth < 16 && (ancestorExposesParamFields || programMode) then
+                   if parentCls.isClass && !parentCls.is(JavaDefined) && parentCls != defn.ObjectClass then
+                     bindSuperCtorFields(parentCls, superBound.foldLeft(env0)((e, pv) => e.updated(pv._1, pv._2)), depth + 1)
+               case _ =>
+                 if debugEnabled then
+                   Console.err.println(s"[anonSuperCtor] callTree did not match Call-with-constructor: ${callTree.getClass} ${callTree.show}")
+           }
+-        if fn.owner.isAnonymousClass || ancestorExposesParamFields then
++        // A whole program (`programMode`) runs every parent constructor call: there is no macro
++        // derivation to keep the narrower behaviour for.
++        if fn.owner.isAnonymousClass || ancestorExposesParamFields || programMode then
+           bindSuperCtorFields(fn.owner, withParams, 0)
+         instance
+       case _ if rawArgs.forall(_.isEmpty) =>
+@@ -4377,6 +4530,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             case "MIN_VALUE" => Some(Character.valueOf(Character.MIN_VALUE))
+             case "MAX_VALUE" => Some(Character.valueOf(Character.MAX_VALUE))
+             case _ => None
++        case "Math" | "StrictMath" =>
++          sym.name.toString match
++            case "PI" => Some(java.lang.Double.valueOf(Math.PI))
++            case "E" => Some(java.lang.Double.valueOf(Math.E))
++            case _ => None
+         case "MathContext" =>
+           // `java.math.MathContext`'s preset constants (jsoniter-scala's
+           // `BigDecimal` precision handling reads `DECIMAL128`).
+@@ -6526,6 +6684,27 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       // it structurally also `IS-A Seq[Char]`).
+       case (b: mutable.StringBuilder, "append", (v: Object) :: Nil) => Some(b.append(v))
+       case (b: mutable.StringBuilder, "toString" | "result", Nil) => Some(b.toString)
++      // its `val underlying`: a field of a host object, which no reflection can read here
++      // (`IterableOnceOps#addString` appends to it directly).
++      case (b: mutable.StringBuilder, "underlying", Nil) => Some(b.underlying)
++      // A host collection's `copyToArray` body reads its private storage (`ArrayBuffer#array`),
++      // which no reflection can reach here: call the host method (reached through `sorted`).
++      case (it: IterableOnce[?], "copyToArray", (a: Array[?]) :: rest) if !it.isInstanceOf[InterpretedInstance] =>
++        val xs = a.asInstanceOf[Array[Any]]
++        rest match
++          case Nil => Some(Int.box(it.iterator.copyToArray(xs)))
++          case (start: Integer) :: Nil => Some(Int.box(it.iterator.copyToArray(xs, start)))
++          case (start: Integer) :: (len: Integer) :: Nil => Some(Int.box(it.iterator.copyToArray(xs, start, len)))
++          case _ => None
++      // An interpreted subclass of a JDK exception: `Throwable`'s own methods have no body to run.
++      case (inst: InterpretedInstance, name, _) if inst.cls.derivesFrom(defn.ThrowableClass) && throwableCall(inst, name, args).isDefined =>
++        throwableCall(inst, name, args)
++      // `f"..."`: `StringContext.f`'s library body is `???` (dotc's `StringInterpolatorOpt`, a later
++      // phase than the trees interpreted here, implements it). A part not starting with a format
++      // spec formats the argument before it with `%s`, as the real interpolator does.
++      case (sc: scala.StringContext, "f", (args: Seq[?]) :: Nil) =>
++        val fmt = sc.parts.iterator.zipWithIndex.map((p, i) => if i == 0 || p.startsWith("%") then p else "%s" + p).mkString
++        Some(String.format(fmt, args.map(_.asInstanceOf[Object])*))
+       // `classOf[T]` for a macro-expansion-time type `T`: represented as the
+       // real dotc `Type` (a `TypeRef` etc, from the literal's `Constant`),
+       // not a loadable JVM `Class[_]` -- `T` may not even exist as a real
+@@ -6866,6 +7045,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+       case (a, "update", (i: Integer) :: v :: Nil) if a.getClass.isArray =>
+         java.lang.reflect.Array.set(a, i.intValue, v); Some(().asInstanceOf[Object])
+       case (a, "length", Nil) if a.getClass.isArray => Some(Int.box(java.lang.reflect.Array.getLength(a)))
++      // `Array#clone`'s library body is `throw new Error()` (arrays are intrinsic).
++      case (a: Array[?], "clone", Nil) => Some(a.clone().asInstanceOf[Object])
+       case (a: Array[Object] @unchecked, "update", (i: Integer) :: v :: Nil) =>
+         a(i) = v; Some(().asInstanceOf[Object])
+       case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
+@@ -7225,7 +7406,9 @@ case class ModuleValue(moduleClass: Symbol)
+ final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Object])(using Context):
+   val fields: mutable.Map[String, Object] = mutable.Map.empty
+   private val clsName: String = cls.name.toString
+-  override def toString: String = s"$clsName(${fields.mkString(", ")})"
++  override def toString: String =
++    val render = InterpretedInstance.render
++    if render != null then render(this) else s"$clsName(${fields.mkString(", ")})"
+   // A real `case class` gets compiler-generated structural `equals`/
+   // `hashCode` (every constructor param compared); a plain class doesn't,
+   // keeping ordinary reference identity -- match that distinction here
+@@ -7247,6 +7430,17 @@ final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Objec
+     if cls.is(Case) then cls.hashCode + fields.iterator.map((k, v) => k.hashCode ^ (if v == null then 0 else v.hashCode)).sum
+     else super.hashCode()
+ 
++/** `InterpretedInstance.fields` keys of an interpreted exception's message and cause. */
++val ThrowableMessageField = "<throwable-message>"
++val ThrowableCauseField = "<throwable-cause>"
++
++object InterpretedInstance:
++  /** Whole-program runs (`Interpreter#runMain`): `toString` of an instance runs its interpreted
++   *  `toString`, so host code printing it (`println`, a host `List`'s own `toString`) shows what the
++   *  program would. Macro expansion keeps the field dump.
++   */
++  var render: (InterpretedInstance => String) | Null = null
++
+ /** A local `lazy val` slot: `thunk` runs on first read, and its result is cached. */
+ final class LocalLazyVal(thunk: () => Object):
+   private var cached: Object = null
+@@ -7308,10 +7502,21 @@ final case class LabeledReturn(label: Symbol, value: Object) extends Exception(n
+  */
+ final case class InterpretedThrow(value: Object) extends Exception(null, null, false, false)
+ 
++/** `sys.exit(status)` in an interpreted program: unwinds to `ScalinoInterpret`, which flushes and exits. */
++final case class ProgramExit(status: Int) extends scala.util.control.ControlThrowable
++
+ object NonFatalInterpretedException:
+   def unapply(ex: Throwable): Option[Throwable] = scala.util.control.NonFatal.unapply(ex)
+ 
+ object Interpreter:
++  /** The state of `object`s (their `val`s and `var`s) one `Interpreter` leaves behind. Usually
++   *  one per interpreter; the REPL (`ScalinoRepl`) shares one across the interpreters of all its
++   *  inputs, so a later line sees the objects earlier lines initialised.
++   */
++  final class Session:
++    val moduleVars: mutable.Map[(Symbol, String), Object] = mutable.Map.empty
++    val staticFieldCache: mutable.Map[Symbol, Object] = mutable.Map.empty
++
+   /** The method names `interpretQuotesApi`'s cases test as literals (generated from its source;
+    *  keep in step when adding a case).
+    */

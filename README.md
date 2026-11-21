@@ -136,6 +136,9 @@ scalino examples/Hello.scala                                                # ru
 scalino run examples/macro-hello/Test.scala examples/macro-hello/Foo.scala  # a real macro
 scalino run examples/ --main-class Hello                                    # a whole directory
 scalino run examples/Hello.scala -w                                         # watch mode
+scalino run examples/Hello.scala --interpret                                # no link step: run on the interpreter
+scalino run hello.sc -- some args                                           # a script
+scalino repl --dep com.lihaoyi::os-lib::0.11.3                              # REPL, no JVM
 scalino test                                                                # munit/utest/scalatest/zio-test
 scalino package examples/Hello.scala -o hello && ./hello
 scalino package . --main-class Server,Worker -o bin/                        # one binary per main, each with its own link cache
@@ -147,6 +150,7 @@ scalino package . --main-class Server,Worker -o bin/                        # on
 | `compile` | compile only, no link |
 | `package` | link a native binary (or, with `--js`, a JavaScript bundle); `--format` also wraps it as a deb/rpm/tar/docker/brew package ([Packaging](#packaging)) |
 | `test` | compile main + test scope, run the tests |
+| `repl` | interactive Scala REPL, interpreted ([REPL and the interpreter](#repl-and-the-interpreter)) |
 | `setup-ide` | write the LSP config ([Editor support](#editor-support)) |
 | `lock` | write `scalino.lock.json` ([Hermetic builds](#hermetic--nix-builds)) |
 | `publish-local`, `publish` | publish a library to `~/.ivy2/local` or Maven Central ([Publishing libraries](#publishing-libraries)) |
@@ -221,6 +225,34 @@ it is off by default when `$CI` is set.
 Binaries carry no source-level debug info (DWARF) unless you ask. Pass
 `--native-debug-info` or `//> using nativeDebugInfo true` and lldb, gdb and
 profilers show Scala sources and line numbers.
+
+## REPL and the interpreter
+
+The TASTy tree interpreter that expands macros (it lives in `scalino-dotc`) can
+also run whole programs, so some things need no link step at all:
+
+- **`scalino repl [sources...]`**: a Scala 3 REPL. Each input is compiled in one
+  warm `scalino-dotc` and run on the interpreter, with the given sources and
+  `--dep`s on the classpath. Commands: `:help`, `:quit`, `:type <expr>`,
+  `:imports`, `:reset`, `:load <file>`. `--repl-init-script <code>` runs code
+  first, `--repl-quit-after-init` exits after it. There is no line editing or
+  history (`rlwrap scalino repl` adds them).
+- **`scalino run --interpret`**: compiles as usual, then interprets `main`
+  instead of linking: the edit-run loop skips the link step. Works with `-w`
+  (there it never falls back to linking: rerun without `--interpret`).
+- **Scripts:** a `.sc` file passed as a source runs its top-level statements in
+  order, with the program arguments as `args`, linked or (`--interpret`)
+  interpreted. Directories never pick up `.sc` files.
+
+The interpreter has no native runtime: code using `@extern`,
+`scala.scalanative.unsafe`, threads or `Future` is linked instead
+(`run --interpret` says so on stderr and falls back by itself). When the
+interpreter meets something it doesn't support while running, `run` also
+falls back to linking, unless the program already printed something; then it
+stops with an error naming the unsupported call. An uncaught exception prints
+its message and the interpreted call stack, without line numbers. It is
+slower than a linked binary for long computations: it is meant for the
+edit-run loop and for scripts, not benchmarks.
 
 ## Scala.js
 
@@ -668,6 +700,9 @@ third-party project, and end to end in Zed.
 
 Known gaps:
 
+- The interpreter (`repl`, `run --interpret`) covers common Scala and stdlib
+  code, but not all of the JDK: `BigInt`/`BigDecimal` arithmetic, for one, is not
+  supported yet.
 - Scala.js `package --format`. The deb/rpm/docker/brew wrapping is Native only.
 - JUnit-style `@Test` discovery. Test frameworks must use
   `SubclassFingerprint`, as munit, utest, scalatest and zio-test-sbt do.
