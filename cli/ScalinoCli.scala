@@ -658,7 +658,7 @@ object ScalinoCli:
       if line.startsWith("//>") then
         anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
           val key = m.group(1)
-          if !recognizedDirectiveKeys(key) && warnedKeys.add(key) then
+          if !recognizedDirectiveKeys(key) && !Publish.isKnownDirective(key) && warnedKeys.add(key) then
             // scala-cli-style diagnostic (it hard-errors on these; we keep going).
             val keyIdx = rawLine.indexOf(key, rawLine.indexOf("using") + 5)
             val values = rawLine.substring(keyIdx + key.length).trim
@@ -1087,6 +1087,9 @@ object ScalinoCli:
 
   /** Just enough JSON to read back `scalino.lock.json`: objects -> Map,
    *  arrays -> List, strings, numbers (Double), booleans, null. */
+  /** `MiniJsonParser` on a whole document (also `scalino publish`'s Central Portal responses). */
+  def parseJson(s: String): Any = new MiniJsonParser(s).parseDocument()
+
   private final class MiniJsonParser(s: String):
     private var i = 0
 
@@ -3137,6 +3140,59 @@ object ScalinoCli:
        |  instead of resolving -- reproducible, and fetchable up front by Nix and friends.
        |""".stripMargin
 
+  private def publishOpts(local: Boolean): String =
+    s"""|  --organization <org>       groupId (default: io.github.<owner> of a GitHub `origin`${if local then ", else `default`" else ""})
+       |  --name <name>              artifact name, before the platform suffix (default: the directory name)
+       |  --module-name <name>       full artifactId (default: <name>_native${BuildInfo.nativeBinaryVersion}_3 or <name>_sjs1_3)
+       |  --project-version <ver>    version${if local then " (default 0.1.0-SNAPSHOT)" else ""}
+       |  --compute-version <how>    git:tag (HEAD's tag, v dropped) or git:dynver (sbt-dynver style)
+       |  --url, --license, --vcs, --description, --developer, --version-scheme   POM metadata,
+       |                             as the publish.* directives below
+       |  --sources=false, --doc=false   leave out the sources / javadoc jar
+       |""".stripMargin + (
+      if local then
+        s"""|  --ivy2-home <dir>          ivy home to publish into (default ~/.ivy2; the repository is <dir>/local)
+           |  --m2                       publish to the Maven local repository (~/.m2/repository) instead
+           |  --m2-home <dir>            Maven local repository to publish into (implies --m2)
+           |""".stripMargin
+      else
+        s"""|  -R, --publish-repository <repo>   central (default: Sonatype Central Portal; -SNAPSHOT
+       |                             versions go to its snapshots repository), an https:// Maven
+       |                             repository (HTTP PUT), a directory or file: URL, ivy2-local, m2-local
+       |  --user, --password <secret>   repository credentials: env:NAME, file:path or value:text
+       |                             (default $$SONATYPE_USERNAME / $$SONATYPE_PASSWORD, the portal's user token)
+       |  --signer <gpg|none>        gpg by default for Central and when a key is given
+       |  --gpg-key <id>             key to sign with (gpg --local-user)
+       |  --gpg-option <opt>         extra gpg flag (repeatable)
+       |  --secret-key <secret>      armored secret key, or its base64 (default $$PGP_SECRET), imported
+       |                             into a throwaway GNUPGHOME; --secret-key-password <secret>
+       |                             (default $$PGP_PASSPHRASE)
+       |  --manual-release           leave the Central deployment validated, for publishing from
+       |                             the portal (default: published automatically once validated)
+       |  --dummy                    build and sign everything, upload nothing
+       |""".stripMargin)
+
+  private def publishNote: String =
+    s"""|publish directives (scala-cli's; `publish.ci.<key>` overrides `publish.<key>` when $$CI is set):
+       |  //> using publish.organization io.github.me
+       |  //> using publish.name mylib
+       |  //> using publish.version 1.2.3            (or: publish.computeVersion git:tag)
+       |  //> using publish.description "One-line summary"
+       |  //> using publish.url https://github.com/me/mylib
+       |  //> using publish.license Apache-2.0       (SPDX id, or "name:url")
+       |  //> using publish.versionControl github:me/mylib
+       |  //> using publish.developer "me|My Name|https://github.com/me"   (repeatable; |email optional)
+       |  //> using publish.versionScheme early-semver
+       |  //> using publish.repository central
+       |  //> using publish.gpgKey 0123ABCD          publish.secretKey env:PGP_SECRET
+       |  //> using publish.user env:SONATYPE_USERNAME   publish.password env:SONATYPE_PASSWORD
+       |
+       |The main jar holds the .tasty and the .nir (Scala Native) or .sjsir (Scala.js) dotc wrote,
+       |plus the resource directories; there are no .class files (no JVM backend). Use --js to
+       |publish the Scala.js artifact (<name>_sjs1_3). A project depends on the result with
+       |`//> using dep <org>::<name>::<version>`.
+       |""".stripMargin
+
   private def oProgArgs: String =
     s"""|  -- <args...>               program args (run) or test-framework filter args (test),
        |                             e.g. `scalino test . -- "*MySuite*"` (munit/utest-style filter)
@@ -3412,6 +3468,8 @@ object ScalinoCli:
          |  scalino test [options] [-- <framework args>]   compile and run tests in the current directory
          |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
          |  scalino lock <sources...> [options]    resolve dependencies and write scalino.lock.json
+         |  scalino publish-local [options]         publish the library to ~/.ivy2/local (`publish local` too)
+         |  scalino publish [options]               publish the library to Maven Central (or -R <repository>)
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
          |  scalino sysroot build <triple>...      set up the sysroot for cross-compiling to <triple> (see --native-target-triple)
          |  scalino clean                         delete the .scalino-build directory
@@ -3432,7 +3490,7 @@ object ScalinoCli:
          |$completionsNote""".stripMargin, out))
 
   val HelpCommands: Set[String] =
-    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "sysroot", "daemon", "version")
+    Set("run", "compile", "package", "test", "setup-ide", "lock", "publish", "publish-local", "completions", "clean", "sysroot", "daemon", "version")
 
   /** `scalino <command> --help`: usage plus only the options/notes that apply to
    *  that command. */
@@ -3469,6 +3527,12 @@ object ScalinoCli:
         head("scalino lock <sources...> [options]", s"Resolve all dependencies and write $LockFileName.") +
           sourcesNote + "\n" + opts(oDeps + oRepo + oScala + oScalac + oArgsFile + oVerbose + oQuiet + oColor + oOffline) +
           directivesBlock + "\n" + lockNote
+      case "publish" | "publish-local" =>
+        val local = cmd == "publish-local"
+        head(s"scalino $cmd <sources...> [options]",
+          if local then "Publish the library to ~/.ivy2/local, where any scalino project's `//> using dep` finds it."
+          else "Publish the library to Maven Central (Sonatype Central Portal), or another repository.") +
+          sourcesNote + "\n" + opts(common + publishOpts(local)) + jsHeader + "\n" + directivesBlock + "\n" + publishNote
       case "completions" =>
         head("scalino completions <bash|zsh|fish>", "Print a shell completion script to stdout.") + completionsNote
       case "clean" =>
@@ -3789,6 +3853,29 @@ object ScalinoCli:
         compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)
         0
 
+  /** What `scalino publish` packages: the compiled classes, the sources they came from (after
+   *  `target.platform` filtering) and their directives. */
+  case class PublishBuild(classesDir: Path, sources: List[Path], directives: Directives, js: Boolean)
+
+  /** `compile`'s path for `scalino publish`/`publish-local` (no jsClient bundle, no link). Sets
+   *  `jsPlatform` like `buildAndMaybeRun`, so `toCoursierCoord` then names `::` dependencies for
+   *  the platform being published. */
+  def compileForPublish(expandedIn: List[Path], o: RunOpts): PublishBuild =
+    val directives0 = parseDirectives(expandedIn)
+    val platform = resolvePlatform(directives0, o)
+    val expanded = forPlatform(expandedIn, platform)
+    val directives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
+    jsPlatform = platform == "js"
+    val repos = (directives.repositories ++ o.cliRepositories).distinct
+    val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
+    val deps = (directives.deps ++ o.cliDeps).distinct
+    val resolved = if jsPlatform then resolveJsDeps((jsBaseDeps ++ deps).distinct, depsCache, repos) else resolveDeps(deps, depsCache, repos)
+    val extraClasspath = (List(resolved) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+    val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
+    val options = directives.options ++ o.cliOptions
+    val classesDir = compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental, js = jsPlatform)
+    PublishBuild(classesDir, expanded, directives, jsPlatform)
+
   /** Polls source mtimes every 500ms and reruns `attempt` on change (java.nio.file.WatchService is
    *  unverified in this javalib port). Runs once immediately, like scala-cli's `-w`. */
   def watchLoop(resolve: () => (List[Path], List[Path]))(attempt: List[Path] => Unit): Unit =
@@ -4090,7 +4177,7 @@ object ScalinoCli:
   // `Sysroot.Supported`) and `sysroot`'s sub-arguments. Prints to stdout, like cargo/rustup
   // (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
 
-  private val completionSubcommands = "run compile package test setup-ide lock clean sysroot daemon version completions"
+  private val completionSubcommands = "run compile package test setup-ide lock publish publish-local clean sysroot daemon version completions"
   private val completionSysrootActions = "build list path"
   // Closed value sets of the Scala.js options (scala-cli's spellings, see resolveJsOpts/platformName)
   private val completionJsModuleKinds = "commonjs common esmodule es nomodule none"
@@ -4110,7 +4197,10 @@ object ScalinoCli:
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
     "--js --native --platform --js-mode --js-client-out --js-module-kind --js-emit-source-maps --js-no-opt --js-check-ir --js-header --js-es-version --js-module-split-style --js-small-module-for-package " +
     "--js-avoid-classes --js-avoid-lets-and-consts --js-allow-big-ints-for-longs --js-runtime " +
-    "--formats --package-name --package-version -h --help"
+    "--formats --package-name --package-version " +
+    "--organization --name --module-name --project-version --compute-version --url --license --vcs --description --developer " +
+    "--version-scheme --publish-repository --gpg-key --gpg-option --secret-key --secret-key-password --signer --user --password " +
+    "--sources --doc --ivy2-home --m2 --m2-home --dummy --manual-release -h --help"
 
   private def bashCompletion: String =
     s"""_scalino() {
@@ -4286,7 +4376,7 @@ object ScalinoCli:
   // Boolean flags are also accepted before the sub-command (`scalino -w compile`, mill/bun-style)
   // and hoisted after it. Value-taking flags aren't: their value looks like the sub-command.
   private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental", "--no-daemon", "--offline")
-  private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock")
+  private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock", "publish", "publish-local")
 
   def hoistLeadingFlags(args: Array[String]): Array[String] =
     val lead = args.takeWhile(HoistableFlags.contains)
@@ -4330,6 +4420,10 @@ object ScalinoCli:
       case "sysroot" => Sysroot.handle(args.drop(1))
       case "daemon" => DotcDaemon.handle(args.drop(1))
       case "lock" => handleLock(args.drop(1))
+      case "publish-local" => Publish.handle(args.drop(1), local = true)
+      // scala-cli's spelling
+      case "publish" if args.length > 1 && args(1) == "local" => Publish.handle(args.drop(2), local = true)
+      case "publish" => Publish.handle(args.drop(1), local = false)
       case first if first.startsWith("-") || Files.exists(Paths.get(first)) =>
         handleRunOrCompile("run", args) // implicit `run`, e.g. `scalino Foo.scala`
       case other =>
