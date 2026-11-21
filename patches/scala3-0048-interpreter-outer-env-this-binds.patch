@@ -1,0 +1,39 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 2b118a1..c59c987 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -256,7 +256,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+         case None =>
+           throw new StopInterpretation(
+             em"""Unexpected tree could not be interpreted: ${tree.toString}
+-                |  (`this` of ${tree.symbol.showLocated} is not bound; bound classes: ${env.keys.filter(_.isClass).map(_.name.toString).toList.sorted.mkString(", ")})""",
++                |  (`this` of ${tree.symbol.showLocated} is not bound; bound classes: ${envKeys(env).filter(_.isClass).distinct.map(_.name.toString).toList.sorted.mkString(", ")})""",
+             tree.srcPos)
+ 
+     // `super.foo(...)`: the receiver value is just the same `this` --
+@@ -3322,6 +3322,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+   private def classNotFound(name: String): ClassNotFoundException =
+     new ClassNotFoundException(name) with scala.util.control.NoStackTrace
+ 
++  /** Every key `env` answers: for a `ThisEnv` that includes the base classes of its bound
++   *  receivers, which its `iterator` leaves out. Copying an env key by key must use this, or the
++   *  copy loses those `this` bindings (`Type.Ctor1.Bounded`'s outer `TypeConstructors.this`).
++   */
++  private def envKeys(env: Env)(using Context): Iterator[Symbol] = env match
++    case t: ThisEnv => t.m.keysIterator ++ t.thisBinds.iterator.flatMap(_._1.asClass.baseClasses)
++    case _ => env.keysIterator
++
+   /** An `Env` that also answers `this` lookups for every base class of the receivers bound by
+    *  `bindThis`, without one entry per base class. `thisBinds` holds `(class, receiver)`, newest
+    *  first. Lookups give the same answer as the eager fill-gaps-only fold this replaces: an
+@@ -3660,7 +3668,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+             // The outer instance's own enclosing instances (`Type.Ctor1.Bounded` ->
+             // `Ctor1` -> `Type` -> `TypeConstructors.this`) are visible too.
+             outer match
+-              case i: InterpretedInstance => i.outerEnv.foldLeft(bound)((e, kv) => if e.contains(kv._1) then e else e.updated(kv._1, kv._2))
++              case i: InterpretedInstance =>
++                val outerEnv = i.outerEnv
++                envKeys(outerEnv).foldLeft(bound)((e, k) => if e.contains(k) then e else e.updated(k, outerEnv(k)))
+               case _ => bound
+           case None =>
+             if !env0.contains(cls.owner) && System.getenv("SCALINO_OUTER_DIAG") != null then Console.err.println(s"[outerDiag] cls=$cls prefix=${tr.prefix} prefixClass=${tr.prefix.getClass.getSimpleName}")
