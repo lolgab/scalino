@@ -87,6 +87,8 @@ echo "lib/$PLUGIN_BASE" > "$DIST/nscplugin.jar.txt"
 # resolveDeps/fetchSourcesBestEffort/fetchStdlibSourcesBestEffort) doesn't depend on the user's
 # PATH; renamed to avoid colliding with a user's own `cs`. The `cs` on PATH is the right binary
 # for this machine (00-env.sh requires it; CI installs it per target).
+# rm first: Homebrew's cs is read-only (r-x), so the previous copy is too and cp can't overwrite it.
+rm -f "$DIST/scalino-cs"
 cp "$(command -v cs)" "$DIST/scalino-cs"
 chmod +x "$DIST/scalino-cs"
 
