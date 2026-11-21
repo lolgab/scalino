@@ -377,3 +377,36 @@ changed output for no gain. Clone/merge volume is evidently not dominated by blo
   (about 8.5GB of swap in use, about 4.7GB in the compressor), so GC pauses were 4-5x the 6.7s
   measured on a quiet machine and the absolute numbers are inflated. The comparison is still fair:
   Optimizing went from 79-102s to 62-70s, and the link total from 138-167s to 116-131s.
+
+### Follow-up: idle GC markers block instead of spinning (patch 0041, 2026-11-21)
+
+The "sched_yield spin" side finding, revisited. A synthetic reproducer (8 threads building 4k-node
+lists while keeping about 256k live nodes each) shows that oversubscription alone does not cause a
+10x slowdown: with 10 busy loops on 10 cores it runs 2.4x slower, as expected. Today's stalled
+link and the 553s run both coincided with heavy swapping (RSS falling while in GC mark), which is
+the likelier cause. The spin itself is real, though. Mark workers with no work ran
+`cpu_relax` x256 then `sched_yield` until marking ended, and `sample` put more time in that loop
+(`swtch_pri` 5.0k + `Marker_task` spin 2.3k) than in the marking itself (`markEdge` + `Object_Mark`
+2.4k).
+
+0041 adds `GCWorkers_IdleWait`/`GCWorkers_IdleWake` (a condition variable on the pool lock, plus a
+waiter count so a wake with no waiters is one atomic load). An idle marker spins
+`MARK_IDLE_SPINS` (2048) times and then blocks. Publishing a shared chunk wakes one waiter, and the
+last worker to leave `markActive` wakes all of them.
+
+- Reproducer, unloaded: same wall time, CPU 13.2s -> 8.9s, sys 3.4s -> 1.1s. Loaded (10 busy
+  loops): 5.0s -> 4.4s.
+- Native ape link, where only the linkdriver differs (identical output, sha1 `4cf60e345b...`):
+
+  | run | Optimizing | link total | STW | user | sys |
+  |---|---|---|---|---|---|
+  | base (2 runs) | 71.7s / 62.1s | 127.8s / 116.1s | 30.3s / 26.4s | 358s / 355s | 92s / 68s |
+  | 0041 (2 runs) | 62.1s / 61.4s | 115.5s / 112.8s | 24.7s / 23.7s | 333s / 327s | 54s / 45s |
+  | base, 6 busy loops | 206.1s | 305.9s | 43.5s | 504s | 62s |
+  | 0041, 6 busy loops | 196.0s | 299.9s | 38.1s | 507s | 46s |
+
+- Stress: 48 reproducer runs over GC_NPROCS 2/3/8/16 x 1-32 mutator threads, plus 20 runs under
+  12 busy loops, with no hang or failure; tests/escape-analysis/run.sh passes with the new nativelib.
+- Left alone: the collector's safepoint wait (`Synchronizer.c`) yields so that mutators can run to
+  their safepoints, and `GCWorkers_Run`'s 2000-yield wait is short in practice because helpers
+  finish with the leader.
