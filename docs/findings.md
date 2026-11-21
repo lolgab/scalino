@@ -228,6 +228,54 @@ dependent of. A patch spanning multiple compiler files, or one needing an
 API not exposed by the published jar's public surface, would need the full
 sbt build instead (see "Remaining work").
 
+## Whole programs on the interpreter: `repl`, `run --interpret`, scripts (2026-11-21)
+
+`patches/scala3-0048` gives `scalino-dotc` two more entry modes next to `--daemon`:
+
+- `--interpret [--fallback-exit] <mainClass> <classesDir> <options> [-- args]`
+  (`dotc/ScalinoInterpret.scala`): re-reads the program's own `.tasty` (the normal
+  compile output, so the incremental cache and the daemon are reused) through a
+  `-from-tasty` run of `readTasty, inlining, postInlining` and a phase that points
+  every symbol's `defTree` (and each top-level class's root tree) at the
+  post-inlining tree. Inline calls and macros are then expanded exactly as for the
+  linked binary; library code is interpreted from its TASTy as for macros. Then
+  `Interpreter#runMain`.
+- `--repl` (`dotc/ScalinoRepl.scala`): one `ContextBase` and one `Compiler`, a new
+  `Run` per input (`parser, typer, postTyper, inlining, postInlining` + the same
+  tree-installing phase). Earlier inputs' symbols stay valid in later runs because
+  they are still entered in the empty package (`stillValid`), as in the daemon. An
+  input is wrapped as `import rs$line1.{*, given}; ...; object rs$lineN { ... }`
+  with each expression statement turned into `val resK = <expr>`, and the wrapper's
+  statements are interpreted in order (`Interpreter#evalStatement`). One
+  `Interpreter.Session` (object `val`s/`var`s) is shared by every input's interpreter.
+
+Interpreter changes for whole programs (`programMode`, set by both): `Console.out/err/in`,
+`StdIn.read*` and `sys.exit`/`System.exit` go to the host (`Console`'s streams are
+`DynamicVariable`s over `InheritableThreadLocal`, which the interpreter can't run);
+every parent constructor call runs (macro expansion keeps the narrower historic rule,
+see `bindSuperCtorFields`); an interpreted subclass of a JDK exception records its
+message/cause and answers `Throwable`'s methods (`throwableCall`); `InterpretedInstance#toString`
+runs the interpreted `toString` (`InterpretedInstance.render`), so host code printing it
+(`println`, a host `List`'s `toString`) shows the right text. General gaps fixed on the
+way: `StringBuilder#underlying`, `Array#clone`, `f"..."` (`StringContext.f`'s body is
+`???`; `StringInterpolatorOpt` can't run on pre-erasure trees), `java.lang.Math`
+(`HostValueCalls.math`, by declared parameter types), a host collection's `copyToArray`,
+secondary constructors declaring locals, more JDK exception classes.
+
+Unsupported code is found before running where possible (`ScalinoInterpret.unsupportedFeature`:
+`scala.scalanative.unsafe/runtime/posix/libc/...`, `@extern`, `Thread`,
+`java.util.concurrent`, `Future`/`Promise`/`ExecutionContext`), so `run --interpret`
+links it instead. A `StopInterpretation` while running falls back too, but only
+when the program wrote nothing yet (stdout/stderr are wrapped to tell).
+
+Known gaps: `BigInt`/`BigDecimal` (javalib's `BigInteger` bodies interpret, but hit
+gaps deep inside; host `java.math` objects would be the better route), interpreted
+`for`-comprehensions over a `Range` with a guard yield a `List` where the real one
+yields a `Vector`, exception stack traces have no line numbers, object bodies'
+statements other than `val`/`var` initialisers don't run at module access (the
+interpreter initialises module `val`s lazily per access; scripts are therefore wrapped
+in a method, not an object).
+
 ## Toward a build-tool experience without a JVM
 
 Goal: scala-cli-like ergonomics (single command, dependency resolution,

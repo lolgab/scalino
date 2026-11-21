@@ -1815,6 +1815,40 @@ object ScalinoCli:
         patterns.exists(_.matches(rel))
       }
 
+  // `.sc` scripts (given as a file argument, not picked up from directories: a stray `build.sc` is
+  // usually some other tool's): top-level statements, run in order, with the program arguments as
+  // `args`. Compiled as a generated wrapper, `object <name>_sc { def main(args: Array[String]): Unit = {`
+  // + the script + `}}`, the header on the script's first line so every line keeps its number; the
+  // wrapper's path is mapped back to the script's in diagnostics.
+
+  private val scriptOrigins = scala.collection.mutable.Map.empty[String, String]
+
+  /** The object a script compiles to, whose `main` runs it: `hello.sc` -> `hello_sc`. */
+  def scriptObjectName(script: Path): String =
+    val base = script.getFileName.toString.stripSuffix(".sc")
+    val id = base.map(c => if Character.isLetterOrDigit(c) || c == '_' then c else '_')
+    (if id.isEmpty || id.head.isDigit then "_" + id else id) + "_sc"
+
+  /** `paths` with every `.sc` script replaced by its (re)generated wrapper. */
+  def wrapScripts(paths: List[Path]): List[Path] =
+    paths.map { p =>
+      if !p.getFileName.toString.endsWith(".sc") then p
+      else
+        val dir = Paths.get(".scalino-build", "scripts")
+        Files.createDirectories(dir)
+        val name = scriptObjectName(p)
+        val wrapped = dir.resolve(s"$name.scala")
+        val text = s"object $name { def main(args: Array[String]): Unit = { " + readFile(p) + "\n}}\n"
+        // unchanged text keeps its mtime, so the incremental compile skips it
+        if !Files.exists(wrapped) || readFile(wrapped) != text then Files.write(wrapped, text.getBytes("UTF-8"))
+        scriptOrigins(wrapped.toString) = p.toString
+        wrapped
+    }
+
+  /** Compiler output with the scripts' wrapper paths replaced by the scripts'. */
+  def unwrapScriptPaths(out: String): String =
+    scriptOrigins.foldLeft(out) { case (acc, (wrapped, orig)) => acc.replace(wrapped, orig) }
+
   def expandSources(paths: List[Path]): List[Path] =
     val base = paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p)).distinct
     applyFileAndExcludeDirectives(base)
@@ -2119,7 +2153,7 @@ object ScalinoCli:
         DotcDaemon.forgetGeneration(classesDir)
         runCaptureAll(tool("scalino-dotc") :: compileOptions ++ files)
       }
-      Diagnostics.render(compileOut).foreach(System.err.println)
+      Diagnostics.render(unwrapScriptPaths(compileOut)).foreach(System.err.println)
       if compileExit != 0 then
         System.err.println(Color.gray(s"Error compiling project (${if js then jsBuildLabel else buildLabel})"))
         fail(CompilationFailed)
@@ -3124,6 +3158,35 @@ object ScalinoCli:
        |                             SCALINO_DOTC_DAEMON=0; off by default when $$CI is set)
        |""".stripMargin
 
+  private def oInterpret: String =
+    s"""|  --interpret                run the program on scalino-dotc's tree interpreter instead of
+       |                             linking a native binary: no link step, for a fast edit-run
+       |                             loop. Code that needs the native runtime (@extern,
+       |                             scala.scalanative.unsafe, threads, Future) is linked as usual
+       |                             (also when the interpreter hits an unsupported construct
+       |                             before the program printed anything)
+       |""".stripMargin
+
+  private def replNote: String =
+    s"""|repl:
+       |  Inputs are compiled in one warm scalino-dotc and run on its tree interpreter: no JVM,
+       |  no linking. The given sources (and dependencies) are on the classpath.
+       |  :help :quit :type <expr> :imports :reset :load <file>
+       |  Not supported: code needing the native runtime (@extern, scala.scalanative.unsafe,
+       |  threads), line editing/history (pipe through rlwrap for that).
+       |""".stripMargin
+
+  private def oRepl: String =
+    s"""|  --repl-init-script <code>  run <code> before the first prompt
+       |  --repl-quit-after-init     exit after the init script
+       |""".stripMargin
+
+  private def scriptsNote: String =
+    s"""|scripts:
+       |  A `.sc` file given as a source is a script: top-level statements run in order,
+       |  the program arguments are `args`. Directories never pick up `.sc` files.
+       |""".stripMargin
+
   private def oOffline: String =
     s"""|  --offline                  never touch the network: resolve from $LockFileName and the
        |                             local artifact cache only (also SCALINO_OFFLINE=1). Cache dir:
@@ -3410,6 +3473,7 @@ object ScalinoCli:
          |  scalino compile [options]               compile only, no link (see build output)
          |  scalino package <sources...> [options] -o <out>   compile and link a native binary
          |  scalino test [options] [-- <framework args>]   compile and run tests in the current directory
+         |  scalino repl [sources...] [options]    interactive Scala REPL (interpreted, no linking)
          |  scalino setup-ide <sources...> [options]   write .scalino-build/scalino-lsp.json for editor LSP support
          |  scalino lock <sources...> [options]    resolve dependencies and write scalino.lock.json
          |  scalino completions <bash|zsh|fish>    print a shell completion script to stdout
@@ -3423,16 +3487,18 @@ object ScalinoCli:
          |$sourcesNote
          |$incrementalNote
          |${Color.bold("options:", out)}
-         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oNoInc$oOffline$oProgArgs
+         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oInterpret$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oNoInc$oOffline$oProgArgs$oRepl
          |$nativeHeader$nativeOpts
          |$directivesBlock
          |$lockNote
          |$testNote
+         |$scriptsNote
+         |$replNote
          |$setupIdeNote
          |$completionsNote""".stripMargin, out))
 
   val HelpCommands: Set[String] =
-    Set("run", "compile", "package", "test", "setup-ide", "lock", "completions", "clean", "sysroot", "daemon", "version")
+    Set("run", "compile", "package", "test", "repl", "setup-ide", "lock", "completions", "clean", "sysroot", "daemon", "version")
 
   /** `scalino <command> --help`: usage plus only the options/notes that apply to
    *  that command. */
@@ -3446,8 +3512,8 @@ object ScalinoCli:
       case "run" =>
         head("scalino run <sources...> [options] [-- <program args>]", "Compile and run.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
-          opts(oMain + common + oWatch + oProgArgs) +
-          nativeHeader + nativeOpts + "\n" + jsHeader + "\n" + directivesBlock
+          opts(oMain + common + oWatch + oInterpret + oProgArgs) +
+          nativeHeader + nativeOpts + "\n" + jsHeader + "\n" + directivesBlock + "\n" + scriptsNote
       case "compile" =>
         head("scalino compile [options]", "Compile only, no link (see build output), the current directory by default.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
@@ -3462,6 +3528,9 @@ object ScalinoCli:
           sourcesNote + "\n" + incrementalNote + "\n" +
           opts(common + oWatch + oTestFw + oTestOnly + oProgArgs) +
           nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + testNote
+      case "repl" =>
+        head("scalino repl [sources...] [options]", "Start an interactive Scala REPL.") +
+          opts(common + oRepl) + directivesBlock + "\n" + replNote
       case "setup-ide" =>
         head("scalino setup-ide <sources...> [options]", "Write .scalino-build/scalino-lsp.json for editor LSP support.") +
           sourcesNote + "\n" + opts(common) + directivesBlock + "\n" + setupIdeNote
@@ -3524,6 +3593,9 @@ object ScalinoCli:
     testFrameworkOpt: Option[String] = None,
     testOnly: Option[String] = None,
     noIncremental: Boolean = false,
+    interpret: Boolean = false,
+    replInitScript: Option[String] = None,
+    replQuitAfterInit: Boolean = false,
     cliNativeMode: Option[String] = None,
     cliNativeGc: Option[String] = None,
     cliNativeLto: Option[String] = None,
@@ -3602,6 +3674,9 @@ object ScalinoCli:
         case "--test-framework" => o = o.copy(testFrameworkOpt = Some(args(i + 1))); i += 1
         case "--test-only" => o = o.copy(testOnly = Some(args(i + 1))); i += 1
         case "--no-incremental" => o = o.copy(noIncremental = true)
+        case "--interpret" => o = o.copy(interpret = true)
+        case "--repl-init-script" => o = o.copy(replInitScript = Some(args(i + 1))); i += 1
+        case "--repl-quit-after-init" => o = o.copy(replQuitAfterInit = true)
         case "--no-daemon" => DotcDaemon.mode = DotcDaemon.Mode.Off
         case "--offline" => offlineMode = true
         case "--js" => o = o.copy(cliPlatform = Some("js"))
@@ -3707,8 +3782,10 @@ object ScalinoCli:
   def buildAndMaybeRun(mode: String, expandedIn: List[Path], o: RunOpts): Int =
     val directives0 = parseDirectives(expandedIn)
     // `//> using target.platform` files drop out for the other platform (the platform itself comes from the rest)
-    val expanded = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
-    val directives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
+    val expandedOrig = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
+    val directives = if expandedOrig.size == expandedIn.size then directives0 else parseDirectives(expandedOrig)
+    // Directives come from the sources as written; `.sc` scripts compile as their generated wrappers.
+    val expanded = wrapScripts(expandedOrig)
     directives.scalaVersion.orElse(o.cliScala).foreach { v =>
       if !BuildInfo.scalaVersion.startsWith(v) then
         System.err.println(
@@ -3747,6 +3824,10 @@ object ScalinoCli:
           fail(s"run: can't execute a binary for ${nativeOpts.targetTriples.mkString(", ")} on this machine -- use `scalino package`")
         val hostOpts = nativeOpts.copy(targetTriples = Nil, sysroots = Nil)
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(hostBinName)
+        if o.interpret then
+          interpretProgram(expanded, explicitMainClass, extraClasspath, options, extraCompileOnlyClasspath, o, runEnvOf(directives, o)) match
+            case Some(exit) => return exit
+            case None => if !o.quiet then System.err.println(Color.gray("Linking it instead"))
         val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
         runProgram(binPathFor(mainClass).toString :: o.progArgs, o.watch, runEnvOf(directives, o))
       case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
@@ -3874,6 +3955,61 @@ object ScalinoCli:
     else
       try sys.exit(buildAndMaybeRun(mode, expanded, o))
       catch case BuildFailed(msg) => exitBuildFailure(msg)
+
+  // `run --interpret` and `repl`: scalino-dotc runs the program's TASTy on its tree interpreter (the
+  // one macros run on, see docs/findings.md), so no link step at all. `scalino-dotc --interpret`
+  // exits with `InterpretFallbackExit` when the program needs what only a native binary has
+  // (`@extern`, threads, an interpreter gap hit before any output); `run` then links it as usual.
+
+  val InterpretFallbackExit = 3
+
+  /** The compile step of `run`, then `scalino-dotc --interpret` on the result. The program's exit
+   *  code, or None when it has to be linked instead. Under `-w` the program runs in the background
+   *  and never falls back (its exit code isn't waited for). */
+  def interpretProgram(sources: List[Path], explicitMainClass: Option[String], extraClasspath: String, options: List[String],
+      extraCompileOnlyClasspath: String, o: RunOpts, env: Map[String, String]): Option[Int] =
+    val classesDir = compileOnly(sources, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)
+    val mainClass = splitMainClasses(explicitMainClass) match
+      case Nil => detectMainClass(classesDir, None)
+      case List(one) => one
+      case several => fail(s"several main classes given (${several.mkString(",")}): `run` runs one")
+    val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+    val cmd = List(tool("scalino-dotc"), "--interpret") ++ (if o.watch then Nil else List("--fallback-exit")) ++
+      List(mainClass, classesDir.toString, "-javabootclasspath", cc.javaBase, "-classpath", s"$classesDir$CP_SEP${cc.compileCp}") ++
+      javalibTastyOptions ++ options ++ ("--" :: o.progArgs)
+    val exit = runProgram(cmd, o.watch, env)
+    if exit == InterpretFallbackExit && !o.watch then None else Some(exit)
+
+  /** `scalino repl [inputs]`: compiles the inputs (if any) and starts `scalino-dotc --repl` with them
+   *  and the dependencies on the classpath. scala-cli's flags: `--dep`, `-O`, `--repl-init-script`,
+   *  `--repl-quit-after-init`. */
+  def handleRepl(args: Array[String]): Unit =
+    val o = parseRunOpts(args)
+    if o.watch then die("repl: --watch is not supported")
+    o.sources.find(!Files.exists(_)).foreach(p => fileNotFound(p))
+    val expandedOrig = partitionSources(expandSources(o.sources))._1
+    val directives = parseDirectives(expandedOrig)
+    if resolvePlatform(directives, o) == "js" then die("repl: Scala.js is not supported, the REPL runs on the native toolchain's interpreter")
+    if o.progArgs.nonEmpty then die("repl: program arguments (after `--`) are not supported")
+    val expanded = wrapScripts(expandedOrig)
+    try
+      val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
+      val repos = (directives.repositories ++ o.cliRepositories).distinct
+      val extraClasspath = (List(resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs)
+        .filter(_.nonEmpty).mkString(CP_SEP)
+      val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
+      val options = directives.options ++ o.cliOptions
+      val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
+      val classpath =
+        if expanded.isEmpty then cc.compileCp
+        else s"${compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)}$CP_SEP${cc.compileCp}"
+      val initScript = o.replInitScript.toList.flatMap(s => List("--init-script", s))
+      val quit = if o.replQuitAfterInit then List("--quit-after-init") else Nil
+      val interactive = if scala.scalanative.posix.unistd.isatty(0) != 0 then List("--interactive") else Nil
+      val cmd = List(tool("scalino-dotc"), "--repl") ++ interactive ++ initScript ++ quit ++
+        List("-javabootclasspath", cc.javaBase, "-classpath", classpath) ++ javalibTastyOptions ++ options
+      sys.exit(runInherited(cmd, extraEnv = runEnvOf(directives, o)))
+    catch case BuildFailed(msg) => exitBuildFailure(msg)
 
   /** `scalino test`; approach in the design note above `readAllBytes`/`ClassInfo`. Unlike
    *  `run`/`compile`, compiles main *and* test scope together in one pass (no `partitionSources`). */
@@ -4090,7 +4226,7 @@ object ScalinoCli:
   // `Sysroot.Supported`) and `sysroot`'s sub-arguments. Prints to stdout, like cargo/rustup
   // (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
 
-  private val completionSubcommands = "run compile package test setup-ide lock clean sysroot daemon version completions"
+  private val completionSubcommands = "run compile package test repl setup-ide lock clean sysroot daemon version completions"
   private val completionSysrootActions = "build list path"
   // Closed value sets of the Scala.js options (scala-cli's spellings, see resolveJsOpts/platformName)
   private val completionJsModuleKinds = "commonjs common esmodule es nomodule none"
@@ -4104,7 +4240,7 @@ object ScalinoCli:
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
-    "--color --test-framework --test-only --no-incremental --no-daemon --offline --native-mode --native-gc --native-lto " +
+    "--color --test-framework --test-only --no-incremental --no-daemon --offline --interpret --repl-init-script --repl-quit-after-init --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --post-link --run-env --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
@@ -4286,7 +4422,7 @@ object ScalinoCli:
   // Boolean flags are also accepted before the sub-command (`scalino -w compile`, mill/bun-style)
   // and hoisted after it. Value-taking flags aren't: their value looks like the sub-command.
   private val HoistableFlags = Set("-w", "--watch", "-v", "--verbose", "-q", "--quiet", "--no-incremental", "--no-daemon", "--offline")
-  private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock")
+  private val HoistTargets = Set("run", "compile", "package", "test", "setup-ide", "lock", "repl")
 
   def hoistLeadingFlags(args: Array[String]): Array[String] =
     val lead = args.takeWhile(HoistableFlags.contains)
@@ -4324,6 +4460,7 @@ object ScalinoCli:
       case "compile" => handleRunOrCompile("compile", args.drop(1))
       case "package" => handleRunOrCompile("package", args.drop(1))
       case "test" => handleTest(args.drop(1))
+      case "repl" | "console" => handleRepl(args.drop(1))
       case "setup-ide" => handleSetupIde(args.drop(1))
       case "completions" => handleCompletions(args.drop(1))
       case "clean" => handleClean(args.drop(1))
