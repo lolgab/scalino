@@ -7,7 +7,7 @@ index 4a4ae32..8395297 100644
  
    private var init = false
 -  @nowarn("msg=`= _` has been deprecated")
-+  @nowarn // no msg= filter: scalino-dotc <= v0.0.33 crashes on one (no \e in its regex, patch 0043)
++  @nowarn // no msg= filter: scalino-dotc <= v0.0.33 crashes on one (no \e in its regex, patch 0044)
    private var value: A = _
  
    def get: A = if (!init) throw ScopedVar.Unitialized() else value
@@ -16,7 +16,7 @@ index 4a4ae32..8395297 100644
    implicit def toValue[T](scVar: ScopedVar[T]): T = scVar.get
  
 -  @nowarn("msg=`_` is deprecated for wildcard arguments of types")
-+  @nowarn // no msg= filter: scalino-dotc <= v0.0.33 crashes on one (no \e in its regex, patch 0043)
++  @nowarn // no msg= filter: scalino-dotc <= v0.0.33 crashes on one (no \e in its regex, patch 0044)
    def scoped[T](ass: Assignment[_]*)(body: => T): T = {
      val stack = ass.map(_.push())
      try body

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # `scalino run --interpret`, `.sc` scripts and `scalino repl` (scalino-dotc's `--interpret`/`--repl`,
-# patches/scala3-0051): programs run on the tree interpreter must print exactly what the linked
+# patches/scala3-0051/0052): programs run on the tree interpreter must print exactly what the linked
 # binary prints; code that needs the native runtime falls back to linking; the REPL keeps state
 # across inputs.
 #
@@ -81,6 +81,13 @@ set -e
 diff linked.out interp.out > /dev/null || { diff linked.out interp.out >&2; fail "interpreted output differs from the linked binary's"; }
 echo "ok: --interpret prints what the linked binary prints"
 
+# --- @main in a package (the main class is `app.hello`, not in the empty package) ---
+mkdir -p pkg/src/app
+printf 'package app\n\n@main\ndef hello =\n  println("hi from app")\n' > pkg/src/app/main.scala
+out="$(cd pkg && "$SCALINO" run -q --interpret)"
+[[ "$out" == "hi from app" ]] || fail "@main in a package: got '$out'"
+echo "ok: @main in a package"
+
 # --- an uncaught exception: message on stderr, exit 1 ---
 mkdir boom
 printf 'class Oops(m: String) extends RuntimeException(m)\nobject Boom:\n  def main(args: Array[String]): Unit =\n    println("before")\n    throw Oops("bad")\n' > boom/Boom.scala
@@ -144,6 +151,12 @@ List(1, 2,
 println("printed")
 throw new IllegalStateException("oops")
 x
+case class Q(a: Int, b: String)
+Q(1, "s")
+Array(1, 2, 3)
+1 to 3
+case object Done
+Done
 EOF
 "$SCALINO" repl -q < repl.in > repl.out 2>&1 || { cat repl.out >&2; fail "repl exited non-zero"; }
 expect() { grep -qxF "$1" repl.out || { cat repl.out >&2; fail "repl: missing line '$1'"; }; }
@@ -152,7 +165,7 @@ expect 'val res0: Int = 21'
 expect 'def twice(n: Int): Int'
 expect '// defined case class P'
 expect 'val res1: P = P(40)'
-expect 'val m: scala.collection.mutable.Map[String, Int] = HashMap(k -> 1)'
+expect 'val m: mutable.Map[String, Int] = HashMap("k" -> 1)'
 expect 'val res2: Int = 22'
 expect 'var c: Int = 0'
 expect 'val res3: Int = 5'
@@ -161,6 +174,11 @@ expect 'String'
 expect 'printed'
 expect 'java.lang.IllegalStateException: oops'
 expect 'val res5: Int = 20'
+expect 'val res6: Q = Q(a = 1, b = "s")'
+expect 'val res7: Array[Int] = Array(1, 2, 3)'
+expect 'val res8: Range.Inclusive = Range(1, 2, 3)'
+expect '// defined object Done'
+expect 'val res9: Done.type = Done'
 grep -q 'Type Mismatch' repl.out || { cat repl.out >&2; fail "repl: the type error was not reported"; }
 echo "ok: repl"
 
@@ -170,5 +188,41 @@ printf 'package lib\nobject Greet:\n  def hi(n: String) = s"hi $n"\n' > lib/Gree
 out="$("$SCALINO" repl lib -q --repl-init-script 'println(lib.Greet.hi("init"))' --repl-quit-after-init < /dev/null)"
 [[ "$out" == "hi init" ]] || fail "repl with sources: got '$out'"
 echo "ok: repl with sources and an init script"
+
+# --- the line editor, through a pseudo-terminal: completion, a multi-line input, history ---
+if command -v python3 > /dev/null; then
+  mkdir home
+  cat > drive.py <<'EOF'
+import os, pty, select, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1], "repl", "-q", "--color", "never"])
+out = bytearray()
+def drain(t):
+    end = time.time() + t
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: return
+            if not d: return
+            out.extend(d)
+def wait_prompt():
+    start = len(out)
+    end = time.time() + 120
+    while b"scala> " not in out[start:] and time.time() < end: drain(0.2)
+wait_prompt()
+for keys in ["List(7, 8).hea\t\r", "def twice(n: Int) =\r  n * 2\r\r", "twice(21)\r"]:
+    os.write(fd, keys.encode()); wait_prompt()
+os.write(fd, b"\x04"); drain(2)
+sys.stdout.write(out.decode("utf-8", "replace"))
+EOF
+  HOME="$WORK/home" python3 drive.py "$SCALINO" > edit.out 2>&1 || true
+  tr -d '\r' < edit.out | grep -q 'val res0: Int = 7' || { cat -v edit.out >&2; fail "line editor: completion of .hea did not run List(7, 8).head"; }
+  tr -d '\r' < edit.out | grep -q 'def twice(n: Int): Int' || { cat -v edit.out >&2; fail "line editor: the multi-line definition was not submitted"; }
+  tr -d '\r' < edit.out | grep -q 'val res1: Int = 42' || { cat -v edit.out >&2; fail "line editor: wrong result"; }
+  grep -qxF 'List(7, 8).head' home/.scalino_history || { cat home/.scalino_history >&2; fail "line editor: history not saved"; }
+  echo "ok: line editor"
+fi
 
 echo "PASS"

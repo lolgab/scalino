@@ -15,6 +15,8 @@ source ./00-env.sh
 
 [[ -f "$WORK/compiler.cp" ]] || { echo "run build/01-fetch-deps.sh first" >&2; exit 1; }
 
+source ./repl-deps.sh
+
 BOOT_DIR="$WORK/selfhost-bootstrap"
 rm -rf "$BOOT_DIR"
 mkdir -p "$BOOT_DIR"
@@ -42,7 +44,7 @@ mkdir -p "$OUT_CLASSES"
 
 # Compile against the non-compiler dependencies only: these sources redefine many classes of
 # the published scala3-compiler_3 jar, and having both risks duplicate-symbol errors.
-DEPS_CP="$(tr "$CP_SEP" '\n' < "$WORK/compiler.cp" | grep -v '/scala3-compiler_3-' | paste -sd"$CP_SEP" -)"
+DEPS_CP="$(tr "$CP_SEP" '\n' < "$WORK/compiler.cp" | grep -v '/scala3-compiler_3-' | paste -sd"$CP_SEP" -)$CP_SEP$REPL_CP"
 
 echo "== compiling patched dotc+nscplugin source to plain JVM classes (bootstrap, for MiniPhase discovery only) =="
 # The compiler sources of Scala 3.10+ are written for -Yexplicit-nulls (scala3/project/Build.scala); the

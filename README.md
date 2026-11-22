@@ -257,8 +257,12 @@ also run whole programs, so some things need no link step at all:
   warm `scalino-dotc` and run on the interpreter, with the given sources and
   `--dep`s on the classpath. Commands: `:help`, `:quit`, `:type <expr>`,
   `:imports`, `:reset`, `:load <file>`. `--repl-init-script <code>` runs code
-  first, `--repl-quit-after-init` exits after it. There is no line editing or
-  history (`rlwrap scalino repl` adds them).
+  first, `--repl-quit-after-init` exits after it. Values print with pprint and
+  definitions are highlighted, as in the stock REPL. In a terminal the input is
+  edited in place: Tab completes, Up/Down walk the lines of a multi-line input
+  and the history (`~/.scalino_history`), Enter on an unfinished input starts a
+  new line (Alt-Enter always does, an empty line submits). Ctrl-C drops the
+  input but can't stop a running evaluation: it ends the session.
 - **`scalino run --interpret`**: compiles as usual, then interprets `main`
   instead of linking: the edit-run loop skips the link step. Works with `-w`
   (there it never falls back to linking: rerun without `--interpret`).

@@ -30,6 +30,7 @@ done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
 source ./link-lib.sh
 source ./bootstrap-lib.sh
+source ./repl-deps.sh
 link_require
 [[ -e "$JAVAC" ]] || { echo "missing javac at $JAVAC -- need a full JDK (not JRE) for JAVA_HOME" >&2; exit 1; }
 
@@ -92,7 +93,7 @@ dotc_compile "$(cat "$WORK/lsp.cp")" \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
   -Yretain-trees \
-  -classpath "$(cat "$NATIVELIBS_CP")$CP_SEP$(cat "$WORK/lsp.cp")$CP_SEP$PC_REAL_JARS_CP$CP_SEP$(to_native_path "$MTAGS_IFACE_CLASSES_DIR")" \
+  -classpath "$(cat "$NATIVELIBS_CP")$CP_SEP$(cat "$WORK/lsp.cp")$CP_SEP$REPL_CP$CP_SEP$PC_REAL_JARS_CP$CP_SEP$(to_native_path "$MTAGS_IFACE_CLASSES_DIR")" \
   -d "$NIR_OUT_MAIN" \
   "@$FILE_LIST"
 
@@ -128,7 +129,7 @@ done
 echo "== linking (scalino-linkdriver -- entry point dotty.tools.languageserver.Main, --mode $SCALINO_LINK_MODE) =="
 source ./pgo/pgo-lib.sh
 # The link classpath is kept for build/pgo/pgo-lsp.sh, which relinks it.
-LSP_LINK_CP="$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP"
+LSP_LINK_CP="$(to_native_path "$NIR_OUT_MAIN")$CP_SEP$(to_native_path "$NIR_OUT_SHIM")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$LSP_NATIVE_CP$CP_SEP$REPL_NATIVE_CP"
 printf '%s' "$LSP_LINK_CP" > "$SELFHOST_DIR/lsp-link.cp"
 # Native scalino-linkdriver (04b), not LinkDriver on a JVM; see 03-build-scalino-dotc.sh.
 # SCALANATIVE_EVAC_ENABLE=1 (compacting GC), for this command only: linking dotc-sized programs
