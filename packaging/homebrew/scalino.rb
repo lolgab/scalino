@@ -1,4 +1,4 @@
-# Homebrew formula for a custom tap (e.g. lolgab/homebrew-scalino), not homebrew-core: core
+# Homebrew formula for a custom tap (e.g. lolgab/homebrew-tap), not homebrew-core: core
 # requires building from source, and build/all.sh needs vendored, patched scala3+scala-native
 # checkouts that don't fit its sandbox. Installs the prebuilt relocatable release tarball (the
 # one install.sh fetches).
