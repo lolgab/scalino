@@ -236,9 +236,31 @@ recompile 22 files, and idea 01. Revisit splice caching only if B stalls above ~
      native speedup claimed. wes: 0047 fails (6 "not bound"), 0049 exits 0 with 1483 files, all `.tasty`
      identical to the JVM gate; 3 `.nir` differ (`APULoadStore$`, `PPULoadStore$`, `MMC1$`), the same
      run-to-run nondeterminism class as above.
-   - *Open.* A quiet-machine native timing. `dist/scalino-dotc` as of 2026-11-21 11:17 is an
-     unoptimized 90MB debug build (ape 34s vs 7.1s for the 0047 release link); left in place, since
-     `build/03` defaults to `SCALINO_LINK_MODE=debug` for local builds.
+   - *Native timing at lower load (2026-11-22, load ~5).* Release-fast + PGO links of 0047 and 0049,
+     5 interleaved ape runs: median real 6.42 s -> 6.17 s (-4%), user 7.52 -> 7.32 s; outputs
+     byte-identical. `dist/scalino-dotc` is now this 0049 release link (45 MB), not the debug build.
+   - *Frame-pointer profile after 0049* (ape, `sample` 12 s at 1 ms): the macro thread is down to
+     1249 busy samples (2246 before 0046, 1804 after). Self time by callee, below the deepest
+     `Interpreter` frame: `String.equals` 7.3% (the `interpretQuotesApi` name match: 186 sequential
+     `equals`; the guards keep scalac from emitting a hash switch), `Types.memberDenots` 4.4% (all of
+     it `allMemberSymbols`), `TreeUnpickler.LazyReader.complete` 4.4% (first read of retained trees:
+     `findTemplate` for anonymous classes, `InterpretedFn1`), `GC_alloc_small` 4.3%, `List.map` 3.7%,
+     `HashMap.updated` 3.6% (`ThisEnv.updated` from `bindThis`), `Tree.symbol` 3.1%,
+     `scalanative_throw` 1.9% (in `interpretTree0`). Inclusive: `interpretStdlibIntrinsic`'s
+     collection-op closures (the interpreted macro code itself) are 2/3 of the thread;
+     `changeNonLocalOwners` per quote ~3%.
+   - **scala3-0050** (`allMembers` of classpath symbols per run): `allMemberSymbols` missed 34 times
+     per ape compile, all on `upickle.default`, once per `derives` expansion, because the memo was
+     per expansion. Symbols not defined in the current run now share one memo per `Run` (companion
+     object, reset when `ctx.run` changes, so a daemon's next compile starts fresh). JVM gate
+     byte-identical (ape, wes, examples, interpreter fixtures; only the known noise). Warm JVM: macro
+     thread 739 -> 716 MB allocated (-3%), macro CPU ~-5% in late iterations. Not relinked natively
+     (expected ~-60 ms, inside native noise).
+   - *Checked, not changed.* `changeNonLocalOwners` in `Splicer`: 2654 of 5628 calls per ape compile
+     get a tree without definitions, where the `TreeTypeMap` already returns the tree unchanged; the
+     rest do real owner rewriting. `findTemplate`'s cost is the first read of lazily unpickled trees,
+     which a cross-expansion memo would not save (`rootTree` keeps them). The `interpretQuotesApi`
+     string match would need splitting into a name-keyed table of the ~230 guarded cases.
 8. Regenerate patches after every batch (vendor is disposable) and update `docs/findings.md`.
 
 ## Effort estimate and risks

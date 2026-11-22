@@ -1,0 +1,44 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -3416,10 +3416,14 @@
+         .flatMap(_.info.decls.lookupAll(fn.name).filter(c => c.isTerm && !c.is(Deferred) && !c.is(Method)))
+         .nextOption().getOrElse(fn))
+   private def allMemberSymbols(s: Symbol)(using Context): List[Symbol] =
+-    allMemberSymbolsCache.getOrElseUpdate(s, {
+-      val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
+-      prefix.allMembers.iterator.map(_.symbol).toList
+-    })
++    allMemberSymbolsCache.getOrElseUpdate(s,
++      // A symbol from the classpath has the same members in every expansion of this run (on ape,
++      // every `derives ReadWriter` scans `upickle.default`), so those are shared across expansions.
++      if s.isDefinedInCurrentRun then allMemberSymbols0(s)
++      else Interpreter.classpathMembers(s, allMemberSymbols0(s)))
++  private def allMemberSymbols0(s: Symbol)(using Context): List[Symbol] =
++    val prefix = if s.isClass then s.asClass.thisType else s.denot.namedType
++    prefix.allMembers.iterator.map(_.symbol).toList
+ 
+   /** `parent type parameter -> the concrete argument` pairs for `cls`'s parents, e.g.
+    *  `T -> Op` for `class C extends TableDispatch[Op]`. Only fully concrete arguments.
+@@ -7371,6 +7375,21 @@
+   def unapply(ex: Throwable): Option[Throwable] = scala.util.control.NonFatal.unapply(ex)
+ 
+ object Interpreter:
++  /** `allMembers` symbols of classpath (not current-run) symbols, for the run in `membersRun`. */
++  private var membersRun: AnyRef | Null = null
++  private val membersOfRun = new java.util.HashMap[Symbol, List[Symbol]]()
++  private def classpathMembers(s: Symbol, compute: => List[Symbol])(using Context): List[Symbol] = synchronized {
++    if membersRun ne ctx.run then
++      membersOfRun.clear()
++      membersRun = ctx.run
++    val cached = membersOfRun.get(s)
++    if cached != null then cached
++    else
++      val r = compute
++      membersOfRun.put(s, r)
++      r
++  }
++
+   /** The method names `interpretQuotesApi`'s cases test as literals (generated from its source;
+    *  keep in step when adding a case).
+    */
