@@ -2720,6 +2720,15 @@ is scanned, which no software prefetch can shorten. The gain is for heaps whose 
 memory order: long-running processes (watch mode, the LSP), anything after an evacuation. Stress loop (60 runs,
 1-8 GC threads, evacuation and poison) and the evacuation validator stay clean.
 
+## Cross-compilation gaps found by livedrift (patches 0031-0033, 2026-11-14)
+
+- macOS sysroot lacked `sys/posix_sem.h` (commix `Phase.c` wants `PSEMNAMLEN`): generated in `SysrootBuild`. The CI cross smoke used immix only, so it never compiled Phase.c; `tests/cross/Commix.scala` does now.
+- windowslib `time.c` redefined `asctime_s`/`gmtime_s`/`localtime_s` that UCRT mingw headers declare (patch 0032). Only compiled when `__SCALANATIVE_POSIX_TIME` is defined, hence invisible to Hello; `tests/cross/Time.scala` covers it.
+- Sysroots now carry `.scalino-recipe` (hash of SysrootBuild.scala, symbol lists, pins); a mismatch triggers a rebuild.
+- javalib `tryPollOnConnect` treated POLLIN as refusal; a peer writing right after accept made a good connect fail (patch 0033: read `SO_ERROR`). `tests/cross/Connect.scala` + SocketTest cases.
+- `--native-*` flags now win over `//> using` directives; `llvm-config` probe stderr silenced (patch 0031).
+- Open: Windows cross-link taking >35 min on the ubuntu-24.04 runner is unexplained; not timed yet.
+
 ## javalib file-descriptor leaks (patch 0035, 2026-11-15)
 
 - `java.util.zip.ZipFile`'s constructor opened a `RandomAccessFile` and then read the central directory; when that threw (a directory, a file that is not a zip) nobody held a `ZipFile` to `close()`, so the descriptor stayed open until a finalizer that never ran in time. `ScalinoCli.readClassFromJar` did this once per class looked up on a classpath that has a resource directory: ~450 tests reached ~10,235 open descriptors, past macOS `OPEN_MAX` (10240), and every later `posix_spawn` failed with `Could not adddup2 pipe file descriptor 0 [res=9, errno=9]` (`posix_spawn_file_actions_adddup2` rejects descriptors >= `OPEN_MAX`). 0.0.30 and 0.0.31 have it; f332aed worked around it in the CLI. Patch 0035 closes the file when the constructor throws.
