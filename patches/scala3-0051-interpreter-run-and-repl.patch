@@ -747,7 +747,7 @@ index 5187f88f..1e76c758 100644
    def numericConversion(x: Object, name: String): Option[Object] =
      val n: Number | Null = x match
 diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
-index 2b118a14..16280e9d 100644
+index 469940a9..a07dc11b 100644
 --- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 +++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
 @@ -94,14 +94,14 @@ import dotty.tools.dotc.core.CyclicReference
@@ -879,16 +879,17 @@ index 2b118a14..16280e9d 100644
    /** Returns the result of interpreting the code in the tree.
     *  Throws a StopInterpretation if the tree could not be interpreted or a runtime exception occurred.
     */
-@@ -2468,7 +2564,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -2478,7 +2574,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
  
    private def interpretStaticCall(moduleClass: Symbol, fn: Symbol, rawArgs: List[Tree], typeArgs: List[Type] = Nil)(using Env): Object =
      lazy val args = evalNonErased(rawArgs, fn)
--    interpretCollectionFactory(moduleClass, fn, args).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
-+    programRuntimeCall(fn, args).orElse(interpretCollectionFactory(moduleClass, fn, args)).orElse(interpretBoxingIntrinsic(fn, args)).orElse(interpretJavaReflectionIntrinsic(fn, args)).orElse(interpretQuotesApi(None, fn, args)).orElse(interpretHearthServiceLoader(fn, args)).orElse(wellKnownSingleton(fn)).getOrElse {
-       resolveExternalDefTree(fn) match
-         // `moduleClass` (not `None`) as the receiver: a top-level object's
-         // own method can still reference `this` internally (e.g. to call a
-@@ -2839,6 +2935,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+-    var intrinsic = interpretCollectionFactory(moduleClass, fn, args)
++    var intrinsic = programRuntimeCall(fn, args)
++    if intrinsic.isEmpty then intrinsic = interpretCollectionFactory(moduleClass, fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretBoxingIntrinsic(fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretJavaReflectionIntrinsic(fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretQuotesApi(None, fn, args)
+@@ -2855,6 +2952,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          case ("isHighSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isHighSurrogate(c.charValue)))
          case ("isLowSurrogate", (c: Character) :: Nil) => Some(Boolean.box(Character.isLowSurrogate(c.charValue)))
          case _ => None
@@ -898,7 +899,7 @@ index 2b118a14..16280e9d 100644
      // A handful of common `java.lang.{Integer,Long}` real JDK-native
      // static parsing methods -- no Scala source ever, but exercised by
      // e.g. ip4s's own literal-validation macros hand-parsing numbers at
-@@ -2920,7 +3019,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -2936,7 +3036,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          srcPos)
      lazy val args = evalNonErased(rawArgs, fn)
      val collectionFactory = receiver match
@@ -907,7 +908,7 @@ index 2b118a14..16280e9d 100644
        case _ => None
      val concreteCls = receiverConcreteClass(receiver)
      // `fn` is whatever symbol the call site's *static* type resolved to
-@@ -3191,6 +3290,12 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -3209,6 +3309,12 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
     *  (only for diagnostics: "Unexpected tree" errors list the top frames).
     */
    private var defStack: List[Symbol] = Nil
@@ -920,7 +921,7 @@ index 2b118a14..16280e9d 100644
    private var reportedStackOverflow = false
    /** Type arguments of the instance call being dispatched (read by `interpretQuotesApi`). */
    private var currentTypeArgs: List[Type] = Nil
-@@ -3202,6 +3307,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -3220,6 +3326,14 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
      if debugFn != null && ddef.symbol.name.toString == debugFn then debugWindow = true
      try callUserDefDef0(receiver, ddef, args, typeArgs)
      catch
@@ -935,7 +936,7 @@ index 2b118a14..16280e9d 100644
        case so: StackOverflowError =>
          if !reportedStackOverflow then
            reportedStackOverflow = true
-@@ -3458,18 +3571,45 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -3511,18 +3625,45 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
      // handling, same story as `WeakReference` above. Curated by name as
      // specific ones get exercised, not exhaustive over every JDK exception.
      else if fn.owner.is(JavaDefined) && fn.owner.derivesFrom(defn.ThrowableClass) then
@@ -989,7 +990,7 @@ index 2b118a14..16280e9d 100644
      // `java.lang.StringBuilder`: a real JDK class, no retained Scala source
      // -- checked by `JavaDefined` (like `WeakReference` above), BEFORE the
      // bare-name `"StringBuilder"` case below (which builds a
-@@ -3711,9 +3851,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -3766,9 +3907,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
            // run any statements after it (rare for a trivial forwarding aux
            // constructor, but not disallowed) against that instance's `this`.
            ddef.rhs match
@@ -1003,7 +1004,7 @@ index 2b118a14..16280e9d 100644
                instance
              case _ => notInterpretable(fn)
          case _ => notInterpretable(fn)
-@@ -3861,14 +4003,25 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -3916,14 +4059,25 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
                    Console.err.println(s"[anonSuperCtor] superParams=$superParams superRawArgs=$superRawArgs superBound=$superBound")
                  superBound.foreach((p, v) => instance.fields.getOrElseUpdate(p.name.toString, v))
                  val parentCls = superFn.symbol.owner
@@ -1031,7 +1032,7 @@ index 2b118a14..16280e9d 100644
            bindSuperCtorFields(fn.owner, withParams, 0)
          instance
        case _ if rawArgs.forall(_.isEmpty) =>
-@@ -4377,6 +4530,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -4432,6 +4586,11 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
              case "MIN_VALUE" => Some(Character.valueOf(Character.MIN_VALUE))
              case "MAX_VALUE" => Some(Character.valueOf(Character.MAX_VALUE))
              case _ => None
@@ -1043,7 +1044,7 @@ index 2b118a14..16280e9d 100644
          case "MathContext" =>
            // `java.math.MathContext`'s preset constants (jsoniter-scala's
            // `BigDecimal` precision handling reads `DECIMAL128`).
-@@ -6526,6 +6684,27 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -6589,6 +6748,27 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        // it structurally also `IS-A Seq[Char]`).
        case (b: mutable.StringBuilder, "append", (v: Object) :: Nil) => Some(b.append(v))
        case (b: mutable.StringBuilder, "toString" | "result", Nil) => Some(b.toString)
@@ -1071,7 +1072,7 @@ index 2b118a14..16280e9d 100644
        // `classOf[T]` for a macro-expansion-time type `T`: represented as the
        // real dotc `Type` (a `TypeRef` etc, from the literal's `Constant`),
        // not a loadable JVM `Class[_]` -- `T` may not even exist as a real
-@@ -6866,6 +7045,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -6929,6 +7109,8 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
        case (a, "update", (i: Integer) :: v :: Nil) if a.getClass.isArray =>
          java.lang.reflect.Array.set(a, i.intValue, v); Some(().asInstanceOf[Object])
        case (a, "length", Nil) if a.getClass.isArray => Some(Int.box(java.lang.reflect.Array.getLength(a)))
@@ -1080,7 +1081,7 @@ index 2b118a14..16280e9d 100644
        case (a: Array[Object] @unchecked, "update", (i: Integer) :: v :: Nil) =>
          a(i) = v; Some(().asInstanceOf[Object])
        case (a: Array[Object] @unchecked, "length", Nil) => Some(Int.box(a.length))
-@@ -7122,6 +7303,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
+@@ -7185,6 +7367,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader)(using Context):
          case "==" => Boolean.box(a == b)
          case "!=" => Boolean.box(a != b)
          case _ => throw new StopInterpretation(em"Interpreter (own implementation): unsupported primitive op $op on Boolean", pos)
@@ -1090,7 +1091,7 @@ index 2b118a14..16280e9d 100644
      else
        val y = args.head
        def asD(o: Object): Double = o match
-@@ -7225,7 +7409,9 @@ case class ModuleValue(moduleClass: Symbol)
+@@ -7288,7 +7473,9 @@ case class ModuleValue(moduleClass: Symbol)
  final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Object])(using Context):
    val fields: mutable.Map[String, Object] = mutable.Map.empty
    private val clsName: String = cls.name.toString
@@ -1101,7 +1102,7 @@ index 2b118a14..16280e9d 100644
    // A real `case class` gets compiler-generated structural `equals`/
    // `hashCode` (every constructor param compared); a plain class doesn't,
    // keeping ordinary reference identity -- match that distinction here
-@@ -7247,6 +7433,17 @@ final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Objec
+@@ -7310,6 +7497,17 @@ final class InterpretedInstance(val cls: Symbol, val outerEnv: Map[Symbol, Objec
      if cls.is(Case) then cls.hashCode + fields.iterator.map((k, v) => k.hashCode ^ (if v == null then 0 else v.hashCode)).sum
      else super.hashCode()
  
@@ -1119,7 +1120,7 @@ index 2b118a14..16280e9d 100644
  /** A local `lazy val` slot: `thunk` runs on first read, and its result is cached. */
  final class LocalLazyVal(thunk: () => Object):
    private var cached: Object = null
-@@ -7308,10 +7505,21 @@ final case class LabeledReturn(label: Symbol, value: Object) extends Exception(n
+@@ -7371,6 +7569,9 @@ final case class LabeledReturn(label: Symbol, value: Object) extends Exception(n
   */
  final case class InterpretedThrow(value: Object) extends Exception(null, null, false, false)
  
@@ -1129,7 +1130,10 @@ index 2b118a14..16280e9d 100644
  object NonFatalInterpretedException:
    def unapply(ex: Throwable): Option[Throwable] = scala.util.control.NonFatal.unapply(ex)
  
- object Interpreter:
+@@ -7390,6 +7591,14 @@ object Interpreter:
+       r
+   }
+ 
 +  /** The state of `object`s (their `val`s and `var`s) one `Interpreter` leaves behind. Usually
 +   *  one per interpreter; the REPL (`ScalinoRepl`) shares one across the interpreters of all its
 +   *  inputs, so a later line sees the objects earlier lines initialised.
