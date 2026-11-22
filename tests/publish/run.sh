@@ -28,6 +28,20 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Python can take several seconds to start on a cold macOS x86_64 runner
+start_mock() {
+  rm -f "$WORK/port"
+  mkdir -p "$WORK/mock"
+  python3 "$ROOT/tests/publish/mock_central.py" "$WORK/mock" > "$WORK/port" &
+  MOCK_PID=$!
+  for _ in $(seq 300); do
+    [[ -s "$WORK/port" ]] && break
+    kill -0 "$MOCK_PID" 2>/dev/null || fail "mock_central.py exited before printing its port"
+    sleep 0.1
+  done
+  [[ -s "$WORK/port" ]] || fail "mock_central.py printed no port within 30s"
+  export SCALINO_CENTRAL_URL="http://127.0.0.1:$(cat "$WORK/port")"
+}
 SN="$("$SCALINO" version | sed -n 's/.*Scala Native \([0-9]*\.[0-9]*\).*/\1/p')"
 NATIVE="greeter_native${SN}_3"
 
@@ -128,11 +142,8 @@ done
 grep -q '<version>0.1.0</version>' "$R/maven-metadata.xml" || fail "no maven-metadata.xml"
 
 echo "== publish to Central (mock Portal API)"
-python3 "$ROOT/tests/publish/mock_central.py" "$WORK/mock" > "$WORK/port" &
-MOCK_PID=$!
-mkdir -p "$WORK/mock"
-for _ in $(seq 50); do [[ -s "$WORK/port" ]] && break; sleep 0.1; done
-export SCALINO_CENTRAL_URL="http://127.0.0.1:$(cat "$WORK/port")" SCALINO_CENTRAL_POLL_MS=50
+start_mock
+export SCALINO_CENTRAL_POLL_MS=50
 SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . > "$WORK/out" 2>&1 || { cat "$WORK/out" >&2; fail "publish to central"; }
 grep -q "Published $ORG:$NATIVE:0.1.0 to Maven Central" "$WORK/out" || fail "no success line: $(cat "$WORK/out")"
 python3 - "$WORK/mock/requests.jsonl" <<'EOF' || fail "upload request"
@@ -159,11 +170,7 @@ echo "== --manual-release, then a FAILED deployment"
 SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . --manual-release -q > /dev/null 2>&1 || true
 grep -q '"publishingType": \["USER_MANAGED"\]' "$WORK/mock/requests.jsonl" || fail "--manual-release is not USER_MANAGED"
 kill "$MOCK_PID"; wait "$MOCK_PID" 2>/dev/null || true
-rm -f "$WORK/port"
-MOCK_FAIL=1 python3 "$ROOT/tests/publish/mock_central.py" "$WORK/mock" > "$WORK/port" &
-MOCK_PID=$!
-for _ in $(seq 50); do [[ -s "$WORK/port" ]] && break; sleep 0.1; done
-export SCALINO_CENTRAL_URL="http://127.0.0.1:$(cat "$WORK/port")"
+MOCK_FAIL=1 start_mock
 if SONATYPE_USERNAME=user SONATYPE_PASSWORD=token "$SCALINO" publish . > "$WORK/out" 2>&1; then fail "a FAILED deployment exited 0"; fi
 grep -q "Missing signature for file" "$WORK/out" || fail "the portal's errors are not shown: $(cat "$WORK/out")"
 
