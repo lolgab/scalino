@@ -18,6 +18,7 @@ for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt; do
 done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
 source ./link-lib.sh
+source ./bootstrap-lib.sh
 source ./repl-deps.sh
 link_require
 [[ -f "$DIST/java.base.jar" ]] || { echo "missing $DIST/java.base.jar -- run build/02-build-java-base.sh first" >&2; exit 1; }
