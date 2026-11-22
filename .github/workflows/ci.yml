@@ -85,7 +85,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/state.tgz
-          key: scalino-core-state-v1-${{ matrix.target }}-${{ steps.week.outputs.week }}-${{ hashFiles('build/**', '!build/03*', '!build/04d-*', '!build/07-*', '!build/08*', '!build/lsp-*', '!build/buildinfo-lib.sh', '!build/13-*', 'patches/**', 'versions.env', 'src/**', 'tools/**', '.github/actions/setup-build-deps/**') }}
+          key: scalino-core-state-v1-${{ matrix.target }}-${{ steps.week.outputs.week }}-${{ hashFiles('build/**', '!build/03*', '!build/04d-*', '!build/07-*', '!build/08*', '!build/lsp-*', '!build/buildinfo-lib.sh', '!build/bootstrap-lib.sh', '!build/13-*', 'patches/**', 'versions.env', 'src/**', 'tools/**', '.github/actions/setup-build-deps/**') }}
 
       - uses: ./.github/actions/setup-build-deps
         if: steps.core-cache.outputs.cache-hit != 'true'
@@ -153,6 +153,11 @@ jobs:
       # build/00-env.sh defaults linux-x86_64 to thin LTO; CI only checks the
       # build works, so skip it (links stay in debug mode, release.yml opts in).
       SCALINO_LINK_LTO: none
+      # Compile dotc's (and the LSP's) sources with a released scalino-dotc instead of dotc on a
+      # JVM (build/bootstrap-lib.sh). Pinned: a broken release can't break CI, bump it on purpose.
+      SCALINO_BOOTSTRAP_DOTC: release
+      SCALINO_BOOTSTRAP_VERSION: v0.0.33
+      GITHUB_TOKEN: ${{ github.token }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -172,6 +177,12 @@ jobs:
       - name: Restore build state
         shell: bash
         run: ./build/ci-state.sh restore "$RUNNER_TEMP/state.tgz"
+
+      - name: Cache the bootstrap scalino-dotc
+        uses: actions/cache@v4
+        with:
+          path: .build-work/bootstrap
+          key: scalino-bootstrap-${{ env.SCALINO_BOOTSTRAP_VERSION }}-${{ matrix.target }}
 
       - name: Build scalino-lsp
         shell: bash
@@ -232,6 +243,11 @@ jobs:
       # build/00-env.sh defaults linux-x86_64 to thin LTO; CI only checks the
       # build works, so skip it (links stay in debug mode, release.yml opts in).
       SCALINO_LINK_LTO: none
+      # Compile dotc's (and the LSP's) sources with a released scalino-dotc instead of dotc on a
+      # JVM (build/bootstrap-lib.sh). Pinned: a broken release can't break CI, bump it on purpose.
+      SCALINO_BOOTSTRAP_DOTC: release
+      SCALINO_BOOTSTRAP_VERSION: v0.0.33
+      GITHUB_TOKEN: ${{ github.token }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -251,6 +267,12 @@ jobs:
       - name: Restore build state
         shell: bash
         run: ./build/ci-state.sh restore "$RUNNER_TEMP/state.tgz"
+
+      - name: Cache the bootstrap scalino-dotc
+        uses: actions/cache@v4
+        with:
+          path: .build-work/bootstrap
+          key: scalino-bootstrap-${{ env.SCALINO_BOOTSTRAP_VERSION }}-${{ matrix.target }}
 
       - name: Build toolchain (scalino-dotc, scalino)
         shell: bash

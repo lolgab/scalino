@@ -18,6 +18,7 @@ for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt; do
 done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
 source ./link-lib.sh
+source ./bootstrap-lib.sh
 link_require
 [[ -f "$DIST/java.base.jar" ]] || { echo "missing $DIST/java.base.jar -- run build/02-build-java-base.sh first" >&2; exit 1; }
 
@@ -47,13 +48,13 @@ echo "== generating self-hosted source file list =="
 ./selfhost/gen-file-list.sh | to_native_path_list > "$FILE_LIST"
 echo "  $(wc -l < "$FILE_LIST" | tr -d ' ') files"
 
-echo "== compiling dotc+nscplugin to NIR (bootstrap JVM dotc, real nscplugin jar as -Xplugin) =="
+echo "== compiling dotc+nscplugin to NIR (bootstrap dotc, see bootstrap-lib.sh) =="
 rm -rf "$NIR_OUT"
 mkdir -p "$NIR_OUT"
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 # The compiler sources of Scala 3.10+ are written for -Yexplicit-nulls (scala3/project/Build.scala); the
 # rest of the source set (nscplugin, nir, our patches) is not, hence unsafeNulls for the whole compile.
-"$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+dotc_compile "" \
   -Yexplicit-nulls -language:unsafeNulls -language:implicitConversions \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \

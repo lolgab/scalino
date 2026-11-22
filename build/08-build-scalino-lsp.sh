@@ -29,6 +29,7 @@ for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt lsp.c
 done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
 source ./link-lib.sh
+source ./bootstrap-lib.sh
 link_require
 [[ -e "$JAVAC" ]] || { echo "missing javac at $JAVAC -- need a full JDK (not JRE) for JAVA_HOME" >&2; exit 1; }
 
@@ -86,7 +87,7 @@ mkdir -p "$NIR_OUT_MAIN"
 NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
 # The compiler sources of Scala 3.10+ are written for -Yexplicit-nulls (scala3/project/Build.scala); the
 # rest of the source set (nscplugin, nir, our patches) is not, hence unsafeNulls for the whole compile.
-"$JAVA" -cp "$(cat "$WORK/compiler.cp")$CP_SEP$(cat "$WORK/lsp.cp")" dotty.tools.dotc.Main \
+dotc_compile "$(cat "$WORK/lsp.cp")" \
   -Yexplicit-nulls -language:unsafeNulls -language:implicitConversions \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
@@ -101,7 +102,7 @@ cp "$ROOT/build/selfhost/compiler.properties" "$NIR_OUT_MAIN/compiler.properties
 echo "== compiling lsp-shim/lsp4j+lsp-shim/mtags-interfaces to NIR (invocation 2: standalone; supplies the NIR definitions for the org.eclipse.lsp4j.*/scala.meta.pc.* symbols) =="
 rm -rf "$NIR_OUT_SHIM"
 mkdir -p "$NIR_OUT_SHIM"
-"$JAVA" -cp "$(cat "$WORK/compiler.cp")" dotty.tools.dotc.Main \
+dotc_compile "" \
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
   -Yretain-trees \
