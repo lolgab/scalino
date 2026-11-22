@@ -1,41 +1,40 @@
-# scalino-lsp (Neovim)
+# Scalino for Neovim
 
-Wires `dist/scalino-lsp` up as a Neovim LSP client for `.scala` files. No JVM
-is needed to run it. See [`../README.md`](../README.md#editor-support) and
-`../docs/findings.md` ("JVM-free language server (LSP)").
+Neovim setup for `scalino-lsp`, scalino's language server. The server is a
+native binary, so nothing here needs a JVM. What it can do is listed under
+[Editor support](../README.md#editor-support) in the main README.
 
-Unlike [`zed-extension/`](../zed-extension/) and
-[`vscode-extension/`](../vscode-extension/), this is not a packaged extension:
-[`lua/scalino-lsp.lua`](lua/scalino-lsp.lua) is a client config for Neovim's
-built-in `vim.lsp` (0.11+). On Neovim < 0.11, `vim.lsp.config` and
-`vim.lsp.enable` do not exist; use
-[nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) (see below).
+This is not a packaged plugin like the [Zed](../zed-extension/) and
+[VS Code](../vscode-extension/) extensions. Neovim has an LSP client built in,
+so all it takes is a client config:
+[`lua/scalino-lsp.lua`](lua/scalino-lsp.lua), for `vim.lsp` in Neovim 0.11 and
+later. Older Neovims have no `vim.lsp.config` or `vim.lsp.enable`; use
+[nvim-lspconfig](https://github.com/neovim/nvim-lspconfig) there, as shown
+[below](#neovim-before-011).
 
 ## Install (Neovim 0.11+)
 
-1. Put `scalino-lsp` on your `PATH`. `../install.sh` symlinks it next to
-   `scalino`. If you built from source (`../build/08-build-scalino-lsp.sh`,
-   output `../dist/scalino-lsp`), put `dist/` on `PATH` or pass `path` in step 3.
-   Without `path`, the config looks it up on `PATH` (`vim.fn.executable`).
-2. In the project root, generate the config the server reads on `initialize`
-   (`DottyLanguageServer.IDE_CONFIG_FILE`):
+1. Put `scalino-lsp` on your `PATH`. `install.sh` links it next to `scalino`.
+   If you built scalino from source, the binary is `dist/scalino-lsp`. You can
+   also pass its path in step 3.
+2. In the project root, write the config the server reads at startup:
    ```
-   dist/scalino setup-ide <your sources...>
+   scalino setup-ide <your sources...>
    ```
-   This writes `.scalino-build/scalino-lsp.json` (`setup-ide` in
-   `../cli/ScalinoCli.scala`).
+   This creates `.scalino-build/scalino-lsp.json`.
 3. In your `init.lua`:
    ```lua
    require("scalino-lsp").setup({
      -- path = "/absolute/path/to/dist/scalino-lsp", -- only if not on PATH
    })
    ```
-   Make the module loadable in one of three ways: append this repo's
-   `neovim-extension/` to the runtimepath
-   (`vim.opt.rtp:append("/path/to/scalino/neovim-extension")` before the
-   `require`), copy `lua/scalino-lsp.lua` into your config's `lua/` directory,
-   or point a plugin manager at the directory. With
-   [lazy.nvim](https://github.com/folke/lazy.nvim):
+   Neovim has to find the module. Any of these works:
+   - add this directory to the runtimepath before the `require`:
+     `vim.opt.rtp:append("/path/to/scalino/neovim-extension")`
+   - copy `lua/scalino-lsp.lua` into your own config's `lua/` directory
+   - point a plugin manager at the directory
+
+   With [lazy.nvim](https://github.com/folke/lazy.nvim):
    ```lua
    {
      dir = "/path/to/scalino/neovim-extension",
@@ -52,15 +51,12 @@ built-in `vim.lsp` (0.11+). On Neovim < 0.11, `vim.lsp.config` and
      end,
    }
    ```
-   `dir` marks a local plugin that lazy.nvim should not clone (there is no
-   remote to clone from). `ft = "scala"` loads it only for Scala buffers.
+   `dir` tells lazy.nvim this is a local plugin with nothing to clone, and
+   `ft = "scala"` loads it only for Scala buffers.
 4. Open a `.scala` file. `:LspInfo` (or `:checkhealth vim.lsp`) shows whether
-   `scalino_lsp` attached. If diagnostics or hover are missing, read
-   `.scalino-build/scalino-lsp.log` in the project root, a timestamped trace of
-   every request and notification (`Log` in
-   `../vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala`).
+   `scalino_lsp` attached.
 
-## Install (nvim-lspconfig, Neovim < 0.11)
+## Neovim before 0.11
 
 `nvim-lspconfig` has no `scalino_lsp` config, so define one before calling
 `setup`:
@@ -79,18 +75,17 @@ end
 require("lspconfig").scalino_lsp.setup({})
 ```
 
-Steps 1-2 above (`PATH` and `setup-ide`) still apply.
+Steps 1 and 2 above still apply.
 
-## Scope
+## When something is missing
 
-The server offers what `DottyLanguageServer` implements
-(`../vendor/scala3/language-server/`, trimmed by
-`../patches/scala3-0002-trim-language-server.patch`): diagnostics, hover,
-definition, completion, references, rename, document and workspace symbols,
-implementation, signature help.
+Read `.scalino-build/scalino-lsp.log` in the project root. The server writes
+every request and notification there, with a timestamp.
 
-- No DAP/debug: the worksheet module that would back it was trimmed.
-- No auto-download of `scalino-lsp`: it is not published anywhere generic.
+If Metals (through `nvim-metals`, say) attaches to the same `.scala` file, you
+get every diagnostic and hover twice. Disable one of the two for the workspace.
 
-If this and Metals (for example `nvim-metals`) attach to the same `.scala` file,
-you get duplicate diagnostics and hover; disable one for the workspace.
+## What it doesn't do
+
+- Debugging. There is no DAP support.
+- Download `scalino-lsp`. Install scalino first.

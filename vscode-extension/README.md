@@ -1,19 +1,19 @@
-# scalino-lsp (VS Code extension)
+# Scalino for VS Code
 
-Registers `dist/scalino-lsp` as the language server for `.scala` files. No JVM
-is needed to run it. See [`../README.md`](../README.md#editor-support) and
-`../docs/findings.md` ("JVM-free language server (LSP)").
+A VS Code client for `scalino-lsp`, scalino's language server. The server is a
+native binary, so nothing here needs a JVM. What it can do is listed under
+[Editor support](../README.md#editor-support) in the main README.
 
-The extension attaches by document selector (`**/*.scala`) and does not claim
+The extension attaches to `**/*.scala` by document selector and does not claim
 the `scala` language id. VS Code merges `languages` contributions from several
-extensions, so unlike Zed ([`../zed-extension/`](../zed-extension/)) there is no
-collision with Metals. If both are active in a workspace you get duplicate
-diagnostics and hover; disable one with `cmd/ctrl-shift-p` -> "Extensions:
-Disable (Workspace)".
+extensions, so there is no fight with Metals over who owns Scala files (Zed is
+different, see [`../zed-extension/`](../zed-extension/)). If both are active in
+a workspace you get every diagnostic and hover twice. Turn one of them off with
+"Extensions: Disable (Workspace)" from the command palette.
 
 ## Install
 
-The extension is not on the VS Code Marketplace. Package and install it locally:
+The extension is not on the Marketplace. Package it and install the `.vsix`:
 
 ```
 cd vscode-extension
@@ -23,54 +23,45 @@ npx vsce package
 code --install-extension scalino-lsp-0.0.7.vsix
 ```
 
-`scalino-lsp` itself is not downloaded by the extension (see "Scope"), so steps
-1-3 are still required.
+It does not download the server, so:
 
-1. Put `scalino-lsp` on your `PATH`. `install.sh` symlinks it next to `scalino`.
-   If you built from source (`../build/08-build-scalino-lsp.sh`, output
-   `dist/scalino-lsp`), put `dist/` on `PATH` or set the path in step 2. With no
-   path configured the extension looks it up on `PATH` (`findOnPath` in
-   `src/extension.ts`).
-2. Optional: if it is not on `PATH`, set the path in `.vscode/settings.json`:
+1. Put `scalino-lsp` on your `PATH`. `install.sh` links it next to `scalino`.
+   If you built scalino from source, the binary is `dist/scalino-lsp`. To use
+   one that is not on `PATH`, point the extension at it in
+   `.vscode/settings.json`:
    ```json
    {
      "scalino-lsp.path": "/absolute/path/to/dist/scalino-lsp"
    }
    ```
-3. In the project root, generate the config the server reads on `initialize`
-   (`DottyLanguageServer.IDE_CONFIG_FILE`):
+2. Open your project. The server reads `.scalino-build/scalino-lsp.json`, and
+   when a workspace folder has none the extension offers to run
+   `scalino setup-ide .` for you. You can also run it yourself:
    ```
-   dist/scalino setup-ide <your sources...>
+   scalino setup-ide <your sources...>
    ```
-   This writes `.scalino-build/scalino-lsp.json` (`setup-ide` in
-   `../cli/ScalinoCli.scala`). It does not touch editor settings.
-4. Open the project in VS Code. If diagnostics or hover are missing, check the
-   "Scalino" output channel (`View` -> `Output`). Set `scalino-lsp.trace.server`
-   to `"verbose"` to trace every request and notification. The server also
-   writes `.scalino-build/scalino-lsp.log` in the project root (`Log` in
-   `vendor/scala3/language-server/src/dotty/tools/languageserver/Main.scala`).
+   It only writes that file. Your editor settings are not touched.
 
-## Inlay hint toggles
+## When something is missing
 
-Each hint kind can be switched off individually (all on by default):
+Look at the "Scalino" output channel (`View` -> `Output`). Setting
+`scalino-lsp.trace.server` to `"verbose"` traces every request and
+notification. The server keeps its own log too, in
+`.scalino-build/scalino-lsp.log` in the project root.
+
+## Inlay hints
+
+Each kind of hint has its own switch, and all are on by default:
 `inferredTypes`, `typeParameters`, `implicitArguments`, `implicitConversions`,
-`byNameParameters`, `namedParameters`, `hintsInPatternMatch`. The server reads
-them as `inlayHints.<kind>.enable` from `initializationOptions` and
-`workspace/didChangeConfiguration`, and asks the client to refresh hints when
-they change.
+`byNameParameters`, `namedParameters`, `hintsInPatternMatch`.
 
-In VS Code these are the `scalino-lsp.inlayHints.<kind>.enable` settings
-(Settings UI: search "scalino inlay").
+In VS Code they are the `scalino-lsp.inlayHints.<kind>.enable` settings. Search
+for "scalino inlay" in the Settings UI. Changes apply without a restart.
 
-## Scope
+## What it doesn't do
 
-The extension offers what `DottyLanguageServer` implements
-(`vendor/scala3/language-server/`, trimmed by
-`patches/scala3-0002-trim-language-server.patch`): diagnostics, hover,
-definition, completion, references, rename, document and workspace symbols,
-implementation, signature help.
-
-- No DAP/debug: the worksheet module that would back it was trimmed.
-- No auto-download of `scalino-lsp`: it is not published anywhere generic.
-- No bundled grammar: syntax highlighting comes from whatever TextMate grammar
-  is installed (Metals, or a plain Scala syntax extension).
+- Debugging. There is no DAP support.
+- Download `scalino-lsp`. Install scalino first.
+- Syntax highlighting. There is no bundled grammar, so colours come from
+  whatever TextMate grammar you have installed: Metals, or a plain Scala syntax
+  extension.

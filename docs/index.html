@@ -3,526 +3,733 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>scalino — Scala 3, compiled straight to native. No JVM.</title>
-<meta name="description" content="scalino compiles Scala 3 straight to a native executable via Scala Native. No bytecode, no JIT, no java on your machine — not even to build the compiler itself.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23C1440E'/><text x='50' y='68' font-size='58' font-family='monospace' font-weight='bold' fill='white' text-anchor='middle'>s</text></svg>">
+<title>scalino: Scala 3 without a JVM</title>
+<meta name="description" content="scalino is a small scala-cli for Scala Native and Scala.js. The compiler, the linker and the language server are native executables, so there is no java to install.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='16' fill='%23DC322F'/><text x='50' y='70' font-size='60' font-family='monospace' font-weight='bold' fill='white' text-anchor='middle'>s</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&display=swap" rel="stylesheet">
+<script>document.documentElement.classList.add('js')</script>
 <style>
   :root{
-    --bg:#fbfaf8;
-    --bg-alt:#f2efe9;
-    --ink:#1c1a17;
-    --ink-dim:#5b564d;
-    --line:#e4ded3;
-    --accent:#c1440e;
+    --bg:#eeecea;
+    --surface:#e4e1dd;
+    --ink:#2e2d2c;
+    --muted:#65615d;
+    --accent:#dc322f;
     --accent-ink:#ffffff;
-    --code-bg:#1c1a17;
-    --code-ink:#f2efe9;
-    --code-comment:#8a8478;
-    --code-string:#9fc27a;
-    --code-keyword:#e8a24c;
-    --code-type:#7ab3d9;
-    --shadow: 0 1px 2px rgba(28,26,23,.04), 0 8px 24px rgba(28,26,23,.05);
+    --stone:#cdc3b6;
+    --char:#2e2d2c;
+    --char-ink:#eeecea;
+    --pale:#f7f6f4;
+    --term:#232221;
+    --term-ink:#e9e6e1;
+    --term-dim:#a09a92;
+    --term-ok:#a9c98f;
+    --term-str:#e2b97f;
+    --term-kw:#e58f86;
+
+    --step-small:clamp(0.8125rem, 0.79rem + 0.1vw, 0.875rem);
+    --step-body:clamp(1.0625rem, 1rem + 0.25vw, 1.1875rem);
+    --step-lead:clamp(1.25rem, 1.1rem + 0.7vw, 1.625rem);
+    --step-head:clamp(2rem, 1.3rem + 3.2vw, 4rem);
+    --step-display:clamp(2.75rem, 1.1rem + 6.4vw, 6.25rem);
+
+    --m:clamp(20px, 2.4vw, 36px);
+    --gap:clamp(96px, 11vw, 176px);
+    --r:6px;
+    --out:cubic-bezier(.19,1,.22,1);
   }
   @media (prefers-color-scheme: dark){
     :root{
-      --bg:#151311;
-      --bg-alt:#1c1a17;
-      --ink:#f2efe9;
-      --ink-dim:#b3ab9d;
-      --line:#332f29;
-      --accent:#e8703a;
-      --accent-ink:#151311;
-      --code-bg:#0e0d0b;
-      --code-ink:#f2efe9;
-      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+      --bg:#191817;
+      --surface:#242322;
+      --ink:#e8e7e5;
+      --muted:#a5a19c;
+      --stone:#3b3733;
+      --char:#0e0e0d;
+      --char-ink:#e8e7e5;
+      --pale:#2c2a28;
+      --term:#0e0e0d;
     }
   }
   *{box-sizing:border-box}
-  html{scroll-behavior:smooth}
+  html{-webkit-text-size-adjust:100%}
   body{
     margin:0;
     background:var(--bg);
     color:var(--ink);
-    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    font-family:"Bricolage Grotesque", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size:var(--step-body);
+    line-height:1.5;
     -webkit-font-smoothing:antialiased;
   }
-  .wrap{max-width:1040px;margin:0 auto;padding-inline:24px}
-  a{color:inherit}
-  code, pre, .mono{font-family:"SF Mono",ui-monospace,Menlo,Consolas,"Liberation Mono",monospace}
+  .wrap{max-width:1520px;margin-inline:auto;padding-inline:var(--m)}
+  a{color:inherit;text-decoration-thickness:.07em;text-underline-offset:.18em;transition:text-decoration-color .2s ease, color .2s ease}
+  a:hover{text-decoration-color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  p{margin:0 0 1em;text-wrap:pretty}
+  p:last-child{margin-bottom:0}
+  h1,h2,h3{margin:0;font-weight:600;letter-spacing:-.04em;line-height:.95;text-wrap:balance}
+  h1{font-size:var(--step-display);line-height:.9}
+  h2{font-size:var(--step-head)}
+  h3{font-size:var(--step-body);font-weight:600;letter-spacing:-.01em;line-height:1.3}
+  code,pre{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+  p code, li code, td code, .clause code{font-size:.88em;background:var(--surface);padding:.1em .35em;border-radius:4px;white-space:nowrap}
+  .soft{color:var(--muted)}
+  section{margin-top:calc(var(--gap) - 16px);padding-top:16px}
+  .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));column-gap:var(--m);row-gap:40px}
+  .text > * + *{margin-top:1.2em}
+  .text h2 + *{margin-top:28px}
 
-  /* nav */
-  header.nav{
-    position:sticky;top:0;z-index:20;
-    background:color-mix(in srgb, var(--bg) 88%, transparent);
-    backdrop-filter:blur(8px);
-    border-bottom:1px solid var(--line);
+  /* top */
+  .top{display:flex;align-items:center;justify-content:space-between;gap:24px;padding-block:22px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:-.02em;text-decoration:none}
+  .brand svg{flex:none;color:var(--ink)}
+  .top nav{display:flex;gap:clamp(16px,2.4vw,32px);flex-wrap:wrap;justify-content:flex-end}
+  .top nav a{text-decoration-color:transparent}
+  .top nav a:hover{text-decoration-color:var(--accent)}
+
+  /* terminal and code fragments */
+  .term{
+    margin:0;background:var(--term);color:var(--term-ink);border-radius:var(--r);
+    padding:clamp(18px,2vw,28px);font-size:var(--step-small);line-height:1.65;
+    overflow-x:auto;tab-size:2;
   }
-  .nav .wrap{display:flex;align-items:center;gap:28px;height:60px}
-  .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:17px;text-decoration:none;flex:none}
-  .scala-logo{color:var(--ink);flex:none}
-  .navlinks{display:flex;gap:22px;overflow-x:auto;flex:1;scrollbar-width:none}
-  .navlinks::-webkit-scrollbar{display:none}
-  .navlinks a{white-space:nowrap;font-size:14px;text-decoration:none;color:var(--ink-dim);padding:4px 0;border-bottom:2px solid transparent}
-  .navlinks a:hover{color:var(--ink);border-color:var(--accent)}
-  .navgh{flex:none;font-size:14px;text-decoration:none;color:var(--ink-dim);border:1px solid var(--line);padding:6px 12px;border-radius:7px;white-space:nowrap}
-  .navgh:hover{border-color:var(--accent);color:var(--ink)}
+  .term .p{color:var(--term-dim);user-select:none}
+  .term .d{color:var(--term-dim)}
+  .term .ok{color:var(--term-ok)}
+  .term .s{color:var(--term-str)}
+  .term .k{color:var(--term-kw)}
+  .term .l{display:block;min-height:1.65em}
+  .term.wrapok{white-space:pre-wrap;overflow-wrap:anywhere}
+  .cursor{display:inline-block;width:.6em;height:1.1em;background:var(--term-ink);vertical-align:-.18em;animation:blink 1.1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
 
   /* hero */
-  .hero{padding-block:88px 56px;text-align:center}
-  .kicker{display:inline-block;font-size:13px;letter-spacing:.04em;color:var(--accent);background:color-mix(in srgb, var(--accent) 12%, transparent);border:1px solid color-mix(in srgb, var(--accent) 35%, transparent);padding:5px 12px;border-radius:999px;margin-bottom:22px;font-weight:600}
-  h1{font-size:clamp(30px,5vw,50px);line-height:1.12;margin:0 0 20px;letter-spacing:-.01em;font-weight:700}
-  h1 em{color:var(--accent);font-style:normal}
-  .lead{max-width:640px;margin:0 auto 34px;color:var(--ink-dim);font-size:18px}
-  .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:44px}
-  .btn{display:inline-flex;align-items:center;gap:8px;padding:12px 22px;border-radius:9px;font-weight:600;font-size:15px;text-decoration:none;border:1px solid transparent}
-  .btn.primary{background:var(--accent);color:var(--accent-ink)}
-  .btn.primary:hover{opacity:.9}
-  .btn.ghost{border-color:var(--line);color:var(--ink)}
-  .btn.ghost:hover{border-color:var(--accent);color:var(--accent)}
+  .hero{margin-top:clamp(28px,6vw,88px);align-items:start}
+  .hero .text{grid-column:1 / span 5}
+  .hero .shot{grid-column:6 / -1}
+  .hero h1 + p{margin-top:clamp(24px,3vw,40px);font-size:var(--step-lead);line-height:1.35;max-width:26ch}
+  .actions{display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-top:32px}
+  .btn{
+    display:inline-block;background:var(--accent);color:var(--accent-ink);font-weight:500;
+    padding:.72em 1.5em;border-radius:var(--r);text-decoration:none;border:0;cursor:pointer;font:inherit;font-weight:500;
+    transition:transform .18s var(--out), background-color .2s ease;
+  }
+  .btn:hover{background:#c22622}
+  .btn:active{transform:scale(.97)}
 
-  .installbar{max-width:640px;margin:0 auto;display:flex;align-items:center;background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:14px 10px 14px 18px;box-shadow:var(--shadow);gap:10px}
-  .installbar code{flex:1;text-align:left;font-size:13.5px;overflow-x:auto;white-space:nowrap;color:var(--code-ink)}
-  .installbar code .muted{color:var(--code-comment)}
-  .copybtn{flex:none;background:transparent;border:1px solid #ffffff2b;color:var(--code-ink);border-radius:7px;padding:7px 12px;font-size:12.5px;cursor:pointer;font-family:inherit}
-  .copybtn:hover{border-color:#ffffff5c}
+  /* install */
+  .install .text{grid-column:1 / span 5}
+  .install .pick{grid-column:6 / -1}
+  .tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .tab{
+    font:inherit;font-size:var(--step-small);font-weight:500;color:var(--ink);background:var(--surface);
+    border:0;border-radius:var(--r);padding:.6em 1em;cursor:pointer;
+    transition:background-color .2s ease, color .2s ease, transform .18s var(--out);
+  }
+  .tab:hover{background:var(--stone)}
+  .tab:active{transform:scale(.97)}
+  .tab[aria-selected="true"]{background:var(--ink);color:var(--bg)}
+  .panel > p{font-size:var(--step-small);font-weight:500;margin:22px 0 8px}
+  .panel:first-of-type > p{margin-top:0}
+  .js .panel > p{display:none}
+  .js .panel[hidden]{display:none}
+  .pick .after{margin-top:18px;font-size:var(--step-small);color:var(--muted);max-width:60ch}
 
-  /* divider */
-  .divider{border:0;height:1px;background:var(--line);margin:0}
-  section{padding-block:72px}
-  .eyebrow{font-size:13px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
-  h2{font-size:clamp(24px,3.4vw,34px);margin:0 0 14px;letter-spacing:-.01em}
-  .section-sub{color:var(--ink-dim);max-width:620px;margin:0 0 40px;font-size:16px}
+  /* scala-cli */
+  .like .text{grid-column:1 / span 5}
+  .like .shots{grid-column:6 / -1;display:grid;gap:8px}
 
-  /* in action tabs */
-  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
-  .tab{background:transparent;border:1px solid var(--line);color:var(--ink-dim);padding:8px 14px;border-radius:8px;font-size:13.5px;cursor:pointer;font-family:inherit}
-  .tab.active{background:var(--ink);color:var(--bg);border-color:var(--ink)}
-  .panelwrap{background:var(--code-bg);color:var(--code-ink);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
-  .panel-head{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #ffffff17;font-size:12.5px;color:var(--code-comment)}
-  .panel{display:none;padding:20px 22px 22px}
-  .panel.active{display:block}
-  .panel pre{margin:0;overflow-x:auto;font-size:13.5px;line-height:1.65}
-  .panel .note{margin-top:14px;color:var(--code-comment);font-size:13px;border-top:1px solid #ffffff17;padding-top:12px}
-  .kw{color:var(--code-keyword)}
-  .st{color:var(--code-string)}
-  .ty{color:var(--code-type)}
-  .cm{color:var(--code-comment)}
+  /* pipeline */
+  .pipeline{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))}
+  .field{
+    position:relative;min-height:min(84svh,780px);padding:var(--m);
+    display:flex;flex-direction:column;justify-content:space-between;gap:40px;
+  }
+  .field:nth-child(1){background:var(--pale)}
+  .field:nth-child(2){background:var(--stone)}
+  .field:nth-child(3){background:var(--char);color:var(--char-ink)}
+  .field:nth-child(4){background:var(--accent);color:#fff}
+  .field h2{font-size:var(--step-lead);letter-spacing:-.03em;line-height:1.15;min-height:2.3em}
+  .field .spacer{min-height:2.3em}
+  .card{
+    background:var(--term);color:var(--term-ink);border-radius:var(--r);padding:18px 18px 16px;
+    font-size:var(--step-small);line-height:1.6;transition:transform .15s var(--out);min-height:14.2em;
+  }
+  .field:hover .card{transform:translateY(-6px)}
+  .card b{display:block;font-weight:500;margin-bottom:10px}
+  .card table{width:100%;border-collapse:collapse}
+  .card code{background:none;padding:0;font-size:1em}
+  .card td{padding:1px 0;vertical-align:top}
+  .card td:last-child{text-align:right;color:var(--term-dim);white-space:nowrap;padding-left:12px;font-variant-numeric:tabular-nums}
+  .card .new td:first-child, .card .new td:first-child code{color:var(--term-ok)}
+  .clause{font-size:var(--step-lead);line-height:1.2;letter-spacing:-.02em;font-weight:500;margin:0;max-width:16ch}
+  .field:nth-child(3) .clause code,.field:nth-child(4) .clause code{background:transparent;padding:0}
 
-  /* benefits */
-  .benefits{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden}
-  .benefit{background:var(--bg);padding:26px 24px}
-  .benefit .icon{width:36px;height:36px;border-radius:9px;background:color-mix(in srgb, var(--accent) 14%, transparent);color:var(--accent);display:flex;align-items:center;justify-content:center;font-size:17px;margin-bottom:14px;font-weight:700}
-  .benefit h3{font-size:16px;margin:0 0 8px}
-  .benefit p{margin:0;color:var(--ink-dim);font-size:14px;line-height:1.55}
+  /* cells */
+  .cells h2{margin-bottom:56px}
+  .cellgrid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:8px}
+  .cell{grid-column:span 4}
+  .cell:nth-child(1),.cell:nth-child(5){grid-column:span 5}
+  .cell:nth-child(2),.cell:nth-child(6){grid-column:span 3}
+  .cell{background:var(--surface);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;min-height:460px;transition:background-color .25s ease}
+  .cell:hover{background:var(--pale)}
+  .cell .t{padding:24px}
+  .cell .t p{margin-top:10px;line-height:1.45;max-width:46ch}
+  .cell .t p code{background:var(--bg)}
+  .cell .f{flex:1;display:flex;min-height:0}
+  .cell .f .term{border-radius:0;flex:1;font-size:var(--step-small)}
+  .cell.flip{flex-direction:column-reverse}
+  .cell:not(.flip) .f{margin-left:24px}
+  .cell:not(.flip) .f .term{border-top-left-radius:var(--r)}
+  .cell.flip .f{margin-right:24px}
+  .cell.flip .f .term{border-bottom-right-radius:var(--r)}
+
+  /* cross */
+  .cross .text{grid-column:1 / span 5}
+  .cross .live{grid-column:6 / -1}
+  fieldset{border:0;margin:0;padding:0}
+  legend{padding:0;font-size:var(--step-small);font-weight:500;margin-bottom:10px}
+  .targets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-bottom:10px}
+  .targets label{
+    display:flex;align-items:center;gap:10px;background:var(--surface);border-radius:var(--r);
+    padding:.7em .9em;cursor:pointer;font-size:var(--step-small);
+    transition:background-color .2s ease;
+  }
+  .targets label:hover{background:var(--stone)}
+  .targets code{white-space:nowrap}
+  .targets input{accent-color:var(--accent);width:16px;height:16px;margin:0;flex:none}
+  .from{margin:14px 0 0;padding:0;list-style:none;font-size:var(--step-small);color:var(--muted)}
+  .from li + li{margin-top:4px}
+  .from b{color:var(--ink);font-weight:500}
+  .live .term + .term{margin-top:8px}
 
   /* status */
-  .status-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px}
-  @media (max-width:720px){.status-grid{grid-template-columns:1fr}}
-  .statuscard{border:1px solid var(--line);border-radius:12px;padding:22px 24px;background:var(--bg-alt)}
-  .statuscard h3{margin:0 0 12px;font-size:15px;display:flex;align-items:center;gap:8px}
-  .statuscard ul{margin:0;padding-left:18px;color:var(--ink-dim);font-size:14.5px}
-  .statuscard li{margin-bottom:8px}
-  .pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;letter-spacing:.03em}
-  .pill.ok{background:#2f7d3a22;color:#2f7d3a}
-  .pill.next{background:color-mix(in srgb, var(--accent) 18%, transparent);color:var(--accent)}
+  .status h2{grid-column:1 / -1}
+  .status .col{grid-column:span 6}
+  .status .col > p{color:var(--muted);margin-bottom:10px}
+  .rows{list-style:none;margin:0;padding:0}
+  .rows li{display:flex;justify-content:space-between;gap:24px;padding:7px 0;align-items:baseline}
+  .rows li span:last-child{font-size:var(--step-small);color:var(--muted);text-align:right;flex:none;max-width:50%}
 
-  /* editor grid */
-  .editors{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
-  .editor{border:1px solid var(--line);border-radius:12px;padding:20px;text-align:center}
-  .editor .glyph{font-size:26px;margin-bottom:8px}
-  .editor h4{margin:0 0 4px;font-size:15px}
-  .editor p{margin:0;color:var(--ink-dim);font-size:13px}
+  /* footer */
+  footer{margin-top:max(var(--gap),24svh);padding-bottom:30px;display:grid;grid-template-columns:1fr auto 1fr;gap:24px;align-items:baseline;font-size:var(--step-small);color:var(--muted)}
+  footer nav{display:flex;gap:24px;flex-wrap:wrap}
+  footer a{color:var(--ink)}
+  footer span:last-child{text-align:right}
 
-  footer{border-top:1px solid var(--line);background:var(--bg-alt)}
-  .footgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:28px;padding:52px 0 28px}
-  .footcol h5{font-size:12.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-dim);margin:0 0 14px}
-  .footcol a{display:block;font-size:14px;text-decoration:none;color:var(--ink);margin-bottom:10px;opacity:.85}
-  .footcol a:hover{color:var(--accent);opacity:1}
-  .footbottom{border-top:1px solid var(--line);padding:20px 0 32px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;color:var(--ink-dim);font-size:13px}
+  /* motion: the page works without it */
+  @media (prefers-reduced-motion: no-preference){
+    .js .rise{opacity:0;transform:translateY(22px);transition:opacity .7s var(--out), transform .9s var(--out);transition-delay:calc(var(--i,0) * 80ms)}
+    .js .rise.in{opacity:1;transform:none}
+    .js .term[data-play] .l{opacity:0;transform:translateY(5px);transition:opacity .28s ease, transform .4s var(--out)}
+    .js .term[data-play] .l.on{opacity:1;transform:none}
+  }
+  @media (prefers-reduced-motion: reduce){
+    .cursor{animation:none}
+    .field:hover .card{transform:none}
+  }
+
+  @media (max-width: 1040px){
+    .hero .text,.hero .shot,.install .text,.install .pick,.like .text,.like .shots,.cross .text,.cross .live{grid-column:1 / -1}
+    .hero h1 + p{max-width:34ch}
+    .pipeline{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .field{min-height:0;gap:32px}
+    .field h2,.field .spacer{min-height:0}
+    .field .spacer{display:none}
+    .cellgrid .cell{grid-column:span 6}
+  }
+  @media (max-width: 680px){
+    .pipeline{grid-template-columns:1fr}
+    .field{min-height:64svh}
+    .clause{max-width:22ch}
+    .cellgrid{gap:6px}
+    .cellgrid .cell{grid-column:1 / -1}
+    .cell{min-height:0}
+    .cell,.cell.flip{flex-direction:column}
+    .cell:nth-child(odd) .f{margin:0 0 0 24px}
+    .cell:nth-child(even) .f{margin:0 24px 0 0}
+    .cell:nth-child(odd) .f .term{border-radius:var(--r) 0 0 0}
+    .cell:nth-child(even) .f .term{border-radius:0 var(--r) 0 0}
+    .targets{grid-template-columns:1fr}
+    .term[data-play]{white-space:pre-wrap;overflow-wrap:anywhere}
+    .status .col{grid-column:1 / -1}
+    .rows li{flex-direction:column;gap:0;padding:9px 0}
+    .rows li span:last-child{text-align:left;max-width:none}
+    .top nav a:nth-child(2){display:none}
+    footer{grid-template-columns:1fr;gap:8px;margin-top:20svh;padding-bottom:24px}
+    footer span:last-child{text-align:left}
+  }
 </style>
 </head>
 <body>
 
-<header class="nav">
-  <div class="wrap">
-    <a class="brand" href="#top">
-      <svg class="scala-logo" viewBox="440 110 300 480" width="20" height="32" aria-hidden="true">
-        <g transform="matrix(1.25,0,0,-1.25,0,750)">
-          <path fill="currentColor" d="M359.293,280.162V252.27c0-4.702,101.439-12.576,167.528-27.893l0,0c31.926,7.402,55.61,16.534,55.61,27.893l0,0v27.892c0,11.351-23.684,20.493-55.61,27.892l0,0C460.732,292.735,359.293,284.859,359.293,280.162"/>
-          <path fill="currentColor" d="M359.293,391.731v-27.893c0-4.702,101.439-12.576,167.528-27.892l0,0c31.926,7.399,55.61,16.534,55.61,27.892l0,0v27.893c0,11.352-23.684,20.492-55.61,27.892l0,0C460.732,404.304,359.293,396.428,359.293,391.731"/>
-          <path fill="#DC322F" d="M359.293,335.946V252.27c0,6.973,223.138,20.919,223.138,55.784l0,0v83.677C582.431,356.866,359.293,342.92,359.293,335.946"/>
-          <path fill="#DC322F" d="M359.293,447.516v-83.677c0,6.973,223.138,20.92,223.138,55.785l0,0V503.3C582.431,468.434,359.293,454.488,359.293,447.516"/>
-          <path fill="#DC322F" d="M359.293,224.377V140.7c0,6.973,223.138,20.92,223.138,55.784l0,0v83.677C582.431,245.296,359.293,231.35,359.293,224.377"/>
-        </g>
-      </svg>
-      scalino
-    </a>
-    <nav class="navlinks">
-      <a href="#install">Install</a>
-      <a href="#action">In action</a>
-      <a href="#benefits">Benefits</a>
-      <a href="#scalajs">Scala.js</a>
-      <a href="#ship">Ship</a>
-      <a href="#hermetic">Nix</a>
-      <a href="#editors">Editors</a>
-      <a href="#status">Status</a>
-    </nav>
-    <a class="navgh" href="https://github.com/lolgab/scalino" target="_blank" rel="noopener">GitHub ↗</a>
-  </div>
+<header class="wrap top">
+  <a class="brand" href="#top" aria-label="scalino, top of page">
+    <svg viewBox="440 110 300 480" width="18" height="29" aria-hidden="true">
+      <g transform="matrix(1.25,0,0,-1.25,0,750)">
+        <path fill="currentColor" d="M359.293,280.162V252.27c0-4.702,101.439-12.576,167.528-27.893l0,0c31.926,7.402,55.61,16.534,55.61,27.893l0,0v27.892c0,11.351-23.684,20.493-55.61,27.892l0,0C460.732,292.735,359.293,284.859,359.293,280.162"/>
+        <path fill="currentColor" d="M359.293,391.731v-27.893c0-4.702,101.439-12.576,167.528-27.892l0,0c31.926,7.399,55.61,16.534,55.61,27.892l0,0v27.893c0,11.352-23.684,20.492-55.61,27.892l0,0C460.732,404.304,359.293,396.428,359.293,391.731"/>
+        <path fill="#DC322F" d="M359.293,335.946V252.27c0,6.973,223.138,20.919,223.138,55.784l0,0v83.677C582.431,356.866,359.293,342.92,359.293,335.946"/>
+        <path fill="#DC322F" d="M359.293,447.516v-83.677c0,6.973,223.138,20.92,223.138,55.785l0,0V503.3C582.431,468.434,359.293,454.488,359.293,447.516"/>
+        <path fill="#DC322F" d="M359.293,224.377V140.7c0,6.973,223.138,20.92,223.138,55.784l0,0v83.677C582.431,245.296,359.293,231.35,359.293,224.377"/>
+      </g>
+    </svg>
+    scalino
+  </a>
+  <nav aria-label="Sections">
+    <a href="#install">Install</a>
+    <a href="#how">How it works</a>
+    <a href="#status">Status</a>
+    <a href="https://github.com/lolgab/scalino">GitHub</a>
+  </nav>
 </header>
 
-<div id="top"></div>
-<section class="hero wrap">
-  <span class="kicker">Scala 3 · self-hosted · zero JVM</span>
-  <h1>Scala 3, compiled straight<br>to <em>native</em>. No JVM. Ever.</h1>
-  <p class="lead">
-    <code class="mono">scalino</code> builds and runs Scala 3 straight to a native
-    executable via Scala Native — no bytecode, no JIT, no <code class="mono">java</code>
-    anywhere on the machine. The compiler, linker, and LSP server are themselves
-    self-hosted: compiled by dotc from their own patched source, targeting
-    Scala Native directly.
-  </p>
-  <div class="cta">
-    <a class="btn primary" href="#install">Install scalino</a>
-    <a class="btn ghost" href="https://github.com/lolgab/scalino" target="_blank" rel="noopener">View source</a>
-  </div>
-  <div class="installbar">
-    <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/lolgab/scalino/main/install.sh <span class="muted">| bash</span></code>
-    <button class="copybtn" onclick="copyInstall(this)">Copy</button>
-  </div>
-</section>
+<main id="top">
 
-<hr class="divider">
-
-<section id="install" class="wrap">
-  <p class="eyebrow">Install</p>
-  <h2>One line. No JVM to set up first.</h2>
-  <p class="section-sub">Grabs the latest release for your OS/arch, verifies its checksum, and installs
-    <code class="mono">scalino</code> to <code class="mono">~/.local/bin</code>. The only thing it expects
-    already on the machine is <code class="mono">clang</code> — every build links through it, even a
-    zero-dependency Hello World. Packages (deb, rpm, Arch, Nix, Homebrew) install bash/zsh/fish
-    completions for you.</p>
-
-  <div class="tabs" id="install-tabs">
-    <button class="tab active" data-panel="i-curl">curl</button>
-    <button class="tab" data-panel="i-deb">Debian / Ubuntu</button>
-    <button class="tab" data-panel="i-rpm">Fedora / RHEL</button>
-    <button class="tab" data-panel="i-manual">Manual tarball</button>
-  </div>
-  <div class="panelwrap">
-    <div class="panel-head"><span>shell</span><span>scalino install</span></div>
-    <div class="panel active" id="i-curl"><pre><span class="cm"># installs to ~/.local/bin, verified checksum</span>
-curl -fsSL https://raw.githubusercontent.com/lolgab/scalino/main/install.sh | bash</pre></div>
-    <div class="panel" id="i-deb"><pre>curl -fsSLO https://github.com/lolgab/scalino/releases/download/vX.Y.Z/scalino_X.Y.Z_amd64.deb
-sudo apt install ./scalino_X.Y.Z_amd64.deb
-<span class="cm"># clang is wired in as a real package dependency</span></pre></div>
-    <div class="panel" id="i-rpm"><pre>sudo dnf install https://github.com/lolgab/scalino/releases/download/vX.Y.Z/scalino-X.Y.Z-1.x86_64.rpm
-<span class="cm"># installs to /usr/lib/scalino/, symlinked into /usr/bin/</span></pre></div>
-    <div class="panel" id="i-manual"><pre><span class="cm"># each release ships a self-contained dist/ tarball:</span>
-<span class="cm"># compiler + linker + scalino, for linux/macOS (x86_64+arm64)</span>
-./dist/scalino
-<span class="cm"># shell completions: dist/completions/, or `scalino completions &lt;bash|zsh|fish&gt;`</span></pre></div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<section id="action" class="wrap">
-  <p class="eyebrow">Scalino in action</p>
-  <h2>Shaped like scala-cli, on purpose.</h2>
-  <p class="section-sub">Same <code class="mono">//&gt; using</code> directives and flags as scala-cli —
-    <code class="mono">dep</code>, <code class="mono">-w</code>, <code class="mono">-o</code> — so
-    existing muscle memory carries straight over.</p>
-
-  <div class="tabs" id="action-tabs">
-    <button class="tab active" data-panel="a-hello">Run a file</button>
-    <button class="tab" data-panel="a-macro">Real macros</button>
-    <button class="tab" data-panel="a-deps">Dependencies</button>
-    <button class="tab" data-panel="a-watch">Watch mode</button>
-    <button class="tab" data-panel="a-test">Tests</button>
-    <button class="tab" data-panel="a-js">Scala.js</button>
-    <button class="tab" data-panel="a-compile">Build a binary</button>
-    <button class="tab" data-panel="a-cross">Cross-compile</button>
-    <button class="tab" data-panel="a-pkg">Package</button>
-    <button class="tab" data-panel="a-ide">Editor setup</button>
-  </div>
-  <div class="panelwrap">
-    <div class="panel-head"><span>scala</span><span id="action-file">Hello.scala</span></div>
-
-    <div class="panel active" id="a-hello"><pre><span class="kw">object</span> <span class="ty">Hello</span>:
-  <span class="kw">def</span> main(args: <span class="ty">Array</span>[<span class="ty">String</span>]): <span class="ty">Unit</span> = println(<span class="st">"hello from scalino"</span>)</pre>
-      <div class="note">$ scalino   <span class="cm">— run is the default command, no build step to think about</span></div></div>
-
-    <div class="panel" id="a-macro"><pre><span class="kw">import</span> scala.quoted.*
-
-<span class="kw">object</span> <span class="ty">Foo</span> {
-  <span class="kw">inline def</span> myMacro(): <span class="ty">Unit</span> = ${ aMacroImplementation }
-  <span class="kw">def</span> aMacroImplementation(<span class="kw">using</span> <span class="ty">Quotes</span>): <span class="ty">Expr</span>[<span class="ty">Unit</span>] = '{ println(<span class="st">"Hello"</span>) }
-}</pre>
-      <div class="note">$ scalino run <span class="cm">— expanded by scalino's own from-scratch TASTy tree interpreter, not JVM bytecode execution</span></div></div>
-
-    <div class="panel" id="a-deps"><pre><span class="cm">//&gt; using dep com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.40.1</span>
-<span class="cm">//&gt; using compileOnly.dep com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros::2.40.1</span>
-
-<span class="kw">import</span> com.github.plokhotnyuk.jsoniter_scala.macros.*
-<span class="kw">import</span> com.github.plokhotnyuk.jsoniter_scala.core.*
-
-<span class="kw">case class</span> User(name: <span class="ty">String</span>, devices: <span class="ty">Seq</span>[<span class="ty">Int</span>])
-<span class="kw">given</span> codec: <span class="ty">JsonValueCodec</span>[<span class="ty">User</span>] = <span class="ty">JsonCodecMaker</span>.make</pre>
-      <div class="note">Resolution shells out to a bundled, renamed coursier (<code class="mono">scalino-cs</code>) — no separate install, classpaths cached in <code class="mono">.scalino-build/</code>.</div></div>
-
-    <div class="panel" id="a-watch"><pre>scalino run -w</pre>
-      <div class="note">Rebuilds and reruns on save, with scala-cli-style output (same wording, colors and diagnostics). Builds are incremental: only changed sources recompile. Same flags as scala-cli: <code class="mono">--dep</code>, <code class="mono">-S/--scala</code>, <code class="mono">-O/--scalac-option</code>, <code class="mono">--main-class</code>, <code class="mono">-o/--output</code>. Boolean flags like <code class="mono">-w</code> work before the sub-command, and every command has <code class="mono">--help</code>.</div></div>
-
-    <div class="panel" id="a-test"><pre><span class="cm">//&gt; using test.dep org.scalameta::munit::1.0.0</span>
-
-scalino test
-scalino test --test-only <span class="st">"*MySuite*"</span></pre>
-      <div class="note">Finds munit, utest, scalatest and zio-test automatically. <code class="mono">--test-only &lt;glob&gt;</code> links only the selected test classes, so the rest never reach the binary.</div></div>
-
-    <div class="panel" id="a-js"><pre><span class="cm">//&gt; using platform js</span>
-
-<span class="kw">@main def</span> hello() = println(<span class="st">"hello from Scala.js"</span>)</pre>
-      <div class="note">$ scalino   <span class="cm">— or pass <code class="mono">--js</code>. No JVM: <code class="mono">dotc -scalajs</code>, then <code class="mono">scalino-jslink</code>; runs on node, deno or bun. <code class="mono">--js-mode release</code> for the optimizer and minifier, <code class="mono">--js-module-kind esmodule</code> for modules.</span></div></div>
-
-    <div class="panel" id="a-compile"><pre>scalino package -o hello
-./hello</pre>
-      <div class="note">A real, standalone native executable — no JVM, no bytecode, nothing to install on the machine that runs it. Tune it with <code class="mono">--native-mode release-fast</code>, <code class="mono">--native-gc</code>, <code class="mono">--native-lto</code>, or shrink it with <code class="mono">--native-prune</code> (link-time method pruning).</div></div>
-
-    <div class="panel" id="a-cross"><pre>scalino package app/ -o myapp \
-  --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
-<span class="cm"># -&gt; myapp-x86_64-unknown-linux-musl, myapp-aarch64-unknown-linux-musl</span></pre>
-      <div class="note">One command, several platforms, one linker process — the program is parsed once. Missing sysroots are assembled on first use. Musl targets are fully static, so one binary runs on every distro.</div></div>
-
-    <div class="panel" id="a-pkg"><pre>scalino package --format tar,deb,rpm,docker -o packages --pkg-version 1.2.3
-scalino package --format brew --release-url https://github.com/me/app/releases/download/v1.2.3</pre>
-      <div class="note">No fpm or dpkg needed. Metadata comes from <code class="mono">//&gt; using packageName|packageVersion|packageDescription|…</code> directives.</div></div>
-
-    <div class="panel" id="a-ide"><pre>scalino setup-ide</pre>
-      <div class="note">Generates <code class="mono">.scalino-build/scalino-lsp.json</code>, then <code class="mono">scalino-lsp</code> gives your editor diagnostics, completions, hover, go-to-definition, references, and rename — without Metals' JVM dependency. Zed and VS Code offer to run it for you in a project that hasn't been set up.</div></div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<section id="benefits" class="wrap">
-  <p class="eyebrow">Benefits</p>
-  <h2>Why scalino, not scala-cli + a JVM.</h2>
-  <div class="benefits">
-    <div class="benefit"><div class="icon">0</div>
-      <h3>Zero JVM, top to bottom</h3>
-      <p>Compiler, linker, build tool, and LSP all ship as native executables. Nothing you run day to day touches <code class="mono">java</code>.</p></div>
-    <div class="benefit"><div class="icon">⚡</div>
-      <h3>Fast to install, fast to run</h3>
-      <p>One native binary — no JDK to provision, no <code class="mono">setup-java</code> step. Starts instantly, no JIT warmup, which adds up over every CI run.</p></div>
-    <div class="benefit"><div class="icon">⚙</div>
-      <h3>Fast builds</h3>
-      <p>Object files come straight from libLLVM's C API — no <code class="mono">.ll</code> text, no per-file clang. Compilation and linking are both incremental, so a rebuild touches only what changed.</p></div>
-    <div class="benefit"><div class="icon">▫</div>
-      <h3>Lean binaries</h3>
-      <p>4-byte object headers (class id and lock bits in one word) shrink every object and array, on by default. Escape analysis moves short-lived objects to the stack, and <code class="mono">--native-prune</code> drops unreachable methods at link time.</p></div>
-    <div class="benefit"><div class="icon">#</div>
-      <h3>Hermetic builds</h3>
-      <p><code class="mono">scalino lock</code> pins every jar by URL and sha256, and <code class="mono">--offline</code> builds with no network. A Nix flake builds on top of it.</p></div>
-    <div class="benefit"><div class="icon">→</div>
-      <h3>Cross-compile from anywhere</h3>
-      <p>Build for Linux (musl and glibc), macOS and Windows from one machine with <code class="mono">--native-target-triple</code>. Sysroots are assembled client-side from pinned upstream packages.</p></div>
-    <div class="benefit"><div class="icon">JS</div>
-      <h3>Scala.js, also without a JVM</h3>
-      <p><code class="mono">--js</code> builds the same sources for the browser or node with a Scala.js linker compiled to Scala Native. A native server can embed its Scala.js client in one binary.</p></div>
-    <div class="benefit"><div class="icon">▣</div>
-      <h3>Ship it packaged</h3>
-      <p><code class="mono">scalino package --format</code> emits tar, deb, rpm, docker and Homebrew artifacts — no extra packaging tools.</p></div>
-    <div class="benefit"><div class="icon">$</div>
-      <h3>Familiar by design</h3>
-      <p>A mini scala-cli, shaped like the real one on purpose — same directives, same flags, same instinct for finding your entry point.</p></div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<section id="scalajs" class="wrap">
-  <p class="eyebrow">Scala.js</p>
-  <h2>Native server, Scala.js client, one binary.</h2>
-  <p class="section-sub">Scala.js is a second target, with scala-cli's flags and defaults. The linker
-    (<code class="mono">scalino-jslink</code>) is the Scala.js linker compiled to Scala Native, so there is no JVM and
-    no C toolchain, only <code class="mono">node</code> to run the output. <code class="mono">run</code>,
-    <code class="mono">test</code>, <code class="mono">package</code>, <code class="mono">lock</code>, watch mode and
-    <code class="mono">setup-ide</code> all work.</p>
-  <div class="panelwrap">
-    <div class="panel-head"><span>scala</span><span>server/Server.scala</span></div>
-    <div class="panel active"><pre><span class="cm">//&gt; using jsClient ../client</span>   <span class="cm">// a Scala.js project</span>
-<span class="cm">//&gt; using shared ../shared</span>     <span class="cm">// sources compiled into both sides</span>
-
-<span class="cm">// serve the client as the embedded resource /client/main.js</span>
-<span class="kw">val</span> js = getClass.getResourceAsStream(<span class="st">"/client/main.js"</span>)</pre>
-      <div class="note">$ scalino run server   <span class="cm">— builds the client and embeds it in the server binary. linked with fastLinkJS, or fullLinkJS in a <code class="mono">release-*</code> native mode.</span></div></div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<section id="ship" class="wrap">
-  <p class="eyebrow">Cross-compile &amp; package</p>
-  <h2>Build once, ship everywhere.</h2>
-  <p class="section-sub">Pass one or more target triples and scalino links them all in a single linker
-    process. A sysroot holds each target's libc headers and libraries;
-    <code class="mono">scalino sysroot build &lt;triple&gt;</code> assembles one on your machine from upstream
-    packages, each checked against a pinned sha256 — it needs only <code class="mono">curl</code> and
-    <code class="mono">tar</code>, nothing is compiled. <code class="mono">scalino package</code> builds missing ones for you.</p>
-  <div class="panelwrap">
-    <div class="panel-head"><span>shell</span><span>targets</span></div>
-    <div class="panel active"><pre>scalino package app/ -o myapp --format tar,deb \
-  --native-target-triple x86_64-unknown-linux-musl,aarch64-apple-darwin
-
-<span class="cm"># linux musl / gnu (glibc &gt;= 2.31), macOS, Windows (mingw, experimental)</span>
-<span class="cm"># x86_64 and aarch64 — from any host</span></pre>
-      <div class="note"><code class="mono">//&gt; using nativeTargetTriple …</code> works too. <code class="mono">run</code> and <code class="mono">test</code> always build for the host. Cross targets link with <code class="mono">lld</code>, downloaded automatically when it isn't on PATH; the Windows sysroot needs clang 21 or newer.</div>
+<div class="wrap grid hero">
+  <div class="text">
+    <h1 class="rise">Scala 3<br>without a JVM</h1>
+    <p class="rise" style="--i:1">A small scala-cli for Scala Native and Scala.js, where the compiler, the linker and the language server are native executables too.</p>
+    <div class="actions rise" style="--i:2">
+      <a class="btn" href="#install">Install scalino</a>
+      <a href="https://github.com/lolgab/scalino">Source on GitHub</a>
     </div>
   </div>
+  <div class="shot rise" style="--i:3" data-ui>
+<pre class="term" data-play aria-label="Terminal session: scalino compiles and runs Hello.scala"><span class="p">$ </span>cat Hello.scala
+<span class="k">@main def</span> hello() = println(<span class="s">"Hello from native Scala!"</span>)
+
+<span class="p">$ </span>scalino Hello.scala
+Compiling project (Scala 3.10.0, Scala Native 0.5.13-SNAPSHOT)
+Compiled project (Scala 3.10.0, Scala Native 0.5.13-SNAPSHOT)
+<span class="d">[info] Linking (multithreadingEnabled=true) (1843 ms)</span>
+<span class="d">[info] Discovered 962 classes and 5966 methods after classloading</span>
+<span class="d">[info] Checking intermediate code (quick) (11 ms)</span>
+<span class="d">[info] Discovered 936 classes and 4470 methods after optimization</span>
+<span class="d">[info] Optimizing (debug mode) (1058 ms)</span>
+<span class="d">[info] Produced 51 object files (direct codegen)</span>
+<span class="d">[info] Generating intermediate code (2716 ms)</span>
+<span class="d">[info] Compiling to native code (2955 ms)</span>
+<span class="d">[info] Linking with [pthread, dl, m]</span>
+<span class="d">[info] Linking native code (immix gc, none lto) (451 ms)</span>
+<span class="d">[info] Postprocessing (0 ms)</span>
+<span class="d">[info] Total (8682 ms)</span>
+Hello from native Scala!
+<span class="p">$ </span><span class="cursor" aria-hidden="true"></span></pre>
+  </div>
+</div>
+
+<section id="install" class="wrap grid install">
+  <div class="text">
+    <h2 class="rise">Install</h2>
+    <p class="rise" style="--i:1">The installer downloads the latest release for your OS and architecture, checks its sha256 and puts <code>scalino</code> in <code>~/.local/bin</code>.</p>
+    <p class="rise" style="--i:2">Scala Native links through clang, so Linux and macOS need <code>clang</code> on the <code>PATH</code>. The Xcode Command Line Tools have it; elsewhere it is <code>apt install clang</code> or the equivalent. Windows needs nothing: the first build downloads llvm-mingw.</p>
+  </div>
+  <div class="pick rise" style="--i:2">
+    <div class="tabs" role="tablist" aria-label="Ways to install" hidden>
+      <button class="tab" role="tab" id="t-sh" aria-controls="p-sh" aria-selected="true">Linux and macOS</button>
+      <button class="tab" role="tab" id="t-win" aria-controls="p-win" aria-selected="false" tabindex="-1">Windows</button>
+      <button class="tab" role="tab" id="t-brew" aria-controls="p-brew" aria-selected="false" tabindex="-1">Homebrew</button>
+      <button class="tab" role="tab" id="t-deb" aria-controls="p-deb" aria-selected="false" tabindex="-1">deb</button>
+      <button class="tab" role="tab" id="t-rpm" aria-controls="p-rpm" aria-selected="false" tabindex="-1">rpm</button>
+    </div>
+    <div class="panel" role="tabpanel" id="p-sh" aria-labelledby="t-sh">
+      <p>Linux and macOS</p>
+<pre class="term">curl -fsSL https://raw.githubusercontent.com/lolgab/scalino/main/install.sh | bash</pre>
+    </div>
+    <div class="panel" role="tabpanel" id="p-win" aria-labelledby="t-win">
+      <p>Windows, from PowerShell</p>
+<pre class="term">irm https://raw.githubusercontent.com/lolgab/scalino/main/install.ps1 | iex</pre>
+    </div>
+    <div class="panel" role="tabpanel" id="p-brew" aria-labelledby="t-brew">
+      <p>Homebrew</p>
+<pre class="term">brew tap lolgab/tap
+brew install lolgab/tap/scalino</pre>
+    </div>
+    <div class="panel" role="tabpanel" id="p-deb" aria-labelledby="t-deb">
+      <p>Debian and Ubuntu</p>
+<pre class="term">curl -fsSLO https://github.com/lolgab/scalino/releases/download/vX.Y.Z/scalino_X.Y.Z_amd64.deb
+sudo apt install ./scalino_X.Y.Z_amd64.deb</pre>
+    </div>
+    <div class="panel" role="tabpanel" id="p-rpm" aria-labelledby="t-rpm">
+      <p>Fedora, RHEL and openSUSE</p>
+<pre class="term">sudo dnf install https://github.com/lolgab/scalino/releases/download/vX.Y.Z/scalino-X.Y.Z-1.x86_64.rpm</pre>
+    </div>
+    <p class="after">Every <a href="https://github.com/lolgab/scalino/releases">release</a> also has a plain tarball (a zip on Windows) for x86_64 and arm64. There are an AUR PKGBUILD and a Nix flake in <a href="https://github.com/lolgab/scalino/tree/main/packaging">packaging/</a>, not published anywhere yet.</p>
+  </div>
 </section>
 
-<hr class="divider">
+<section class="wrap grid like">
+  <div class="text">
+    <h2 class="rise">A small scala-cli</h2>
+    <p class="rise" style="--i:1">The commands are scala-cli's: <code>run</code>, <code>compile</code>, <code>test</code>, <code>package</code>, <code>setup-ide</code>, <code>clean</code>. So are the <code>//&gt; using</code> directives and the flags, where scalino implements them. <code>-w</code> watches, <code>--dep</code> adds a dependency, and files under <code>test/</code> are test scope.</p>
+    <p class="rise" style="--i:2">What it doesn't give you is a choice of versions. A release is built from one Scala, one Scala Native and one Scala.js, and those are the ones you get (<code>scalino version</code> prints them). There is no JVM target either, so every dependency has to be published for Native or for JS.</p>
+    <p class="rise" style="--i:3">Dependencies still come from Maven Central through <a href="https://get-coursier.io/">coursier</a>, whose <code>cs</code> launcher ships in the box.</p>
+  </div>
+  <div class="shots rise" style="--i:2" data-ui>
+<pre class="term" aria-label="test/FibSuite.scala"><span class="d">// test/FibSuite.scala</span>
+<span class="d">//&gt; using test.dep org.scalameta::munit::1.2.1</span>
 
-<section id="hermetic" class="wrap">
-  <p class="eyebrow">Hermetic builds</p>
-  <h2>Lock it, then build with no network.</h2>
-  <p class="section-sub">Nix builds can't reach the network, so dependencies need a lockfile that something
-    else fetches first. <code class="mono">scalino lock</code> writes one;
-    <code class="mono">--offline</code> (or <code class="mono">SCALINO_OFFLINE=1</code>) builds from it and the local cache only.</p>
-  <div class="panelwrap">
-    <div class="panel-head"><span>shell / nix</span><span>scalino.lock.json</span></div>
-    <div class="panel active"><pre>scalino lock           <span class="cm"># per jar: path + URL + sha256</span>
-scalino run --offline  <span class="cm"># lock + local cache only</span>
+<span class="k">class</span> FibSuite <span class="k">extends</span> munit.FunSuite:
+  test(<span class="s">"fib(10) is 55"</span>):
+    assertEquals(fib(10), BigInt(55))
+  test(<span class="s">"fib(0) is 0"</span>):
+    assertEquals(fib(0), BigInt(0))</pre>
+<pre class="term" data-play aria-label="Terminal session: scalino test"><span class="p">$ </span>scalino test .
+Compiling project (Scala 3.10.0, Scala Native 0.5.13-SNAPSHOT)
+Compiled project (Scala 3.10.0, Scala Native 0.5.13-SNAPSHOT)
+<span class="d">...</span>
+FibSuite:
+  <span class="ok">+</span> fib(10) is 55 <span class="d">0.000s</span>
+  <span class="ok">+</span> fib(0) is 0 <span class="d">0.000s</span>
+scalino: 2 passed, 0 failed, 0 errored, 0 skipped</pre>
+  </div>
+</section>
 
-<span class="cm"># flake.nix</span>
+<section id="how" class="pipeline" aria-label="How a build works">
+  <div class="field">
+    <h2>One build, start to finish</h2>
+    <div class="card rise" data-ui>
+      <b><code>scalino-dotc</code></b>
+      <table>
+        <tr><td><code>Hello.scala</code></td><td>62 B</td></tr>
+        <tr class="new"><td><code>hello.tasty</code></td><td>425 B</td></tr>
+        <tr class="new"><td><code>Hello$package.tasty</code></td><td>521 B</td></tr>
+        <tr class="new"><td><code>hello.nir</code></td><td>664 B</td></tr>
+        <tr class="new"><td><code>Hello$package.nir</code></td><td>222 B</td></tr>
+        <tr class="new"><td><code>Hello$package$.nir</code></td><td>568 B</td></tr>
+      </table>
+    </div>
+    <p class="clause">First dotc, with Scala Native's plugin, compiles the source to NIR.</p>
+  </div>
+  <div class="field">
+    <div class="spacer"></div>
+    <div class="card rise" data-ui>
+      <b><code>scalino-linkdriver</code></b>
+      <table>
+        <tr><td>loaded</td><td>962 classes</td></tr>
+        <tr><td></td><td>5966 methods</td></tr>
+        <tr class="new"><td>kept</td><td>936 classes</td></tr>
+        <tr class="new"><td></td><td>4470 methods</td></tr>
+        <tr><td>link</td><td>1843 ms</td></tr>
+        <tr><td>optimize</td><td>1058 ms</td></tr>
+      </table>
+    </div>
+    <p class="clause">Then the linker keeps what the entry point can reach and optimizes it.</p>
+  </div>
+  <div class="field">
+    <div class="spacer"></div>
+    <div class="card rise" data-ui>
+      <b><code>scalino-linkdriver</code></b>
+      <table>
+        <tr><td>NIR</td><td>4470 methods</td></tr>
+        <tr class="new"><td>object files</td><td>51</td></tr>
+        <tr><td>generate</td><td>2716 ms</td></tr>
+        <tr><td>compile</td><td>2955 ms</td></tr>
+      </table>
+    </div>
+    <p class="clause">Then it calls libLLVM directly and writes object files. No <code>.ll</code> text on the way.</p>
+  </div>
+  <div class="field">
+    <div class="spacer"></div>
+    <div class="card rise" data-ui>
+      <b><code>clang</code></b>
+      <table>
+        <tr><td>object files</td><td>51</td></tr>
+        <tr class="new"><td><code>hello</code></td><td>3.4 MB</td></tr>
+        <tr><td>format</td><td>Mach-O arm64</td></tr>
+        <tr><td>links against</td><td>libSystem</td></tr>
+        <tr><td>link</td><td>451 ms</td></tr>
+      </table>
+    </div>
+    <p class="clause">Last, clang links them. The result is one executable and nothing else.</p>
+  </div>
+</section>
+
+<section class="wrap cells">
+  <h2 class="rise">Also in the box</h2>
+  <div class="cellgrid">
+
+    <article class="cell rise">
+      <div class="t">
+        <h3>Macros run in an interpreter</h3>
+        <p>dotc expands a macro by loading its bytecode into the compiler's own JVM. Here there is no JVM to load it into, so scalino interprets the macro's TASTy trees. Inline and quoted macros work, derivation such as jsoniter-scala's <code>JsonCodecMaker.make</code> included.</p>
+      </div>
+      <div class="f" data-ui>
+<pre class="term"><span class="d">//&gt; using dep com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.40.1</span>
+<span class="d">//&gt; using compileOnly.dep com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros::2.40.1</span>
+
+<span class="k">case class</span> Device(id: Int, model: String)
+<span class="k">case class</span> User(name: String, devices: Seq[Device])
+
+<span class="k">given</span> userCodec: JsonValueCodec[User] =
+  JsonCodecMaker.make</pre>
+      </div>
+    </article>
+
+    <article class="cell flip rise" style="--i:1">
+      <div class="t">
+        <h3>The compiler stays warm</h3>
+        <p>A background <code>scalino-dotc</code> keeps the compiler and your dependencies loaded between builds, and unchanged sources are reused. It exits after 15 idle minutes. These are Hello World on an M2&nbsp;Pro: first build, after an edit, nothing changed.</p>
+      </div>
+      <div class="f" data-ui>
+<pre class="term wrapok" data-play><span class="p">$ </span>time scalino Hello.scala
+<span class="d">...</span>
+17.90s user 2.88s system 197% cpu <span class="ok">10.536 total</span>
+<span class="d"># edit Hello.scala</span>
+<span class="p">$ </span>time scalino Hello.scala
+<span class="d">...</span>
+7.96s user 0.49s system 221% cpu <span class="ok">3.824 total</span>
+<span class="p">$ </span>time scalino Hello.scala
+<span class="d">[info] Build skipped: No changes detected</span>
+0.03s user 0.02s system 9% cpu <span class="ok">0.507 total</span></pre>
+      </div>
+    </article>
+
+    <article class="cell rise" style="--i:2">
+      <div class="t">
+        <h3>Scala.js, also without a JVM</h3>
+        <p><code>--js</code> or <code>//&gt; using platform js</code> builds the same sources for Scala.js. The linker is the Scala.js linker compiled with Scala Native, so all you need besides scalino is <code>node</code> to run the output. A native server can embed its Scala.js client with <code>//&gt; using jsClient</code>.</p>
+      </div>
+      <div class="f" data-ui>
+<pre class="term" data-play><span class="p">$ </span>scalino run --js Hello.scala
+Compiling project (Scala 3.10.0, Scala.js 1.22.0)
+Compiled project (Scala 3.10.0, Scala.js 1.22.0)
+Linking project (Scala.js 1.22.0, dev)
+Hello from Scala.js!
+<span class="p">$ </span>scalino package Hello.scala --js --js-mode release -o hello.js
+Linking project (Scala.js 1.22.0, release)
+Wrote ~/demo/hello.js, run it with
+  node ./hello.js</pre>
+      </div>
+    </article>
+
+    <article class="cell flip rise">
+      <div class="t">
+        <h3>A language server, native as well</h3>
+        <p><code>scalino-lsp</code> sits on dotty's presentation compiler, the one Metals uses for Scala 3. Completion, hover, go to definition, references, rename, inlay hints, semantic tokens and code actions, with clients for <a href="https://github.com/lolgab/scalino/tree/main/zed-extension">Zed</a>, <a href="https://github.com/lolgab/scalino/tree/main/vscode-extension">VS Code</a> and <a href="https://github.com/lolgab/scalino/tree/main/neovim-extension">Neovim</a>.</p>
+      </div>
+      <div class="f" data-ui>
+<pre class="term" data-play><span class="p">$ </span>scalino setup-ide .
+Wrote configuration file for ide in: ~/demo/.scalino-build/scalino-lsp.json
+<span class="p">$ </span>head -5 .scalino-build/scalino-lsp.json
+[
+  {
+    <span class="s">"id"</span>: <span class="s">"main"</span>,
+    <span class="s">"platform"</span>: <span class="s">"native"</span>,
+    <span class="s">"dependsOn"</span>: [],</pre>
+      </div>
+    </article>
+
+    <article class="cell rise" style="--i:1">
+      <div class="t">
+        <h3>Packages without fpm</h3>
+        <p><code>package --format</code> wraps the binary as a tarball, a <code>.deb</code>, an <code>.rpm</code>, a Docker image or a Homebrew formula. The name, version and maintainer come from <code>//&gt; using package…</code> directives.</p>
+      </div>
+      <div class="f" data-ui>
+<pre class="term" data-play><span class="p">$ </span>scalino package Hello.scala --format tar,deb -o packages \
+    --pkg-version 1.2.3 \
+    --native-target-triple x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+<span class="d">...</span>
+Wrote ~/demo/packages/hello-1.2.3-x86_64-unknown-linux-gnu.tar.gz
+Wrote ~/demo/packages/hello_1.2.3_amd64.deb
+Wrote ~/demo/packages/hello-1.2.3-aarch64-unknown-linux-gnu.tar.gz
+Wrote ~/demo/packages/hello_1.2.3_arm64.deb</pre>
+      </div>
+    </article>
+
+    <article class="cell flip rise" style="--i:2">
+      <div class="t">
+        <h3>Builds that stay offline</h3>
+        <p><code>scalino lock</code> writes every jar's URL and sha256 to <code>scalino.lock.json</code>, and <code>--offline</code> builds from that and the local cache. The Nix flake fetches the locked jars itself, so a scalino program is an ordinary derivation.</p>
+      </div>
+      <div class="f" data-ui>
+<pre class="term"><span class="d"># flake.nix</span>
 scalino.lib.${system}.mkScalinoApp {
-  pname = <span class="st">"myapp"</span>;
-  src = ./.;   <span class="cm"># contains scalino.lock.json</span>
+  pname = <span class="s">"myapp"</span>;
+  src = ./.;  <span class="d"># has scalino.lock.json</span>
+  nativeTargetTriples = [
+    <span class="s">"x86_64-unknown-linux-musl"</span>
+    <span class="s">"aarch64-unknown-linux-musl"</span>
+  ];
 }</pre>
-      <div class="note">Every locked jar is fetched with <code class="mono">pkgs.fetchurl</code>. <code class="mono">mkScalinoDevShell</code> gives an offline <code class="mono">nix develop</code> shell where <code class="mono">scalino-lsp</code> and go-to-definition into libraries work too. Linux and macOS, x86_64 and aarch64.</div>
-    </div>
+      </div>
+    </article>
+
   </div>
 </section>
 
-<hr class="divider">
-
-<section id="editors" class="wrap">
-  <p class="eyebrow">Editor support</p>
-  <h2>Metals-inspired tooling, without Metals' JVM.</h2>
-  <p class="section-sub"><code class="mono">scalino-lsp</code> is built on dotc's presentation compiler and self-hosted
-    the same way as the compiler. It covers diagnostics, completion, hover, go-to-definition (into
-    dependency sources read straight from their jars, and into Scala Native's own sources),
-    type definition, references, rename, selection ranges, inlay hints, semantic tokens and code actions.
-    It shuts down when idle, keeps its memory footprint low (evacuating GC, heap that shrinks back to the OS),
-    lets you toggle inlay hint kinds from editor settings, and Neovim clients reattach on restart.</p>
-  <div class="editors">
-    <div class="editor"><div class="glyph">Z</div><h4>Zed</h4><p>Published to Zed's extension gallery as "Scalino"</p></div>
-    <div class="editor"><div class="glyph">▤</div><h4>VS Code</h4><p>Packaged in <code class="mono">vscode-extension/</code>, not yet on the Marketplace</p></div>
-    <div class="editor"><div class="glyph">⌘</div><h4>Neovim</h4><p><code class="mono">vim.lsp</code> client config, no plugin manager needed</p></div>
+<section class="wrap grid cross">
+  <div class="text">
+    <h2 class="rise">Cross-compile from one machine</h2>
+    <p class="rise" style="--i:1"><code>--native-target-triple</code> takes a list. Every target is linked in the same process, so the program is read once.</p>
+    <p class="rise" style="--i:2">The first time you name a target, scalino assembles its sysroot from upstream packages pinned by sha256. That takes <code>curl</code> and <code>tar</code>, and nothing is compiled. Cross links go through <code>ld.lld</code>, which scalino downloads if you don't have one.</p>
+    <p class="rise" style="--i:3">The musl binaries are fully static, so one file runs on every distro. Tick some targets and see what you would run.</p>
+  </div>
+  <div class="live rise" style="--i:2">
+    <fieldset>
+      <legend>Targets</legend>
+      <div class="targets" id="targets">
+        <label><input type="checkbox" value="x86_64-unknown-linux-musl" checked> <code>x86_64-unknown-linux-musl</code></label>
+        <label><input type="checkbox" value="aarch64-unknown-linux-musl" checked> <code>aarch64-unknown-linux-musl</code></label>
+        <label><input type="checkbox" value="x86_64-unknown-linux-gnu"> <code>x86_64-unknown-linux-gnu</code></label>
+        <label><input type="checkbox" value="aarch64-unknown-linux-gnu"> <code>aarch64-unknown-linux-gnu</code></label>
+        <label><input type="checkbox" value="x86_64-apple-darwin"> <code>x86_64-apple-darwin</code></label>
+        <label><input type="checkbox" value="aarch64-apple-darwin"> <code>aarch64-apple-darwin</code></label>
+        <label><input type="checkbox" value="x86_64-pc-windows-gnu"> <code>x86_64-pc-windows-gnu</code></label>
+        <label><input type="checkbox" value="aarch64-pc-windows-gnu"> <code>aarch64-pc-windows-gnu</code></label>
+      </div>
+    </fieldset>
+<pre class="term" id="cross-out" aria-live="polite" data-ui><span class="p">$ </span>scalino package Hello.scala -o hello \
+    --native-target-triple x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+Wrote hello-x86_64-unknown-linux-musl
+Wrote hello-aarch64-unknown-linux-musl</pre>
+<pre class="term" data-play data-ui aria-label="Terminal session: the binaries a Mac produced"><span class="p">$ </span>file hello-*-musl hello-*.exe
+hello-aarch64-unknown-linux-musl: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
+hello-x86_64-unknown-linux-musl:  ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, with debug_info, not stripped
+hello-x86_64-pc-windows-gnu.exe:  PE32+ executable (console) x86-64, for MS Windows</pre>
+    <ul class="from" id="cross-from">
+      <li><b>musl</b> sysroot: Debian's <code>musl-dev</code> and compiler-rt</li>
+    </ul>
   </div>
 </section>
 
-<hr class="divider">
-
-<section id="status" class="wrap">
-  <p class="eyebrow">Status</p>
-  <h2>Today vs. next.</h2>
-  <div class="status-grid">
-    <div class="statuscard">
-      <h3><span class="pill ok">Working</span> Compiler, linker, build tool</h3>
-      <ul>
-        <li>Scala 3 → NIR → native executable, end to end</li>
-        <li>Real inline/quote macros via the custom tree interpreter</li>
-        <li><code class="mono">scalino-lsp</code>: diagnostics, completion, hover, go-to-definition, type definition, references, rename, inlay hints, semantic tokens, code actions</li>
-        <li>Direct LLVM codegen, incremental compile and link, 4-byte object headers, all on by default</li>
-        <li><code class="mono">run</code>, <code class="mono">test</code>, <code class="mono">package</code>, <code class="mono">lock</code>, <code class="mono">--offline</code>, shell completions</li>
-        <li>Scala.js target (<code class="mono">--js</code>) with <code class="mono">run</code>, <code class="mono">test</code>, <code class="mono">package</code>, watch mode, and <code class="mono">jsClient</code> embedding in a native server</li>
-        <li>Cross-compilation to Linux, macOS and Windows targets; <code class="mono">package --format</code> for tar, deb, rpm, docker, brew</li>
-        <li>Escape analysis with stack-allocated objects, link-time method pruning, and an evacuating GC that returns memory to the OS</li>
-        <li>Watch mode that survives renames, deletes and failed links; stale outputs purged on incremental rebuilds</li>
-        <li>Self-hosted since 2026-09-07 — zero JVM anywhere in the shipped binaries</li>
-      </ul>
-    </div>
-    <div class="statuscard">
-      <h3><span class="pill next">Next</span> Gaps still open</h3>
-      <ul>
-        <li>VS Code Marketplace listing</li>
-        <li><code class="mono">package --format</code> for Scala.js builds</li>
-        <li>Windows is experimental (host builds and the mingw cross target)</li>
-        <li>JUnit-style <code class="mono">@Test</code> discovery — frameworks must use <code class="mono">SubclassFingerprint</code> (munit, utest, scalatest, zio-test do)</li>
-        <li>Broader third-party library coverage cross-published for scala-native</li>
-      </ul>
-    </div>
+<section id="status" class="wrap grid status">
+  <h2>Status</h2>
+  <div class="col">
+    <p>Works today</p>
+    <ul class="rows">
+      <li><span>Scala 3 to a native executable, macros included</span><span>Linux, macOS, Windows</span></li>
+      <li><span>Test frameworks</span><span>munit, utest, scalatest, zio-test</span></li>
+      <li><span>Watch mode and incremental builds</span><span><code>-w</code></span></li>
+      <li><span>Scala.js: run, test, package, watch</span><span>node, deno, bun</span></li>
+      <li><span>Cross-compilation</span><span>8 targets</span></li>
+      <li><span>Packaging</span><span>tar, deb, rpm, docker, brew</span></li>
+      <li><span>Language server</span><span>Zed, VS Code, Neovim</span></li>
+      <li><span>Lockfile, offline builds, Nix flake</span><span><code>scalino lock</code></span></li>
+    </ul>
+  </div>
+  <div class="col">
+    <p>Not there</p>
+    <ul class="rows">
+      <li><span>JUnit-style <code>@Test</code> discovery</span><span>frameworks need <code>SubclassFingerprint</code></span></li>
+      <li><span><code>package --format</code> for Scala.js builds</span><span>Native only</span></li>
+      <li><span>VS Code Marketplace listing</span><span>install the <code>.vsix</code> yourself</span></li>
+      <li><span>AUR and nixpkgs packages</span><span>recipes exist, unpublished</span></li>
+      <li><span>A JVM target</span><span>never, by design</span></li>
+      <li><span>Choosing the Scala version per project</span><span>one per release</span></li>
+    </ul>
   </div>
 </section>
 
-<footer>
-  <div class="wrap">
-    <div class="footgrid">
-      <div class="footcol">
-        <h5>Project</h5>
-        <a href="https://github.com/lolgab/scalino" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/lolgab/scalino/releases" target="_blank" rel="noopener">Releases</a>
-        <a href="https://github.com/lolgab/scalino/blob/main/docs/findings.md" target="_blank" rel="noopener">Self-hosting findings</a>
-        <a href="https://github.com/lolgab/scalino/tree/main/tools/heap-viewer" target="_blank" rel="noopener">GC heap viewer</a>
-        <a href="https://github.com/lolgab/scalino/blob/main/LICENSE" target="_blank" rel="noopener">License (Apache 2.0)</a>
-      </div>
-      <div class="footcol">
-        <h5>Editors</h5>
-        <a href="https://github.com/lolgab/scalino/tree/main/zed-extension" target="_blank" rel="noopener">Zed extension</a>
-        <a href="https://github.com/lolgab/scalino/tree/main/vscode-extension" target="_blank" rel="noopener">VS Code extension</a>
-        <a href="https://github.com/lolgab/scalino/tree/main/neovim-extension" target="_blank" rel="noopener">Neovim config</a>
-      </div>
-      <div class="footcol">
-        <h5>Packaging</h5>
-        <a href="https://github.com/lolgab/scalino/blob/main/packaging/arch/PKGBUILD" target="_blank" rel="noopener">Arch (AUR)</a>
-        <a href="https://github.com/lolgab/scalino/blob/main/packaging/nix/flake.nix" target="_blank" rel="noopener">Nix flake</a>
-        <a href="https://github.com/lolgab/scalino/blob/main/packaging/homebrew/scalino.rb" target="_blank" rel="noopener">Homebrew formula</a>
-        <a href="https://github.com/lolgab/scalino/blob/main/NOTICE" target="_blank" rel="noopener">NOTICE</a>
-      </div>
-      <div class="footcol">
-        <h5>Builds on</h5>
-        <a href="https://github.com/scala/scala3" target="_blank" rel="noopener">Scala 3 (dotc)</a>
-        <a href="https://github.com/scala-native/scala-native" target="_blank" rel="noopener">Scala Native</a>
-        <a href="https://scala-cli.virtuslab.org/" target="_blank" rel="noopener">scala-cli (UX model)</a>
-      </div>
-    </div>
-    <div class="footbottom">
-      <span>scalino — Apache License 2.0</span>
-      <span>Compiler, linker &amp; LSP self-hosted on Scala Native. No JVM required.</span>
-    </div>
-  </div>
+</main>
+
+<footer class="wrap">
+  <span>scalino, Apache License 2.0</span>
+  <nav aria-label="Project links">
+    <a href="https://github.com/lolgab/scalino">GitHub</a>
+    <a href="https://github.com/lolgab/scalino/releases">Releases</a>
+    <a href="https://github.com/lolgab/scalino/blob/main/README.md">README</a>
+    <a href="https://github.com/lolgab/scalino/blob/main/NOTICE">Notice</a>
+  </nav>
+  <span>Maintained by <a href="https://github.com/lolgab">lolgab</a></span>
 </footer>
 
 <script>
-  function wireTabs(groupId, panelSelector){
-    var group = document.getElementById(groupId);
-    if(!group) return;
-    group.querySelectorAll('.tab').forEach(function(btn){
-      btn.addEventListener('click', function(){
-        group.querySelectorAll('.tab').forEach(function(b){ b.classList.remove('active'); });
-        btn.classList.add('active');
-        var wrap = group.nextElementSibling;
-        wrap.querySelectorAll('.panel').forEach(function(p){ p.classList.remove('active'); });
-        var target = wrap.querySelector('#' + btn.dataset.panel);
-        if(target) target.classList.add('active');
-        var head = wrap.querySelector('#action-file');
-        if(head) head.textContent = btn.textContent.trim();
+(function(){
+  var reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Install tabs: pick the visitor's platform, keep every panel readable without script.
+  var tablist = document.querySelector('.tabs');
+  if (tablist){
+    tablist.hidden = false;
+    var tabs = [].slice.call(tablist.querySelectorAll('.tab'));
+    var select = function(tab, focus){
+      tabs.forEach(function(t){
+        var on = t === tab;
+        t.setAttribute('aria-selected', on);
+        t.tabIndex = on ? 0 : -1;
+        document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+      });
+      if (focus) tab.focus();
+    };
+    tabs.forEach(function(t, i){
+      t.addEventListener('click', function(){ select(t); });
+      t.addEventListener('keydown', function(e){
+        if (e.key === 'ArrowRight') select(tabs[(i + 1) % tabs.length], true);
+        if (e.key === 'ArrowLeft') select(tabs[(i + tabs.length - 1) % tabs.length], true);
       });
     });
+    select(/Win/i.test(navigator.platform || navigator.userAgent) ? tabs[1] : tabs[0]);
   }
-  wireTabs('install-tabs');
-  wireTabs('action-tabs');
 
-  function copyInstall(btn){
-    var text = 'curl -fsSL https://raw.githubusercontent.com/lolgab/scalino/main/install.sh | bash';
-    navigator.clipboard.writeText(text).then(function(){
-      var old = btn.textContent;
-      btn.textContent = 'Copied';
-      setTimeout(function(){ btn.textContent = old; }, 1500);
+  // Cross-compilation: build the command for the ticked targets.
+  var from = {
+    musl: "<b>musl</b> sysroot: Debian's <code>musl-dev</code> and compiler-rt",
+    gnu: "<b>glibc</b> sysroot: Debian 11's glibc 2.31 and kernel headers, so the binary runs wherever glibc is 2.31 or newer",
+    darwin: "<b>macOS</b> sysroot: the Darwin libc headers from Zig's source tarball, with generated <code>libSystem</code> stubs. No Apple frameworks",
+    windows: "<b>Windows</b> sysroot: mingw-w64 and libc++ from llvm-mingw. Needs clang 21 or newer"
+  };
+  var box = document.getElementById('targets'), out = document.getElementById('cross-out'), list = document.getElementById('cross-from');
+  var render = function(){
+    var picked = [].slice.call(box.querySelectorAll('input:checked')).map(function(i){ return i.value; });
+    var p = '<span class="p">$ </span>';
+    if (!picked.length){
+      out.innerHTML = p + 'scalino package Hello.scala -o hello\nWrote hello';
+      list.innerHTML = '<li>No target named: a plain build for this machine, with its own toolchain and libraries</li>';
+      return;
+    }
+    out.innerHTML = p + 'scalino package Hello.scala -o hello \\\n    --native-target-triple ' + picked.join(',') + '\n' +
+      picked.map(function(t){ return 'Wrote hello-' + t + (/windows/.test(t) ? '.exe' : ''); }).join('\n');
+    var kinds = [];
+    picked.forEach(function(t){
+      var k = /musl/.test(t) ? 'musl' : /gnu$/.test(t) && /linux/.test(t) ? 'gnu' : /darwin/.test(t) ? 'darwin' : 'windows';
+      if (kinds.indexOf(k) < 0) kinds.push(k);
     });
+    list.innerHTML = kinds.map(function(k){ return '<li>' + from[k] + '</li>'; }).join('');
+  };
+  if (box){ box.addEventListener('change', render); render(); }
+
+  // Motion. Terminal sessions print line by line, sections arrive in reading order.
+  if (reduce){
+    document.documentElement.classList.remove('js');
+    if (tablist) document.documentElement.classList.add('js');
+    return;
   }
+  document.querySelectorAll('.term[data-play]').forEach(function(pre){
+    pre.innerHTML = pre.innerHTML.split('\n').map(function(line){ return '<span class="l">' + line + '</span>'; }).join('');
+  });
+  var play = function(pre){
+    var slow = !!pre.closest('.hero'), t = 120;
+    [].slice.call(pre.querySelectorAll('.l')).forEach(function(l){
+      var isCmd = l.firstElementChild && l.firstElementChild.className === 'p';
+      if (isCmd) t += slow ? 320 : 140;
+      setTimeout(function(){ l.classList.add('on'); }, t);
+      t += isCmd ? (slow ? 380 : 180) : (slow ? 60 : 32);
+    });
+  };
+  // Anything at or above the reveal line is shown, so a jump down the page never leaves a hole.
+  var pending = [].slice.call(document.querySelectorAll('.rise, .term[data-play]'));
+  var check = function(){
+    var line = innerHeight * 0.94;
+    pending = pending.filter(function(el){
+      if (el.getBoundingClientRect().top > line) return true;
+      if (el.matches('.term[data-play]')) play(el); else el.classList.add('in');
+      return false;
+    });
+  };
+  addEventListener('scroll', check, { passive: true });
+  addEventListener('resize', check);
+  addEventListener('load', check);
+  if ('IntersectionObserver' in window){
+    var io = new IntersectionObserver(check);
+    pending.forEach(function(el){ io.observe(el); });
+  }
+  check();
+})();
 </script>
 </body>
 </html>
