@@ -1,0 +1,104 @@
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
+--- a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
+@@ -403,12 +403,43 @@
+     if (nonnull) {
+       str("nonnull ")
+     }
+-    str(deref)
+-    str("(")
+-    str(size)
+-    str(") ")
++    if (size > 0) {
++      str(deref)
++      str("(")
++      str(size)
++      str(") ")
++    }
+   }
+ 
++  /** Box classes whose instances may be tagged immediates rather than heap
++   *  objects (see `nir.Type.Smi` / `nir.Type.PtrTag`), 64-bit targets only.
++   */
++  private lazy val taggedBoxInfos: Seq[linker.Class] =
++    if (platform.is32Bit) Nil
++    else
++      (nir.Type.Smi.eligibleBoxTypes ++ nir.Type.PtrTag.discriminantOfBox.keySet).toSeq
++        .collect { case nir.Type.Ref(name, _, _) => meta.analysis.infos.get(name) }
++        .collect { case Some(cls: linker.Class) => cls }
++
++  private val mayHoldTaggedCache = mutable.Map.empty[nir.Global.Top, Boolean]
++
++  /** Can a value of static type `refty` be a tagged immediate? True for the
++   *  tagged box classes and all their supertypes (`Object`, `Number`,
++   *  `Comparable`, ...). Such a value is never zero, but it is not a
++   *  pointer, so it must not be declared `dereferenceable`: LLVM would be
++   *  free to speculate a load from it ahead of the tag check (seen as a
++   *  `ldrb [x0, #4]` hoisted above the SMI branch of an unboxed
++   *  `java.lang.Boolean` return, faulting on 0x8000000000000005).
++   */
++  private def mayHoldTaggedImmediate(refty: nir.Type.RefKind): Boolean =
++    taggedBoxInfos.nonEmpty && mayHoldTaggedCache.getOrElseUpdate(
++      refty.className,
++      meta.analysis.infos.get(refty.className) match {
++        case Some(info: linker.ScopeInfo) => taggedBoxInfos.exists(_.is(info))
++        case _                            => false
++      }
++    )
++
+   private[codegen] def toDereferenceable(
+       refty: nir.Type.RefKind
+   ): (Boolean, String, Long) = {
+@@ -421,10 +452,12 @@
+         unreachable
+     }
+ 
++    // size 0: emit no dereferenceable attribute/metadata at all
++    val derefSize = if (mayHoldTaggedImmediate(refty)) 0L else size
+     if (!refty.isNullable) {
+-      (true, "dereferenceable", size)
++      (true, "dereferenceable", derefSize)
+     } else {
+-      (false, "dereferenceable_or_null", size)
++      (false, "dereferenceable_or_null", derefSize)
+     }
+   }
+ 
+@@ -924,11 +957,13 @@
+               if (nonnull) {
+                 str(", !nonnull !{}")
+               }
+-              str(", !")
+-              str(deref)
+-              str(" !{i64 ")
+-              str(size)
+-              str("}")
++              if (size > 0) {
++                str(", !")
++                str(deref)
++                str(" !{i64 ")
++                str(size)
++                str("}")
++              }
+             case _ =>
+               ()
+           }
+@@ -1225,11 +1260,13 @@
+         if (nonnull) {
+           str(" nonnull")
+         }
+-        str(" ")
+-        str(deref)
+-        str("(")
+-        str(size)
+-        str(")")
++        if (size > 0) {
++          str(" ")
++          str(deref)
++          str("(")
++          str(size)
++          str(")")
++        }
+         str(" ")
+         genJustVal(v)
+       case _ =>
