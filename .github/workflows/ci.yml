@@ -402,6 +402,13 @@ jobs:
         shell: bash
         run: ./tests/publish/run.sh dist/scalino
 
+      - name: Smoke test -- toolkits
+        if: matrix.test == 'js'
+        # `//> using toolkit default` and `typelevel:default`: run, munit from toolkit-test, test.toolkit.
+        # See tests/toolkit/run.sh.
+        shell: bash
+        run: ./tests/toolkit/run.sh dist/scalino
+
       - name: Smoke test -- stack-allocated objects (escape analysis)
         if: matrix.test == 'escape'
         # Every release mode stack-allocates objects the escape analysis

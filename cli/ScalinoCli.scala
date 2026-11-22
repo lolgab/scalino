@@ -538,9 +538,9 @@ object ScalinoCli:
   private def usingRe(key: String) = s"""//>\\s*using\\s+${java.util.regex.Pattern.quote(key)}\\b(.*)$$""".r
 
   /** Every `//> using <key>` understood by parseDirectives below (keep in sync by hand), so
-   *  unrecognized keys (e.g. `platform`, `jvm`, `toolkit`, `publish.*`) can be flagged. */
+   *  unrecognized keys (e.g. `jvm`, `nativeVersion`) can be flagged. */
   private val recognizedDirectiveKeys = Set(
-    "dep", "deps", "dependency", "dependencies",
+    "dep", "deps", "dependency", "dependencies", "toolkit", "test.toolkit",
     "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies",
     "test.dep", "test.deps", "test.dependency", "test.dependencies",
     "scala", "mainClass", "options", "option", "scalacOption", "scalacOptions",
@@ -594,6 +594,31 @@ object ScalinoCli:
       case Some("false") => Some(false)
       case Some(_) | None => Some(true)
     }
+
+  /** Versions `//> using toolkit default` / `typelevel:default` stand for. Pinned (like scala-cli's
+   *  own defaults) so a build doesn't change under you; `latest` asks Maven Central instead. */
+  val ScalaToolkitDefaultVersion = "0.9.2"
+  val TypelevelToolkitDefaultVersion = "0.2.0"
+
+  /** `//> using toolkit <spec>`, scala-cli's syntax: `[org:]version`, where `version` is a version,
+   *  `default` or `latest`, and `org` is `typelevel` (org.typelevel), any other organization that
+   *  publishes a `toolkit`/`toolkit-test` pair, or absent (the Scala Toolkit, org.scala-lang).
+   *  Returns the main dependency and the test one (`toolkit-test`, which also brings munit). */
+  def toolkitDeps(spec: String): (String, String) =
+    val i = spec.lastIndexOf(':')
+    val (flavor, rawVersion) = if i < 0 then (None, spec) else (Some(spec.substring(0, i)), spec.substring(i + 1))
+    val (org, defaultVersion) = flavor match
+      case None | Some("scala") | Some("org.scala-lang") => ("org.scala-lang", ScalaToolkitDefaultVersion)
+      case Some("typelevel") | Some("org.typelevel") => ("org.typelevel", TypelevelToolkitDefaultVersion)
+      case Some(other) =>
+        val org = other.stripSuffix(":")
+        if org.isEmpty || org.contains(':') then fail(s"invalid toolkit '$spec': expected [organization:]version, e.g. `default` or `typelevel:default`")
+        (org, "latest.release")
+    val version = rawVersion match
+      case "" | "default" => defaultVersion
+      case "latest" => "latest.release"
+      case v => v
+    (s"$org::toolkit::$version", s"$org::toolkit-test::$version")
 
   def parseDirectives(sources: List[Path]): Directives =
     var deps = List.empty[String]
@@ -672,6 +697,12 @@ object ScalinoCli:
         directiveValues(line, "dep", "deps", "dependency", "dependencies").foreach(vs => deps = deps ++ vs)
         directiveValues(line, "compileOnly.dep", "compileOnly.deps", "compileOnly.dependency", "compileOnly.dependencies").foreach(vs => compileOnlyDeps = compileOnlyDeps ++ vs)
         directiveValues(line, "test.dep", "test.deps", "test.dependency", "test.dependencies").foreach(vs => testDeps = testDeps ++ vs)
+        directiveValues(line, "toolkit").foreach(_.foreach { v =>
+          val (main, test) = toolkitDeps(v)
+          deps = deps :+ main
+          testDeps = testDeps :+ test
+        })
+        directiveValues(line, "test.toolkit").foreach(_.foreach(v => testDeps = testDeps :+ toolkitDeps(v)._2))
         directiveValues(line, "scala").foreach(_.headOption.foreach(v => scalaVersion = Some(v)))
         // several (`//> using mainClass A B`): `scalino package` links one binary each
         directiveValues(line, "mainClass").foreach(vs => if vs.nonEmpty then mainClass = Some(vs.mkString(",")))
@@ -3344,6 +3375,9 @@ object ScalinoCli:
        |  //> using dep org::name::version
        |  //> using compileOnly.dep org::name::version
        |  //> using test.dep org::name::version    (test scope; e.g. munit, utest, scalatest, zio-test-sbt)
+       |  //> using toolkit default               (Scala Toolkit: os-lib, upickle, sttp; munit for tests)
+       |  //> using toolkit typelevel:default     (Typelevel Toolkit; also latest, a version, or org:version)
+       |  //> using test.toolkit default          (toolkit in test scope only)
        |  //> using testFramework fully.qualified.Framework   (explicit override)
        |  //> using scala 3.x
        |  //> using mainClass Foo

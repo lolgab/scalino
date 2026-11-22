@@ -206,6 +206,28 @@ scalino: 2 passed, 0 failed, 0 errored, 0 skipped
 `--test-only <glob>` leaves the other suites out of the link altogether, and
 anything after `--` goes to the framework.
 
+### Toolkits
+
+`//> using toolkit default` adds the [Scala Toolkit](https://docs.scala-lang.org/toolkit/introduction.html)
+(os-lib, upickle, sttp) to the build and `toolkit-test` (munit) to the tests,
+so the examples from the toolkit tutorials build as they are. The syntax is
+scala-cli's: a version, `default` (a version pinned in scalino, 0.9.2 for now)
+or `latest`, optionally prefixed by an organization. `typelevel:` is short for
+`org.typelevel`, the [Typelevel Toolkit](https://typelevel.org/toolkit/):
+
+```scala
+//> using toolkit default             // org.scala-lang::toolkit::0.9.2
+//> using toolkit typelevel:default   // org.typelevel::toolkit::0.2.0
+//> using toolkit com.example:1.0     // com.example::toolkit::1.0 and toolkit-test
+//> using test.toolkit default        // only toolkit-test, in test scope
+```
+
+On the Typelevel Toolkit, three macros don't expand yet: circe's
+`derives Codec.AsObject`, http4s's `uri"..."` literal, and weaver's test
+source positions, which leaves weaver suites unusable for now. Write the codec
+with `Codec.forProduct*` and parse the URI with `Uri.unsafeFromString`; the
+rest (cats-effect, fs2, decline, the Ember client) runs.
+
 ### Incremental builds and the warm compiler
 
 Sources that didn't change are reused from the last build (`--no-incremental`
