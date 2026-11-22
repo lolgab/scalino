@@ -1,0 +1,879 @@
+diff --git a/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala b/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
+index e0855fde..211abeb8 100644
+--- a/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
++++ b/compiler/src/dotty/tools/dotc/ScalinoInterpret.scala
+@@ -172,9 +172,13 @@ object ScalinoInterpret:
+   def runMain(mainClass: String, progArgs: Array[String])(using Context): Int =
+     // Classes of the empty package aren't reachable through `staticRef` from the root.
+     val dot = mainClass.lastIndexOf('.')
++    // Walk the package path one term member at a time: `getPackageClassIfDefined` looks the path
++    // up as a type name, which finds no package (`app.main` reported "no main method").
+     val owner =
+       if dot < 0 then defn.EmptyPackageClass
+-      else getPackageClassIfDefined(mainClass.substring(0, dot))
++      else mainClass.substring(0, dot).split('.').foldLeft(defn.RootClass: Symbol) { (pkg, part) =>
++        if pkg.exists then pkg.info.decl(part.toTermName).symbol.moduleClass else NoSymbol
++      }
+     val simple = mainClass.substring(dot + 1)
+     def member(name: Name): Symbol = if owner.exists then owner.info.decl(name).symbol else NoSymbol
+     val moduleCls = member(simple.toTermName).moduleClass
+diff --git a/compiler/src/dotty/tools/dotc/ScalinoLineReader.scala b/compiler/src/dotty/tools/dotc/ScalinoLineReader.scala
+new file mode 100644
+index 00000000..c5e84939
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/ScalinoLineReader.scala
+@@ -0,0 +1,469 @@
++package dotty.tools
++package dotc
++
++import java.io.{InputStream, OutputStream}
++import java.nio.charset.StandardCharsets.UTF_8
++import java.nio.file.{Files, Path}
++import scala.collection.mutable
++
++/** The REPL's line editor (`ScalinoRepl`): what JLine does for the stock REPL, which has no Scala
++ *  Native build. A multi-line buffer edited in place, syntax highlighting as you type, history
++ *  (saved across sessions), tab completion and bracketed paste.
++ *
++ *  The terminal goes into non-canonical, no-echo mode through `stty` on `/dev/tty` (the compiler's
++ *  sources also build on the JVM, so no termios binding), only while a line is being read: the
++ *  program's own input and Ctrl-C (which ends the session, there is no evaluation thread to
++ *  interrupt) behave as without the editor.
++ *
++ *  Enter submits the input when it parses as complete and starts a new line otherwise; Alt-Enter
++ *  always starts a new line. Up/Down move between lines of the input, and through the history
++ *  from its first/last line.
++ *
++ *  @param isIncomplete does the input end inside an unfinished construct
++ *  @param highlight    the input with ANSI colors (same visible characters)
++ *  @param complete     candidates at the cursor: where the completed word starts, and the labels
++ */
++final class ScalinoLineReader(
++    historyFile: Option[Path],
++    isIncomplete: String => Boolean,
++    highlight: String => String,
++    complete: (String, Int) => (Int, List[String])):
++
++  import ScalinoLineReader.*
++
++  private val in: InputStream = System.in
++  private val out: OutputStream = System.out
++
++  private val history = mutable.ArrayBuffer.empty[String]
++  loadHistory()
++
++  private var savedMode: String | Null = null
++  /** Terminal columns, read when a line starts. */
++  private var width = 80
++
++  /** Edited text, the cursor in it (a char index) and how far below the prompt's first row the
++   *  terminal cursor is. */
++  private val buf = new java.lang.StringBuilder
++  private var cursor = 0
++  private var cursorRow = 0
++  private var prompt = ""
++  private var promptLen = 0
++  private var contPrompt = ""
++
++  /** The terminal's width in columns (80 when it can't be read). */
++  def columns: Int = width
++
++  /** Can this terminal be put into the mode the editor needs. */
++  def init(): Boolean =
++    savedMode = stty("-g").orNull
++    savedMode != null
++
++  /** Reads one input; None at end of input (Ctrl-D on an empty line). */
++  def readLine(prompt: String, contPrompt: String): Option[String] =
++    this.prompt = prompt
++    this.promptLen = visibleLength(prompt)
++    this.contPrompt = contPrompt
++    stty("size").foreach { s =>
++      s.split(' ') match
++        case Array(_, c) => c.toIntOption.filter(_ > 10).foreach(width = _)
++        case _ =>
++    }
++    stty("-icanon -echo -isig -ixon -iexten min 1 time 0")
++    write("\u001b[?2004h") // bracketed paste
++    buf.setLength(0)
++    cursor = 0
++    cursorRow = 0
++    historyIndex = history.length
++    pendingInput = ""
++    try loop()
++    finally
++      write("\u001b[?2004l")
++      restore()
++
++  /** The terminal's own mode back (also on exit). */
++  def restore(): Unit =
++    val m = savedMode
++    if m != null then stty(m)
++
++  // --- history ---
++
++  private var historyIndex = 0
++  /** The input being written when history navigation started. */
++  private var pendingInput = ""
++
++  private def loadHistory(): Unit =
++    historyFile.foreach { f =>
++      try
++        if Files.isRegularFile(f) then
++          val text = new String(Files.readAllBytes(f), UTF_8)
++          text.split("\n").iterator.filter(_.nonEmpty).foreach(l => history += unescape(l))
++      catch case _: Exception => ()
++    }
++
++  private def addHistory(entry: String): Unit =
++    if entry.trim.nonEmpty && history.lastOption.forall(_ != entry) then
++      history += entry
++      historyFile.foreach { f =>
++        try
++          Option(f.getParent).foreach(Files.createDirectories(_))
++          // trimmed to the last MaxHistory entries now and then
++          if history.length > MaxHistory + MaxHistory / 10 then
++            history.remove(0, history.length - MaxHistory)
++            Files.write(f, history.map(escape(_) + "\n").mkString.getBytes(UTF_8))
++          else
++            Files.write(f, (escape(entry) + "\n").getBytes(UTF_8),
++              java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)
++        catch case _: Exception => ()
++      }
++
++  private def showHistory(i: Int): Unit =
++    if historyIndex == history.length then pendingInput = buf.toString
++    historyIndex = i
++    buf.setLength(0)
++    buf.append(if i == history.length then pendingInput else history(i))
++    cursor = buf.length
++
++  // --- input ---
++
++  /** One key press: a character (`Key.Ch`), pasted text, or a named key. */
++  private enum Key:
++    case Ch(c: Int)
++    case Paste(text: String)
++    case Enter, AltEnter, Tab, Backspace, Delete, Left, Right, Up, Down, Home, End,
++      WordLeft, WordRight, KillWordBack, KillWordForward, Eof, Ignore
++
++  private def readByte(): Int = in.read()
++
++  /** A UTF-8 encoded code point whose first byte is `b0`. */
++  private def readUtf8(b0: Int): Int =
++    val extra = if b0 >= 0xf0 then 3 else if b0 >= 0xe0 then 2 else if b0 >= 0xc0 then 1 else 0
++    var cp = if extra == 3 then b0 & 0x07 else if extra == 2 then b0 & 0x0f else if extra == 1 then b0 & 0x1f else b0
++    var i = 0
++    while i < extra do
++      val b = readByte()
++      if b < 0 then return cp
++      cp = (cp << 6) | (b & 0x3f)
++      i += 1
++    cp
++
++  private def readKey(): Key =
++    val b = readByte()
++    b match
++      case -1 => Key.Eof
++      case 27 => readEscape()
++      case 13 | 10 => Key.Enter
++      case 9 => Key.Tab
++      case 127 | 8 => Key.Backspace
++      case c if c < 32 => Key.Ch(c) // control keys, handled by `loop`
++      case c if c < 128 => Key.Ch(c)
++      case c => Key.Ch(readUtf8(c))
++
++  /** The rest of an escape sequence (CSI `ESC [ params final`, SS3 `ESC O x`, or Alt+key). */
++  private def readEscape(): Key =
++    readByte() match
++      case '[' =>
++        val params = new java.lang.StringBuilder
++        var c = readByte()
++        while c >= 0x30 && c <= 0x3f do
++          params.append(c.toChar)
++          c = readByte()
++        val p = params.toString
++        (c.toChar, p) match
++          case ('A', _) => Key.Up
++          case ('B', _) => Key.Down
++          case ('C', p) => if p.endsWith(";5") || p.endsWith(";3") then Key.WordRight else Key.Right
++          case ('D', p) => if p.endsWith(";5") || p.endsWith(";3") then Key.WordLeft else Key.Left
++          case ('H', _) => Key.Home
++          case ('F', _) => Key.End
++          case ('~', "1" | "7") => Key.Home
++          case ('~', "4" | "8") => Key.End
++          case ('~', "3") => Key.Delete
++          case ('~', "200") => Key.Paste(readPaste())
++          case _ => Key.Ignore
++      case 'O' =>
++        readByte() match
++          case 'H' => Key.Home
++          case 'F' => Key.End
++          case 'A' => Key.Up
++          case 'B' => Key.Down
++          case 'C' => Key.Right
++          case 'D' => Key.Left
++          case _ => Key.Ignore
++      case 13 | 10 => Key.AltEnter
++      case 'b' => Key.WordLeft
++      case 'f' => Key.WordRight
++      case 'd' => Key.KillWordForward
++      case 127 | 8 => Key.KillWordBack
++      case _ => Key.Ignore
++
++  /** Pasted text, up to the closing `ESC [ 201 ~`. */
++  private def readPaste(): String =
++    val bytes = new java.io.ByteArrayOutputStream
++    val end = "\u001b[201~".getBytes(UTF_8)
++    var matched = 0
++    var done = false
++    while !done do
++      val b = readByte()
++      if b < 0 then done = true
++      else if b == end(matched) then
++        matched += 1
++        if matched == end.length then done = true
++      else
++        bytes.write(end, 0, matched)
++        matched = 0
++        if b == end(0) then matched = 1 else bytes.write(b)
++    new String(bytes.toByteArray, UTF_8).replace("\r\n", "\n").replace('\r', '\n').replace("\t", "  ")
++
++  // --- editing ---
++
++  private def insert(s: String): Unit =
++    buf.insert(cursor, s)
++    cursor += s.length
++
++  private def lineStart(at: Int): Int =
++    val i = buf.lastIndexOf("\n", at - 1)
++    if i < 0 then 0 else i + 1
++  private def lineEnd(at: Int): Int =
++    val i = buf.indexOf("\n", at)
++    if i < 0 then buf.length else i
++
++  private def isWordChar(c: Char) = c.isLetterOrDigit || c == '_'
++  private def wordLeft(at: Int): Int =
++    var i = at
++    while i > 0 && !isWordChar(buf.charAt(i - 1)) do i -= 1
++    while i > 0 && isWordChar(buf.charAt(i - 1)) do i -= 1
++    i
++  private def wordRight(at: Int): Int =
++    var i = at
++    while i < buf.length && !isWordChar(buf.charAt(i)) do i += 1
++    while i < buf.length && isWordChar(buf.charAt(i)) do i += 1
++    i
++
++  /** Moves the cursor one line up (-1) or down (1) in the input, keeping its column; false when
++   *  there is no such line. */
++  private def moveLine(dir: Int): Boolean =
++    val start = lineStart(cursor)
++    val col = cursor - start
++    if dir < 0 then
++      if start == 0 then false
++      else
++        val prevStart = lineStart(start - 1)
++        cursor = math.min(prevStart + col, start - 1)
++        true
++    else
++      val end = lineEnd(cursor)
++      if end == buf.length then false
++      else
++        val nextStart = end + 1
++        cursor = math.min(nextStart + col, lineEnd(nextStart))
++        true
++
++  private def loop(): Option[String] =
++    refresh()
++    var result: Option[Option[String]] = None
++    while result.isEmpty do
++      readKey() match
++        case Key.Eof => result = Some(None)
++        case Key.Enter =>
++          val text = buf.toString
++          // Enter on an empty last line submits whatever is there (a parse error is reported
++          // then), as two empty lines do in the stock REPL
++          val onEmptyLastLine = lineEnd(cursor) == buf.length && buf.substring(lineStart(cursor)).trim.isEmpty && text.contains('\n')
++          if text.trim.isEmpty || text.trim.startsWith(":") || onEmptyLastLine || !isIncomplete(text) then
++            cursor = buf.length
++            refresh()
++            write("\r\n")
++            addHistory(text)
++            result = Some(Some(text))
++          else
++            // a new line, indented like the current one
++            val start = lineStart(cursor)
++            var i = start
++            while i < buf.length && buf.charAt(i) == ' ' do i += 1
++            insert("\n" + " " * (i - start))
++        case Key.AltEnter => insert("\n")
++        case Key.Tab => completeAtCursor()
++        case Key.Backspace =>
++          if cursor > 0 then
++            buf.deleteCharAt(cursor - 1)
++            cursor -= 1
++        case Key.Delete =>
++          if cursor < buf.length then buf.deleteCharAt(cursor)
++        case Key.Left => if cursor > 0 then cursor -= 1
++        case Key.Right => if cursor < buf.length then cursor += 1
++        case Key.Up =>
++          if !moveLine(-1) && historyIndex > 0 then showHistory(historyIndex - 1)
++        case Key.Down =>
++          if !moveLine(1) && historyIndex < history.length then showHistory(historyIndex + 1)
++        case Key.Home => cursor = lineStart(cursor)
++        case Key.End => cursor = lineEnd(cursor)
++        case Key.WordLeft => cursor = wordLeft(cursor)
++        case Key.WordRight => cursor = wordRight(cursor)
++        case Key.KillWordBack =>
++          val from = wordLeft(cursor)
++          buf.delete(from, cursor)
++          cursor = from
++        case Key.KillWordForward => buf.delete(cursor, wordRight(cursor))
++        case Key.Paste(text) => insert(text)
++        case Key.Ignore =>
++        case Key.Ch(c) =>
++          c match
++            case 1 => cursor = lineStart(cursor) // ^A
++            case 2 => if cursor > 0 then cursor -= 1 // ^B
++            case 3 => // ^C: drop the input
++              cursor = buf.length
++              refresh()
++              write("^C\r\n")
++              result = Some(Some(""))
++            case 4 => // ^D
++              if buf.length == 0 then
++                write("\r\n")
++                result = Some(None)
++              else if cursor < buf.length then buf.deleteCharAt(cursor)
++            case 5 => cursor = lineEnd(cursor) // ^E
++            case 6 => if cursor < buf.length then cursor += 1 // ^F
++            case 11 => // ^K
++              val end = lineEnd(cursor)
++              if end == cursor && end < buf.length then buf.deleteCharAt(cursor) // joins lines
++              else buf.delete(cursor, end)
++            case 12 => // ^L
++              write("\u001b[H\u001b[2J")
++              cursorRow = 0
++            case 14 => if !moveLine(1) && historyIndex < history.length then showHistory(historyIndex + 1) // ^N
++            case 16 => if !moveLine(-1) && historyIndex > 0 then showHistory(historyIndex - 1) // ^P
++            case 21 => // ^U
++              val start = lineStart(cursor)
++              buf.delete(start, cursor)
++              cursor = start
++            case 23 => // ^W
++              val from = wordLeft(cursor)
++              buf.delete(from, cursor)
++              cursor = from
++            case c if c < 32 =>
++            case c => insert(new String(Character.toChars(c)))
++      if result.isEmpty then refresh()
++    result.get
++
++  private def completeAtCursor(): Unit =
++    val text = buf.toString
++    val (start0, candidates0) =
++      try complete(text, cursor)
++      catch case _: Throwable => (cursor, Nil)
++    val start = math.max(0, math.min(start0, cursor))
++    val typed = text.substring(start, cursor)
++    val candidates = candidates0.distinct.filter(_.startsWith(typed)).sorted
++    if candidates.nonEmpty then
++      val prefix = candidates.reduce((a, b) => a.zip(b).takeWhile(_ == _).map(_._1).mkString)
++      if candidates.length == 1 || prefix.length > typed.length then
++        buf.replace(start, cursor, if candidates.length == 1 then candidates.head else prefix)
++        cursor = start + (if candidates.length == 1 then candidates.head.length else prefix.length)
++      else
++        // list them under the input, then draw the input again below
++        val saved = cursor
++        cursor = buf.length
++        refresh()
++        val colWidth = candidates.map(_.length).max + 2
++        val perRow = math.max(1, width / colWidth)
++        val sb = new StringBuilder("\r\n")
++        candidates.grouped(perRow).foreach { row =>
++          sb.append(row.map(c => c + " " * (colWidth - c.length)).mkString.stripTrailing).append("\r\n")
++        }
++        write(sb.toString)
++        cursorRow = 0
++        cursor = saved
++
++  // --- display ---
++
++  /** Redraws the prompt and the input, and puts the terminal cursor at `cursor`. */
++  private def refresh(): Unit =
++    val sb = new StringBuilder
++    sb.append('\r')
++    if cursorRow > 0 then sb.append(s"\u001b[${cursorRow}A")
++    sb.append("\u001b[J")
++    val text = buf.toString
++    val plainLines = text.split("\n", -1)
++    val colored = coloredLines(text, plainLines.length)
++    var row = 0 // first row of the current line
++    var endRow = 0
++    var targetRow = 0
++    var targetCol = 0
++    var offset = 0
++    for i <- plainLines.indices do
++      val line = plainLines(i)
++      if i > 0 then sb.append("\r\n")
++      sb.append(if i == 0 then prompt else contPrompt)
++      sb.append(colored(i))
++      val len = promptLen + line.length
++      if cursor >= offset && cursor <= offset + line.length then
++        val pos = promptLen + cursor - offset
++        targetRow = row + pos / width
++        targetCol = pos % width
++      val rows = if len == 0 then 1 else (len + width - 1) / width
++      endRow = row + rows - 1
++      row += rows
++      offset += line.length + 1
++    if targetRow > endRow then // at the very end of a line that fills its last row
++      sb.append("\r\n")
++      endRow = targetRow
++    sb.append('\r')
++    if endRow > targetRow then sb.append(s"\u001b[${endRow - targetRow}A")
++    if targetCol > 0 then sb.append(s"\u001b[${targetCol}C")
++    cursorRow = targetRow
++    write(sb.toString)
++
++  /** `text` highlighted, split into its lines; a color that spans a line break (a multi-line
++   *  string or comment) is started again on the next line. */
++  private def coloredLines(text: String, n: Int): Array[String] =
++    val hl =
++      try highlight(text)
++      catch case _: Throwable => text
++    val lines = hl.split("\n", -1)
++    if lines.length != n then text.split("\n", -1)
++    else
++      var active = ""
++      lines.map { line =>
++        val withColor = active + line + (if active.nonEmpty || line.contains('\u001b') then Reset else "")
++        val m = Sgr.findAllIn(line).toList
++        m.lastOption.foreach(last => active = if last == Reset || last == "\u001b[0m" then "" else last)
++        withColor
++      }
++
++  private def write(s: String): Unit =
++    out.write(s.getBytes(UTF_8))
++    out.flush()
++
++object ScalinoLineReader:
++  private val MaxHistory = 1000
++  private val Reset = "\u001b[0m"
++  private val Sgr = "\u001b\\[[0-9;]*m".r
++
++  def visibleLength(s: String): Int = Sgr.replaceAllIn(s, "").length
++
++  /** History entries are one per line: newlines and backslashes escaped. */
++  private def escape(s: String): String = s.replace("\\", "\\\\").replace("\n", "\\n")
++  private def unescape(s: String): String =
++    val sb = new StringBuilder
++    var i = 0
++    while i < s.length do
++      val c = s.charAt(i)
++      if c == '\\' && i + 1 < s.length then
++        sb.append(if s.charAt(i + 1) == 'n' then '\n' else s.charAt(i + 1))
++        i += 2
++      else
++        sb.append(c)
++        i += 1
++    sb.toString
++
++  /** `stty <args> < /dev/tty`: its output, None when it fails. */
++  private def stty(args: String): Option[String] =
++    try
++      val p = new ProcessBuilder("/bin/sh", "-c", s"stty $args < /dev/tty").redirectErrorStream(true).start()
++      val bytes = new java.io.ByteArrayOutputStream
++      val is = p.getInputStream
++      val chunk = new Array[Byte](256)
++      var n = is.read(chunk)
++      while n >= 0 do
++        bytes.write(chunk, 0, n)
++        n = is.read(chunk)
++      if p.waitFor() == 0 then Some(new String(bytes.toByteArray, UTF_8).trim) else None
++    catch case _: Exception => None
+diff --git a/compiler/src/dotty/tools/dotc/ScalinoRepl.scala b/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
+index abfd4d1c..239ffe97 100644
+--- a/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
++++ b/compiler/src/dotty/tools/dotc/ScalinoRepl.scala
+@@ -11,11 +11,14 @@ import core.StdNames.nme
+ import core.Symbols.*
+ import core.Types.*
+ import parsing.Parsers
+-import quoted.{Interpreter, InterpretedThrow, ProgramExit}
++import interactive.Completion
++import printing.{ReplPrinter, SyntaxHighlighting}
++import quoted.{Interpreter, InterpretedInstance, InterpretedThrow, ModuleValue, ProgramExit}
+ import reporting.{ConsoleReporter, Diagnostic, Reporter, StoreReporter}
+ import transform.{Inlining, PostInlining, PostTyper}
+ import typer.TyperPhase
+-import util.SourceFile
++import util.{SourceFile, SourcePosition}
++import util.Spans.Span
+ 
+ import java.io.{BufferedReader, InputStreamReader, PrintStream, PrintWriter}
+ import java.nio.charset.StandardCharsets.UTF_8
+@@ -25,9 +28,15 @@ import scala.collection.mutable
+ /** `scalino-dotc --repl`: a Scala 3 REPL whose inputs run on the tree interpreter
+  *  (`quoted.Interpreter`), so no JVM and no linking (`scalino repl`).
+  *
+- *  Usage: `scalino-dotc --repl [--interactive] [--init-script <code>] [--quit-after-init] <compiler options>`.
+- *  `--interactive` (stdin is a terminal) prints the welcome banner. The options carry the
+- *  classpath (the project's classes and dependencies) and the javalib TASTy setting.
++ *  Usage: `scalino-dotc --repl [--interactive] [--edit] [--color] [--init-script <code>] [--quit-after-init] <compiler options>`.
++ *  `--interactive` (stdin is a terminal) prints the welcome banner and prompts, `--edit` (stdin and
++ *  stdout are a terminal) reads inputs with `ScalinoLineReader`, `--color` colors the output as
++ *  the stock REPL does (syntax-highlighted definitions, pprint's colors for values). The options
++ *  carry the classpath (the project's classes and dependencies) and the javalib TASTy setting.
++ *
++ *  Values print with pprint, as in the stock REPL; instances of classes defined in the session
++ *  are the interpreter's `InterpretedInstance`s, which `pprintHandlers` renders like the case
++ *  class (or `toString`) they stand for.
+  *
+  *  Each input is compiled in one long-lived context (one `Run` per input, so the symbols of
+  *  earlier inputs stay entered, as in `ScalinoDaemon`) as
+@@ -54,6 +63,10 @@ object ScalinoRepl:
+       units = units :+ tree
+       lastCtx = ctx
+ 
++  /** Typing only, for completions. */
++  private final class TypecheckCompiler extends Compiler:
++    override def phases: List[List[Phase]] = List(List(new parsing.Parser), List(new TyperPhase))
++
+   private final class ReplCompiler extends Compiler:
+     /** The last run's (a phase instance serves one run only). */
+     var installTrees = new InstallTrees
+@@ -68,6 +81,7 @@ object ScalinoRepl:
+   /** Everything that `:reset` drops. */
+   private final class State(val rootCtx: Context):
+     val compiler = new ReplCompiler
++    val typecheckCompiler = new TypecheckCompiler
+     val session = new Interpreter.Session
+     /** Top-level imports every later input starts with: the earlier wrappers' members and the
+      *  user's own imports, in input order (a later one shadows an earlier one). */
+@@ -77,13 +91,23 @@ object ScalinoRepl:
+ 
+   private val Prompt = "scala> "
+   private val Continue = "     | "
+-  /** Longest rendered value, as in the stock REPL. */
+-  private val MaxValueLength = 1000
++  /** The line editor's continuation prompt, as JLine's in the stock REPL. */
++  private val EditContinue = "       "
++  /** Lines of a rendered value before `...`, as in the stock REPL. */
++  private val MaxValueHeight = 50
++  /** Longest rendered value (characters). */
++  private val MaxValueLength = 50000
++
++  /** `--color`: highlighted definitions, colored values and diagnostics. */
++  private var color = false
++  /** Columns values are laid out in. */
++  private var width = 80
+ 
+   def run(args: Array[String]): Unit =
+     var initScript: String | Null = null
+     var quitAfterInit = false
+     var interactive = false
++    var edit = false
+     var rest = args.toList
+     var more = true
+     while more do
+@@ -92,9 +116,11 @@ object ScalinoRepl:
+         case "--quit-after-init" :: tail => quitAfterInit = true; rest = tail
+         // stdin is a terminal (the caller knows: this javalib has no `System.console`)
+         case "--interactive" :: tail => interactive = true; rest = tail
++        case "--edit" :: tail => edit = true; rest = tail
++        case "--color" :: tail => color = true; rest = tail
+         case _ => more = false
+     // E230: the wrappers' `$` names, which are ours
+-    val options = rest ++ List("-Yretain-trees", "-color:never", "-Wconf:id=E230:s")
++    val options = rest ++ List("-Yretain-trees", if color then "-color:always" else "-color:never", "-Wconf:id=E230:s")
+     def newState(): State =
+       driver.setupFor(options.toArray, (new ContextBase).initialCtx) match
+         case Some((_, ctx)) => State(ctx)
+@@ -102,14 +128,28 @@ object ScalinoRepl:
+     var state = newState()
+     val in = new BufferedReader(new InputStreamReader(System.in, UTF_8))
+     val out = System.out
++    val reader =
++      if !edit then None
++      else
++        val history = Option(System.getenv("HOME")).filter(_.nonEmpty).orElse(Option(System.getProperty("user.home"))).map(h => Paths.get(h, ".scalino_history"))
++        val r = new ScalinoLineReader(history, isIncomplete(state, _), highlight(state, _), completions(state, _, _))
++        if r.init() then Some(r) else None
+     if interactive then
+       out.println(s"Welcome to Scala ${config.Properties.simpleVersionString} (scalino, interpreted: no JVM, no linking).")
+       out.println("Type in expressions for evaluation. Or try :help.")
+-      out.println()
++      if !edit then out.println() // the line editor starts each prompt on a fresh line
+     if initScript != null then evalInput(state, initScript.nn, out)
+     var done = quitAfterInit
+     while !done do
+-      readInput(state, in, out, interactive) match
++      val input = reader match
++        case Some(r) =>
++          out.println()
++          out.flush()
++          val read = r.readLine(if color then s"\u001b[35m$Prompt\u001b[0m" else Prompt, EditContinue)
++          width = r.columns
++          read
++        case None => readInput(state, in, out, interactive)
++      input match
+         case None => done = true
+         case Some(input) =>
+           val trimmed = input.trim
+@@ -136,7 +176,8 @@ object ScalinoRepl:
+             catch case ProgramExit(status) =>
+               out.flush()
+               sys.exit(status)
+-    if interactive then out.println()
++    reader.foreach(_.restore())
++    if interactive && reader.isEmpty then out.println()
+     sys.exit(0)
+ 
+   private def printHelp(out: PrintStream): Unit =
+@@ -150,6 +191,10 @@ object ScalinoRepl:
+         |:imports                 show import history
+         |:reset                   reset the REPL to its initial state, forgetting all session entries
+         |
++        |In a terminal: Tab completes, Up/Down go through the lines of the input and the history
++        |(~/.scalino_history), Enter on an unfinished input starts a new line (Alt-Enter always does,
++        |an empty line submits it), Ctrl-C drops the input, Ctrl-D on an empty line exits.
++        |
+         |Inputs are interpreted (scalino-dotc's tree interpreter), not linked: code that needs the
+         |native runtime (@extern, scala.scalanative.unsafe, threads) is not supported here.""".stripMargin)
+ 
+@@ -178,18 +223,25 @@ object ScalinoRepl:
+ 
+   /** Does `code` end inside an unfinished construct (an open brace, a dangling operator)? */
+   private def isIncomplete(state: State, code: String): Boolean =
+-    given Context = state.rootCtx.fresh.setReporter(new StoreReporter(null))
++    // as the stock REPL (`ParseResult.isIncomplete`): the parser reports running out of input
++    // through the reporter's incomplete handler, and only when the input is otherwise fine
++    val reporter = new StoreReporter(null)
+     val source = SourceFile.virtual("<console>", code, maybeIncomplete = true)
+-    val parser = new Parsers.Parser(source)
+-    parser.blockStatSeq()
+-    ctx.reporter.allErrors.exists(_.pos.span.end >= code.length) || code.trim.endsWith("=")
++    given Context = state.rootCtx.fresh
++      .setCompilationUnit(CompilationUnit(source, mustExistIfNotNull = false)(using state.rootCtx))
++      .setReporter(reporter)
++    var needsMore = false
++    reporter.withIncompleteHandler((_, _) => needsMore = true) {
++      new Parsers.Parser(source).blockStatSeq(outermost = true)
++    }
++    needsMore && !reporter.hasErrors
+ 
+   /** Parses `code` into its top-level statements (None on a syntax error, reported). */
+   private def parseStats(state: State, code: String, out: PrintStream): Option[List[untpd.Tree]] =
+     val reporter = newReporter(out)
+     given Context = state.rootCtx.fresh.setReporter(reporter)
+     val source = SourceFile.virtual("<console>", code)
+-    val stats = new Parsers.Parser(source).blockStatSeq()
++    val stats = new Parsers.Parser(source).blockStatSeq(outermost = true)
+     if reporter.hasErrors then None else Some(stats)
+ 
+   private def newReporter(out: PrintStream): ConsoleReporter =
+@@ -221,6 +273,15 @@ object ScalinoRepl:
+       given ctx: Context = compiler.installTrees.lastCtx.nn.fresh.setCompilationUnit(NoCompilationUnit)
+       val wrapper = defn.EmptyPackageClass.info.decl(wrapperName.toTermName).symbol.moduleClass
+       val stats = compiler.installTrees.units.flatMap(templateStats(_, wrapper))
++      // types print as the stock REPL's, shortened by what is imported (`mutable.Map[K, V]`)
++      var withImports: Context = ctx
++      def addImports(trees: List[tpd.Tree]): Unit = trees.foreach {
++        case imp: tpd.Import => withImports = withImports.importContext(imp, imp.symbol)
++        case _ =>
++      }
++      compiler.installTrees.units.foreach { case tpd.PackageDef(_, topLevel) => addImports(topLevel); case _ => }
++      addImports(stats)
++      printCtx = withImports
+       Some((wrapper, stats, ctx))
+ 
+   /** The body statements of `wrapper`'s template inside a compiled unit. */
+@@ -300,56 +361,139 @@ object ScalinoRepl:
+   /** Prints what one statement defined; the `resK` number it used, if any. */
+   private def show(stat: tpd.Tree, value: Object, resNames: collection.Map[String, Int], out: PrintStream)(using Context): Option[Int] =
+     stat match
+-      case vdef: tpd.ValDef if !vdef.symbol.is(Synthetic) =>
++      case vdef: tpd.ValDef if !vdef.symbol.isOneOf(Synthetic | Module) =>
+         val sym = vdef.symbol
+-        val name = sym.name.toString
+-        val res = resNames.get(name)
+-        val tpe = sym.info.widenExpr
++        val res = resNames.get(sym.name.toString)
+         // an expression of type Unit shows nothing, and leaves its `resK` to the next one
+-        if res.isDefined && tpe.widenDealias.isRef(defn.UnitClass) then None
++        if res.isDefined && sym.info.widenExpr.widenDealias.isRef(defn.UnitClass) then None
+         else
+-          if sym.is(Lazy) then out.println(s"lazy val $name: ${showType(tpe)}")
+-          else out.println(s"${if sym.is(Mutable) then "var" else "val"} $name: ${showType(tpe)} = ${render(value)}")
++          val dcl = showDcl(sym)
++          if sym.is(Lazy) then out.println(dcl)
++          else
++            val prefix = dcl + " = "
++            val offset = ScalinoLineReader.visibleLength(prefix.linesIterator.toSeq.lastOption.getOrElse(""))
++            out.println(prefix + render(value, offset))
+           res
+       case ddef: tpd.DefDef if !ddef.symbol.isOneOf(Synthetic | Accessor) && !ddef.symbol.isConstructor =>
+-        out.println(stripWrappers(ddef.symbol.showDcl))
++        out.println(showDcl(ddef.symbol))
+         None
+       case tdef: tpd.TypeDef if !tdef.symbol.is(Synthetic) =>
+         val sym = tdef.symbol
+-        val kind =
+-          if sym.is(ModuleClass) then "object"
+-          else if sym.is(Trait) then "trait"
+-          else if sym.is(Case) then "case class"
+-          else if sym.isClass then "class"
+-          else if sym.isOpaqueAlias then "opaque type"
+-          else "type"
+-        val name = if sym.is(ModuleClass) then sym.name.stripModuleClassSuffix else sym.name
+-        out.println(s"// defined $kind $name")
++        // as the stock REPL: `// defined case class P`, `// defined alias type T = Int`
++        val c = noColors
++        val dcl = stripWrappers(new ReplPrinter(c).dclText(if sym.is(ModuleClass) then sym.sourceModule else sym).mkString(width))
++        val what =
++          if sym.is(ModuleClass) then s"object ${sym.name.stripModuleClassSuffix}"
++          else if sym.isClass then dcl
++          else s"alias $dcl"
++        out.println(highlighted(s"// defined $what"))
+         None
+       case _ => None
+ 
+-  private val WrapperPrefix = java.util.regex.Pattern.compile("rs\\$line\\d+\\.")
++  private val WrapperPrefix = java.util.regex.Pattern.compile("rs\\$line\\d+\\$?\\.")
+ 
+   /** Types as the user wrote them: without the `rs$lineN.` prefix of the wrapper objects. */
+   private def stripWrappers(s: String): String = WrapperPrefix.matcher(s).replaceAll("")
+ 
+-  private def showType(t: Type)(using Context): String = stripWrappers(t.show)
+-
+-  /** A value as the stock REPL prints it (`Array(1, 2)`, at most `MaxValueLength` characters). */
+-  def render(value: Object): String =
+-    val s = value match
+-      case null => "null"
+-      // boxes before the array test: on this toolchain a small boxed Int is a tagged pointer,
+-      // which an `Array[?]` type test dereferences (SIGSEGV), while a class test is tag-aware
+-      case n: Number => n.toString
+-      case c: Character => c.toString
+-      case b: java.lang.Boolean => b.toString
+-      case s: String => s
+-      case a: Array[?] => a.map(x => render(x.asInstanceOf[Object])).mkString("Array(", ", ", ")")
+-      case other => String.valueOf(other)
+-    if s.length > MaxValueLength then s.take(MaxValueLength) + " ... large output truncated, print value to show all"
++  /** The last compiled input's context with its imports, for printing its definitions. */
++  private var printCtx: Context | Null = null
++
++  private def noColors(using Context): Context =
++    val c = if printCtx != null then printCtx.nn else ctx
++    c.fresh.setSetting(c.settings.color, "never")
++
++  private def showType(t: Type)(using Context): String =
++    val c = noColors
++    stripWrappers(new ReplPrinter(c).toText(t).mkString(width))
++
++  /** `val x: T`, `def f(a: A): B`, as the stock REPL prints a definition (`ReplPrinter`). */
++  private def showDcl(sym: Symbol)(using Context): String =
++    val c = noColors
++    highlighted(stripWrappers(new ReplPrinter(c).dclText(sym).mkString(width)))
++
++  private def highlighted(s: String)(using Context): String =
++    if color then SyntaxHighlighting.highlight(s) else s
++
++  /** The line editor's input highlighting. */
++  private def highlight(state: State, code: String): String =
++    if !color then code
++    else SyntaxHighlighting.highlight(code)(using state.rootCtx)
++
++  /** A value as the stock REPL prints it: pprint, `offset` columns into its first line. */
++  def render(value: Object, offset: Int)(using Context): String =
++    val printer = pprint.PPrinter.Color.copy(additionalHandlers = pprintHandlers)
++    val str = printer.apply(value, width = width, height = MaxValueHeight, initialOffset = offset, showFieldNames = true)
++    val s = if color then str.render else str.plainText
++    if str.length > MaxValueLength then
++      (if color then str.substring(0, MaxValueLength).render else str.plainText.take(MaxValueLength)) +
++        " ... large output truncated, print value to show all"
+     else s
+ 
++  /** pprint for the interpreter's own values: an instance of a case class defined in the session
++   *  prints as the case class would (`P(x = 1, name = "a")`), any other instance through its
++   *  interpreted `toString` (enum cases, case objects, user-defined `toString`). */
++  private def pprintHandlers(using Context): PartialFunction[Any, pprint.Tree] =
++    // `1 to 5` is an interpreted `Range`: printed as the host one it stands for, `Range(1, 2, 3, 4, 5)`
++    case inst: InterpretedInstance if inst.cls.derivesFrom(rangeClass) && hostRange(inst).isDefined =>
++      val printer = pprint.PPrinter.Color.copy(additionalHandlers = pprintHandlers)
++      printer.treeify(hostRange(inst).get, escapeUnicode = false, showFieldNames = true)
++    // an object of the session (a `case object`, an `enum` case without parameters): its name
++    case ModuleValue(moduleClass) =>
++      val name = moduleClass.name.stripModuleClassSuffix.toString
++      if moduleClass.is(Case) || moduleClass.isAllOf(EnumCase) then pprint.Tree.Lazy(_ => Iterator(name))
++      else pprint.Tree.Lazy(_ => Iterator(s"$name$$"))
++    case inst: InterpretedInstance =>
++      val cls = inst.cls
++      val fields =
++        if cls.isClass && cls.is(Case) && !hasOwnToString(cls) then
++          cls.asClass.classDenot.paramAccessors.filter(_.is(CaseAccessor))
++        else Nil
++      if fields.isEmpty then pprint.Tree.Lazy(_ => Iterator(stripWrappers(String.valueOf(inst))))
++      else
++        val printer = pprint.PPrinter.Color.copy(additionalHandlers = pprintHandlers)
++        def tree(v: Object) = printer.treeify(v, escapeUnicode = false, showFieldNames = true)
++        val children =
++          if fields.length < 2 then fields.iterator.map(f => tree(inst.fields.getOrElse(f.name.toString, null)))
++          else fields.iterator.map(f => pprint.Tree.KeyValue(f.name.toString, tree(inst.fields.getOrElse(f.name.toString, null))))
++        pprint.Tree.Apply(cls.name.stripModuleClassSuffix.toString, children)
++
++  private def rangeClass(using Context): Symbol = requiredClass("scala.collection.immutable.Range")
++
++  private def hostRange(inst: InterpretedInstance)(using Context): Option[scala.collection.immutable.Range] =
++    (inst.fields.get("start"), inst.fields.get("end"), inst.fields.get("step")) match
++      case (Some(s: Integer), Some(e: Integer), Some(st: Integer)) =>
++        try
++          Some(if inst.cls.name.toString == "Inclusive" then scala.collection.immutable.Range.inclusive(s, e, st) else scala.collection.immutable.Range(s, e, st))
++        catch case _: IllegalArgumentException => None
++      case _ => None
++
++  /** Does `cls` define (or inherit from user code) a `toString` other than the case-class one. */
++  private def hasOwnToString(cls: Symbol)(using Context): Boolean =
++    val m = cls.info.member(nme.toString_).suchThat(s => s.is(Method) && s.info.firstParamTypes.isEmpty).symbol
++    m.exists && !m.is(Synthetic) && m.owner != defn.AnyClass && m.owner != defn.ObjectClass && !m.owner.is(JavaDefined)
++      && m.owner != defn.ProductClass
++
++  private val Commands = List(":help", ":load", ":quit", ":type", ":imports", ":reset", ":exit")
++
++  /** The line editor's completions at `cursor`: the input typed in a wrapper like an input's. */
++  private def completions(state: State, code: String, cursor: Int): (Int, List[String]) =
++    if code.trim.startsWith(":") then
++      val word = code.trim
++      (code.indexOf(':'), Commands.filter(_.startsWith(word)))
++    else
++      val header = (state.preamble :+ "object rs$complete {").mkString("; ") + "\n"
++      val text = header + code + "\n}\n"
++      given ctx0: Context = state.rootCtx.fresh.setReporter(new StoreReporter(null))
++      val run = state.typecheckCompiler.newRun
++      val source = SourceFile.virtual("<completions>", text, maybeIncomplete = true)
++      run.compileSources(List(source))
++      run.units.headOption match
++        case None => (cursor, Nil)
++        case Some(unit) =>
++          given Context = run.runContext.fresh.setCompilationUnit(unit)
++          val (start, cs) = Completion.completions(SourcePosition(source, Span(header.length + cursor)))
++          (start - header.length, cs.map(_.label).filterNot(l => l.startsWith("rs$") || l.contains("$")))
++
+   /** `:type <expr>`: compiles the expression without running it. */
+   private def typeOf(state: State, expr: String, out: PrintStream): Unit =
+     state.line += 1
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index a07dc11b..14af6055 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -2666,6 +2666,10 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader, session: Interpreter.S
+     def elems: scala.collection.Seq[Object] = args match
+       case (s: scala.collection.Seq[Object] @unchecked) :: Nil => s
+       case (s: scala.collection.Seq[Object] @unchecked) :: _ => s
++      // `Array.apply(x: Int, xs: Int*)` (the primitive overloads): the first element apart
++      case first :: (rest: scala.collection.Seq[Object] @unchecked) :: _
++          if fn.info.firstParamTypes.lengthCompare(2) == 0 && fn.info.firstParamTypes(1).isRepeatedParam =>
++        first +: rest
+       case other => other
+     def buildFrom(name: String, source: scala.collection.Seq[Object]): Option[Object] =
+       name.stripSuffix("$") match

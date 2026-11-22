@@ -15,6 +15,7 @@ export SCALINO_LINK_MODE="${SCALINO_LINK_MODE:-release-fast}"
 source ./00-env.sh
 source ./pgo/pgo-lib.sh
 source ./link-lib.sh
+source ./repl-deps.sh
 NAME=dotc; BIN=dotty.tools.dotc.Main
 BOOT="${BOOT:-$DIST/scalino-linkdriver}"
 OUT="${OUT:-$WORK/pgo-dotc}"
@@ -40,7 +41,7 @@ pgo_link() { # linker, dir, env...  -> dir/$BIN (same command as build/03)
   # longer than the GC's 60s safepoint timeout
   LINK_ENV=("$@" SCALANATIVE_EVAC_ENABLE="${EVAC:-1}" SCALANATIVE_GC_SYNC_TIMEOUT_MS=0)
   LINKDRIVER="$linker" linkdriver_run \
-    "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" "$(to_native_path "$dir")" \
+    "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$REPL_NATIVE_CP" "$(to_native_path "$dir")" \
     "$BIN" --mode "$SCALINO_LINK_MODE" \
     --multithreading --no-incremental-compilation --embed-resources \
     "${extra[@]+"${extra[@]}"}" > "$dir.log" 2>&1 \

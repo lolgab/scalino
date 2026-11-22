@@ -76,7 +76,16 @@ native `scalino-dotc`. ~20s per iteration vs ~15 min per native rebuild.
 - Scripts are wrapped in a method, not an object body: the interpreter initialises object `val`s
   lazily per access and never runs other object-body statements. Consequence: a script can't
   forward-reference a `def` across a `val` (local-block rules).
-- No line editing in the REPL (no JLine on Scala Native); `rlwrap` suggested in the docs.
+- ~~No line editing in the REPL~~ 2026-11-22, patch scala3-0052: `ScalinoLineReader` (own line
+  editor: `stty` on /dev/tty, multi-line buffer, highlighting, Tab completion via
+  `interactive.Completion` on a typecheck-only run of the wrapper, history in
+  `~/.scalino_history`, bracketed paste), values printed with the released pprint
+  (`com.lihaoyi::pprint_native0.5_3`, linked into scalino-dotc/scalino-lsp, JVM jars for the
+  compile, fetched by `build/repl-deps.sh` sourced from 02a/03/08/pgo-dotc) plus handlers for the interpreter's
+  `InterpretedInstance`/`ModuleValue`, definitions through `ReplPrinter` + `SyntaxHighlighting` in
+  a context with the input's imports. Also fixed: `run --interpret` of an `@main` in a package
+  (package path looked up as a type name), `Array(1, 2, 3)` (primitive `Array.apply(x, xs*)`
+  overload built `Array(1, List(2, 3))`). Ctrl-C during an evaluation still ends the session.
 
 ## Found on the way (not fixed here)
 

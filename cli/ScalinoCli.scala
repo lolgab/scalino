@@ -4126,8 +4126,14 @@ object ScalinoCli:
         else s"${compileOnly(expanded, extraClasspath, options, extraCompileOnlyClasspath, !o.noIncremental)}$CP_SEP${cc.compileCp}"
       val initScript = o.replInitScript.toList.flatMap(s => List("--init-script", s))
       val quit = if o.replQuitAfterInit then List("--quit-after-init") else Nil
-      val interactive = if scala.scalanative.posix.unistd.isatty(0) != 0 then List("--interactive") else Nil
-      val cmd = List(tool("scalino-dotc"), "--repl") ++ interactive ++ initScript ++ quit ++
+      val stdinTty = scala.scalanative.posix.unistd.isatty(0) != 0
+      val interactive = if stdinTty then List("--interactive") else Nil
+      // the line editor needs both ends on a terminal it can drive with ANSI sequences and `stty`
+      val edit =
+        if stdinTty && scala.scalanative.posix.unistd.isatty(1) != 0 && System.getenv("TERM") != "dumb" && !isWindows then List("--edit")
+        else Nil
+      val color = if Color.enabled(System.out) then List("--color") else Nil
+      val cmd = List(tool("scalino-dotc"), "--repl") ++ interactive ++ edit ++ color ++ initScript ++ quit ++
         List("-javabootclasspath", cc.javaBase, "-classpath", classpath) ++ javalibTastyOptions ++ options
       sys.exit(runInherited(cmd, extraEnv = runEnvOf(directives, o)))
     catch case BuildFailed(msg) => exitBuildFailure(msg)

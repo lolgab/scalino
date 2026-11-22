@@ -18,6 +18,7 @@ for f in compiler.cp tools.cp nativelibs.cp nscplugin.cp nscplugin.jar.txt; do
 done
 [[ -f "$WORK/generated/MiniPhaseOverrides.scala" ]] || { echo "missing $WORK/generated/MiniPhaseOverrides.scala -- run build/02b-gen-megaphase-overrides.sh first" >&2; exit 1; }
 source ./link-lib.sh
+source ./repl-deps.sh
 link_require
 [[ -f "$DIST/java.base.jar" ]] || { echo "missing $DIST/java.base.jar -- run build/02-build-java-base.sh first" >&2; exit 1; }
 
@@ -58,7 +59,7 @@ NSCPLUGIN_JAR="$(cat "$WORK/nscplugin.jar.txt")"
   -Xplugin:"$NSCPLUGIN_JAR" \
   -Xplugin-require:scalanative \
   -Yretain-trees \
-  -classpath "$(cat "$NATIVELIBS_CP")" \
+  -classpath "$(cat "$NATIVELIBS_CP")$CP_SEP$REPL_CP" \
   -d "$NIR_OUT" \
   "@$FILE_LIST"
 
@@ -89,7 +90,7 @@ dotc_link() {
   mkdir -p "$LINK_WORK"
   LINK_ENV=("$@")
   linkdriver_run \
-    "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")" \
+    "$(to_native_path "$NIR_OUT")$CP_SEP$(cat "$NATIVELIBS_CP")$CP_SEP$REPL_NATIVE_CP" \
     "$(to_native_path "$LINK_WORK")" \
     dotty.tools.dotc.Main \
     --mode "$SCALINO_LINK_MODE" \
