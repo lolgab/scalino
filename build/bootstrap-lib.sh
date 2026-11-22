@@ -58,7 +58,9 @@ bootstrap_fetch_dotc() {
     expected="$(awk '{print $1}' "$cache/release.tar.gz.sha256")"
     actual="$( (shasum -a 256 "$cache/release.tar.gz" 2>/dev/null || sha256sum "$cache/release.tar.gz") | awk '{print $1}')"
     [[ "$expected" == "$actual" ]] || { echo "sha256 mismatch for $url" >&2; return 1; }
-    tar -xzf "$cache/release.tar.gz" -C "$cache" --strip-components=1 '*/scalino-dotc' >&2
+    # GNU tar needs --wildcards for the pattern, bsdtar (macOS) has no such flag.
+    tar -xzf "$cache/release.tar.gz" -C "$cache" --strip-components=1 --wildcards '*/scalino-dotc' 2>/dev/null \
+      || tar -xzf "$cache/release.tar.gz" -C "$cache" --strip-components=1 '*/scalino-dotc' >&2
     rm -f "$cache/release.tar.gz"
     [[ -f "$cache/scalino-dotc" ]] || { echo "release tarball has no scalino-dotc" >&2; return 1; }
     chmod +x "$cache/scalino-dotc"
@@ -66,10 +68,11 @@ bootstrap_fetch_dotc() {
   echo "$cache/scalino-dotc"
 }
 
-# JDK modules beyond java.base that dotc's own sources use (profile/ChromeTrace.scala:
-# java.lang.management). User code only gets java.base.jar, so these are built here, for the
-# bootstrap compile only, from the JDK the build already needs (02-build-java-base.sh).
-BOOTSTRAP_JDK_MODULES=(java.management)
+# JDK modules beyond java.base that the self-hosted sources use: java.management (dotc's
+# profile/ChromeTrace.scala) and java.logging (presentation-compiler and mtags-shared, whose NIR
+# comes from lsp-shim/java-util-logging). User code only gets java.base.jar, so these are built
+# here, for the bootstrap compile only, from the JDK the build already needs (02-build-java-base.sh).
+BOOTSTRAP_JDK_MODULES=(java.management java.logging)
 
 # Prints the -javabootclasspath for scalino-dotc: java.base.jar plus BOOTSTRAP_JDK_MODULES.
 bootstrap_bootclasspath() {
