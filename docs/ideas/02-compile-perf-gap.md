@@ -13,8 +13,10 @@ an outer env through `ThisEnv.iterator`, which omits the lazily bound base class
 macro-thread allocation per ape compile from ~1190 MB to ~745 MB (-38%, warm JVM, deterministic):
 intrinsic dispatch without `orElse` closures, memoized base-class scans, an allocation-light `Call`
 extractor, hoisted `TreeTypeMap` substitution lists, `SCALINO_OUTER_DIAG` read once. Both are
-checked on the JVM only (byte-identical ape, wes, examples, interpreter fixtures), not relinked or
-timed natively. Details and what was ruled out under step 7 below.
+checked on the JVM (byte-identical ape, wes, examples, interpreter fixtures). A release-fast native
+link (2026-11-22) compiles wes again (1483 files, every `.tasty` identical to the JVM output) and gives
+byte-identical ape output; native ape timing vs 0047 is within noise on a loaded machine. Details and
+what was ruled out under step 7 below.
 
 ## Summary
 
@@ -228,8 +230,15 @@ recompile 22 files, and idea 01. Revisit splice caching only if B stalls above ~
      interpreter/test-fixtures. wes was missing from earlier gates, which is how 0046's regression
      shipped. Known noise: i8746 embeds an identity hash; wes's `APULoadStore$.nir` is
      nondeterministic run to run with the same compiler (field order, cause not investigated).
-   - *Open.* Native relink + timing of 0048/0049. `dist/scalino-dotc` as of 2026-11-21 11:17 is
-     an unoptimized 90MB build (ape 34s vs 7.1s for the 0047 release link) and needs a release relink.
+   - *Native (2026-11-22).* `SCALINO_LINK_MODE=release-fast` link of origin/main (02a + 03, 45 MB, smoke
+     OK). ape: 970 files byte-identical to the 0047 release link. Six alternating runs at load 9-11:
+     median real 8.8 s (0047) vs 8.6 s (0049), user 8.6 vs 8.45 s, inside the run-to-run spread, so no
+     native speedup claimed. wes: 0047 fails (6 "not bound"), 0049 exits 0 with 1483 files, all `.tasty`
+     identical to the JVM gate; 3 `.nir` differ (`APULoadStore$`, `PPULoadStore$`, `MMC1$`), the same
+     run-to-run nondeterminism class as above.
+   - *Open.* A quiet-machine native timing. `dist/scalino-dotc` as of 2026-11-21 11:17 is an
+     unoptimized 90MB debug build (ape 34s vs 7.1s for the 0047 release link); left in place, since
+     `build/03` defaults to `SCALINO_LINK_MODE=debug` for local builds.
 8. Regenerate patches after every batch (vendor is disposable) and update `docs/findings.md`.
 
 ## Effort estimate and risks
