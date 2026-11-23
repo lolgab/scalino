@@ -522,7 +522,9 @@ object ScalinoCli:
     // `//> using postLink <cmd>`: one command per directive, see runPostLink
     postLink: List[String] = Nil,
     // `//> using runEnv KEY=VALUE`: extra environment for the program `run`/`test` start
-    runEnv: List[String] = Nil
+    runEnv: List[String] = Nil,
+    // absolute directories of `//> using dependsOn`: upstream modules, see cli/Modules.scala
+    dependsOn: List[String] = Nil
   )
 
   /** A path from a `//> using` line: relative to the declaring file, or, when nothing is there, to the
@@ -552,7 +554,7 @@ object ScalinoCli:
     "nativeTargetTriple", "nativeTargetTriples", "nativeSysroot", "nativePkgConfig",
     "platform", "platforms", "target.platform", "jsModuleKind", "jsMode", "jsEmitSourceMaps", "jsClient", "jsClientOut", "shared",
     "jsNoOpt", "jsCheckIr", "jsHeader", "jsEsVersionStr", "jsModuleSplitStyleStr", "jsSmallModuleForPackage", "jsAvoidClasses", "jsAvoidLetsAndConsts", "jsAllowBigIntsForLongs",
-    "postLink", "runEnv",
+    "postLink", "runEnv", "dependsOn",
     "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
@@ -674,6 +676,7 @@ object ScalinoCli:
     var jsAllowBigIntsForLongs = Option.empty[Boolean]
     var postLink = List.empty[String]
     var runEnv = List.empty[String]
+    var dependsOn = List.empty[String]
     val warnedKeys = scala.collection.mutable.Set.empty[String]
     // Directive lines must start with `//>` (after whitespace): an unanchored scan also matches
     // `//> using ...` in prose and help-text literals, and this repo's own cli/ScalinoCli.scala
@@ -744,6 +747,7 @@ object ScalinoCli:
         directiveValues(line, "shared").foreach(vs => shared = shared ++ vs.map(v => directivePath(src, v).toString))
         directiveCommands(line, "postLink").foreach(cs => postLink = postLink ++ cs)
         directiveValues(line, "runEnv").foreach(vs => runEnv = runEnv ++ vs)
+        directiveValues(line, "dependsOn").foreach(vs => dependsOn = dependsOn ++ vs.map(v => directivePath(src, v).toString))
         directiveBool(line, "nativeEmbedResources").foreach(v => nativeEmbedResources = Some(v))
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
@@ -764,7 +768,7 @@ object ScalinoCli:
       nativeTargetTriples, nativeSysroots, nativePkgConfig,
       platform, jsModuleKind, jsMode, jsSourceMaps, jsClients.distinct, shared.distinct,
       jsNoOpt, jsCheckIr, jsHeader, jsEsVersion, jsAvoidClasses, jsAvoidLetsAndConsts, jsAllowBigIntsForLongs, jsClientOut, jsModuleSplitStyle, jsSmallModulePackages.distinct,
-      postLink, runEnv
+      postLink, runEnv, dependsOn.distinct
     )
 
   /** scala-cli's dependency formats (only `org::name::version` is advertised in
@@ -777,7 +781,7 @@ object ScalinoCli:
    */
   /** Set by `buildAndMaybeRun` before anything resolves a dependency: true for a Scala.js build, whose
    *  `org::name::version` means `name_sjs1_3` instead of `name_native0.5_3`. */
-  private var jsPlatform = false
+  var jsPlatform = false
 
   def toCoursierCoord(dep: String): String =
     val full = dep.indexOf(":::")
@@ -1061,8 +1065,20 @@ object ScalinoCli:
       val d0 = parseDirectives(srcs)
       val platform = resolvePlatform(d0, o)
       val filtered = forPlatform(srcs, platform)
-      val d = if filtered.size == srcs.size then d0 else parseDirectives(filtered)
+      val own = if filtered.size == srcs.size then d0 else parseDirectives(filtered)
+      // `dependsOn` modules: the root resolves its deps with theirs, each module its closure's (Modules.classpathOf)
+      val modules = try Modules.resolve(own, filtered, platform) catch case BuildFailed(msg) => die(msg)
+      val d = Modules.withUpstream(own, modules)
       val repos = (d.repositories ++ o.cliRepositories).distinct
+      def addModuleSets(ms: List[Modules.Module], js: Boolean): Unit =
+        for m <- ms do
+          val closure = m.closure.map(_.directives)
+          val mRepos = (closure.flatMap(_.repositories) ++ o.cliRepositories).distinct
+          val deps = closure.flatMap(_.deps).distinct
+          if js then addSet((jsBaseDeps ++ deps).distinct, mRepos, true)
+          else if deps.nonEmpty then addSet(deps, mRepos, false)
+          if m.directives.compileOnlyDeps.nonEmpty then addSet(m.directives.compileOnlyDeps.distinct, (m.directives.repositories ++ o.cliRepositories).distinct, js)
+      addModuleSets(modules, platform == "js")
       if platform == "js" then
         val base = jsBaseDeps ++ d.deps ++ o.cliDeps
         addSet(base.distinct, repos, true)
@@ -1075,8 +1091,11 @@ object ScalinoCli:
         for dir <- d.jsClients do
           val (clientSources, _) = partitionSources(forPlatform(expandSources(Paths.get(dir) :: d.shared.map(Paths.get(_))), "js"))
           if clientSources.nonEmpty then
-            val cd = parseDirectives(clientSources)
+            val ownClient = parseDirectives(clientSources)
+            val clientModules = try Modules.resolve(ownClient, clientSources, "js") catch case BuildFailed(msg) => die(msg)
+            val cd = Modules.withUpstream(ownClient, clientModules)
             addSet((jsBaseDeps ++ cd.deps).distinct, (cd.repositories ++ o.cliRepositories).distinct, true)
+            addModuleSets(clientModules, true)
 
     try
       val resolved = groups.toList.sortBy(_._1).map { case (key, (ds, repos, js)) =>
@@ -1569,12 +1588,17 @@ object ScalinoCli:
    *  code and typically ends in a dependency jar (`MySuite extends munit.FunSuite extends
    *  munit.Suite`). */
   def findClassInfo(name: String, classesDir: Path, jars: List[String]): Option[ClassInfo] =
-    val localClass = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".class")
-    if Files.exists(localClass) then analyzeClassFile(Files.readAllBytes(localClass))
-    else
-      val localNir = classesDir.resolve(name.replace('.', java.io.File.separatorChar) + ".nir")
-      if Files.exists(localNir) then nirClassInfoOf(readNirDefns(localNir))
-      else jars.iterator.flatMap(j => readClassFromJar(j, name).iterator).nextOption().flatMap(analyzeClassFile)
+    def inDir(dir: Path): Option[ClassInfo] =
+      val localClass = dir.resolve(name.replace('.', java.io.File.separatorChar) + ".class")
+      if Files.exists(localClass) then analyzeClassFile(Files.readAllBytes(localClass))
+      else
+        val localNir = dir.resolve(name.replace('.', java.io.File.separatorChar) + ".nir")
+        if Files.exists(localNir) then nirClassInfoOf(readNirDefns(localNir)) else None
+    // A classpath directory is an upstream module's output (cli/Modules.scala) or a resource directory.
+    inDir(classesDir).orElse(jars.iterator.flatMap { j =>
+      if Files.isDirectory(Paths.get(j)) then inDir(Paths.get(j)).iterator
+      else readClassFromJar(j, name).iterator.flatMap(analyzeClassFile)
+    }.nextOption())
 
   /** Does `startClass`'s ancestry (superclasses and, at every step, interfaces: Scala traits
    *  compile to interfaces and markers are often traits like `munit.Suite`) include `target`?
@@ -1823,12 +1847,7 @@ object ScalinoCli:
    *  and `//> using exclude` (glob against each source's path relative to the cwd) over the
    *  directory-expanded set. Only directives of sources already in `base` count; as in scala-cli,
    *  a `file`-referenced source's own directives are not expanded again. */
-  private def applyFileAndExcludeDirectives(base: List[Path]): List[Path] =
-    def directiveValuesOf(src: Path, keys: String*): List[String] =
-      if !Files.exists(src) then Nil
-      else readFile(src).linesIterator.filter(_.trim.startsWith("//>")).flatMap { rawLine =>
-        directiveValues(rawLine.trim, keys*).getOrElse(Nil)
-      }.toList
+  private def applyFileAndExcludeDirectives(base: List[Path], roots: List[Path] = Nil): List[Path] =
     val extraFiles = base.flatMap { src =>
       directiveValuesOf(src, "file", "files").map(f => src.toAbsolutePath.getParent.resolve(f).normalize())
     }
@@ -1838,8 +1857,14 @@ object ScalinoCli:
     // `shared`: sources the project and its jsClient have in common, files or directories
     val sharedFiles = base.flatMap(src => directiveValuesOf(src, "shared").map(directivePath(src, _))).flatMap(p =>
       if Files.isDirectory(p) then collectScalaFiles(p) else List(p))
+    // A `dependsOn` directory (and whatever it depends on in turn) is a module of its own too. One the
+    // command line names, or one holding it, stays: that is the module being built (or a cycle, which
+    // Modules.resolve reports).
+    val rootDirs = roots.map(_.toAbsolutePath.normalize)
+    val moduleDirs = moduleDirsReachableFrom(base).filterNot(d => rootDirs.exists(_.startsWith(d)))
     // `./shared/A.scala` (from a directory scan) and the absolute path a directive gives are the same file
-    val combined = (base ++ extraFiles ++ sharedFiles).distinctBy(_.toAbsolutePath.normalize).filterNot(p => clientDirs.exists(d => p.toAbsolutePath.normalize.startsWith(d)))
+    val combined = (base ++ extraFiles ++ sharedFiles).distinctBy(_.toAbsolutePath.normalize)
+      .filterNot(p => (clientDirs ++ moduleDirs).exists(d => p.toAbsolutePath.normalize.startsWith(d)))
     if excludeGlobs.isEmpty then combined
     else
       val cwd = Paths.get("").toAbsolutePath.normalize()
@@ -1883,9 +1908,27 @@ object ScalinoCli:
   def unwrapScriptPaths(out: String): String =
     scriptOrigins.foldLeft(out) { case (acc, (wrapped, orig)) => acc.replace(wrapped, orig) }
 
+  private def directiveValuesOf(src: Path, keys: String*): List[String] =
+    if !Files.exists(src) then Nil
+    else readFile(src).linesIterator.filter(_.trim.startsWith("//>")).flatMap { rawLine =>
+      directiveValues(rawLine.trim, keys*).getOrElse(Nil)
+    }.toList
+
+  /** Every directory reached from `sources` through `//> using dependsOn`, transitively (a module's
+   *  own sources are scanned whole for theirs: over-approximating is harmless, each of those
+   *  directories is a module of the build either way). */
+  def moduleDirsReachableFrom(sources: List[Path]): List[Path] =
+    val seen = scala.collection.mutable.LinkedHashSet.empty[Path]
+    def visit(src: Path): Unit =
+      for v <- directiveValuesOf(src, "dependsOn") do
+        val dir = directivePath(src, v)
+        if seen.add(dir) && Files.isDirectory(dir) then collectScalaFiles(dir).foreach(visit)
+    sources.foreach(visit)
+    seen.toList
+
   def expandSources(paths: List[Path]): List[Path] =
     val base = paths.flatMap(p => if Files.isDirectory(p) then collectScalaFiles(p) else List(p)).distinct
-    applyFileAndExcludeDirectives(base)
+    applyFileAndExcludeDirectives(base, paths)
 
   /** `--watching`/`--watching-path`: extra paths polled for mtime changes, walked like
    *  `collectScalaFiles` but keeping every file (they are arbitrary resources). */
@@ -2004,7 +2047,10 @@ object ScalinoCli:
   // recompiles the mentioning file. A whole-project fingerprint (compile classpath, scalac
   // options, scalino-dotc's mtime) forces a full rebuild when any of those change.
 
-  case class FileRecord(hash: String, pkg: String, declaredNames: List[String])
+  /** `declaredNames`: top-level types, what the file's outputs are named after (purged by name).
+   *  `terms`: its top-level `def`/`val`/`var`/`type`/`given` names, which only widen invalidation. */
+  case class FileRecord(hash: String, pkg: String, declaredNames: List[String], terms: List[String] = Nil):
+    def mentionable: List[String] = declaredNames ++ terms
   case class IncrManifest(fingerprint: String, files: Map[String, FileRecord])
 
   // Top-level by convention, not indentation tracking. Missing a nested name only drops its edges
@@ -2020,6 +2066,16 @@ object ScalinoCli:
 
   def extractPackage(text: String): String =
     packageRe.findFirstMatchIn(text).map(_.group(1)).getOrElse("")
+
+  // Top-level terms, by the stricter convention that they start at column 0 (members are indented,
+  // whether or not a file uses braces; so are the methods of a multi-line `extension` block, which
+  // are missed). Compiled into `<File>$package`, which no source mentions, so
+  // without these a file calling a top-level def would not be recompiled when that def changes.
+  private val topLevelTermRe =
+    """(?m)^(?:@\w+(?:\([^)]*\))?\s+)*(?:extension\s*(?:\[[^\]]*\]\s*)?\([^)]*\)\s*)?(?:(?:private|protected|inline|transparent|implicit|final|lazy|opaque|infix)(?:\[\w+\])?\s+)*(?:def|val|var|type|given)\s+([A-Za-z_][A-Za-z0-9_]*)""".r
+
+  def extractTopLevelTerms(text: String): List[String] =
+    topLevelTermRe.findAllMatchIn(text).map(_.group(1)).toList.distinct
 
   def extractDeclaredNames(text: String): List[String] =
     (topLevelDeclRe.findAllMatchIn(text).map(_.group(1)) ++
@@ -2043,7 +2099,8 @@ object ScalinoCli:
             val files = rest.filter(_.nonEmpty).map { line =>
               val parts = line.split("\t", -1)
               val names = if parts(3).isEmpty then Nil else parts(3).split(",").toList
-              parts(0) -> FileRecord(parts(1), parts(2), names)
+              val terms = parts.lift(4).filter(_.nonEmpty).map(_.split(",").toList).getOrElse(Nil)
+              parts(0) -> FileRecord(parts(1), parts(2), names, terms)
             }.toMap
             Some(IncrManifest(fingerprint, files))
           case Nil => None
@@ -2052,12 +2109,49 @@ object ScalinoCli:
   def saveManifest(path: Path, m: IncrManifest): Unit =
     Files.createDirectories(Option(path.getParent).getOrElse(Paths.get(".")))
     val lines = m.fingerprint :: m.files.toList.map { case (p, r) =>
-      s"$p\t${r.hash}\t${r.pkg}\t${r.declaredNames.mkString(",")}"
+      s"$p\t${r.hash}\t${r.pkg}\t${r.declaredNames.mkString(",")}\t${r.terms.mkString(",")}"
     }
     Files.write(path, lines.mkString("\n").getBytes("UTF-8"))
 
   private def manifestPathFor(classesDir: Path): Path =
     classesDir.resolveSibling(classesDir.getFileName.toString + ".incr-manifest")
+
+  // Upstream modules (cli/Modules.scala) are compiled by compileToClasses too, so a compile classpath
+  // directory with a manifest beside it is one. What their manifests said at this directory's last
+  // successful compile is kept in `<classesDir>.upstream`, one `<upstream dir>\t<manifest line>` per
+  // file: the names declared in the upstream files that changed since then are this compile's
+  // changed names from outside (see compileToClasses).
+
+  private def upstreamSnapshotPathFor(classesDir: Path): Path =
+    classesDir.resolveSibling(classesDir.getFileName.toString + ".upstream")
+
+  /** Upstream file records by `<upstream dir>\t<source path>`. */
+  private def upstreamRecords(compileCp: String, classesDir: Path): Map[String, FileRecord] =
+    val self = classesDir.toAbsolutePath.normalize
+    compileCp.split(CP_SEP).toList.filter(_.nonEmpty).map(Paths.get(_)).filter { d =>
+      d.toAbsolutePath.normalize != self && Files.isDirectory(d) && Files.exists(manifestPathFor(d))
+    }.flatMap { d =>
+      loadManifest(manifestPathFor(d)).toList.flatMap(_.files.map { case (src, r) => s"$d\t$src" -> r })
+    }.toMap
+
+  private def loadUpstreamSnapshot(classesDir: Path): Option[Map[String, FileRecord]] =
+    val path = upstreamSnapshotPathFor(classesDir)
+    try
+      if !Files.exists(path) then None
+      else Some(readFile(path).linesIterator.filter(_.nonEmpty).map { line =>
+        val parts = line.split("\t", -1)
+        val names = if parts(4).isEmpty then Nil else parts(4).split(",").toList
+        val terms = parts.lift(5).filter(_.nonEmpty).map(_.split(",").toList).getOrElse(Nil)
+        s"${parts(0)}\t${parts(1)}" -> FileRecord(parts(2), parts(3), names, terms)
+      }.toMap)
+    catch case _: Exception => None
+
+  private def saveUpstreamSnapshot(classesDir: Path, records: Map[String, FileRecord]): Unit =
+    val path = upstreamSnapshotPathFor(classesDir)
+    if records.isEmpty then Files.deleteIfExists(path)
+    else
+      val lines = records.toList.map { case (k, r) => s"$k\t${r.hash}\t${r.pkg}\t${r.declaredNames.mkString(",")}\t${r.terms.mkString(",")}" }
+      Files.write(path, lines.mkString("\n").getBytes("UTF-8"))
 
   /** Deletes what `classesDir` holds for the given (package, declared top-level names):
    *  `Name.class`/`Name.tasty`/`Name.nir` plus nested outputs (`Name$.class`, `Name$Inner.class`),
@@ -2083,7 +2177,9 @@ object ScalinoCli:
     extraOptions: List[String] = Nil,
     incremental: Boolean = true,
     js: Boolean = false,
-    daemon: Boolean = true
+    daemon: Boolean = true,
+    // what the progress lines call it: "module core" for an upstream module (cli/Modules.scala)
+    what: String = "project"
   ): Unit =
     val manifestPath = manifestPathFor(classesDir)
     val fingerprint = computeFingerprint(cc, extraOptions)
@@ -2098,8 +2194,19 @@ object ScalinoCli:
       p -> (extractDeclaredNames(t) :+ s"$base$$package").distinct
     }
     val curPkg = texts.view.mapValues(extractPackage).toMap
+    val curTerms = texts.view.mapValues(extractTopLevelTerms).toMap
+    val curMentionable = curDeclared.map { case (p, names) => p -> (names ++ curTerms(p)).distinct }
 
-    val fullRebuild = !incremental || prev.isEmpty || prev.exists(_.fingerprint != fingerprint) || !Files.isDirectory(classesDir)
+    val upstreamNow = upstreamRecords(cc.compileCp, classesDir)
+    val upstreamPrev = if incremental && upstreamNow.nonEmpty then loadUpstreamSnapshot(classesDir) else None
+    // Names declared by upstream files that were added, edited or removed since the last compile.
+    val upstreamChangedNames: Set[String] = upstreamPrev.toList.flatMap { before =>
+      (before.keySet ++ upstreamNow.keySet).toList.filter(k => before.get(k).map(_.hash) != upstreamNow.get(k).map(_.hash))
+        .flatMap(k => before.get(k).toList.flatMap(_.mentionable) ++ upstreamNow.get(k).toList.flatMap(_.mentionable))
+    }.toSet
+
+    val fullRebuild = !incremental || prev.isEmpty || prev.exists(_.fingerprint != fingerprint) || !Files.isDirectory(classesDir) ||
+      (upstreamNow.nonEmpty && upstreamPrev.isEmpty)
 
     val (toCompile, removedRecords) =
       if fullRebuild then (sources, Nil)
@@ -2111,13 +2218,13 @@ object ScalinoCli:
 
         // name -> declaring file(s), recomputed from the current sources every run; stands in for
         // dotc's symbol table: any textual mention of a name is an edge to its declarer.
-        val nameToFile = curDeclared.toList.flatMap { case (p, names) => names.map(_ -> p) }.groupMap(_._1)(_._2)
+        val nameToFile = curMentionable.toList.flatMap { case (p, names) => names.map(_ -> p) }.groupMap(_._1)(_._2)
         // Names that vanished, with their declaring file or from a file that still exists (a renamed
         // class), still invalidate their referrers: dotc then reports a real "not found" instead of
         // the referrer keeping a stale reference to outputs that were purged.
-        val curNames = curDeclared.values.flatten.toSet
-        val vanishedNames = changed.flatMap(p => m.files.get(p.toString).toList.flatMap(_.declaredNames)).filterNot(curNames)
-        val removedNames = removed.values.flatMap(_.declaredNames).toSet ++ vanishedNames
+        val curNames = curMentionable.values.flatten.toSet
+        val vanishedNames = changed.flatMap(p => m.files.get(p.toString).toList.flatMap(_.mentionable)).filterNot(curNames)
+        val removedNames = removed.values.flatMap(_.mentionable).toSet ++ vanishedNames ++ upstreamChangedNames
         val allKnownNames = nameToFile.keySet ++ removedNames
 
         // Tokenize each text once and intersect with the known names, rather than one regex per name
@@ -2136,7 +2243,7 @@ object ScalinoCli:
         removedNames.foreach(n => dependentsOf(n).foreach(markInvalid))
         while queue.nonEmpty do
           val p = queue.dequeue()
-          curDeclared.getOrElse(p, Nil).foreach(n => dependentsOf(n).foreach(markInvalid))
+          curMentionable.getOrElse(p, Nil).foreach(n => dependentsOf(n).foreach(markInvalid))
 
         (sources.filter(p => invalid(p.toString)), removed.toList)
 
@@ -2152,7 +2259,7 @@ object ScalinoCli:
 
     if toCompile.nonEmpty then
       // scalino-dotc is silent on success, so print a line like scala-cli/sbt or a long compile looks hung.
-      System.err.println(Color.gray(s"Compiling project (${if js then jsBuildLabel else buildLabel})"))
+      System.err.println(Color.gray(s"Compiling $what (${if js then jsBuildLabel else buildLabel})"))
       // classesDir on the compile classpath (harmless on a full rebuild, it's emptied above) lets
       // scalino-dotc resolve symbols of files not recompiled this round from their .tasty/.class.
       val compileCp = s"$classesDir$CP_SEP${cc.compileCp}"
@@ -2175,6 +2282,8 @@ object ScalinoCli:
       // Sources whose outputs were purged above: the daemon drops their symbols from its warm state.
       val staleSources = if fullRebuild then Nil else files ++ removedRecords.map(_._1)
 
+      // The daemon's warm symbols for an upstream module's classes are those before its change: start cold.
+      if upstreamChangedNames.nonEmpty then DotcDaemon.forgetGeneration(classesDir)
       val viaDaemon =
         if !daemon || DotcDaemon.mode == DotcDaemon.Mode.Off then None
         else
@@ -2189,24 +2298,32 @@ object ScalinoCli:
       }
       Diagnostics.render(unwrapScriptPaths(compileOut)).foreach(System.err.println)
       if compileExit != 0 then
-        System.err.println(Color.gray(s"Error compiling project (${if js then jsBuildLabel else buildLabel})"))
+        System.err.println(Color.gray(s"Error compiling $what (${if js then jsBuildLabel else buildLabel})"))
+        // The manifest keeps the last good state, except that this batch's outputs are gone (purged
+        // above): its records lose their hash, so the next attempt recompiles them even if their
+        // text is then back to what the manifest had (an upstream module's edit reverted, or a
+        // reverted file whose dependents failed).
+        if incremental && !fullRebuild then
+          val m = prev.get
+          val batch = toCompile.map(_.toString).toSet
+          saveManifest(manifestPath, m.copy(files = m.files.map { case (p, r) => p -> (if batch(p) then r.copy(hash = "") else r) }))
         fail(CompilationFailed)
-      System.err.println(Color.gray(s"Compiled project (${if js then jsBuildLabel else buildLabel})"))
-      // On failure the manifest stays untouched (the last good state), so the next attempt retries
-      // every file of this batch plus dependents.
+      System.err.println(Color.gray(s"Compiled $what (${if js then jsBuildLabel else buildLabel})"))
 
     if incremental then
       val toCompileSet = toCompile.toSet
       val newFiles = sources.map { p =>
         val key = p.toString
         val record =
-          if fullRebuild || toCompileSet(p) then FileRecord(curHash(key), curPkg(key), curDeclared(key))
+          if fullRebuild || toCompileSet(p) then FileRecord(curHash(key), curPkg(key), curDeclared(key), curTerms(key))
           else prev.get.files(key)
         key -> record
       }.toMap
       saveManifest(manifestPath, IncrManifest(fingerprint, newFiles))
+      saveUpstreamSnapshot(classesDir, upstreamNow)
     else
       Files.deleteIfExists(manifestPath)
+      Files.deleteIfExists(upstreamSnapshotPathFor(classesDir))
 
   /** A copy of `dir` in a temp directory, for SCALINO_DOTC_DAEMON=verify. */
   private def snapshotDir(dir: Path): Path =
@@ -2826,14 +2943,15 @@ object ScalinoCli:
     if !Files.isDirectory(clientDir) then fail(s"jsClient: '$dir' is not a directory")
     val (sources, _) = partitionSources(forPlatform(expandSources(clientDir :: shared.map(Paths.get(_))), "js"))
     if sources.isEmpty then fail(s"jsClient: no .scala files in '$dir'")
-    val d = parseDirectives(sources)
     val saved = jsPlatform
     jsPlatform = true
     try
       System.err.println(Color.gray(s"Building JS client ${Paths.get("").toAbsolutePath.normalize.relativize(clientDir)}"))
+      // a client's `dependsOn` modules are built for Scala.js, whatever the server's platform
+      val (d, moduleCp) = Modules.prepare(parseDirectives(sources), sources, "js", o)
       val repos = (d.repositories ++ o.cliRepositories).distinct
       val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-      val classpath = (List(resolveJsDeps((jsBaseDeps ++ d.deps).distinct, depsCache, repos)) ++ d.jars ++ d.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+      val classpath = (moduleCp ++ List(resolveJsDeps((jsBaseDeps ++ d.deps).distinct, depsCache, repos)) ++ d.jars ++ d.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
       val compileOnly = resolveDeps(d.compileOnlyDeps.distinct, depsCache, repos)
       val jsOpts = resolveJsOpts(d, o, defaultMode = if serverNativeMode.exists(_.startsWith("release")) then "release" else "dev")
       val outDir = out.map(Paths.get(_))
@@ -2850,12 +2968,12 @@ object ScalinoCli:
           Some(resources.toAbsolutePath)
     finally jsPlatform = saved
 
-  def buildJsAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts, directives: Directives): Int =
+  def buildJsAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts, directives: Directives, moduleCp: List[String] = Nil): Int =
     if o.formats.nonEmpty then fail("--format is not supported for Scala.js")
     val allDeps = (jsBaseDeps ++ directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = (List(resolveJsDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+    val extraClasspath = (moduleCp ++ List(resolveJsDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     if splitMainClasses(explicitMainClass).size > 1 then fail(s"several main classes given (${explicitMainClass.get}): not supported for Scala.js")
@@ -3027,14 +3145,14 @@ object ScalinoCli:
        |    ))
        |""".stripMargin
 
-  def testJs(expanded: List[Path], o: RunOpts, directives: Directives): Int =
+  def testJs(expanded: List[Path], o: RunOpts, directives: Directives, moduleCp: List[String] = Nil): Int =
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
     // One resolution for main and test dependencies: resolved apart, a framework's own (older) Scala 3
     // and Scala.js libraries would sit next to ours on the class path.
     val testDeps = (jsBaseDeps ++ directives.deps ++ o.cliDeps ++ directives.testDeps).distinct
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
-    val testClasspath = (List(resolveJsDeps(testDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
+    val testClasspath = (moduleCp ++ List(resolveJsDeps(testDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs).filter(_.nonEmpty).mkString(CP_SEP)
     val options = directives.options ++ o.cliOptions ++ directives.testOptions
     val jsOpts = resolveJsOpts(directives, o)
     val cc = computeJsCompileClasspath(testClasspath, extraCompileOnlyClasspath)
@@ -3390,6 +3508,9 @@ object ScalinoCli:
        |  //> using repository https://my.org/maven   (extra Maven repo, repeatable)
        |  //> using file ./Other.scala             (extra source, relative to this file's dir)
        |  //> using exclude generated/**            (glob; drop matching sources, cwd-relative)
+       |  //> using dependsOn ../core               (a module: that directory is compiled on its own first and its
+       |                                             classes, dep/jar/resourceDir/repository directives join this
+       |                                             project's; relative to this file, else to the cwd; repeatable)
        |  //> using nativeMode release-fast
        |  //> using nativeGc immix
        |  //> using nativeLto thin
@@ -3881,25 +4002,27 @@ object ScalinoCli:
     val directives0 = parseDirectives(expandedIn)
     // `//> using target.platform` files drop out for the other platform (the platform itself comes from the rest)
     val expandedOrig = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
-    val directives = if expandedOrig.size == expandedIn.size then directives0 else parseDirectives(expandedOrig)
+    val ownDirectives = if expandedOrig.size == expandedIn.size then directives0 else parseDirectives(expandedOrig)
     // Directives come from the sources as written; `.sc` scripts compile as their generated wrappers.
     val expanded = wrapScripts(expandedOrig)
-    directives.scalaVersion.orElse(o.cliScala).foreach { v =>
+    ownDirectives.scalaVersion.orElse(o.cliScala).foreach { v =>
       if !BuildInfo.scalaVersion.startsWith(v) then
         System.err.println(
           Color.warn(s"scalino: warning: scala \"$v\" requested, but this toolchain only supports ${BuildInfo.scalaVersion} -- ignoring")
         )
     }
-    jsPlatform = resolvePlatform(directives, o) == "js"
+    jsPlatform = resolvePlatform(ownDirectives, o) == "js"
     jsRuntime = o.cliJsRuntime.getOrElse("node")
-    if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives)
+    // `//> using dependsOn`: upstream modules are compiled first, their classes go first on the class path
+    val (directives, moduleCp) = Modules.prepare(ownDirectives, expandedOrig, if jsPlatform then "js" else "native", o)
+    if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives, moduleCp)
     if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
     // `compile` only type-checks the server: it doesn't need the bundle.
     val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = o.cliNativeMode.orElse(directives.nativeMode)))
     val allDeps = (directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
-    val extraClasspath = (List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs ++ clientResources.map(_.toString)).filter(_.nonEmpty).mkString(CP_SEP)
+    val extraClasspath = (moduleCp ++ List(resolveDeps(allDeps, depsCache, repos)) ++ directives.jars ++ directives.resourceDirs ++ clientResources.map(_.toString)).filter(_.nonEmpty).mkString(CP_SEP)
     val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
     val explicitMainClass = o.mainClassOpt.orElse(directives.mainClass)
     val options = directives.options ++ o.cliOptions
@@ -4067,8 +4190,11 @@ object ScalinoCli:
       def resolve() =
         val srcs = try partitionSources(expandSources(o.sources.filter(Files.exists(_))))._1 catch case _: java.io.IOException => Nil
         // the sources of a `jsClient` are not in `srcs` (they are another project) but a change rebuilds the server too
-        val clients = try parseDirectives(srcs).jsClients.map(Paths.get(_)).filter(Files.exists(_)) catch case _: java.io.IOException => Nil
-        (srcs, expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)).filter(Files.exists(_)) ++ clients))
+        val d = try Some(parseDirectives(srcs)) catch case _: java.io.IOException => None
+        val clients = d.toList.flatMap(_.jsClients.map(Paths.get(_)).filter(Files.exists(_)))
+        // so are the modules it depends on (and the client's)
+        val modules = d.toList.flatMap(Modules.watchedSources) ++ clients.flatMap(c => Modules.watchedSources(parseDirectives(collectScalaFiles(c))))
+        (srcs, expandWatchPaths(o.cliWatchingPaths.map(Paths.get(_)).filter(Files.exists(_)) ++ clients) ++ modules)
       watchLoop(resolve) { current =>
         try buildAndMaybeRun(mode, current, o)
         catch case BuildFailed(msg) => reportBuildFailure(msg)
@@ -4149,10 +4275,12 @@ object ScalinoCli:
     def attempt(expandedIn: List[Path]): Int =
       val directives0 = parseDirectives(expandedIn)
       val expanded = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
-      val directives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
-      jsPlatform = resolvePlatform(directives, o) == "js"
+      val ownDirectives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
+      jsPlatform = resolvePlatform(ownDirectives, o) == "js"
       jsRuntime = o.cliJsRuntime.getOrElse("node")
-      if jsPlatform then return testJs(expanded, o, directives)
+      // The root module's tests, with its upstream modules (main scope) on the class path.
+      val (directives, moduleCp) = Modules.prepare(ownDirectives, expanded, if jsPlatform then "js" else "native", o)
+      if jsPlatform then return testJs(expanded, o, directives, moduleCp)
       directives.scalaVersion.orElse(o.cliScala).foreach { v =>
         if !BuildInfo.scalaVersion.startsWith(v) then
           System.err.println(
@@ -4167,7 +4295,7 @@ object ScalinoCli:
       val mainClasspath = resolveDeps((directives.deps ++ o.cliDeps).distinct, depsCache, repos)
       val testOnlyClasspath = resolveDeps(directives.testDeps, depsCache, repos)
       val extraCompileOnlyClasspath = resolveDeps((directives.compileOnlyDeps ++ o.cliCompileOnlyDeps).distinct, depsCache, repos)
-      val testClasspath = (List(mainClasspath, testOnlyClasspath) ++ directives.jars ++ directives.resourceDirs ++ clientResources.map(_.toString)).filter(_.nonEmpty).mkString(CP_SEP)
+      val testClasspath = (moduleCp ++ List(mainClasspath, testOnlyClasspath) ++ directives.jars ++ directives.resourceDirs ++ clientResources.map(_.toString)).filter(_.nonEmpty).mkString(CP_SEP)
       val options = directives.options ++ o.cliOptions ++ directives.testOptions
       val cc = computeCompileClasspath(testClasspath, extraCompileOnlyClasspath)
 
@@ -4241,7 +4369,8 @@ object ScalinoCli:
 
     if o.watch then
       def resolve() =
-        (try expandSources(o.sources.filter(Files.exists(_))) catch case _: java.io.IOException => Nil, Nil)
+        val srcs = try expandSources(o.sources.filter(Files.exists(_))) catch case _: java.io.IOException => Nil
+        (srcs, try Modules.watchedSources(parseDirectives(srcs)) catch case _: java.io.IOException => Nil)
       watchLoop(resolve) { current =>
         try attempt(current)
         catch case BuildFailed(msg) => reportBuildFailure(msg)
@@ -4270,9 +4399,14 @@ object ScalinoCli:
     // One IDE project per compilation scope, mirroring buildBinary (main) and handleTest (main +
     // test, test seeing main's). Separate classpaths keep test-only dependencies invisible to main.
     // `platform`/`dependsOn` let a multi-target layout add entries without format changes.
-    val mainDirectives = parseDirectives(expanded)
-    jsPlatform = resolvePlatform(mainDirectives, o) == "js"
-    val allDirectives = if testSources.isEmpty then mainDirectives else parseDirectives(allExpanded)
+    val ownDirectives = parseDirectives(expanded)
+    jsPlatform = resolvePlatform(ownDirectives, o) == "js"
+    // `//> using dependsOn`: one more project per module, the root's seeing its modules' dependencies
+    val modules =
+      try Modules.resolve(ownDirectives, expanded, if jsPlatform then "js" else "native")
+      catch case BuildFailed(msg) => die(msg)
+    val mainDirectives = Modules.withUpstream(ownDirectives, modules)
+    val allDirectives = if testSources.isEmpty then mainDirectives else Modules.withUpstream(parseDirectives(allExpanded), modules)
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
     val repos = (allDirectives.repositories ++ mainDirectives.repositories ++ o.cliRepositories).distinct
     val mainDeps = ((if jsPlatform then jsBaseDeps else Nil) ++ mainDirectives.deps ++ o.cliDeps).distinct
@@ -4306,8 +4440,28 @@ object ScalinoCli:
          |  }""".stripMargin
 
     val mainCp = if jsPlatform then resolveJsDeps(mainDeps, depsCache, repos) else resolveDeps(mainDeps, depsCache, repos)
+    // A `jsClient` is a Scala.js project of its own: its sources plus the shared ones, its own class
+    // path, its own modules (built for js).
+    case class Client(sources: List[Path], own: Directives, modules: List[Modules.Module])
+    val clients = mainDirectives.jsClients.map { dir =>
+      val (clientSources, _) = partitionSources(forPlatform(expandSources(Paths.get(dir) :: mainDirectives.shared.map(Paths.get(_))), "js"))
+      val ownClient = parseDirectives(clientSources)
+      val clientModules =
+        try Modules.resolve(ownClient, clientSources, "js")
+        catch case BuildFailed(msg) => die(msg)
+      Client(clientSources, ownClient, clientModules)
+    }
+    def moduleIds(d: Directives, among: List[Modules.Module]): List[String] =
+      d.dependsOn.flatMap(dir => among.find(_.dir == Paths.get(dir)).map(Modules.lspId))
+    // A module's sources reach its dependents through `dependsOn` (scalino-lsp puts them on the
+    // presentation compiler's source path), so its classes directory is not on their class paths.
+    def moduleProjects(ms: List[Modules.Module]): List[String] = ms.map { m =>
+      val cp = Modules.classpathOf(m.closure, Some(m), o, depsCache).split(CP_SEP).filter(_.nonEmpty)
+        .filterNot(e => m.closure.exists(_.classesDir.toString == e)).toList
+      project(Modules.lspId(m), moduleIds(m.directives, ms), m.sources, cp, m.directives.options ++ o.cliOptions)
+    }
     val mainProject = project(
-      "main", Nil, expanded,
+      "main", moduleIds(ownDirectives, modules), expanded,
       List(mainCp) ++ mainDirectives.jars ++ mainDirectives.resourceDirs,
       mainDirectives.options ++ o.cliOptions)
     val projects =
@@ -4321,20 +4475,19 @@ object ScalinoCli:
             resolveDeps(testDeps, depsCache, repos)) ++ allDirectives.jars ++ allDirectives.resourceDirs
         List(
           mainProject,
-          project("test", List("main"), testSources, testCp,
+          project("test", "main" :: moduleIds(ownDirectives, modules), testSources, testCp,
             allDirectives.options ++ o.cliOptions ++ allDirectives.testOptions))
-    // A `jsClient` is a Scala.js project of its own: its sources plus the shared ones, its own class path.
-    val clientProjects = mainDirectives.jsClients.map { dir =>
+    val clientProjects = clients.flatMap { c =>
       val saved = jsPlatform
       jsPlatform = true
       try
-        val (clientSources, _) = partitionSources(forPlatform(expandSources(Paths.get(dir) :: mainDirectives.shared.map(Paths.get(_))), "js"))
-        val cd = parseDirectives(clientSources)
+        val cd = Modules.withUpstream(c.own, c.modules)
         val cp = resolveJsDeps((jsBaseDeps ++ cd.deps).distinct, depsCache, repos)
-        project("client", Nil, clientSources, List(cp) ++ cd.jars ++ cd.resourceDirs, cd.options ++ o.cliOptions)
+        project("client", moduleIds(c.own, c.modules), c.sources, List(cp) ++ cd.jars ++ cd.resourceDirs, cd.options ++ o.cliOptions) ::
+          moduleProjects(c.modules)
       finally jsPlatform = saved
     }
-    val json = (projects ++ clientProjects).mkString("[\n", ",\n", "\n]\n")
+    val json = (projects ++ moduleProjects(modules) ++ clientProjects).mkString("[\n", ",\n", "\n]\n")
 
     // Inside .scalino-build/ (patches/scala3-0015) rather than dotty's ".dotty-ide.json" at the
     // root, so one .gitignore entry covers it.

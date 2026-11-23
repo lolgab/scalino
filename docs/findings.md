@@ -379,7 +379,8 @@ link with unreachable symbols, as under scala-cli `--native`.
 
 Not implemented: incremental Scala compilation (every build recompiles all
 sources; only the native-library object cache and the dependency-resolution
-cache are incremental), multi-module projects, and
+cache are incremental), multi-module projects (since done, see "Multi-module
+projects" under remaining-work item 4), and
 `--compiler-plugin`/`//> using plugin`. Watch mode and `//> using file`/
 `exclude` are implemented (below).
 
@@ -797,10 +798,33 @@ requests serially.
 4. **`scalino` follow-ups.** Implemented items are under "Toward a build-tool
    experience without a JVM" (watch mode, directory/CLI-flag parity with
    scala-cli, incremental compilation, see item 7). Still missing:
-   multi-module/multi-target projects, an entry-point detector that is not a
-   text scan, and scala-cli's `fmt`/`repl`/`package`/`publish`/`bsp`/`export`
+   an entry-point detector that is not a text scan, and scala-cli's `fmt`/`repl`/`package`/`publish`/`bsp`/`export`
    (no JVM-free equivalent: no scalafmt, no bloop). These print "not
    implemented".
+
+   **Multi-module projects (2026-11-21).** `//> using dependsOn <dir>` makes a
+   directory a module of the declaring sources (`cli/Modules.scala`, design and
+   verification in `docs/ideas/IMPL-NOTES-07-multi-module.md`). scala-cli has no
+   equivalent, so the syntax follows `jsClient`/`shared`: no build file, a module
+   is a directory with its own `//> using` lines. Upstream modules compile in
+   dependency order into `.scalino-build/modules/<name>-<hash>/classes[-js]`,
+   main scope only, each with its own incremental manifest; `dep`/`jar`/
+   `resourceDir`/`repository` flow downstream, everything else stays per module;
+   a module without `platform` takes its dependent's (one module can serve a
+   native server and its js client). Cross-module invalidation reuses the
+   text-level name graph: `compileToClasses` recognizes classpath directories
+   that are other `compileToClasses` outputs (a manifest beside them), snapshots
+   their manifests in `<classesDir>.upstream`, and treats the names declared in
+   upstream files changed since as changed names. Two fixes to the incremental
+   compiler came with it, both also affecting single-module builds: a failed
+   compile now blanks its batch's hashes in the manifest (before, reverting the
+   edit that broke a dependent left the dependent's purged outputs missing until
+   a link failed with "unreachable symbols"), and column-0 `def`/`val`/`var`/
+   `type`/`given` names are tracked for invalidation (before, a caller of a
+   changed top-level def was not recompiled). `run`/`compile`/`package`/`test`/
+   `-w`/`lock`/`setup-ide` (one LSP project per module, `dependsOn` wired, which
+   scalino-lsp already used for the PC source path and cross-project
+   references) all handle modules. Test: `tests/modules/run.sh`.
 
    `scalino test` (2026-09-04) is implemented with no JVM in the chain; see the
    doc comment above `readAllBytes`/`ClassInfo` in `cli/ScalinoCli.scala`. sbt-scala-native

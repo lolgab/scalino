@@ -180,6 +180,9 @@ quotes are still accepted:
 //> using nativeMode release-fast
 ```
 
+`//> using dependsOn ../core` splits a project into modules, each compiled on
+its own with its own dependencies. See [Modules](#modules).
+
 ### Tests
 
 The test framework is detected from the classpath, so anything with a Scala
@@ -280,6 +283,43 @@ its message and the interpreted call stack, without line numbers. It is
 slower than a linked binary for long computations: it is meant for the
 edit-run loop and for scripts, not benchmarks.
 
+## Modules
+
+A directory can depend on other directories, each a module with its own sources
+and `//> using` lines. There is no build file, and scala-cli has no equivalent.
+
+```
+app/Main.scala      //> using dependsOn ../core
+core/Core.scala     //> using dependsOn ../util
+                    //> using dep com.lihaoyi::upickle::4.0.2
+util/Util.scala
+```
+
+```sh
+scalino run app        # compiles util, then core, then app; links all three
+scalino test app       # app's tests, with core and util on the class path
+scalino test core      # core's own tests
+```
+
+- **Paths:** relative to the declaring file, else to the current directory, as
+  for `jsClient`. A module's directory is left out of every other module's
+  sources, so `scalino run .` over a tree of modules builds the one at the top.
+- **Compilation:** modules compile in dependency order, each into its own
+  directory under `.scalino-build/modules/` and incrementally. After an edit to
+  a module, its dependents recompile only the files that mention a top-level
+  class, trait, object or enum declared in an edited file.
+- **Directives passed down:** `dep`, `jar`, `resourceDir` and `repository`
+  (sbt's `dependsOn` semantics). Each module's `compileOnly.dep`, `options` and
+  test scope stay its own. Link and package settings (`mainClass`, `native*`,
+  `js*`, `postLink`, `runEnv`, `package*`) count only in the module you build.
+  `--option`s from the command line apply to every module.
+- **Platform:** a module without `//> using platform` builds for the platform of
+  whatever depends on it. One `model` module can serve a Scala Native server and
+  its Scala.js `jsClient`. A module that declares a different platform than its
+  dependent is an error, and so is a cycle.
+- `run`, `compile`, `package`, `test`, `-w` (every module is watched), `lock` and
+  `setup-ide` (one editor project per module) all handle modules.
+
 ## Scala.js
 
 Scala.js is a second target next to Scala Native, with scala-cli's flags and
@@ -321,6 +361,10 @@ A Scala Native server can embed a Scala.js frontend:
 //> using shared ../shared     // sources compiled into both sides
 ```
 
+A client can also share code through a [module](#modules) without `//> using platform`
+(`//> using dependsOn ../model` in both the server and the client). The module
+is compiled once for each platform, and its own dependencies come with it.
+
 `scalino run` builds the client and embeds it in the server binary as the
 resource `/client/main.js`. The client is linked with fastLinkJS, or with
 fullLinkJS when the server is built in a `release-*` native mode (`--js-mode`
@@ -354,13 +398,14 @@ actions and diagnostics.
 1. Run `scalino setup-ide <sources...>`. It writes
    `.scalino-build/scalino-lsp.json` with one project for the main scope and,
    when there are `test/` sources, a second one that depends on it. Test
-   dependencies (`//> using test.dep`) are only visible to the test project,
-   and each project gets its own compiler, started on first use. The file is
-   an array of `{id, platform, dependsOn, compilerArguments, sourceDirectories,
-   dependencyClasspath}`, so another target (a js frontend, say) is one more
-   entry and not a new format.
-2. Install the client for your editor. Each directory has a README with the
-   steps:
+   dependencies (`//> using test.dep`) are only visible to the test project.
+   Every [module](#modules) is a project too, which `dependsOn` the modules it
+   depends on, so definitions, references and rename work across modules.
+   Each project gets its own compiler, started on first use. The file is an
+   array of `{id, platform, dependsOn, compilerArguments, sourceDirectories,
+   dependencyClasspath}`, so further targets (say a js frontend) are more
+   entries, not a new format.
+2. Install the client for your editor (each directory's README has the steps):
    - Zed: [`zed-extension/`](zed-extension/), in Zed's gallery as "Scalino".
    - VS Code: [`vscode-extension/`](vscode-extension/), installed locally (it is not on the Marketplace).
    - Neovim: [`neovim-extension/`](neovim-extension/), a `vim.lsp` config. No plugin needed.
