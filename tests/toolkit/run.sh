@@ -52,9 +52,13 @@ cat > test/OsSuite.test.scala <<'SCALA'
 class OsSuite extends munit.FunSuite:
   test("os-lib in tests"):
     assert(os.exists(os.pwd))
+  test("munit's Location is the call site, not munit's MacroCompat.scala (#13)"):
+    val loc = summon[munit.Location]
+    assertEquals(loc.line, 6)
+    assert(loc.path.endsWith("OsSuite.test.scala"), loc.path)
 SCALA
 "$SCALINO" test . > log 2>&1 || { tail -20 log >&2; fail "test.toolkit: test"; }
-grep -q "1 passed, 0 failed" log || { tail -20 log >&2; fail "test.toolkit: suite did not pass"; }
+grep -q "2 passed, 0 failed" log || { tail -20 log >&2; fail "test.toolkit: suite did not pass"; }
 
 echo "== toolkit typelevel:default: run"
 mkdir -p "$WORK/typelevel" && cd "$WORK/typelevel"

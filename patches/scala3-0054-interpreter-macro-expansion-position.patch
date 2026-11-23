@@ -1,0 +1,18 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -5511,8 +5511,13 @@
+       case name if ownerName == "defnModule" =>
+         defnConstant(name).orElse(defnMethod(name, args))
+ 
++      // The outermost inline call site, as QuotesImpl answers: `pos` is the
++      // splice's own position, inside the inline method that holds it (munit's
++      // `implicit inline def generate: Location = ${ locationImpl() }` gave
++      // MacroCompat.scala:16 for every test). A macro annotation runs without
++      // a MacroExpansion context; it keeps the splice position.
+       case "ofMacroExpansion" if ownerName == "PositionModule" =>
+-        Some(pos.sourcePos)
++        Some(MacroExpansion.position.getOrElse(pos.sourcePos))
+ 
+       // `PositionMethods`: `Position` (`quotes.reflect.Position`) is a real
+       // dotc `SourcePosition` under the hood -- these are its own plain real
