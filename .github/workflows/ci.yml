@@ -427,9 +427,12 @@ jobs:
       - name: Smoke test -- toolkits
         if: matrix.test == 'js'
         # `//> using toolkit default` and `typelevel:default`: run, munit from toolkit-test, test.toolkit.
-        # See tests/toolkit/run.sh.
+        # See tests/toolkit/run.sh. sttp's Scala Native backend links libcurl and libidn2, whose
+        # unversioned .so (the -dev packages) the Ubuntu runners lack; the macOS runners have both.
         shell: bash
-        run: ./tests/toolkit/run.sh dist/scalino
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then sudo apt-get install -y libcurl4-openssl-dev libidn2-dev; fi
+          ./tests/toolkit/run.sh dist/scalino
 
       - name: Smoke test -- stack-allocated objects (escape analysis)
         if: matrix.test == 'escape'

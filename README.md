@@ -231,6 +231,9 @@ source positions, which leaves weaver suites unusable for now. Write the codec
 with `Codec.forProduct*` and parse the URI with `Uri.unsafeFromString`; the
 rest (cats-effect, fs2, decline, the Ember client) runs.
 
+The Scala Toolkit's sttp links libcurl and libidn2. On Linux, install their
+development packages (`apt install libcurl4-openssl-dev libidn2-dev`).
+
 ### Incremental builds and the warm compiler
 
 Sources that didn't change are reused from the last build (`--no-incremental`
