@@ -1,4 +1,4 @@
-# Sourced by 02a, 03, 08 and pgo/pgo-dotc.sh: the jars of pprint, which the REPL prints values with
+# Sourced by 02a, 03, 08, 13 and pgo/pgo-dotc.sh: the jars of pprint, which the REPL prints values with
 # (patches/scala3-0052), as the stock Scala 3 REPL does. dotc's sources compile against the JVM jars
 # (REPL_CP: their TASTy is all the compile needs), the link takes the Scala Native cross-builds
 # (REPL_NATIVE_CP). Fetched by each step rather than once in 01, like the LSP's jsoniter in 08:

@@ -61,7 +61,8 @@ MODE="$SCALINO_LINK_MODE"
 
 if wants dotc; then
   echo "== cross-linking scalino-dotc for $TRIPLE =="
-  cross_link dotc "$(to_native_path "$WORK/selfhost/nir-out")$CP_SEP$(cat "$WORK/selfhost/nativelibs.cp")" \
+  source ./repl-deps.sh # the REPL's pprint/fansi/sourcecode, as in 03's link
+  cross_link dotc "$(to_native_path "$WORK/selfhost/nir-out")$CP_SEP$(cat "$WORK/selfhost/nativelibs.cp")$CP_SEP$REPL_NATIVE_CP" \
     dotty.tools.dotc.Main --mode "$MODE" --multithreading --no-incremental-compilation --embed-resources
 fi
 
