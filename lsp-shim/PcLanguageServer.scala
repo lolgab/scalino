@@ -88,18 +88,106 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
   private val bufferVersions: mutable.Map[URI, Long] = mutable.Map.empty
   private val pendingDiagnostics: mutable.Map[URI, java.util.concurrent.ScheduledFuture[?]] = mutable.Map.empty
 
-  /** `scalino setup-ide`'s output. */
-  private def loadConfig(clientRootUri: String): List[ProjectConfig] = {
-    val IDE_CONFIG_FILE = ".scalino-build/scalino-lsp.json"
-    // Some clients (e.g. neovim with no detected root) send `rootUri: null`.
-    val rootUri =
-      if (clientRootUri != null) clientRootUri
-      else Paths.get("").toAbsolutePath.toUri.toString.stripSuffix("/")
-    val configFile = new File(new URI(rootUri + '/' + IDE_CONFIG_FILE))
+  private val IDE_CONFIG_FILE = ".scalino-build/scalino-lsp.json"
+  /** Where `scalino setup-ide` records its arguments, one per line, so the server can rerun it. */
+  private val SETUP_IDE_ARGS_FILE = ".scalino-build/setup-ide-args"
+
+  /** The workspace root, set by `initialize`. */
+  private var rootDir: File = null
+  /** The config file's mtime when `projects` were read from it. */
+  private var configStamp: Long = 0L
+
+  /** `scalino setup-ide`'s output. A config naming files that no longer exist is rewritten first:
+   *  it holds absolute paths into the scalino install that wrote it, and `brew upgrade` deletes the
+   *  old version's directory, so without this every request failed with "Could not find package
+   *  scala" until the user reran `setup-ide` by hand. */
+  private def loadConfig(): List[ProjectConfig] = {
+    val configFile = new File(rootDir, IDE_CONFIG_FILE)
     if (!configFile.exists)
       throw new java.io.FileNotFoundException(
-        s"$IDE_CONFIG_FILE not found at $rootUri -- run `scalino setup-ide <sources...>` in the project root first")
-    readFromArray(Files.readAllBytes(configFile.toPath))(using projectConfigListCodec)
+        s"$IDE_CONFIG_FILE not found at $rootDir -- run `scalino setup-ide <sources...>` in the project root first")
+    def read() = {
+      configStamp = configFile.lastModified
+      readFromArray(Files.readAllBytes(configFile.toPath))(using projectConfigListCodec)
+    }
+    val configs = read()
+    val missing = missingFiles(configs)
+    if (missing.isEmpty) configs
+    else {
+      log(s"$IDE_CONFIG_FILE names ${missing.size} missing file(s), e.g. ${missing.head}; rerunning scalino setup-ide")
+      if (!rerunSetupIde()) configs
+      else {
+        val fresh = read()
+        val stillMissing = missingFiles(fresh)
+        if (stillMissing.nonEmpty) log(s"still missing after setup-ide: ${stillMissing.mkString(", ")}")
+        fresh
+      }
+    }
+  }
+
+  /** Class path entries and `-javabootclasspath` jars a config names that don't exist. */
+  private def missingFiles(configs: List[ProjectConfig]): List[String] =
+    configs.flatMap(c => javaBaseOf(c).toList ++ c.dependencyClasspath).distinct.filterNot(p => new File(p).exists)
+
+  private def javaBaseOf(c: ProjectConfig): Option[String] =
+    c.compilerArguments.sliding(2).collectFirst { case List("-javabootclasspath", p) => p }
+
+  /** Runs `scalino setup-ide` in the workspace root with the arguments it last ran with (`.` for
+   *  configs written before they were recorded). `scalino` is looked up on PATH, not next to this
+   *  binary: after an upgrade this process may still be the old version's, whose directory is gone. */
+  private def rerunSetupIde(): Boolean = {
+    val exe = if (System.getProperty("os.name", "").toLowerCase.contains("win")) "scalino.exe" else "scalino"
+    val scalino = sys.env.getOrElse("PATH", "").split(File.pathSeparator).iterator
+      .filter(_.nonEmpty).map(d => new File(d, exe)).find(f => f.isFile && f.canExecute)
+    scalino match {
+      case None =>
+        log("scalino not found on PATH; run `scalino setup-ide` in the project root")
+        false
+      case Some(bin) =>
+        val argsFile = new File(rootDir, SETUP_IDE_ARGS_FILE)
+        val args =
+          if (argsFile.isFile) Files.readAllLines(argsFile.toPath).asScala.toList.filter(_.nonEmpty)
+          else List(".")
+        try {
+          // stdout is the JSON-RPC channel: collect setup-ide's output and log it to stderr instead.
+          val proc = new ProcessBuilder((bin.getPath :: "setup-ide" :: args).asJava)
+            .directory(rootDir).redirectErrorStream(true).start()
+          proc.getOutputStream.close()
+          val output = new String(proc.getInputStream.readAllBytes(), "UTF-8")
+          val code = proc.waitFor()
+          if (code != 0) log(s"scalino setup-ide failed (exit $code):\n$output")
+          code == 0
+        } catch {
+          case NonFatal(e) =>
+            log(s"scalino setup-ide failed: $e")
+            false
+        }
+    }
+  }
+
+  private def log(msg: String): Unit = {
+    System.err.println(s"scalino-lsp: $msg")
+    System.err.flush()
+  }
+
+  /** Re-reads the config when `setup-ide` rewrote it, or when its java.base.jar disappeared (the
+   *  scalino install it names was removed under a running server). Without this the server kept
+   *  serving requests from the config it read at startup until the editor restarted it. */
+  private def reloadIfChanged(): Unit = {
+    if (rootDir == null || projects.isEmpty) return
+    val configFile = new File(rootDir, IDE_CONFIG_FILE)
+    // A missing file (`scalino clean`) keeps the current projects: setup-ide will write it again.
+    if (!configFile.exists) return
+    val javaBaseGone = projects.exists(p => javaBaseOf(p.config).exists(j => !new File(j).exists))
+    if (configFile.lastModified == configStamp && !javaBaseGone) return
+    try {
+      val loaded = buildProjects(loadConfig())
+      projects.foreach(p => if (p.pendingRecycle != null) p.pendingRecycle.cancel(false))
+      projects = loaded
+      log(s"reloaded $IDE_CONFIG_FILE")
+    } catch {
+      case NonFatal(e) => log(s"could not reload $IDE_CONFIG_FILE: $e")
+    }
   }
 
   /** Per-kind inlay hint toggles, named like Metals' `inlayHints.*.enable` settings. */
@@ -151,9 +239,13 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
           tokenModifiers = PcSemanticTokens.TokenModifiers),
         full = true))
 
+    // Some clients (e.g. neovim with no detected root) send `rootUri: null`.
+    rootDir =
+      if (rootUri != null) new File(new URI(rootUri))
+      else Paths.get("").toAbsolutePath.toFile
     val warmup = new Thread(() => {
       try {
-        val loaded = buildProjects(loadConfig(rootUri))
+        val loaded = buildProjects(loadConfig())
         thisServer.synchronized {
           projects = loaded
           thisServer.notifyAll()
@@ -305,6 +397,7 @@ class PcLanguageServer(publishDiagnostics: (String, List[Lsp.Diagnostic]) => Uni
     if (projects.isEmpty && warmupError != null)
       throw new IllegalStateException(s"presentation compiler failed to initialize: ${warmupError.getMessage}", warmupError)
     if (projects.isEmpty) throw new IllegalStateException("presentation compiler not yet initialized")
+    reloadIfChanged()
     ensurePc(projectFor(uri))
   }
 

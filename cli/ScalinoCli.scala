@@ -2002,7 +2002,7 @@ object ScalinoCli:
       cp.split(CP_SEP).filterNot(j => j.matches(""".*/scala-library-[0-9.]+\.jar""") && !j.endsWith(s"/scala-library-${BuildInfo.scalaVersion}.jar")).mkString(CP_SEP)
 
     val compileCp =
-      List(scalalibRetained, dropPlainScalaLibrary(compilerCp), dropPlainScalaLibrary(nativelibsCp), extraClasspath, extraCompileOnlyClasspath)
+      List(if new java.io.File(scalalibRetained).isFile then scalalibRetained else "", dropPlainScalaLibrary(compilerCp), dropPlainScalaLibrary(nativelibsCp), extraClasspath, extraCompileOnlyClasspath)
         .filter(_.nonEmpty).mkString(CP_SEP)
 
     CompileClasspath(javaBase, pluginJar, compileCp, nativelibsCp)
@@ -4494,6 +4494,9 @@ object ScalinoCli:
     val configPath = Paths.get(".scalino-build", "scalino-lsp.json")
     Files.createDirectories(configPath.getParent)
     Files.write(configPath, json.getBytes("UTF-8"))
+    // scalino-lsp reruns setup-ide with these when the config names files that are gone (an
+    // upgraded scalino, a cleared cache): see PcLanguageServer.loadConfig.
+    Files.write(configPath.resolveSibling("setup-ide-args"), args.mkString("", "\n", "\n").getBytes("UTF-8"))
     println(s"Wrote configuration file for ide in: ${configPath.toAbsolutePath}")
 
     // No editor settings are written: install.sh puts scalino-lsp on PATH and both extensions fall
