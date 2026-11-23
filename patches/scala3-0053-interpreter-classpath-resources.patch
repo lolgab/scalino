@@ -1,0 +1,331 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/HostResourceCalls.scala b/compiler/src/dotty/tools/dotc/quoted/HostResourceCalls.scala
+new file mode 100644
+index 0000000..fea067d
+--- /dev/null
++++ b/compiler/src/dotty/tools/dotc/quoted/HostResourceCalls.scala
+@@ -0,0 +1,250 @@
++package dotty.tools.dotc
++package quoted
++
++import java.io.{ByteArrayInputStream, File, InputStream}
++import java.net.URI
++import java.nio.file.{Files, LinkOption, Path, Paths}
++import java.util.zip.{ZipEntry, ZipFile}
++
++import scala.jdk.CollectionConverters.*
++
++/** Resources of the compile classpath, and the file-system values a macro
++ *  reaches from them.
++ *
++ *  A macro run by the JVM compiler finds resources through its own class
++ *  loader (`getClass.getClassLoader.getResources("db/migration")`, Dumbo's
++ *  `ResourceFilePath.fromResourcesDir`): the macro class loader sees the
++ *  compile classpath, which includes the project's resource directories.
++ *  Here there is no class loader at all, so `getClassLoader` answers a
++ *  `ClasspathLoader`, which looks resources up in the `-classpath` entries
++ *  (directories and jars) the same way.
++ *
++ *  The URLs it hands out are `ResourceUrl`s: Scala Native's javalib, which a
++ *  self-hosted compiler is linked against, has no `java.net.URL`. Everything
++ *  after that (`URI`, `Path`, `Files.walk`, `ZipFile`, the `Enumeration` and
++ *  `Stream` they return) is real host objects, called here by name: their
++ *  bodies are file-system natives, which no interpreted javalib body can run.
++ */
++object HostResourceCalls:
++
++  /** Stand-in for the macro class loader. `classpath` is the `-classpath` setting. */
++  final class ClasspathLoader(classpath: String):
++    // Deduplicated, as the JVM's URL class path is: a test compile lists the
++    // resource directories of both scopes, and the main ones appear twice.
++    private lazy val entries: List[File] =
++      classpath.split(File.pathSeparator).toList.filter(_.nonEmpty).map(File(_).getAbsoluteFile.toPath.normalize.toFile).distinct
++
++    /** Every classpath entry holding `name`, in classpath order. A directory
++     *  is found by name too, as the JVM's URL class loader does.
++     */
++    def find(name: String): List[ResourceUrl] =
++      if name.startsWith("/") then Nil
++      else entries.flatMap { entry =>
++        if entry.isDirectory then
++          val f = File(entry, name)
++          if f.exists then List(ResourceUrl(dirLessUri(f))) else Nil
++        else if entry.isFile then
++          val found =
++            try
++              val zf = ZipFile(entry)
++              try
++                val dir = name.stripSuffix("/") + "/"
++                zf.getEntry(name) != null || zf.getEntry(dir) != null ||
++                  zf.entries().asScala.exists(_.getName.startsWith(dir))
++              finally zf.close()
++            catch case _: java.io.IOException => false
++          if found then List(ResourceUrl("jar:" + entry.getAbsoluteFile.toURI.toString + "!/" + name)) else Nil
++        else Nil
++      }
++
++    override def toString: String = "ClasspathLoader"
++
++  /** `file:` URI of `f` without the trailing `/` `File#toURI` adds to a directory. */
++  private def dirLessUri(f: File): String =
++    f.getAbsoluteFile.toURI.toString.stripSuffix("/")
++
++  /** Stand-in for `java.net.URL`; `spec` is its external form. */
++  final case class ResourceUrl(spec: String):
++    override def toString: String = spec
++
++    def toURI: URI = URI(spec)
++
++    def openStream(): InputStream =
++      if spec.startsWith("jar:") then
++        val sep = spec.lastIndexOf("!/")
++        val jar = Paths.get(URI(spec.substring("jar:".length, sep)))
++        val entryName = spec.substring(sep + 2)
++        val zf = ZipFile(jar.toFile)
++        try
++          val e = zf.getEntry(entryName)
++          if e == null then throw java.io.FileNotFoundException(spec)
++          val in = zf.getInputStream(e)
++          try ByteArrayInputStream(in.readAllBytes())
++          finally in.close()
++        finally zf.close()
++      else Files.newInputStream(Paths.get(URI(spec)))
++
++  /** `ClassLoader` methods on the stand-in loader. */
++  def loaderCall(l: ClasspathLoader, name: String, args: List[Object]): Option[Object] =
++    (name, args) match
++      case ("getResources", (n: String) :: Nil) => Some(java.util.Collections.enumeration(l.find(n).asJava))
++      case ("getResource", (n: String) :: Nil) => Some(l.find(n).headOption.orNull)
++      case ("getResourceAsStream", (n: String) :: Nil) => Some(l.find(n).headOption.map(_.openStream()).orNull)
++      case ("getParent", Nil) => Some(null)
++      case _ => None
++
++  /** `Class#getResource`/`getResourceAsStream`: a name without a leading `/`
++   *  is relative to the class's package (`pkg`, `.`-separated, `""` for the
++   *  empty package).
++   */
++  def classResourceCall(l: ClasspathLoader, pkg: String, name: String, args: List[Object]): Option[Object] =
++    args match
++      case (n: String) :: Nil if name == "getResource" || name == "getResourceAsStream" =>
++        val absolute =
++          if n.startsWith("/") then n.substring(1)
++          else if pkg.isEmpty then n
++          else pkg.replace('.', '/') + "/" + n
++        loaderCall(l, name, absolute :: Nil)
++      case _ => None
++
++  /** A Java varargs parameter arrives as one `Seq` or `Array` argument. */
++  private def varargs(o: Object): List[Object] = o match
++    case a: Array[Object] => a.toList
++    case s: scala.collection.Seq[Object] @unchecked => s.toList
++    case null => Nil
++    case other => List(other)
++
++  private def strings(rest: List[Object]): Array[String] =
++    rest.flatMap(varargs).map(String.valueOf(_)).toArray
++
++  private def box(b: Boolean): Object = java.lang.Boolean.valueOf(b)
++
++  /** Static methods of `java.nio.file.Paths`/`Path`/`Files`; `owner` is the full class name. */
++  def static(owner: String, name: String, args: List[Object]): Option[Object] =
++    (owner, name, args) match
++      case ("java.nio.file.Paths" | "java.nio.file.Path", "get" | "of", (u: URI) :: Nil) => Some(Paths.get(u))
++      case ("java.nio.file.Paths" | "java.nio.file.Path", "get" | "of", (first: String) :: rest) => Some(Paths.get(first, strings(rest)*))
++      case ("java.nio.file.Files", _, (p: Path) :: _) =>
++        name match
++          // Link options (`NOFOLLOW_LINKS`) are ignored: the default, following links, is what callers use.
++          case "exists" => Some(box(Files.exists(p)))
++          case "notExists" => Some(box(Files.notExists(p)))
++          case "isRegularFile" => Some(box(Files.isRegularFile(p)))
++          case "isDirectory" => Some(box(Files.isDirectory(p)))
++          case "isReadable" => Some(box(Files.isReadable(p)))
++          case "size" => Some(java.lang.Long.valueOf(Files.size(p)))
++          case "walk" =>
++            args.tail match
++              case (depth: Integer) :: _ => Some(Files.walk(p, depth.intValue))
++              case _ => Some(Files.walk(p))
++          case "list" => Some(Files.list(p))
++          case "readAllBytes" => Some(Files.readAllBytes(p))
++          case "readAllLines" => Some(Files.readAllLines(p))
++          case "readString" => Some(Files.readString(p))
++          case "lines" => Some(Files.lines(p))
++          case "newInputStream" => Some(Files.newInputStream(p))
++          case _ => None
++      case _ => None
++
++  /** `new ZipFile(...)`/`new File(...)`; `owner` is the full class name. */
++  def newInstance(owner: String, args: List[Object]): Option[Object] =
++    (owner, args) match
++      case ("java.util.zip.ZipFile", (s: String) :: Nil) => Some(ZipFile(s))
++      case ("java.util.zip.ZipFile", (f: File) :: Nil) => Some(ZipFile(f))
++      case _ => None
++
++  /** Instance methods of the host values above. */
++  def instance(receiver: Object, name: String, args: List[Object]): Option[Object] =
++    (receiver, name, args) match
++      case (u: ResourceUrl, _, Nil) =>
++        name match
++          case "toURI" => Some(u.toURI)
++          case "toExternalForm" | "toString" => Some(u.spec)
++          case "getProtocol" => Some(u.toURI.getScheme)
++          case "getPath" | "getFile" => Some(if u.spec.startsWith("jar:") then u.spec.substring("jar:".length) else u.toURI.getPath)
++          case "openStream" => Some(u.openStream())
++          case _ => None
++      case (u: URI, _, Nil) =>
++        name match
++          case "toString" | "toASCIIString" => Some(u.toString)
++          case "getScheme" => Some(u.getScheme)
++          case "getPath" => Some(u.getPath)
++          case "getRawPath" => Some(u.getRawPath)
++          case "getSchemeSpecificPart" => Some(u.getSchemeSpecificPart)
++          case "isOpaque" => Some(box(u.isOpaque))
++          case "normalize" => Some(u.normalize)
++          case _ => None
++      case (p: Path, _, _) =>
++        (name, args) match
++          case ("toString", Nil) => Some(p.toString)
++          case ("getFileName", Nil) => Some(p.getFileName)
++          case ("getParent", Nil) => Some(p.getParent)
++          case ("getRoot", Nil) => Some(p.getRoot)
++          case ("getNameCount", Nil) => Some(Integer.valueOf(p.getNameCount))
++          case ("getName", (i: Integer) :: Nil) => Some(p.getName(i.intValue))
++          case ("isAbsolute", Nil) => Some(box(p.isAbsolute))
++          case ("toAbsolutePath", Nil) => Some(p.toAbsolutePath)
++          case ("normalize", Nil) => Some(p.normalize)
++          case ("toFile", Nil) => Some(p.toFile)
++          case ("toUri", Nil) => Some(p.toUri)
++          case ("relativize", (o: Path) :: Nil) => Some(p.relativize(o))
++          case ("resolve", (o: Path) :: Nil) => Some(p.resolve(o))
++          case ("resolve", (o: String) :: Nil) => Some(p.resolve(o))
++          case ("startsWith", (o: Path) :: Nil) => Some(box(p.startsWith(o)))
++          case ("startsWith", (o: String) :: Nil) => Some(box(p.startsWith(o)))
++          case ("endsWith", (o: Path) :: Nil) => Some(box(p.endsWith(o)))
++          case ("endsWith", (o: String) :: Nil) => Some(box(p.endsWith(o)))
++          case ("iterator", Nil) => Some(p.iterator())
++          case ("equals", o :: Nil) => Some(box(p == o))
++          case ("hashCode", Nil) => Some(Integer.valueOf(p.hashCode))
++          case ("compareTo", (o: Path) :: Nil) => Some(Integer.valueOf(p.compareTo(o)))
++          case _ => None
++      case (f: File, _, Nil) =>
++        name match
++          case "getPath" | "toString" => Some(f.getPath)
++          case "getName" => Some(f.getName)
++          case "getAbsolutePath" => Some(f.getAbsolutePath)
++          case "toPath" => Some(f.toPath)
++          case "exists" => Some(box(f.exists))
++          case "isFile" => Some(box(f.isFile))
++          case "isDirectory" => Some(box(f.isDirectory))
++          case _ => None
++      case (e: java.util.Enumeration[Object] @unchecked, _, Nil) =>
++        name match
++          case "hasMoreElements" => Some(box(e.hasMoreElements))
++          case "nextElement" => Some(e.nextElement())
++          case "asIterator" => Some(e.asIterator())
++          case _ => None
++      case (it: java.util.Iterator[Object] @unchecked, _, Nil) =>
++        name match
++          case "hasNext" => Some(box(it.hasNext))
++          case "next" => Some(it.next())
++          case _ => None
++      case (s: java.util.stream.BaseStream[Object, ?] @unchecked, _, Nil) =>
++        name match
++          case "iterator" => Some(s.iterator())
++          case "close" => s.close(); Some(().asInstanceOf[Object])
++          case _ => None
++      case (zf: ZipFile, _, _) =>
++        (name, args) match
++          case ("entries", Nil) => Some(zf.entries())
++          case ("getEntry", (n: String) :: Nil) => Some(zf.getEntry(n))
++          case ("getInputStream", (e: ZipEntry) :: Nil) => Some(zf.getInputStream(e))
++          case ("getName", Nil) => Some(zf.getName)
++          case ("size", Nil) => Some(Integer.valueOf(zf.size))
++          case ("close", Nil) => zf.close(); Some(().asInstanceOf[Object])
++          case _ => None
++      case (e: ZipEntry, _, Nil) =>
++        name match
++          case "getName" | "toString" => Some(e.getName)
++          case "isDirectory" => Some(box(e.isDirectory))
++          case "getSize" => Some(java.lang.Long.valueOf(e.getSize))
++          case _ => None
++      case (in: InputStream, _, _) =>
++        (name, args) match
++          case ("readAllBytes", Nil) => Some(in.readAllBytes())
++          case ("read", Nil) => Some(Integer.valueOf(in.read()))
++          case ("available", Nil) => Some(Integer.valueOf(in.available()))
++          case ("close", Nil) => in.close(); Some(().asInstanceOf[Object])
++          case _ => None
++      case _ => None
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+index 14af605..195c2c4 100644
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -2578,6 +2578,7 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader, session: Interpreter.S
+     if intrinsic.isEmpty then intrinsic = interpretCollectionFactory(moduleClass, fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretBoxingIntrinsic(fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretJavaReflectionIntrinsic(fn, args)
++    if intrinsic.isEmpty then intrinsic = hostResourceStatic(fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretQuotesApi(None, fn, args)
+     if intrinsic.isEmpty then intrinsic = interpretHearthServiceLoader(fn, args)
+     if intrinsic.isEmpty then intrinsic = wellKnownSingleton(fn)
+@@ -3607,6 +3608,9 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader, session: Interpreter.S
+     // GC-aware weak reference) work fine as-is on this toolchain too, so
+     // just build the real host object instead of interpreting a
+     // nonexistent constructor body.
++    // `new ZipFile(path)` (Dumbo's `ResourceFilePath.fromResourcesDir`, listing a jar's resources): see `HostResourceCalls`.
++    else if fn.owner.name.toString == "ZipFile" && fn.owner.is(JavaDefined) then
++      HostResourceCalls.newInstance(fn.owner.fullName.toString, rawArgs.filterNot(_.isEmpty).map(interpretTree))
+     else if fn.owner.name.toString == "WeakReference" && fn.owner.is(JavaDefined) then
+       rawArgs.filterNot(_.isEmpty) match
+         case v :: Nil => Some(new java.lang.ref.WeakReference(interpretTree(v)))
+@@ -4396,8 +4400,18 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader, session: Interpreter.S
+   private def hostValueCall(receiver: Object, fn: Symbol, args: List[Object]): Option[Object] =
+     receiver match
+       case s: String => HostValueCalls.string(s, fn.name.toString, args)
+-      case _ if args.isEmpty => HostValueCalls.numericConversion(receiver, fn.name.toString)
+-      case _ => None
++      // A static Java method reached with its module as the receiver (see `interpretJavaReflectionIntrinsic`'s call site).
++      case _: ModuleValue => hostResourceStatic(fn, args)
++      case _ =>
++        val r = if args.isEmpty then HostValueCalls.numericConversion(receiver, fn.name.toString) else None
++        if r.isDefined then r else HostResourceCalls.instance(receiver, fn.name.toString, args)
++
++  /** The macro class loader's stand-in (see `HostResourceCalls`). */
++  private lazy val classpathLoader = HostResourceCalls.ClasspathLoader(ctx.settings.classpath.value)
++
++  private def hostResourceStatic(fn: Symbol, args: List[Object]): Option[Object] =
++    if fn.owner.is(JavaDefined) then HostResourceCalls.static(fn.owner.fullName.toString.stripSuffix("$"), fn.name.toString, args)
++    else None
+ 
+   /** An interpreted instance of a javalib class whose `toString` has a real body. */
+   private def hasJavalibToString(receiver: Object)(using Context): Boolean = receiver match
+@@ -6780,14 +6794,23 @@ class Interpreter(pos: SrcPos, classLoader0: ClassLoader, session: Interpreter.S
+       // from the type's own symbol instead of any real reflection.
+       case (t: dotty.tools.dotc.core.Types.Type @unchecked, "isPrimitive", Nil) =>
+         Some(Boolean.box(t.typeSymbol.isPrimitiveValueClass))
+-      // `classOf[T].getClassLoader`: same "no real `Class`, so no real
+-      // reflection" story as `isPrimitive` above -- `null` is also the
+-      // faithful answer a real JVM gives for a bootstrap-loaded class like
+-      // `classOf[Object]`, and it's all `Class.forName` below (the only
+-      // real caller of this, via `scala.runtime.ClassValueCompat`'s
+-      // JDK-feature probe) ever does with the loader it's handed.
+-      case (_: dotty.tools.dotc.core.Types.Type @unchecked, "getClassLoader", Nil) =>
+-        Some(null)
++      // `getClass.getClassLoader`/`classOf[T].getClassLoader`: the macro
++      // class loader, whose resources are those of the compile classpath
++      // (Dumbo's `getResources("db/migration")`), see `HostResourceCalls`.
++      // `Class.forName` ignores the loader it is handed
++      // (`scala.runtime.ClassValueCompat`'s JDK-feature probe).
++      case (_, "getClassLoader", Nil) if fn.owner.name.toString == "Class" && fn.owner.is(JavaDefined) =>
++        Some(classpathLoader)
++      case (l: HostResourceCalls.ClasspathLoader, name, _) => HostResourceCalls.loaderCall(l, name, args)
++      // `Class#getResource(AsStream)`, relative to the class's package. A
++      // `classOf[T]` is a dotc `Type`; any other `Class` here is a host one
++      // (`getClass` of an interpreted object), whose package is not the
++      // macro's, so its relative names resolve from the root.
++      case (t: dotty.tools.dotc.core.Types.Type @unchecked, "getResource" | "getResourceAsStream", _) if fn.owner.name.toString == "Class" && fn.owner.is(JavaDefined) =>
++        val pkg = t.typeSymbol.enclosingPackageClass
++        HostResourceCalls.classResourceCall(classpathLoader, if pkg.isEffectiveRoot then "" else pkg.fullName.toString, fn.name.toString, args)
++      case (_: Class[?], "getResource" | "getResourceAsStream", _) if fn.owner.name.toString == "Class" && fn.owner.is(JavaDefined) =>
++        HostResourceCalls.classResourceCall(classpathLoader, "", fn.name.toString, args)
+       // `x.getClass()` on a REAL host object (e.g. a real `Array[Object]`
+       // built by an interpreted `ArrayBuilder`, seen via `Array.copy`'s own
+       // real body, reached through http4s's `uri"..."` literal macro) --
