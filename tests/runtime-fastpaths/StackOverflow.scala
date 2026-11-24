@@ -2,7 +2,10 @@ import java.util.concurrent.atomic.AtomicInteger
 
 object Rec:
   def depth(n: Int): Int = if n == 0 then 0 else 1 + depth(n - 1)
-  def forever(n: Long): Long = 1 + forever(n + 1)
+  // Not `1 + forever(n + 1)`: since the yieldpoint moved to method entry
+  // (scala-native#5283) LLVM turns that into an accumulator loop in release
+  // modes, which spins forever instead of overflowing.
+  def forever(n: Long): Long = forever(n + 1) * 3 - n
   def withLock(n: Long): Long = this.synchronized { 1 + withLock(n + 1) }
   def fib(n: Int): Int = if n < 2 then n else fib(n - 1) + fib(n - 2)
 

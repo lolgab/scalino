@@ -132,7 +132,7 @@ index 2db7340e8..d361f40b5 100644
    }
  
 diff --git a/javalib/src/main/scala/java/lang/Character.scala b/javalib/src/main/scala/java/lang/Character.scala
-index 88f142c79..213e6bac6 100644
+index b66b2a6ba..bd06bd427 100644
 --- a/javalib/src/main/scala/java/lang/Character.scala
 +++ b/javalib/src/main/scala/java/lang/Character.scala
 @@ -4,21 +4,32 @@ import java.lang.constant.Constable
@@ -171,7 +171,7 @@ index 88f142c79..213e6bac6 100644
  
    @inline override def compareTo(that: Character): Int =
      Character.compare(_value, that._value)
-@@ -452,18 +463,26 @@ object Character {
+@@ -453,18 +464,26 @@ object Character {
    import CharacterCache.cache
  
    def valueOf(charValue: scala.Char): Character = {
@@ -256,7 +256,7 @@ index 275365648..0ca833f10 100644
    @inline override def hashCode(): Int =
      Float.hashCode(_value)
 diff --git a/javalib/src/main/scala/java/lang/Integer.scala b/javalib/src/main/scala/java/lang/Integer.scala
-index e13616e11..267f45c62 100644
+index 231e8eac2..2d473bf79 100644
 --- a/javalib/src/main/scala/java/lang/Integer.scala
 +++ b/javalib/src/main/scala/java/lang/Integer.scala
 @@ -5,8 +5,9 @@ import java.{util => ju}
@@ -301,7 +301,7 @@ index e13616e11..267f45c62 100644
  
    @inline override def hashCode(): scala.Int =
      _value
-@@ -510,18 +520,26 @@ object Integer {
+@@ -508,18 +518,26 @@ object Integer {
    import IntegerCache.cache
  
    @inline def valueOf(intValue: scala.Int): Integer = {
@@ -421,7 +421,7 @@ index 92c83ed6d..3c29720ef 100644
    }
  
 diff --git a/javalib/src/main/scala/java/lang/System.scala b/javalib/src/main/scala/java/lang/System.scala
-index 5b85c58d1..81ae6fef1 100644
+index cab64f357..fbe0f5bbf 100644
 --- a/javalib/src/main/scala/java/lang/System.scala
 +++ b/javalib/src/main/scala/java/lang/System.scala
 @@ -39,8 +39,11 @@ object System {
@@ -439,10 +439,10 @@ index 5b85c58d1..81ae6fef1 100644
    def lineSeparator(): String = {
      if (isWindows) "\r\n"
 diff --git a/javalib/src/main/scala/java/lang/impl/PosixThread.scala b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
-index bff34cfaa..ef0d94892 100644
+index 1596da16f..7490847d9 100644
 --- a/javalib/src/main/scala/java/lang/impl/PosixThread.scala
 +++ b/javalib/src/main/scala/java/lang/impl/PosixThread.scala
-@@ -511,10 +511,16 @@ private[lang] object PosixThread extends NativeThread.Companion {
+@@ -532,10 +532,16 @@ private[lang] object PosixThread extends NativeThread.Companion {
        pthread_attr_init(attrs)
        val stackSize = stackalloc[CSize]()
        pthread_attr_getstacksize(attrs, stackSize)
@@ -460,11 +460,64 @@ index bff34cfaa..ef0d94892 100644
    // PosixThread class state
    @alwaysinline private def LockOffset = 0
    @alwaysinline private def ConditionsOffset = pthread_mutex_t_size.toInt
+diff --git a/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala b/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala
+index ebaa7b452..55355c86c 100644
+--- a/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala
++++ b/javalib/src/main/scala/java/nio/file/FileTreeWalker.scala
+@@ -320,8 +320,8 @@ private final class WalkContext(
+           hasNextImpl()
+ 
+         case FileVisitResult.TERMINATE =>
+-          walkContextHasNext = false
+-          walkContextHasNext
++          close() // the directory streams of the levels still open
++          false
+       }
+     }
+ 
+@@ -522,7 +522,9 @@ private final class FileTreeWalker(
+   def walk(): Unit = {
+     val spliter = this.spliterator()
+ 
+-    while (spliter.tryAdvance(p => ())) {} // loop to invoke side effects
++    // loop to invoke side effects; a throwing visitor must not leave directory streams open
++    try while (spliter.tryAdvance(p => ())) {}
++    finally close()
+   }
+ 
+   /* Porcelain Support methods
 diff --git a/javalib/src/main/scala/java/nio/file/Files.scala b/javalib/src/main/scala/java/nio/file/Files.scala
-index 5eff5d9e5..6fe74dde1 100644
+index b815a3363..b4a245e1c 100644
 --- a/javalib/src/main/scala/java/nio/file/Files.scala
 +++ b/javalib/src/main/scala/java/nio/file/Files.scala
-@@ -369,14 +369,40 @@ object Files {
+@@ -343,11 +343,21 @@ object Files {
+ 
+   def copy(source: Path, target: Path, options: Array[CopyOption]): Path = {
+     val linkOpts = Array(LinkOption.NOFOLLOW_LINKS)
+-    val attrsCls =
+-      if (isWindows) classOf[DosFileAttributes]
+-      else classOf[PosixFileAttributes]
+-
+-    val attrs = Files.readAttributes(source, attrsCls, linkOpts)
++    // A source in another provider's file system (a jar, through ZipFileSystemProvider) has the
++    // basic view only: the Dos one comes back null there, and readAttributes dereferences it.
++    // The branches are nested, never `&&`-ed: see the link-time/runtime note below.
++    val attrsCls: Class[_ <: BasicFileAttributes] =
++      if (isWindows) {
++        if (source.getFileSystem().provider().getScheme() == "file")
++          classOf[DosFileAttributes]
++        else classOf[BasicFileAttributes]
++      } else classOf[PosixFileAttributes]
++
++    val attrs = Files.readAttributes(
++      source,
++      attrsCls.asInstanceOf[Class[BasicFileAttributes]],
++      linkOpts
++    )
+     val targetExists = exists(target, linkOpts)
+     if (targetExists && !options.contains(REPLACE_EXISTING))
+       throw new FileAlreadyExistsException(target.toString)
+@@ -370,14 +380,40 @@ object Files {
            throw new DirectoryNotEmptyException(target.toString)
        } else createDirectory(target, Array.empty)
      } else if (!isWindows) {
@@ -513,18 +566,13 @@ index 5eff5d9e5..6fe74dde1 100644
      } else { // Windows
        val in = newInputStream(source, Array.empty)
        try copy(in, target, options.filter(_ == REPLACE_EXISTING))
-@@ -1007,14 +1033,24 @@ object Files {
+@@ -1162,13 +1198,23 @@ object Files {
       * "./".
       */
  
 -    val dirString =
 -      if (dir.equals(emptyPath)) "./"
 -      else dir.toString()
--
--    if (!isWindows)
--      posixList(dir, dirString) // see comment re: args at top of that method
--    else {
--      Arrays.stream[Path](FileHelpers.list(dirString, (n, _) => dir.resolve(n)))
 +    if (dir.getFileSystem().provider().getScheme() != "file") {
 +      // Non-default providers (e.g. "jar:") have no real OS directory to
 +      // opendir()/FindFirstFile() -- go through the provider's own
@@ -537,20 +585,23 @@ index 5eff5d9e5..6fe74dde1 100644
 +      val dirString =
 +        if (dir.equals(emptyPath)) "./"
 +        else dir.toString()
-+
+ 
+-    if (!isWindows)
+-      posixList(dir, dirString) // see comment re: args at top of that method
+-    else windowsList(dir, dirString)
 +      if (!isWindows)
 +        posixList(dir, dirString) // see comment re: args at top of that method
-+      else {
-+        Arrays.stream[Path](FileHelpers.list(dirString, (n, _) => dir.resolve(n)))
-+      }
-     }
++      else windowsList(dir, dirString)
++    }
    }
  
-@@ -1259,6 +1295,24 @@ object Files {
+   private def mismatchCore(is1: InputStream, is2: InputStream): Long = {
+@@ -1410,7 +1456,25 @@ object Files {
+       throw new OutOfMemoryError("Required array size too large")
+     }
  
-     if (pathSize == 0L) { // SN Issue #I4384, part 1.
-       Array.empty[Byte]
-+    } else if (path.getFileSystem().provider().getScheme() != "file") {
+-    if (!isWindows) {
++    if (path.getFileSystem().provider().getScheme() != "file") {
 +      // Non-default providers (e.g. "jar:") have no real OS file to open()
 +      // directly -- go through the provider's own byte channel instead of
 +      // the POSIX/Windows fast path below.
@@ -568,9 +619,38 @@ index 5eff5d9e5..6fe74dde1 100644
 +        }
 +        bytes
 +      } finally in.close()
-     } else {
-       val len = pathSize.toInt
-       val bytes = scala.scalanative.runtime.ByteArray.alloc(len)
++    } else if (!isWindows) {
+       errno = 0
+       val pathCString = toCString(path.toString)
+       val fd = fcntl.open(pathCString, fcntl.O_RDONLY, 0.toUInt)
+diff --git a/javalib/src/main/scala/java/nio/file/PathMatcherImpl.scala b/javalib/src/main/scala/java/nio/file/PathMatcherImpl.scala
+index 0d520f78f..05c8cdb1c 100644
+--- a/javalib/src/main/scala/java/nio/file/PathMatcherImpl.scala
++++ b/javalib/src/main/scala/java/nio/file/PathMatcherImpl.scala
+@@ -25,7 +25,21 @@ private class RegexPathMatcher(pattern: Pattern) extends PathMatcher {
+ }
+ 
+ private class GlobPathMatcher(pattern: String) extends PathMatcher {
+-  val globPattern = GlobPattern.compile(pattern)
++  /* The glob parser knows '/' as the name separator. On Windows a pattern written for
++   * paths spells it as an escaped backslash ("C:\\dir\\**.c", as Scala Native's own build code does)
++   * and Path.toString has plain backslashes: turn both into '/' so they meet.
++   */
++  val globPattern = GlobPattern.compile(
++    if (scala.scalanative.meta.LinktimeInfo.isWindows)
++      pattern.replace("\\\\", "/")
++    else pattern
++  )
+   override def matches(p: Path): Boolean =
+-    globPattern.matcher(p.toString).matches()
++    globPattern
++      .matcher(
++        if (scala.scalanative.meta.LinktimeInfo.isWindows)
++          p.toString.replace('\\', '/')
++        else p.toString
++      )
++      .matches()
+ }
 diff --git a/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala b/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
 index fed7d4cbd..060f1cacd 100644
 --- a/javalib/src/main/scala/java/nio/file/spi/FileSystemProvider.scala
@@ -628,10 +708,10 @@ index c6b06fc33..35ff97753 100644
          stream.nextIn = Deflater.empty.at(off)
        } else {
 diff --git a/javalib/src/main/scala/java/util/zip/Inflater.scala b/javalib/src/main/scala/java/util/zip/Inflater.scala
-index 0d07fe321..2e3c57dc4 100644
+index 065aadf36..376703e51 100644
 --- a/javalib/src/main/scala/java/util/zip/Inflater.scala
 +++ b/javalib/src/main/scala/java/util/zip/Inflater.scala
-@@ -139,12 +139,22 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
+@@ -143,6 +143,13 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
    def setInput(buf: Array[Byte]): Unit =
      setInput(buf, 0, buf.length)
  
@@ -645,16 +725,17 @@ index 0d07fe321..2e3c57dc4 100644
    def setInput(buf: Array[Byte], off: Int, nbytes: Int): Unit =
      if (stream == null) {
        throw new NullPointerException()
-     } else if (off <= buf.length && nbytes >= 0 && off >= 0 && buf.length - off >= nbytes) {
+@@ -150,6 +157,9 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
        inRead = 0
        inLength = nbytes
+       inputBuffer = buf
 +      inBuf = buf
 +      inOff = off
 +      inTotalAtSet = stream.totalIn.toLong
        if (buf.length == 0) {
          stream.nextIn = Inflater.empty.at(off)
        } else {
-@@ -164,6 +174,9 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
+@@ -169,6 +179,9 @@ class Inflater(noHeader: Boolean) extends AutoCloseable {
      } else {
        stream.nextOut = buf.at(off)
      }
@@ -664,6 +745,31 @@ index 0d07fe321..2e3c57dc4 100644
      val err = zlib.inflate(stream, zlib.Z_SYNC_FLUSH)
  
      if (err != zlib.Z_OK) {
+diff --git a/javalib/src/main/scala/java/util/zip/ZipFile.scala b/javalib/src/main/scala/java/util/zip/ZipFile.scala
+index d715b487f..0075792f7 100644
+--- a/javalib/src/main/scala/java/util/zip/ZipFile.scala
++++ b/javalib/src/main/scala/java/util/zip/ZipFile.scala
+@@ -69,7 +69,19 @@ class ZipFile(file: File, mode: Int, charset: Charset) extends Closeable {
+ 
+   private val mEntries = new ju.LinkedHashMap[String, ZipEntry](64)
+ 
+-  readCentralDir()
++  /* A constructor that throws gives the caller no ZipFile to close(), so the
++   * RandomAccessFile opened above would stay open until (if ever) finalize()
++   * runs. Opening a directory or a non-zip file once per class looked up on a
++   * classpath used to exhaust the process's file descriptors.
++   */
++  try readCentralDir()
++  catch {
++    case t: Throwable =>
++      try mRaf.close()
++      catch { case _: Throwable => () }
++      mRaf = null
++      throw t
++  }
+ 
+   override protected def finalize(): Unit =
+     close()
 diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala
 new file mode 100644
 index 000000000..1587013dd

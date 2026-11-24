@@ -1,8 +1,23 @@
 diff --git a/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala b/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala
-index c56002854..51487f012 100644
+index c56002854..11cb72692 100644
 --- a/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala
 +++ b/nir/src/main/scala/scala/scalanative/nir/ControlFlow.scala
-@@ -43,29 +43,60 @@ private[scalanative] object ControlFlow {
+@@ -20,8 +20,12 @@ private[scalanative] object ControlFlow {
+       insts: Seq[Inst],
+       isEntry: Boolean
+   )(implicit val pos: SourcePosition) {
+-    val inEdges = mutable.UnrolledBuffer.empty[Edge]
+-    val outEdges = mutable.UnrolledBuffer.empty[Edge]
++    // ArrayBuffer, not UnrolledBuffer: a block has one or two edges each
++    // way, and an empty UnrolledBuffer is a ClassTag, the buffer, a node and
++    // a 32-slot array (built reflectively). Graphs are built per function by
++    // UseDef, Opt.removeDeadBlocks and LinktimeValueResolver.
++    val inEdges = new mutable.ArrayBuffer[Edge](2)
++    val outEdges = new mutable.ArrayBuffer[Edge](2)
+ 
+     lazy val splitCount: Int = {
+       var count = 0
+@@ -43,29 +47,60 @@ private[scalanative] object ControlFlow {
    final class Graph(
        val entry: Block,
        val all: Seq[Block],
@@ -72,7 +87,7 @@ index c56002854..51487f012 100644
        var todo = List.empty[Block]
  
        def edge(from: Block, to: Block, next: Next) = {
-@@ -76,16 +107,13 @@ private[scalanative] object ControlFlow {
+@@ -76,16 +111,13 @@ private[scalanative] object ControlFlow {
  
        def block(local: Local)(implicit pos: SourcePosition): Block =
          blocks.getOrElseUpdate(
@@ -92,7 +107,7 @@ index c56002854..51487f012 100644
  
              val block = Block(n, params, body, isEntry = k == 0)
              todo ::= block
-@@ -132,21 +160,19 @@ private[scalanative] object ControlFlow {
+@@ -132,21 +164,19 @@ private[scalanative] object ControlFlow {
  
        val entryInst = insts.head.asInstanceOf[Inst.Label]
        val entry = block(entryInst.id)(entryInst.pos)
@@ -537,13 +552,23 @@ index 1c97cab35..3a118bff3 100644
    /** The type of the value. */
    final def ty: Type = this match {
 diff --git a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
-index 53de09294..c6e82cf07 100644
+index 732c77fba..aa801c283 100644
 --- a/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
 +++ b/util/src/main/scala/scala/scalanative/io/VirtualDirectory.scala
-@@ -37,6 +37,14 @@ sealed trait VirtualDirectory {
+@@ -36,6 +36,24 @@ sealed trait VirtualDirectory {
    /** List all files in this directory. */
    def files: Seq[Path]
  
++  /** The paths in `files` whose rendering (`Path.toString`: absolute inside a
++   *  jar) satisfies `accept`. Same result as filtering `files`, but a jar can
++   *  answer from the names of its entries, without asking the file system
++   *  about each of them (a walk with an attribute lookup per entry was most of
++   *  the time spent opening the classpath, whose jars hold thousands of
++   *  entries that are not NIR).
++   */
++  def filesMatching(accept: String => Boolean): Seq[Path] =
++    files.filter(path => accept(path.toString))
++
 +  /** Last-modified time of the file at `path`, used by scalino's persistent
 +   *  in-process NIR parse cache (ClassPath.Impl) to invalidate a single
 +   *  cached Defn without a full directory rescan/reparse. For a jar entry
@@ -555,7 +580,7 @@ index 53de09294..c6e82cf07 100644
    /** Merges content of source paths into single file in target */
    def merge(sources: Seq[Path], target: Path): Path
  
-@@ -98,6 +106,9 @@ object VirtualDirectory {
+@@ -97,6 +115,9 @@ object VirtualDirectory {
        buffer
      }
  
@@ -565,7 +590,39 @@ index 53de09294..c6e82cf07 100644
      override def read(path: Path, len: Int): ByteBuffer = {
        val stream = Files.newInputStream(resolve(path))
        try {
-@@ -215,6 +226,11 @@ object VirtualDirectory {
+@@ -174,12 +195,30 @@ object VirtualDirectory {
+     def uri: URI = URI.create(s"jar:${path.toUri}")
+     // A private file system, not the one registered for the jar's URI: builds
+     // running at once in one JVM would otherwise close it under each other.
+-    private val fileSystem: FileSystem =
++    // Opened on first use: a jar with nothing the caller asks for (the classpath
++    // also holds jars without NIR) is never opened.
++    private lazy val fileSystem: FileSystem =
+       acquire(FileSystems.newFileSystem(path, null: ClassLoader))
+ 
+     override def pathMatcher(pattern: String): PathMatcher =
+       fileSystem.getPathMatcher(pattern)
+ 
++    override def filesMatching(accept: String => Boolean): Seq[Path] = {
++      val zip = new java.util.zip.ZipFile(path.toFile)
++      try {
++        val out = Seq.newBuilder[Path]
++        val entries = zip.entries()
++        while (entries.hasMoreElements) {
++          val entry = entries.nextElement()
++          if (!entry.isDirectory) {
++            val name = "/" + entry.getName
++            if (accept(name)) out += fileSystem.getPath(name)
++          }
++        }
++        out.result()
++      } finally zip.close()
++    }
++
+     override def files: Seq[Path] = {
+       val roots = jIteratorToSeq(fileSystem.getRootDirectories.iterator())
+ 
+@@ -207,6 +246,11 @@ object VirtualDirectory {
  
      override def read(path: Path, len: Int): ByteBuffer = read(path)
  
@@ -577,3 +634,25 @@ index 53de09294..c6e82cf07 100644
      override def write(path: Path)(fn: Writer => Unit): Path =
        throw new UnsupportedOperationException("Can't write to empty directory.")
  
+diff --git a/util/src/main/scala/scala/scalanative/util/ScopedVar.scala b/util/src/main/scala/scala/scalanative/util/ScopedVar.scala
+index 13bc1b579..73214079c 100644
+--- a/util/src/main/scala/scala/scalanative/util/ScopedVar.scala
++++ b/util/src/main/scala/scala/scalanative/util/ScopedVar.scala
+@@ -11,7 +11,7 @@ class ScopedVar[A](name: String) {
+   def this() = this(null)
+ 
+   private var init = false
+-  @nowarn("msg=`= _` has been deprecated")
++  @nowarn // no msg= filter: scalino-dotc <= v0.0.33 crashes on one (no \e in its regex, patch 0044)
+   private var value: A = _
+ 
+   def get: A =
+@@ -52,7 +52,7 @@ object ScopedVar {
+ 
+   implicit def toValue[T](scVar: ScopedVar[T]): T = scVar.get
+ 
+-  @nowarn("msg=`_` is deprecated for wildcard arguments of types")
++  @nowarn // no msg= filter: scalino-dotc <= v0.0.33 crashes on one (no \e in its regex, patch 0044)
+   def scoped[T](ass: Assignment[_]*)(body: => T): T = {
+     val stack = ass.map(_.push())
+     try body

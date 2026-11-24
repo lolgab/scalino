@@ -32,7 +32,8 @@ BUCKETS = [
     ("runtime-scala", lambda p: p.startswith("nativelib/src/main/scala/")),
     ("gc-immix-commix", lambda p: re.match(
         r"nativelib/src/main/resources/scala-native/gc/(immix|immix_commix|commix|none|boehm)/", p)),
-    ("gc-shared-and-runtime-c", lambda p: p.startswith("nativelib/src/main/resources/")),
+    ("gc-shared-and-runtime-c", lambda p: p.startswith(
+        ("nativelib/src/main/resources/", "windowslib/src/main/resources/"))),
     ("docs", lambda p: p.startswith("docs/")),
 ]
 

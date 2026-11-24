@@ -16,10 +16,10 @@ index 86664bcc3..69174a065 100644
    override def run(using Context): Unit = {
      NirCodeGen(settings).run()
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
-index 8bea16fff..c7bfd4339 100644
+index 93d8184e3..f6fe130de 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirCodeGen.scala
-@@ -123,8 +123,15 @@ class NirCodeGen(val settings: GenNIR.Settings)(using ctx: Context)
+@@ -130,8 +130,15 @@ class NirCodeGen(val settings: GenNIR.Settings)(using ctx: Context)
         * conflicting top-level classes. However, it uses `toLowerCase()`
         * without argument, which is not deterministic.
         */
@@ -37,7 +37,7 @@ index 8bea16fff..c7bfd4339 100644
        val generatedCaseInsensitiveNames =
          generatedDefns.collect {
 diff --git a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
-index 773dc2da4..d45b175e0 100644
+index e46659116..d308b5061 100644
 --- a/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
 +++ b/nscplugin/src/main/scala-3/scala/scalanative/nscplugin/NirGenExpr.scala
 @@ -3,6 +3,7 @@ package nscplugin
@@ -61,7 +61,7 @@ index 074d41eb6..884d22c4a 100644
  import dotty.tools.dotc.core
  import scala.language.implicitConversions
 diff --git a/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala b/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala
-index 27118cde6..73176eed4 100644
+index 265ae8e31..cd960b3cd 100644
 --- a/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala
 +++ b/nscplugin/src/main/scala-between_3.10.0_3.10.0/CompilerCompat.scala
 @@ -10,7 +10,8 @@ import dotty.tools.io.AbstractFile
@@ -74,10 +74,10 @@ index 27118cde6..73176eed4 100644
  
    type ScalaPrimitives = dotty.tools.backend.ScalaPrimitives
  
-diff --git a/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala b/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala
-index dccebc0de..f79a42159 100644
---- a/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala
-+++ b/nscplugin/src/main/scala-since_3.10.1/CompilerCompat.scala
+diff --git a/nscplugin/src/main/scala-between_3.10.1_3.10.1/CompilerCompat.scala b/nscplugin/src/main/scala-between_3.10.1_3.10.1/CompilerCompat.scala
+index 00e541a86..d26dadf96 100644
+--- a/nscplugin/src/main/scala-between_3.10.1_3.10.1/CompilerCompat.scala
++++ b/nscplugin/src/main/scala-between_3.10.1_3.10.1/CompilerCompat.scala
 @@ -14,7 +14,8 @@ import scala.annotation.unused
  object CompilerCompat {
    val Inlines = dotty.tools.dotc.inlines.Inlines

@@ -64,7 +64,7 @@ index 6c95d25dc..c5582e658 100644
        case (Ieq, nir.Val.Virtual(l), nir.Val.Virtual(r))
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
 new file mode 100644
-index 000000000..30a3c9ca5
+index 000000000..eea2524cf
 --- /dev/null
 +++ b/tools/src/main/scala/scala/scalanative/interflow/EscapeAnalysis.scala
 @@ -0,0 +1,1505 @@
@@ -706,7 +706,7 @@ index 000000000..30a3c9ca5
 +        // remember megamorphic scopes as unknown right away
 +        scopeTargets.getOrElseUpdate(
 +          (scope.name, sig), {
-+            val ts = scope.targets(sig)
++            val ts = analysis.targetsOf(scope, sig)
 +            if (ts.size > MaxTargets) None else Some(ts.toSeq)
 +          }
 +        )
@@ -1574,7 +1574,7 @@ index 000000000..30a3c9ca5
 +  }
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/Eval.scala b/tools/src/main/scala/scala/scalanative/interflow/Eval.scala
-index 18ddd5a85..87877a097 100644
+index 18ddd5a85..991a16816 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/Eval.scala
 +++ b/tools/src/main/scala/scala/scalanative/interflow/Eval.scala
 @@ -30,7 +30,7 @@ private[interflow] trait Eval { self: Interflow =>
@@ -1595,6 +1595,15 @@ index 18ddd5a85..87877a097 100644
                case nir.Val.Virtual(addr) =>
                  localName.foreach(state.virtualNames.getOrElseUpdate(addr, _))
                case _ => ()
+@@ -322,7 +322,7 @@ private[interflow] trait Eval { self: Interflow =>
+           case ClassRef(cls) if !sig.isVirtual =>
+             cls.resolve(sig).toSeq
+           case ScopeRef(scope) =>
+-            scope.targets(sig)
++            analysis.targetsOf(scope, sig)
+           case _ =>
+             bailOut
+         }
 @@ -1068,16 +1068,16 @@ private[interflow] trait Eval { self: Interflow =>
          defn.insts.head: @unchecked
  
@@ -1768,8 +1777,29 @@ index 6b6c7f818..5c2a2d3d5 100644
 +  val MaxAllocInlineSize: Int =
 +    sys.env.get("SCALANATIVE_INLINE_ALLOC").flatMap(s => scala.util.Try(s.toInt).toOption).filter(_ > 1).getOrElse(64) // not toIntOption: sbt compiles this on Scala 2.12
 +}
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/Instance.scala b/tools/src/main/scala/scala/scalanative/interflow/Instance.scala
+index 76bb9a21d..ae6b75403 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/Instance.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/Instance.scala
+@@ -18,10 +18,14 @@ private[interflow] sealed abstract class Instance(implicit
+       nir.Type.Ref(cls.name, exact = true, nullable = false)
+   }
+ 
++  // Escaped and delayed instances are immutable (a state replaces the heap
++  // entry, it never mutates one), so a clone can share them; only a virtual
++  // instance's `values` is written in place (Eval's fieldstore/arraystore).
++  // State.fullClone clones every heap entry on every block, so copying the
++  // immutable ones was a large share of Interflow's allocation.
+   override def clone(): Instance = this match {
+-    case inst: EscapedInstance => inst.copy()
+-    case inst: DelayedInstance => inst.copy()
+     case inst: VirtualInstance => inst.copy(values = inst.values.clone())
++    case inst                  => inst
+   }
+ 
+   override def toString: String = this match {
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
-index 7cb77f2aa..0ce020b27 100644
+index f234be813..49259b4e9 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
 +++ b/tools/src/main/scala/scala/scalanative/interflow/Interflow.scala
 @@ -2,9 +2,11 @@ package scala.scalanative
@@ -2129,39 +2159,50 @@ index 7cb77f2aa..0ce020b27 100644
  
    def contextDepth(): Int =
      contextTl.get.size
-@@ -181,9 +356,17 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
-     blockFreshTl.set(blockFreshTl.get.tail)
- 
+@@ -183,13 +358,23 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+   // Keeps the order of the input: relinking takes the order of each class's
+   // fields, and so the object layout, from the order of these definitions.
    def result(): Seq[nir.Defn] = {
--    val optimized = originals.clone()
--    optimized ++= done
--    optimized.values.toSeq
-+    // Was `originals.clone()` then merging `done` into the clone: this
-+    // Interflow instance (and therefore `originals`) is discarded the
-+    // instant this method returns (see `Interflow.optimize` below --
-+    // `interflow` is never referenced again after `.result()`), so the
-+    // clone was a second full-corpus-sized copy of `originals` with no
-+    // downstream reader. Mutating in place removes that copy -- traced,
-+    // via real profiling on dotc's own NIR (~77K reachable methods), to
-+    // the exact site of an `Out of heap space` crash under scala-native's
-+    // own GC linking something at that scale.
-+    originals ++= done.asScala
-+    originals.values.toSeq
+-    val optimized = analysis.defns.map { defn =>
+-      defn.name match {
+-        case name: nir.Global.Member => done.getOrElse(name, defn)
+-        case _                       => defn
+-      }
++    // `originals` must stay the pristine input: this instance is reused by
++    // `incrementalReprocess`, which diffs `originals` against the next
++    // build's input to find what changed. No second map the size of the
++    // corpus: just the result sequence, in input order.
++    val out = Vector.newBuilder[nir.Defn]
++    out.sizeHint(analysis.defns.size)
++    analysis.defns.foreach { defn =>
++      val optimized =
++        defn.name match {
++          case m: nir.Global.Member => done.get(m)
++          case _                    => null
++        }
++      out += (if (optimized != null) optimized else defn)
+     }
+-    optimized ++ done.valuesIterator.filterNot(d => originals.contains(d.name))
++    // Defns that exist only as optimizer output (e.g. specializations).
++    done.forEach { (name, defn) => if (!originals.contains(name)) out += defn }
++    out.result()
    }
  
    protected def mode: build.Mode = config.compilerConfig.mode
-@@ -192,14 +375,28 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
+@@ -198,14 +383,31 @@ private[scalanative] class Interflow(val config: build.Config)(implicit
  
  object Interflow {
  
 +  /** Persisted across calls so scalino's `--long-running` LinkDriver
 +   *  (patches/scala-native-0047/0048/0049) can hand an optimize pass the
 +   *  SAME `Interflow` instance it built last time instead of a fresh one --
-+   *  see `Interflow.incrementalReprocess`. Process-global for the same
-+   *  reason `Link.previousReach` is: one scalino-linkdriver process links
-+   *  exactly one `mainClass`/config.
++   *  see `Interflow.incrementalReprocess`. Keyed by work dir like
++   *  `Link.previousReach`: each config's `Interflow` is paired with the
++   *  analysis of that config's `Reach` (`incrementalReprocess` compares
++   *  their `infos` by identity).
 +   */
-+  private var previousInterflow: Option[Interflow] = None
++  private val previousInterflow =
++    mutable.HashMap.empty[java.nio.file.Path, Interflow]
 +
    def optimize(config: build.Config, analysis: ReachabilityAnalysis.Result)(
        implicit ec: ExecutionContext
@@ -2172,11 +2213,12 @@ index 7cb77f2aa..0ce020b27 100644
 -      .visitLoop()
 -      .map(_ => interflow.result())
 +    previousInterflow
++      .get(config.workDir)
 +      .flatMap(_.incrementalReprocess(config, analysis))
 +      .getOrElse {
 +        val interflow = new Interflow(config)(analysis)
 +        interflow.visitEntries()
-+        previousInterflow = Some(interflow)
++        previousInterflow(config.workDir) = interflow
 +        interflow
 +          .visitLoop()
 +          .map(_ => interflow.result())
@@ -2184,20 +2226,83 @@ index 7cb77f2aa..0ce020b27 100644
    }
  
    private[scalanative] object LLVMIntrinsics {
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeBlock.scala b/tools/src/main/scala/scala/scalanative/interflow/MergeBlock.scala
+index 72f9948ea..51968006a 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/MergeBlock.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/MergeBlock.scala
+@@ -12,7 +12,7 @@ private[interflow] final class MergeBlock(
+   var incoming = mutable.Map.empty[nir.Local, (Seq[nir.Val], State)]
+   var outgoing = mutable.Map.empty[nir.Local, MergeBlock]
+   var phis: Seq[MergePhi] = _
+-  var start: State = _
++  var start: State.Snapshot = _
+   var end: State = _
+   var cf: nir.Inst.Cf = _
+   var invalidations: Int = 0
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
-index f918b1b07..6799c4c7d 100644
+index f918b1b07..1b3011d39 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
 +++ b/tools/src/main/scala/scala/scalanative/interflow/MergeProcessor.scala
-@@ -26,7 +26,7 @@ private[interflow] final class MergeProcessor(
-       case (nir.Inst.Label(local, _), offset) =>
-         local -> offset
-     }.toMap
--  val blocks = mutable.Map.empty[nir.Local, MergeBlock]
-+  val blocks = mutable.LongMap.empty[MergeBlock]
-   val todo = mutable.SortedSet.empty[nir.Local](using Ordering.by(offsets))
+@@ -21,29 +21,37 @@ private[interflow] final class MergeProcessor(
+     s"Too big function, ${insts.length} instructions, max allowed ${MergeBlockOffset}"
+   )
  
-   object currentSize extends Function0[Int] { // context-cached function
-@@ -51,7 +51,7 @@ private[interflow] final class MergeProcessor(
+-  val offsets: Map[nir.Local, Int] =
+-    insts.zipWithIndex.collect {
+-      case (nir.Inst.Label(local, _), offset) =>
+-        local -> offset
+-    }.toMap
+-  val blocks = mutable.Map.empty[nir.Local, MergeBlock]
+-  val todo = mutable.SortedSet.empty[nir.Local](using Ordering.by(offsets))
+-
+-  object currentSize extends Function0[Int] { // context-cached function
+-    var lastBlocksHash: Int = _
+-    var lastSize: Int = _
+-    def apply(): Int = {
+-      val hash = blocks.##
+-      if (blocks.## == lastBlocksHash) lastSize
+-      else {
+-        val size = blocks.values.iterator.map { b =>
+-          if (b.end == null) 0 else b.end.emit.size
+-        }.sum
+-        lastSize = size
+-        lastBlocksHash = blocks.##
+-        size
++  // Label -> instruction offset. One MergeProcessor is built per optimized
++  // function and per inlined callee: no zipWithIndex tuple per instruction.
++  private val labelOffsets = mutable.LongMap.empty[Int]
++  val offsets: Map[nir.Local, Int] = {
++    val b = Map.newBuilder[nir.Local, Int]
++    var i = 0
++    while (i < insts.length) {
++      insts(i) match {
++        case nir.Inst.Label(local, _) =>
++          b += local -> i
++          labelOffsets(local.id) = i
++        case _ => ()
+       }
++      i += 1
++    }
++    b.result()
++  }
++  val blocks = mutable.LongMap.empty[MergeBlock]
++  val todo = new MergeProcessor.Worklist(insts, labelOffsets)
++
++  // Instructions emitted so far by the visited blocks. Summed on every call:
++  // it was cached on `blocks.##`, which only changes when a block is added,
++  // while a revisit replaces `b.end` (and its emit buffer) in place, so the
++  // cached size went stale and inlining saw a caller smaller than it was.
++  // The sum is O(blocks), as was the hash.
++  def currentSize(): Int = {
++    var size = 0
++    blocks.foreachValue { b =>
++      if (b.end != null) size += b.end.emit.size
+     }
++    size
+   }
+ 
+   def findMergeBlock(id: nir.Local): MergeBlock = {
+@@ -51,7 +59,7 @@ private[interflow] final class MergeProcessor(
        val label = insts(offsets(id)).asInstanceOf[nir.Inst.Label]
        this.newMergeBlock(label)
      }
@@ -2206,8 +2311,11 @@ index f918b1b07..6799c4c7d 100644
    }
  
    private def newMergeBlock(label: nir.Inst.Label): MergeBlock =
-@@ -95,14 +95,91 @@ private[interflow] final class MergeProcessor(
+@@ -93,16 +101,94 @@ private[interflow] final class MergeProcessor(
+         (phis, newstate)
+       case _ =>
          val headState = states.head
++        val statesArr = states.toArray
  
          var mergeFresh = nir.Fresh(merge.id)
 -        val mergeLocals = mutable.OpenHashMap.empty[nir.Local, nir.Val]
@@ -2301,7 +2409,7 @@ index f918b1b07..6799c4c7d 100644
  
          def isSingleValue(values: Seq[nir.Val]): Boolean =
            if (values.nonEmpty) {
-@@ -110,13 +187,81 @@ private[interflow] final class MergeProcessor(
+@@ -110,13 +196,81 @@ private[interflow] final class MergeProcessor(
              values.forall(_ == h)
            } else false
  
@@ -2384,7 +2492,7 @@ index f918b1b07..6799c4c7d 100644
              val materialized = states.zip(values).map {
                case (s, v) =>
                  v match {
-@@ -130,7 +275,7 @@ private[interflow] final class MergeProcessor(
+@@ -130,7 +284,7 @@ private[interflow] final class MergeProcessor(
              val paramty = Sub.lub(materialized.map(_.ty), bound)
              val param = nir.Val.Local(id, paramty)
              if (eval.preserveDebugInfo) {
@@ -2393,7 +2501,7 @@ index f918b1b07..6799c4c7d 100644
              }
              mergePhis += MergePhi(param, localIds.zip(materialized))
              param
-@@ -140,9 +285,9 @@ private[interflow] final class MergeProcessor(
+@@ -140,9 +294,9 @@ private[interflow] final class MergeProcessor(
          def localNameOf(local: nir.Local) = if (eval.preserveDebugInfo) {
            debugInfo.localNames
              .get(local)
@@ -2405,24 +2513,41 @@ index f918b1b07..6799c4c7d 100644
              )
          } else None
  
-@@ -154,18 +299,21 @@ private[interflow] final class MergeProcessor(
+@@ -153,19 +307,33 @@ private[interflow] final class MergeProcessor(
+ 
          def computeMerge(): Unit = {
            // 1. Merge locals
++          // `value` is the head state's. Most locals hold the same value on
++          // every edge, and then mergePhi would return it unchanged: decide
++          // that without building the values Seq (an ArrayBuffer and a list
++          // per local per merge, for every local the function defined).
            def mergeLocal(local: nir.Local, value: nir.Val): Unit = {
 -            val values = mutable.UnrolledBuffer.empty[nir.Val]
 -            states.foreach(_.locals.get(local).foreach(values += _))
-+            val values = new mutable.ArrayBuffer[nir.Val](states.size)
-+            states.foreach { s =>
-+              val v = s.locals.getOrNull(local.id)
-+              if (v != null) values += v
-+            }
-             if (states.size == values.size) {
+-            if (states.size == values.size) {
 -              mergeLocals(local) = mergePhi(
-+              mergeLocals(local.id) = mergePhi(
-                 values.toSeq,
-                 Some(value.ty),
-                 localNameOf(local)
-               )
+-                values.toSeq,
+-                Some(value.ty),
+-                localNameOf(local)
+-              )
++            var missing = false
++            var same = true
++            var i = 1
++            while (i < statesArr.length && !missing) {
++              val v = statesArr(i).locals.getOrNull(local.id)
++              if (v == null) missing = true
++              else if (same && v != value) same = false
++              i += 1
++            }
++            if (!missing) {
++              mergeLocals(local.id) =
++                if (same) value
++                else
++                  mergePhi(
++                    states.map(_.locals(local.id)),
++                    Some(value.ty),
++                    localNameOf(local)
++                  )
              }
            }
 -          headState.locals.foreach {
@@ -2432,7 +2557,63 @@ index f918b1b07..6799c4c7d 100644
            }
  
            // 2. Merge heap
-@@ -223,7 +371,7 @@ private[interflow] final class MergeProcessor(
+@@ -174,9 +342,10 @@ private[interflow] final class MergeProcessor(
+           def escapes(addr: Addr): Boolean =
+             states.exists(_.hasEscaped(addr))
+ 
+-          states.head.heap.keysIterator
+-            .filter(includeAddr)
+-            .foreach { addr =>
++          // foreachKey visits the keys in keysIterator's order, without a
++          // boxed Long per key.
++          states.head.heap.foreachKey { addr =>
++            if (includeAddr(addr)) {
+               val headInstance = states.head.deref(addr)
+               headInstance match {
+                 case _ if escapes(addr) =>
+@@ -191,18 +360,21 @@ private[interflow] final class MergeProcessor(
+                     headInstance
+                   )
+                 case head: VirtualInstance =>
+-                  val mergeValues = head.values.zipWithIndex.map {
+-                    case (_, idx) =>
+-                      val values = states.map { state =>
+-                        if (state.hasEscaped(addr)) restart()
+-                        state.derefVirtual(addr).values(idx)
+-                      }
+-                      val bound = head.kind match {
+-                        case ClassKind => Some(head.cls.fields(idx).ty)
+-                        case _         => None
+-                        // No need for bound type since each would be either primitive type or j.l.Object
+-                      }
+-                      mergePhi(values, bound, virtualNameOf(addr))
++                  val mergeValues = new Array[nir.Val](head.values.length)
++                  var idx = 0
++                  while (idx < mergeValues.length) {
++                    val i = idx
++                    val values = states.map { state =>
++                      if (state.hasEscaped(addr)) restart()
++                      state.derefVirtual(addr).values(i)
++                    }
++                    val bound = head.kind match {
++                      case ClassKind => Some(head.cls.fields(i).ty)
++                      case _         => None
++                      // No need for bound type since each would be either primitive type or j.l.Object
++                    }
++                    mergeValues(idx) = mergePhi(values, bound, virtualNameOf(addr))
++                    idx += 1
+                   }
+                   mergeHeap(addr) = head.copy(values = mergeValues)(
+                     head.srcPosition,
+@@ -216,6 +388,7 @@ private[interflow] final class MergeProcessor(
+                 case _ => util.unreachable
+               }
+             }
++          }
+ 
+           // 3. Merge params
+           params.zipWithIndex.foreach {
+@@ -223,7 +396,7 @@ private[interflow] final class MergeProcessor(
                val values = incoming.map {
                  case (_, (values, _)) => values(idx)
                }
@@ -2441,7 +2622,7 @@ index f918b1b07..6799c4c7d 100644
                  values,
                  Some(param.ty),
                  localNameOf(param.id)
-@@ -267,6 +415,9 @@ private[interflow] final class MergeProcessor(
+@@ -267,6 +440,9 @@ private[interflow] final class MergeProcessor(
            mergeDelayed.clear()
            mergeEmitted.clear()
            newEscapes.clear()
@@ -2451,7 +2632,7 @@ index f918b1b07..6799c4c7d 100644
            try computeMerge()
            catch { case MergeProcessor.Restart => () }
            if (retries > 128) {
-@@ -299,14 +450,14 @@ private[interflow] final class MergeProcessor(
+@@ -299,14 +475,14 @@ private[interflow] final class MergeProcessor(
      todo.isEmpty
  
    def invalidate(rootBlock: MergeBlock): Unit = {
@@ -2469,7 +2650,7 @@ index f918b1b07..6799c4c7d 100644
            if (block.cf != null) {
              visitCf(from, block.cf)
            }
-@@ -363,7 +514,7 @@ private[interflow] final class MergeProcessor(
+@@ -363,7 +539,7 @@ private[interflow] final class MergeProcessor(
      invalid.values.foreach { block =>
        block.incoming = block.incoming.filter {
          case (name, _) =>
@@ -2478,16 +2659,34 @@ index f918b1b07..6799c4c7d 100644
        }
        block.outgoing.clear()
        block.phis = null
-@@ -372,7 +523,7 @@ private[interflow] final class MergeProcessor(
+@@ -372,7 +548,7 @@ private[interflow] final class MergeProcessor(
        block.cf = null
      }
  
 -    todo.retain(!invalid.contains(_))
-+    todo.retain((l: nir.Local) => !invalid.contains(l.id))
++    todo.retain(l => !invalid.contains(l.id))
    }
  
    def updateDirectSuccessors(block: MergeBlock): Unit = {
-@@ -498,7 +649,7 @@ private[interflow] final class MergeProcessor(
+@@ -430,7 +606,7 @@ private[interflow] final class MergeProcessor(
+       block.invalidations += 1
+     }
+ 
+-    block.start = newState.fullClone(block.id)
++    block.start = newState.snapshot()
+     block.end = newState
+     block.cf = eval.run(
+       insts = insts,
+@@ -452,7 +628,7 @@ private[interflow] final class MergeProcessor(
+     val (newPhis, newState) = merge(block)
+     block.phis = newPhis
+ 
+-    if (newState != block.start) {
++    if (block.start == null || !block.start.sameAs(newState)) {
+       visit(block, newPhis, newState)
+     }
+   }
+@@ -498,7 +674,7 @@ private[interflow] final class MergeProcessor(
        val syntheticLabel =
          nir.Inst.Label(syntheticFresh(), Seq(syntheticParam))
        val resultMergeBlock = newMergeBlock(syntheticLabel)
@@ -2496,6 +2695,63 @@ index f918b1b07..6799c4c7d 100644
        orderedBlocks += resultMergeBlock
  
        // Update all returning blocks to jump to result block,
+@@ -518,7 +694,7 @@ private[interflow] final class MergeProcessor(
+       val (phis, state) = merge(resultMergeBlock)
+       val syntheticScopeId: nir.ScopeId = scopeMapping(nir.ScopeId.TopLevel)
+       resultMergeBlock.phis = phis
+-      resultMergeBlock.start = state
++      resultMergeBlock.start = State.Snapshot.of(state)
+       resultMergeBlock.end = state
+       resultMergeBlock.cf = nir.Inst.Ret(
+         eval.eval(syntheticParam)(state, synthticPos, syntheticScopeId)
+@@ -531,6 +707,34 @@ private[interflow] final class MergeProcessor(
+ }
+ 
+ private[interflow] object MergeProcessor {
++
++  /** The blocks left to visit, lowest instruction offset first: what was a
++   *  `mutable.SortedSet[nir.Local]` ordered by `offsets`, whose every
++   *  comparison did two lookups with boxed Local keys.
++   */
++  final class Worklist(
++      insts: Array[nir.Inst],
++      labelOffsets: mutable.LongMap[Int]
++  ) {
++    private val bits = new java.util.BitSet(insts.length)
++    private def labelAt(offset: Int): nir.Local =
++      insts(offset).asInstanceOf[nir.Inst.Label].id
++    def isEmpty: Boolean = bits.isEmpty
++    def +=(label: nir.Local): Unit = bits.set(labelOffsets(label.id))
++    def -=(label: nir.Local): Unit = bits.clear(labelOffsets(label.id))
++    def head: nir.Local = {
++      val i = bits.nextSetBit(0)
++      if (i < 0) throw new NoSuchElementException("empty worklist")
++      labelAt(i)
++    }
++    def retain(keep: nir.Local => Boolean): Unit = {
++      var i = bits.nextSetBit(0)
++      while (i >= 0) {
++        if (!keep(labelAt(i))) bits.clear(i)
++        i = bits.nextSetBit(i + 1)
++      }
++    }
++  }
+   case object Restart extends Exception with scala.util.control.NoStackTrace
+ 
+   /* To mitigate risk of duplicated ids each merge block uses a dedicated
+diff --git a/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala b/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala
+index 962267f46..694112703 100644
+--- a/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala
++++ b/tools/src/main/scala/scala/scalanative/interflow/NoOpt.scala
+@@ -93,7 +93,7 @@ private[interflow] trait NoOpt { self: Interflow =>
+         case refty: nir.Type.RefKind =>
+           val name = refty.className
+           val scope = analysis.infos(name).asInstanceOf[ScopeInfo]
+-          scope.targets(sig).foreach(visitEntry)
++          analysis.targetsOf(scope, sig).foreach(visitEntry)
+         case _ =>
+           ()
+       }
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/Opt.scala b/tools/src/main/scala/scala/scalanative/interflow/Opt.scala
 index 3db4547f8..267a4bb1d 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/Opt.scala
@@ -2679,7 +2935,7 @@ index 000000000..e5e3a0eeb
 +  }
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala b/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala
-index 8673699c3..c40214f77 100644
+index 8673699c3..68fff5edf 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala
 +++ b/tools/src/main/scala/scala/scalanative/interflow/PolyInline.scala
 @@ -28,7 +28,7 @@ private[interflow] trait PolyInline { self: Interflow =>
@@ -2691,8 +2947,23 @@ index 8673699c3..c40214f77 100644
                    classesCount <= 8 && implsCount == 2
                  } else {
                    classesCount <= 16 && implsCount >= 2 && implsCount <= 4
+@@ -70,13 +70,7 @@ private[interflow] trait PolyInline { self: Interflow =>
+       case ClassRef(cls) if !sig.isVirtual =>
+         cls.resolve(sig).map(g => (cls, g)).toIndexedSeq
+       case ScopeRef(scope) =>
+-        val targets = mutable.UnrolledBuffer.empty[(Class, nir.Global.Member)]
+-        scope.implementors.foreach { cls =>
+-          if (cls.allocated) {
+-            cls.resolve(sig).foreach { g => targets += ((cls, g)) }
+-          }
+-        }
+-        targets.toIndexedSeq
++        analysis.polyTargetsOf(scope, sig)
+       case _ =>
+         IndexedSeq.empty
+     }
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/State.scala b/tools/src/main/scala/scala/scalanative/interflow/State.scala
-index f769ecdd5..2e9a71e84 100644
+index f769ecdd5..5d93bae40 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/State.scala
 +++ b/tools/src/main/scala/scala/scalanative/interflow/State.scala
 @@ -14,7 +14,14 @@ private[interflow] final class State(val blockId: nir.Local)(
@@ -2766,7 +3037,7 @@ index f769ecdd5..2e9a71e84 100644
    }
    def inherit(other: State, roots: Seq[nir.Val]): Unit = {
      val closure = heapClosure(roots) ++ other.heapClosure(roots)
-@@ -293,7 +303,7 @@ private[interflow] final class State(val blockId: nir.Local)(
+@@ -293,11 +303,17 @@ private[interflow] final class State(val blockId: nir.Local)(
      newstate.getClassCache = getClassCache.clone()
  
      if (preserveDebugInfo) {
@@ -2775,6 +3046,34 @@ index f769ecdd5..2e9a71e84 100644
        newstate.localNames = localNames.clone()
      }
      newstate
+   }
++  // A copy of what `equals` compares and nothing else: MergeProcessor keeps
++  // one per visited block only to tell whether a later merge changed the
++  // block's entry state. A fullClone here also copied delayed/emitted/
++  // getClassCache/names and built a builder, for every block.
++  def snapshot(): State.Snapshot =
++    new State.Snapshot(heap.mapValuesNow(_.clone()), locals.clone())
+   override def equals(other: Any): Boolean = other match {
+     case other: State =>
+       other.heap == this.heap && other.locals == this.locals
+@@ -541,3 +557,17 @@ private[interflow] final class State(val blockId: nir.Local)(
+   }
+ 
+ }
++
++private[interflow] object State {
++  final class Snapshot(
++      val heap: mutable.LongMap[Instance],
++      val locals: mutable.LongMap[nir.Val]
++  ) {
++    def sameAs(state: State): Boolean =
++      state.heap == heap && state.locals == locals
++  }
++  object Snapshot {
++    // Shares the state's maps: for a state that is not evaluated any further.
++    def of(state: State): Snapshot = new Snapshot(state.heap, state.locals)
++  }
++}
 diff --git a/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala b/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala
 index 21d37ebfd..79d24078d 100644
 --- a/tools/src/main/scala/scala/scalanative/interflow/UseDef.scala

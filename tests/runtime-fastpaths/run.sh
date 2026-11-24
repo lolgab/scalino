@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Module loading and stack overflow detection after their fast paths moved into
-# generated code (patches scala-native-0037: the module accessor checks an
-# initialized slot itself and calls __scalanative_loadModule only otherwise;
-# 0038: self-recursive methods poll a global count of threads with a pending
-# StackOverflowError and call scalanative_StackOverflowGuards_check only when it
-# is non-zero).
+# generated code (upstream scala-native#5375, plus the compact-header mask in
+# patches/scala-native-*-codegen: the module accessor checks an initialized slot
+# itself and calls __scalanative_loadModule only otherwise; the codegen and
+# runtime-c patches: self-recursive methods poll a global count of threads with
+# a pending StackOverflowError and call scalanative_StackOverflowGuards_check
+# only when it is non-zero).
 #
 # ModuleInit.scala: 32 threads racing on a slow module ctor (one init), a failing
 # ctor (its exception, then NoClassDefFoundError, also from other threads), a

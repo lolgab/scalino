@@ -18,7 +18,7 @@ The patches are split by area, with disjoint file sets, so they are independent 
 | `nir-util`, `interflow`, `codegen`, `linker`, `build-tools` | the `tools`/`nir`/`util` modules: escape analysis, direct LLVM codegen, incremental builds, link-time pruning, PGO |
 | `runtime-scala` | `nativelib` Scala code: monitors, `SmiBox`, thread slots |
 | `gc-immix-commix` | Immix/Commix: evacuation, compact headers, shared recycle pool, release to OS |
-| `gc-shared-and-runtime-c` | trampoline (aarch64 resume via sigreturn), shared yieldpoint trap page, module init, RTTI table |
+| `gc-shared-and-runtime-c` | trampoline (aarch64 resume via sigreturn), stack overflow poll count, compact-header module init, thread slots |
 | `docs` | `gc-safepoint-trampoline.md` |
 
 ## Bumping `SCALA_NATIVE_REF`
@@ -39,7 +39,12 @@ do one merge instead:
 
 Check each patched area against upstream before keeping it. Upstream has already absorbed several of our changes
 (the x86_64 trampoline red-zone fix, `Path.toUri`, `Arrays.fill`, the growth-deferral constants, the
-`Files` probes, interior-pointer conservative marking, ...).
+`Files` probes, interior-pointer conservative marking, the shared yieldpoint trap page, the inline module-load
+fast path, the connect `SO_ERROR` check, the `\e` regex escape, ...).
+
+Compact headers follow upstream's RTTI: with multithreading the lock bits sit in the upper 16 bits of the RTTI
+pointer word (`[lock:16 | rtti:48]`, 8-byte header instead of 16), so no whole-program class ids are needed and
+RTTI depends only on a type and its ancestors, as upstream intends.
 
 ## Binary compatibility with libraries built for released Scala Native
 

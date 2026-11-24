@@ -39,9 +39,6 @@ object LinkDriver:
     directCodegen: Option[Boolean] = None,
     // None: on, except when targeting Windows (see `windowsTarget`)
     compactHeaders: Option[Boolean] = None,
-    // None: on, unless a library depending on the regular array layout is on
-    // the classpath, see `LayoutDependentLibraries`
-    compactByteArrays: Option[Boolean] = None,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
     debugInfo: Boolean = false,
@@ -101,8 +98,6 @@ object LinkDriver:
 
   def windowsCompatHeader(workDir: Path): Path = workDir.resolve("windows-compat").resolve("scalino_windows_compat.h")
 
-  val LayoutDependentLibraries = List("jsoniter-scala-core_native")
-
   val Usage: String =
     """usage: scalino-linkdriver <classpath> <workDir> <mainClass> <clang> <clang++> [quiet|info|verbose] [flags...]
       |
@@ -127,7 +122,6 @@ object LinkDriver:
       |  --[no-]multithreading         default: on
       |  --[no-]direct-codegen         default: on
       |  --[no-]compact-headers        default: on (off when targeting Windows)
-      |  --[no-]compact-byte-arrays    default: on unless a layout-dependent library is on the classpath
       |  --[no-]incremental-compilation  default: on
       |  --no-opt                      disable the optimizer
       |  --embed-resources   --gc-stw-sweep   --heap-histogram   --debug-info   --long-running
@@ -172,8 +166,6 @@ object LinkDriver:
         case "--no-direct-codegen" => o = o.copy(directCodegen = Some(false))
         case "--compact-headers" => o = o.copy(compactHeaders = Some(true))
         case "--no-compact-headers" => o = o.copy(compactHeaders = Some(false))
-        case "--compact-byte-arrays" => o = o.copy(compactByteArrays = Some(true))
-        case "--no-compact-byte-arrays" => o = o.copy(compactByteArrays = Some(false))
         case "--gc-stw-sweep" => o = o.copy(gcStwSweep = true)
         case "--heap-histogram" => o = o.copy(heapHistogram = true)
         case "--debug-info" => o = o.copy(debugInfo = true)
@@ -234,19 +226,6 @@ object LinkDriver:
     val lto = try opts.lto.map(LTO.apply).getOrElse(LTO.default) catch case e: IllegalArgumentException => die(e.getMessage)
     val target = try opts.target.map(parseBuildTarget).getOrElse(BuildTarget.default) catch case e: IllegalArgumentException => die(e.getMessage)
 
-    // Libraries reading and writing the elements of Array[Byte] through raw
-    // pointers, with a copy of the regular Scala Native array layout (for
-    // instance jsoniter-scala-core's ByteArrayAccess). Compact byte arrays
-    // would make them access the wrong bytes, even past the end of the array.
-    val compactByteArrays = opts.compactByteArrays.getOrElse {
-      LayoutDependentLibraries.find(lib => cp.exists(_.toString.contains(lib))) match
-        case Some(lib) =>
-          if logLevel != "quiet" then
-            System.err.println(s"scalino-linkdriver: not using compact byte arrays, $lib reads them through raw pointers")
-          false
-        case None => true
-    }
-
     val config = Config.empty
       .withBaseDir(workDir)
       .withModuleName(mainClass)
@@ -273,7 +252,6 @@ object LinkDriver:
           .withMultithreading(if opts.multithreading then Some(true) else None)
           .withLLVMDirectCodeGen(opts.directCodegen.getOrElse(true))
           .withCompactHeaders(opts.compactHeaders.getOrElse(!windowsTarget(opts)))
-          .withCompactByteArrays(compactByteArrays)
           .withGCStwSweep(opts.gcStwSweep)
           // DirectCodeGen has its own (scoped) DIBuilder-based debug-info
           // support (Phase 3), so the flag has the same effect regardless of

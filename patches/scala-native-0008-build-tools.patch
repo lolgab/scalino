@@ -1,16 +1,18 @@
 diff --git a/tools/src/main/scala/scala/scalanative/build/Build.scala b/tools/src/main/scala/scala/scalanative/build/Build.scala
-index d1b7d0f4d..db56ceb33 100644
+index d2cedcc0a..628781bb7 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Build.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Build.scala
-@@ -257,15 +257,37 @@ object Build {
+@@ -257,6 +257,7 @@ object Build {
      // - build configuration
      // - class paths' mtime
      // - the output native binary ('s mtime)
 +    // - the link-time environment variables that change the generated code
      // Since the NIR code is shipped in jars, we should be able to detect the changes in NIRs.
      // One thing we miss is, we cannot detect changes in c libraries somewhere in `/usr/lib`.
-     (
+     // - settings of the garbage collector in the environment of the build
+@@ -264,10 +265,31 @@ object Build {
        config,
+       GarbageCollectorConfig.Settings.resolve(config.compilerConfig).values,
        config.classPath.map(getLastModifiedChild(_)),
 -      getLastModified(config.artifactPath)
 +      getLastModified(config.artifactPath),
@@ -41,7 +43,7 @@ index d1b7d0f4d..db56ceb33 100644
    /** Finds and compiles native libaries.
     *
     *  @param config
-@@ -335,10 +357,33 @@ object Build {
+@@ -345,10 +367,33 @@ object Build {
      // Fatal errors, e.g. StackOverflowErrors are not propagated by Futures
      // Use a helper promise to get notified about the underlying problem
      val promise = Promise[T]()
@@ -78,12 +80,26 @@ index d1b7d0f4d..db56ceb33 100644
          thread.setUncaughtExceptionHandler { (thread: Thread, ex: Throwable) =>
            promise.tryFailure(ex)
 diff --git a/tools/src/main/scala/scala/scalanative/build/Discover.scala b/tools/src/main/scala/scala/scalanative/build/Discover.scala
-index 9163a5dbb..a9279e040 100644
+index 7a1b9385a..564d47079 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Discover.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Discover.scala
-@@ -122,6 +122,53 @@ object Discover {
-     (libDirs ++ extraLibDirs).map(s => s"-L$s")
-   }
+@@ -107,8 +107,11 @@ object Discover {
+    */
+   def linkingOptions(): Seq[String] = {
+     val llvmLibDirs =
+-      Try(Process(s"$llvmConfigCLI --libdir").lineStream_!.toSeq)
+-        .getOrElse(Seq.empty)
++      Try(
++        Process(s"$llvmConfigCLI --libdir")
++          .lineStream_!(silentLogger())
++          .toSeq
++      ).getOrElse(Seq.empty)
+ 
+     val libDirs =
+       getenv("SCALANATIVE_LIB_DIRS")
+@@ -142,6 +145,53 @@ object Discover {
+   private def splitOptions(options: String): Seq[String] =
+     options.split("[\\s;]+").filter(_.nonEmpty).toSeq
  
 +  /** Info needed to bind against libLLVM's C API directly (experimental
 +   *  direct codegen backend). See [[NativeConfig.useLLVMDirectCodeGen]].
@@ -136,7 +152,7 @@ index 9163a5dbb..a9279e040 100644
        majorVersion: Int,
        fullVersion: String,
 diff --git a/tools/src/main/scala/scala/scalanative/build/IO.scala b/tools/src/main/scala/scala/scalanative/build/IO.scala
-index fbf4be30b..c9cc2d471 100644
+index fbf4be30b..3cca78ea7 100644
 --- a/tools/src/main/scala/scala/scalanative/build/IO.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/IO.scala
 @@ -4,10 +4,9 @@ package build
@@ -152,11 +168,33 @@ index fbf4be30b..c9cc2d471 100644
  import java.util.EnumSet
  import java.util.zip.{ZipEntry, ZipInputStream}
  
-@@ -194,47 +193,195 @@ private[scalanative] object IO {
+@@ -135,12 +134,13 @@ private[scalanative] object IO {
+   def existsInJar(path: Path, matcher: String => Boolean): Boolean = {
+     import java.util.zip.ZipFile
+     val zf = new ZipFile(path.toFile)
+-    val it = zf.entries()
+-    while (it.hasMoreElements()) {
+-      if (matcher(it.nextElement().getName()))
+-        return true
+-    }
+-    false
++    try {
++      val it = zf.entries()
++      var found = false
++      while (!found && it.hasMoreElements())
++        found = matcher(it.nextElement().getName())
++      found
++    } finally zf.close()
+   }
+ 
+   /** Deletes recursively `directory` and all its content. */
+@@ -193,46 +193,209 @@ private[scalanative] object IO {
+   }
  
    /** Compute a SHA-1 hash of `path`. */
-   def sha1(path: Path, bufSize: Int = 1024): Array[Byte] = {
+-  def sha1(path: Path, bufSize: Int = 1024): Array[Byte] = {
 -    val digest = MessageDigest.getInstance("SHA-1")
++  def sha1(path: Path, bufSize: Int = 65536): Array[Byte] = {
 +    val digest = new Sha1Digest()
      val stream = Files.newInputStream(path)
 -    val digestStream = new DigestInputStream(stream, digest)
@@ -176,8 +214,9 @@ index fbf4be30b..c9cc2d471 100644
    }
  
    /** Compute a SHA-1 hash of `files`. */
-   def sha1files(files: Seq[Path], bufSize: Int = 1024): Array[Byte] = {
+-  def sha1files(files: Seq[Path], bufSize: Int = 1024): Array[Byte] = {
 -    val digest = MessageDigest.getInstance("SHA-1")
++  def sha1files(files: Seq[Path], bufSize: Int = 65536): Array[Byte] = {
 +    val digest = new Sha1Digest()
      files.foreach { file =>
        val stream = Files.newInputStream(file)
@@ -215,16 +254,16 @@ index fbf4be30b..c9cc2d471 100644
 +    private val w = new Array[Int](80)
 +
 +    private def processBlock(block: Array[Byte], off: Int): Unit = {
++      val w = this.w
 +      var i = 0
 +      while (i < 16) {
-+        val j = off + i * 4
++        val j = off + (i << 2)
 +        w(i) = ((block(j) & 0xff) << 24) |
 +          ((block(j + 1) & 0xff) << 16) |
 +          ((block(j + 2) & 0xff) << 8) |
 +          (block(j + 3) & 0xff)
 +        i += 1
 +      }
-+      i = 16
 +      while (i < 80) {
 +        val v = w(i - 3) ^ w(i - 8) ^ w(i - 14) ^ w(i - 16)
 +        w(i) = (v << 1) | (v >>> 31)
@@ -237,30 +276,27 @@ index fbf4be30b..c9cc2d471 100644
 +      var d = h3
 +      var e = h4
 +
++      // One loop per group of 20 rounds: no per-round choice of function and
++      // constant.
 +      i = 0
++      while (i < 20) {
++        val t = ((a << 5) | (a >>> 27)) + ((b & c) | (~b & d)) + e + 0x5a827999 + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
++        i += 1
++      }
++      while (i < 40) {
++        val t = ((a << 5) | (a >>> 27)) + (b ^ c ^ d) + e + 0x6ed9eba1 + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
++        i += 1
++      }
++      while (i < 60) {
++        val t = ((a << 5) | (a >>> 27)) + ((b & c) | (b & d) | (c & d)) + e + 0x8f1bbcdc + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
++        i += 1
++      }
 +      while (i < 80) {
-+        var f = 0
-+        var k = 0
-+        if (i < 20) {
-+          f = (b & c) | ((~b) & d)
-+          k = 0x5a827999
-+        } else if (i < 40) {
-+          f = b ^ c ^ d
-+          k = 0x6ed9eba1
-+        } else if (i < 60) {
-+          f = (b & c) | (b & d) | (c & d)
-+          k = 0x8f1bbcdc
-+        } else {
-+          f = b ^ c ^ d
-+          k = 0xca62c1d6
-+        }
-+
-+        val temp = ((a << 5) | (a >>> 27)) + f + e + k + w(i)
-+        e = d
-+        d = c
-+        c = (b << 30) | (b >>> 2)
-+        b = a
-+        a = temp
++        val t = ((a << 5) | (a >>> 27)) + (b ^ c ^ d) + e + 0xca62c1d6 + w(i)
++        e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t
 +        i += 1
 +      }
 +
@@ -271,33 +307,48 @@ index fbf4be30b..c9cc2d471 100644
 +      h4 += e
 +    }
 +
-+    private def updateByte(b: Byte): Unit = {
-+      buffer(bufferLen) = b
-+      bufferLen += 1
-+      messageLen += 1
-+      if (bufferLen == 64) {
-+        processBlock(buffer, 0)
-+        bufferLen = 0
-+      }
-+    }
-+
++    // Whole blocks are hashed straight from `input`; only what is left of
++    // a block is copied (this used to push every byte through a 64-byte buffer
++    // one at a time, a large part of the time spent hashing the toolchain's
++    // native libraries).
 +    def update(input: Array[Byte], offset: Int, len: Int): Unit = {
-+      var i = 0
-+      while (i < len) {
-+        updateByte(input(offset + i))
-+        i += 1
++      messageLen += len
++      var off = offset
++      var left = len
++      if (bufferLen > 0) {
++        val n = math.min(64 - bufferLen, left)
++        System.arraycopy(input, off, buffer, bufferLen, n)
++        bufferLen += n
++        off += n
++        left -= n
++        if (bufferLen == 64) {
++          processBlock(buffer, 0)
++          bufferLen = 0
++        }
++      }
++      while (left >= 64) {
++        processBlock(input, off)
++        off += 64
++        left -= 64
++      }
++      if (left > 0) {
++        System.arraycopy(input, off, buffer, 0, left)
++        bufferLen = left
 +      }
 +    }
 +
 +    def digest(): Array[Byte] = {
 +      val bitLen = messageLen * 8
-+      updateByte(0x80.toByte)
-+      while (bufferLen != 56) updateByte(0.toByte)
-+      var i = 7
-+      while (i >= 0) {
-+        updateByte(((bitLen >>> (i * 8)) & 0xff).toByte)
-+        i -= 1
++      val padding = new Array[Byte](
++        (if (bufferLen < 56) 56 - bufferLen else 120 - bufferLen) + 8
++      )
++      padding(0) = 0x80.toByte
++      var i = 0
++      while (i < 8) {
++        padding(padding.length - 1 - i) = ((bitLen >>> (i * 8)) & 0xff).toByte
++        i += 1
 +      }
++      update(padding, 0, padding.length)
 +
 +      val result = new Array[Byte](20)
 +      val words = Array(h0, h1, h2, h3, h4)
@@ -349,22 +400,23 @@ index fbf4be30b..c9cc2d471 100644
 +        val rootDirectories = zipFS.getRootDirectories().iterator
 +        while (rootDirectories.hasNext) {
 +          val root = rootDirectories.next()
-+          // Native-lib jars mix compiled `.class` files in with the C/C++/S
-+          // sources this unpacks them for -- the driver only ever compiles
-+          // the latter, so extracting the former is pure wasted time/disk.
-+          copyRecursive(root, target, skip = isClassFile)
++          // Native-lib jars mix compiled `.class`, `.tasty` and `.nir` files in
++          // with the C/C++/S sources this unpacks them for -- the driver only
++          // ever compiles the latter (the linker reads the former from the
++          // jar itself), so extracting them is pure wasted time/disk.
++          copyRecursive(root, target, skip = isCompiledScalaFile)
 +        }
 +      } finally zipFS.close()
 +    }
++  }
++
++  private def isCompiledScalaFile(file: Path): Boolean = {
++    val name = file.getFileName.toString
++    name.endsWith(".class") || name.endsWith(".tasty") || name.endsWith(".nir")
    }
  
-+  private def isClassFile(file: Path): Boolean =
-+    file.getFileName.toString.endsWith(".class")
-+
    /** Copy source directory and contents to target directory. */
-   def copyDirectory(source: Path, target: Path): Unit = {
-     Files.createDirectories(target)
-@@ -247,8 +394,15 @@ private[scalanative] object IO {
+@@ -247,8 +410,15 @@ private[scalanative] object IO {
     *  get a relative path. We can't use the following code because you can't
     *  resolve across filesystems like UNIX FS to ZIP FS: val dest =
     *  target.resolve(source.relativize(file))
@@ -381,7 +433,7 @@ index fbf4be30b..c9cc2d471 100644
      Files.walkFileTree(
        source,
        new SimpleFileVisitor[Path]() {
-@@ -256,9 +410,11 @@ private[scalanative] object IO {
+@@ -256,9 +426,11 @@ private[scalanative] object IO {
              file: Path,
              attrs: BasicFileAttributes
          ): FileVisitResult = {
@@ -397,7 +449,7 @@ index fbf4be30b..c9cc2d471 100644
          }
  
 diff --git a/tools/src/main/scala/scala/scalanative/build/LLVM.scala b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
-index f1eb4dcbd..f7fd5a05a 100644
+index fb18291dc..9be97275e 100644
 --- a/tools/src/main/scala/scala/scalanative/build/LLVM.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/LLVM.scala
 @@ -1,11 +1,10 @@
@@ -410,7 +462,7 @@ index f1eb4dcbd..f7fd5a05a 100644
  
  import scala.concurrent._
 -import scala.sys.process._
- import scala.util.{Failure, Success}
+ import scala.util.{Failure, Success, Try}
  
  import scala.scalanative.build.IO.RichPath
 @@ -35,6 +34,43 @@ private[scalanative] object LLVM {
@@ -534,7 +586,25 @@ index f1eb4dcbd..f7fd5a05a 100644
        if (result != 0) {
          Failure(
            new BuildException(
-@@ -323,7 +377,7 @@ private[scalanative] object LLVM {
+@@ -203,7 +257,16 @@ private[scalanative] object LLVM {
+     try {
+       config.compilerConfig.buildTarget match {
+         case BuildTarget.Application =>
+-          Files.copy(buildPath, outPath, StandardCopyOption.REPLACE_EXISTING)
++          // A hard link rather than a second copy of the binary: nothing
++          // writes either name in place (the linker and the CLI both replace
++          // files), so the two never diverge.
++          try {
++            Files.deleteIfExists(outPath)
++            Files.createLink(outPath, buildPath)
++          } catch {
++            case _: IOException | _: UnsupportedOperationException =>
++              Files.copy(buildPath, outPath, StandardCopyOption.REPLACE_EXISTING)
++          }
+         case _: BuildTarget.Library => outPath
+       }
+     } catch {
+@@ -323,7 +386,7 @@ private[scalanative] object LLVM {
  
      val command = Seq(compiler, s"@${configFile.getAbsolutePath()}")
      config.logger.running(command)
@@ -543,7 +613,7 @@ index f1eb4dcbd..f7fd5a05a 100644
    }
  
    private def prepareArchiveCommand(
-@@ -364,7 +418,7 @@ private[scalanative] object LLVM {
+@@ -364,7 +427,7 @@ private[scalanative] object LLVM {
        val command = Seq(ar.abs, "-M")
        config.logger.running(command)
  
@@ -552,7 +622,7 @@ index f1eb4dcbd..f7fd5a05a 100644
      }
  
      MRICompatibleAR match {
-@@ -372,7 +426,7 @@ private[scalanative] object LLVM {
+@@ -372,7 +435,7 @@ private[scalanative] object LLVM {
          val ar = Discover.discover("ar")
          val command = Seq(ar.abs, "rc", config.buildPath.abs) ++ stageFiles()
          config.logger.running(command)
@@ -561,7 +631,20 @@ index f1eb4dcbd..f7fd5a05a 100644
        case Some(path) => useMRIScript(path)
      }
    }
-@@ -468,6 +522,35 @@ private[scalanative] object LLVM {
+@@ -414,7 +477,11 @@ private[scalanative] object LLVM {
+   @inline private def needsLinking(in: Seq[Path], out: Path): Boolean = {
+     val inmax = in.map(_.toFile().lastModified()).max
+     val outmax = out.toFile().lastModified()
+-    inmax > outmax
++    // `>=`, not `>`: lastModified has second resolution on some platforms, and
++    // an object rewritten in the same second the previous binary was linked
++    // would otherwise look up to date, leaving a stale binary (seen in watch
++    // mode, where a relink takes well under a second).
++    inmax >= outmax
+   }
+ 
+   /** DWARF debug sections embedded in the binary (PE or ELF), used by stack
+@@ -467,6 +534,35 @@ private[scalanative] object LLVM {
        case None     => Seq("-Wno-override-module")
      }
  
@@ -671,10 +754,10 @@ index cc6bb2fd8..01363ce2f 100644
  
  }
 diff --git a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
-index 30cf99d3e..27f8f483c 100644
+index 68880581d..b79a143f3 100644
 --- a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
-@@ -71,6 +71,23 @@ sealed trait NativeConfig {
+@@ -74,6 +74,23 @@ sealed trait NativeConfig {
    /** Shall we use the incremental compilation? */
    def useIncrementalCompilation: Boolean
  
@@ -698,40 +781,24 @@ index 30cf99d3e..27f8f483c 100644
     // format: off
    /** Shall be compiled with multithreading support.
     *
-@@ -110,6 +127,55 @@ sealed trait NativeConfig {
+@@ -113,6 +130,39 @@ sealed trait NativeConfig {
    private[scalanative] def multithreadingSupport: Boolean =
      multithreading.getOrElse(true)
  
-+  /** Use compact object headers: a single 32-bit word holding the class id
-+   *  (and, with multithreading, the lock bits) instead of the rtti pointer +
-+   *  optional lock word. Objects and arrays get 4-12 bytes smaller. On by
-+   *  default, but only takes effect for 64-bit targets using the Immix GC, see
++  /** Use compact object headers: with multithreading, the lock bits are kept
++   *  in the upper 16 bits of the RTTI pointer word instead of a separate lock
++   *  word, so every object header is 8 bytes instead of 16. On by default, but
++   *  only takes effect for multithreaded 64-bit targets using the Immix GC
++   *  (single-threaded programs have no lock word anyway), see
 +   *  [[compactHeadersEnabled]].
 +   */
 +  def compactHeaders: Boolean
 +
-+  /** Also use the compact header for `Array[Byte]`. When disabled, byte arrays
-+   *  keep the elements at the same offset as without compact headers (16 bytes
-+   *  from the start, 24 with multithreading), because libraries such as
-+   *  jsoniter-scala-core read and write them through raw pointers with a copy
-+   *  of the runtime array layout. On by default, disable it if a dependency does
-+   *  that. Has no effect without [[compactHeaders]].
-+   */
-+  def compactByteArrays: Boolean
-+
-+  /** EXPERIMENTAL. Create a new config with given compactByteArrays value. See
-+   *  [[compactByteArrays]].
-+   */
-+  def withCompactByteArrays(value: Boolean): NativeConfig
-+
 +  /** Whether compact object headers are actually used for this configuration.
-+   *  Not supported (yet) on 32-bit platforms, nor with GCs other than Immix.
 +   */
 +  private[scalanative] def compactHeadersEnabled: Boolean =
-+    compactHeaders && !is32BitPlatform && gc == GC.Immix
-+
-+  private[scalanative] def compactByteArraysEnabled: Boolean =
-+    compactHeadersEnabled && compactByteArrays
++    compactHeaders && multithreadingSupport && !is32BitPlatform &&
++      gc == GC.Immix
 +
 +  /** EXPERIMENTAL. Create a new config with given compactHeaders value. See
 +   *  [[compactHeaders]].
@@ -754,7 +821,7 @@ index 30cf99d3e..27f8f483c 100644
    /** Map of user defined properties resolved at linktime */
    def linktimeProperties: NativeConfig.LinktimeProperites
  
-@@ -264,12 +330,22 @@ sealed trait NativeConfig {
+@@ -279,12 +329,22 @@ sealed trait NativeConfig {
    /** Create a new config with given incrementalCompilation value */
    def withIncrementalCompilation(value: Boolean): NativeConfig
  
@@ -777,31 +844,29 @@ index 30cf99d3e..27f8f483c 100644
    /** Create a new config with given linktime properites */
    final def withLinktimeProperties(
        value: NativeConfig.LinktimeProperites
-@@ -347,7 +423,11 @@ object NativeConfig {
+@@ -363,7 +423,10 @@ object NativeConfig {
        linkStubs = false,
        optimize = true,
        useIncrementalCompilation = true,
 +      useLLVMDirectCodeGen = false,
 +      compactHeaders = true,
-+      compactByteArrays = true,
        multithreading = None, // detect
 +      gcStwSweep = false,
        linktimeProperties = Map.empty,
        embedResources = false,
        resourceIncludePatterns = Seq("**"),
-@@ -379,7 +459,11 @@ object NativeConfig {
+@@ -396,7 +459,10 @@ object NativeConfig {
        linkStubs: Boolean,
        optimize: Boolean,
        useIncrementalCompilation: Boolean,
 +      useLLVMDirectCodeGen: Boolean,
 +      compactHeaders: Boolean,
-+      compactByteArrays: Boolean,
        multithreading: Option[Boolean],
 +      gcStwSweep: Boolean,
        linktimeProperties: LinktimeProperites,
        embedResources: Boolean,
        resourceIncludePatterns: Seq[String],
-@@ -458,12 +542,24 @@ object NativeConfig {
+@@ -480,12 +546,22 @@ object NativeConfig {
      override def withIncrementalCompilation(value: Boolean): NativeConfig =
        copy(useIncrementalCompilation = value)
  
@@ -811,8 +876,6 @@ index 30cf99d3e..27f8f483c 100644
 +    override def withCompactHeaders(value: Boolean): NativeConfig =
 +      copy(compactHeaders = value)
 +
-+    override def withCompactByteArrays(value: Boolean): NativeConfig =
-+      copy(compactByteArrays = value)
 +
      def withMultithreading(enabled: Boolean): NativeConfig =
        copy(multithreading = Some(enabled))
@@ -826,34 +889,114 @@ index 30cf99d3e..27f8f483c 100644
      def withLinktimeProperties(
          update: Mapping[LinktimeProperites]
      ): NativeConfig = {
-@@ -551,7 +647,11 @@ object NativeConfig {
+@@ -574,7 +650,10 @@ object NativeConfig {
            | - linkStubs:               $linkStubs
            | - optimize                 $optimize
            | - incrementalCompilation:  $useIncrementalCompilation
 +          | - useLLVMDirectCodeGen:    $useLLVMDirectCodeGen
 +          | - compactHeaders:          $compactHeaders
-+          | - compactByteArrays:       $compactByteArrays
            | - multithreading           ${multithreading.getOrElse("detect")}
 +          | - gcStwSweep:              $gcStwSweep
            | - linktimeProperties:      ${showMap(linktimeProperties)}
            | - embedResources:          $embedResources
            | - resourceIncludePatterns: ${showSeq(resourceIncludePatterns)}
 diff --git a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
-index d7e5e3726..15b429fa8 100644
+index 2726bdf94..bc60b88fd 100644
 --- a/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/NativeLib.scala
-@@ -168,7 +168,9 @@ private[scalanative] object NativeLib {
-         Seq(
-           Some(s"-DSCALANATIVE_GC_${gcName}"),
+@@ -22,6 +22,34 @@ private[scalanative] object NativeLib {
+   /** Name of directory that contains native code: "scala-native" */
+   val nativeCodeDir = "scala-native"
+ 
++  // Dependency jars do not change under a running process short of being
++  // rebuilt, so a (mtime, size) stamp is enough to reuse, across the relinks of
++  // scalino's `--long-running` linkdriver, what only depends on a jar's
++  // contents: whether it carries native sources, its SHA-1 and the list of
++  // sources found once unpacked. Without this every link re-scanned the zip
++  // entries of every classpath jar, re-hashed the native-lib jars and re-globbed
++  // their unpacked directories: ~150ms with no compiler running.
++  private final case class Stamp(mtime: Long, size: Long)
++  /** Persisted across processes (see `unpackNativeJar`). */
++  private def persistedStamp(path: Path): String = {
++    val attrs =
++      Files.readAttributes(path, classOf[java.nio.file.attribute.BasicFileAttributes])
++    val key = attrs.fileKey()
++    val mtime = attrs.lastModifiedTime()
++    s"${attrs.size()}:${mtime.toMillis()}:${mtime.hashCode()}:${if (key == null) 0 else key.hashCode()}"
++  }
++
++  private def stampOf(path: Path): Stamp = {
++    val file = path.toFile()
++    Stamp(file.lastModified(), file.length())
++  }
++  private val jarHasNativeCache =
++    new java.util.concurrent.ConcurrentHashMap[Path, (Stamp, Boolean)]()
++  private val jarSha1Cache =
++    new java.util.concurrent.ConcurrentHashMap[Path, (Stamp, Array[Byte])]()
++  private val nativePathsCache =
++    new java.util.concurrent.ConcurrentHashMap[Path, (Stamp, Seq[Path])]()
++
+   /** Project Descriptor properties file: "scala-native.properties" */
+   private val nativeProjectProps = s"${nativeCodeDir}.properties"
+ 
+@@ -47,7 +75,7 @@ private[scalanative] object NativeLib {
+       nativeLib: NativeLib
+   )(implicit ec: ExecutionContext): Future[Seq[Path]] = {
+     val destPath = unpackNativeCode(nativeLib)
+-    val paths = findNativePaths(destPath)
++    val paths = findNativePaths(nativeLib, destPath)
+     val projConfig = configureNativeLibrary(config, analysis, destPath)
+     /* `projConfig` extends the user's config with flags derived from the
+      * linked program (e.g. `@define`s) and the environment, so it is
+@@ -171,7 +199,9 @@ private[scalanative] object NativeLib {
+           if (config.compilerConfig.gc != GC.boehm) None
+           else Some("-DSCALANATIVE_GC_STOPS_THREADS_ANYWHERE"),
            if (!config.useTrapBasedGCYieldPoints) None
 -          else Some("-DSCALANATIVE_GC_USE_YIELDPOINT_TRAPS")
 +          else Some("-DSCALANATIVE_GC_USE_YIELDPOINT_TRAPS"),
 +          if (!config.compilerConfig.gcStwSweep) None
 +          else Some("-DSCALANATIVE_GC_COMMIX_STW_SWEEP")
-         ).flatten
-       }
+         ).flatten ++
+           GarbageCollectorConfig.Settings
+             .resolve(config.compilerConfig)
+@@ -233,10 +263,12 @@ private[scalanative] object NativeLib {
+     if (Build.userConfigHasChanged(config))
+       IO.deleteRecursive(nativeCodeDir)
  
-@@ -326,18 +328,16 @@ private[scalanative] object NativeLib {
++    val persisted = new PersistedFlags(workDir.resolve("nativejars"))
+     val nativeLibPaths = classpath.flatMap { path =>
+-      if (isJar(path)) readJar(path)
++      if (isJar(path)) readJar(path, persisted)
+       else readDir(path)
+     }
++    persisted.save()
+ 
+     val extractPaths =
+       for ((path, index) <- nativeLibPaths.zipWithIndex) yield {
+@@ -276,9 +308,19 @@ private[scalanative] object NativeLib {
+    *  @return
+    *    All file paths to compile
+    */
+-  private def findNativePaths(destPath: Path): Seq[Path] = {
+-    val srcPatterns = destSrcPattern(destPath)
+-    IO.getAll(destPath, srcPatterns)
++  private def findNativePaths(nativeLib: NativeLib, destPath: Path): Seq[Path] = {
++    def glob() = IO.getAll(destPath, destSrcPattern(destPath))
++    if (!isJar(nativeLib)) glob()
++    else {
++      val stamp = stampOf(nativeLib.src)
++      val cached = nativePathsCache.get(destPath)
++      if (cached != null && cached._1 == stamp && Files.exists(destPath)) cached._2
++      else {
++        val paths = glob()
++        nativePathsCache.put(destPath, (stamp, paths))
++        paths
++      }
++    }
+   }
+ 
+   /** The linker uses the VirtualDirectory which is sensitive to empty
+@@ -333,18 +375,41 @@ private[scalanative] object NativeLib {
        IO.unzip(source, target)
      }
  
@@ -867,21 +1010,108 @@ index d7e5e3726..15b429fa8 100644
 -      if (!unpacked) {
 -        unpack()
 -        IO.write(jarhashPath, jarhash)
--      }
++    def jarhash = {
++      val stamp = stampOf(source)
++      val cached = jarSha1Cache.get(source)
++      if (cached != null && cached._1 == stamp) cached._2
++      else {
++        val hash = IO.sha1(source)
++        jarSha1Cache.put(source, (stamp, hash))
++        hash
+       }
 -    } else unpack()
-+    val jarhash = IO.sha1(source)
++    }
 +    val jarhashPath = target.resolve("jarhash")
++    // A (size, modification time, inode) stamp of the jar, kept next to its
++    // hash. While it is unchanged the jar is not hashed again: for the native
++    // libraries of the toolchain (~12MB) that was the largest part of what a
++    // one-shot build spent before compiling anything, on every build. The hash
++    // is still what decides when the stamp differs (or is missing).
++    val jarstampPath = target.resolve("jarstamp")
++    val currentStamp = persistedStamp(source)
++    def storedStamp: String =
++      if (Files.exists(jarstampPath))
++        new String(Files.readAllBytes(jarstampPath), "UTF-8")
++      else ""
 +    def unpacked =
 +      Files.exists(target) &&
 +        Files.exists(jarhashPath) &&
-+        Arrays.equals(jarhash, Files.readAllBytes(jarhashPath))
++        (storedStamp == currentStamp ||
++          Arrays.equals(jarhash, Files.readAllBytes(jarhashPath)))
 +    if (!unpacked) {
 +      unpack()
 +      IO.write(jarhashPath, jarhash)
++      IO.write(jarstampPath, currentStamp)
++    } else if (storedStamp != currentStamp) {
++      // contents confirmed by the hash: remember the stamp for next time
++      IO.write(jarstampPath, currentStamp)
 +    }
      target
    }
  
+@@ -409,11 +474,58 @@ private[scalanative] object NativeLib {
+       case false => None
+     }
+ 
+-  private def readJar(path: Path): Option[Path] =
+-    IO.existsInJar(path, isNativeFile) match {
+-      case true  => Some(path)
+-      case false => None
++  private def readJar(path: Path, persisted: PersistedFlags): Option[Path] = {
++    val stamp = stampOf(path)
++    val cached = jarHasNativeCache.get(path)
++    val hasNative =
++      if (cached != null && cached._1 == stamp) cached._2
++      else {
++        // across processes (a one-shot build is a new process every time):
++        // keyed by the same (size, modification time, inode) stamp as `jarstamp`
++        val stampText = persistedStamp(path)
++        val has = persisted.get(path, stampText).getOrElse {
++          val scanned = IO.existsInJar(path, isNativeFile)
++          persisted.put(path, stampText, scanned)
++          scanned
++        }
++        jarHasNativeCache.put(path, (stamp, has))
++        has
++      }
++    if (hasNative) Some(path) else None
++  }
++
++  /** Which classpath jars carry native sources, as found by earlier builds,
++   *  in `nativejars` of the work directory: one line per jar, `path`, stamp
++   *  and 0/1 separated by tabs.
++   */
++  private final class PersistedFlags(file: Path) {
++    private val flags = new java.util.HashMap[String, (String, Boolean)]()
++    private var dirty = false
++    if (Files.exists(file))
++      new String(Files.readAllBytes(file), "UTF-8").split("\n").foreach { line =>
++        line.split("\t") match {
++          case Array(path, stamp, flag) => flags.put(path, (stamp, flag == "1"))
++          case _                        => ()
++        }
++      }
++    def get(path: Path, stamp: String): Option[Boolean] = {
++      val entry = flags.get(path.toString)
++      if (entry != null && entry._1 == stamp) Some(entry._2) else None
++    }
++    def put(path: Path, stamp: String, value: Boolean): Unit = {
++      flags.put(path.toString, (stamp, value))
++      dirty = true
+     }
++    def save(): Unit =
++      if (dirty) {
++        val text = new java.lang.StringBuilder
++        flags.forEach { (path, entry) =>
++          text.append(path).append('\t').append(entry._1).append('\t').append(if (entry._2) "1" else "0").append('\n')
++        }
++        try IO.write(file, text.toString)
++        catch { case _: java.io.IOException => () } // only a cache
++      }
++  }
+ 
+   /** Used to find native source files in directories */
+   private def srcPatterns(path: Path, elems: String*): String = {
 diff --git a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala b/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
 index 51607936e..840becc55 100644
 --- a/tools/src/main/scala/scala/scalanative/build/ScalaNative.scala
@@ -961,12 +1191,12 @@ index 51607936e..840becc55 100644
        config.logger.time(s"Dumping intermediate code ($phase)") {
          val path = config.workDir.resolve(phase + ".hnir")
 diff --git a/tools/src/main/scala/scala/scalanative/build/Validator.scala b/tools/src/main/scala/scala/scalanative/build/Validator.scala
-index 1e5c2811d..fb07c8a6a 100644
+index 7ba4452cc..68d8f6590 100644
 --- a/tools/src/main/scala/scala/scalanative/build/Validator.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/Validator.scala
-@@ -58,6 +58,22 @@ private[build] object Validator {
-         "LTO.thin is unstable on MacOS, it can lead to compilation errors. Consider using LTO.full (legacy, slower) or LTO.none (disabled)"
-       )
+@@ -83,6 +83,22 @@ private[build] object Validator {
+         s"the path can be found using `xcrun --sdk $sdk --show-sdk-path`"
+     )
  
 +    // Only warn about the one gap left that's actually still true: this
 +    // backend calls directly into libLLVM's C API, which requires the
