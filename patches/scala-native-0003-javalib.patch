@@ -671,6 +671,150 @@ index fed7d4cbd..060f1cacd 100644
      ServiceLoader.load(classOf[FileSystemProvider]).forEach(list.add(_))
  
      list
+diff --git a/javalib/src/main/scala/java/security/ProviderException.scala b/javalib/src/main/scala/java/security/ProviderException.scala
+new file mode 100644
+index 000000000..53e2dd7bd
+--- /dev/null
++++ b/javalib/src/main/scala/java/security/ProviderException.scala
+@@ -0,0 +1,9 @@
++package java.security
++
++class ProviderException(message: String, cause: Throwable)
++    extends RuntimeException(message, cause) {
++  def this() = this(null, null)
++  def this(message: String) = this(message, null)
++  def this(cause: Throwable) =
++    this(if (cause == null) null else cause.toString, cause)
++}
+diff --git a/javalib/src/main/scala/java/security/SecureRandom.scala b/javalib/src/main/scala/java/security/SecureRandom.scala
+new file mode 100644
+index 000000000..7309992f8
+--- /dev/null
++++ b/javalib/src/main/scala/java/security/SecureRandom.scala
+@@ -0,0 +1,123 @@
++package java.security
++
++import scala.scalanative.meta.LinktimeInfo
++import scala.scalanative.posix.unistd
++import scala.scalanative.unsafe._
++import scala.scalanative.unsigned._
++
++/** A SecureRandom backed by the operating system's CSPRNG: getentropy(3) on Linux, macOS and
++ *  the BSDs, BCryptGenRandom on Windows, /dev/urandom where getentropy is missing (32-bit Linux).
++ *
++ *  There are no providers: every algorithm name the JDK knows resolves to this one generator, as
++ *  `NativePRNG` does on Linux and macOS. Seeds passed to the constructor or to `setSeed` are
++ *  ignored, like NativePRNG mixing them into an OS stream that is never predictable anyway.
++ */
++class SecureRandom private (algorithm: String)
++    extends java.util.Random(0L) {
++
++  def this() = this("NativePRNG")
++
++  def this(seed: Array[Byte]) = this("NativePRNG")
++
++  def getAlgorithm(): String = algorithm
++
++  def setSeed(seed: Array[Byte]): Unit = ()
++
++  // Random's constructor calls setSeed(Long): keep it a no-op that never touches the OS.
++  override def setSeed(seed: Long): Unit = ()
++
++  override def nextBytes(bytes: Array[Byte]): Unit =
++    SecureRandom.fill(bytes)
++
++  override protected def next(numBits: Int): Int = {
++    val b = new Array[Byte](4)
++    SecureRandom.fill(b)
++    val i = (b(0) & 0xff) | ((b(1) & 0xff) << 8) | ((b(2) & 0xff) << 16) |
++      ((b(3) & 0xff) << 24)
++    i >>> (32 - numBits)
++  }
++
++  def generateSeed(numBytes: Int): Array[Byte] = {
++    if (numBytes < 0) throw new IllegalArgumentException("numBytes < 0")
++    val b = new Array[Byte](numBytes)
++    SecureRandom.fill(b)
++    b
++  }
++
++  override def toString(): String = s"$algorithm (OS entropy)"
++}
++
++object SecureRandom {
++  private val knownAlgorithms =
++    Set("NATIVEPRNG", "NATIVEPRNGBLOCKING", "NATIVEPRNGNONBLOCKING", "SHA1PRNG",
++      "DRBG", "WINDOWS-PRNG")
++
++  def getInstance(algorithm: String): SecureRandom = {
++    if (algorithm == null) throw new NullPointerException("null algorithm name")
++    if (!knownAlgorithms.contains(algorithm.toUpperCase()))
++      throw new NoSuchAlgorithmException(s"$algorithm SecureRandom not available")
++    new SecureRandom(algorithm)
++  }
++
++  def getInstance(algorithm: String, provider: String): SecureRandom =
++    getInstance(algorithm)
++
++  def getInstanceStrong(): SecureRandom = new SecureRandom("NativePRNGBlocking")
++
++  def getSeed(numBytes: Int): Array[Byte] =
++    new SecureRandom().generateSeed(numBytes)
++
++  @extern @link("bcrypt")
++  private object bcrypt {
++    def BCryptGenRandom(
++        hAlgorithm: CVoidPtr,
++        pbBuffer: Ptr[Byte],
++        cbBuffer: CUnsignedInt,
++        dwFlags: CUnsignedInt
++    ): CInt = extern
++  }
++
++  private final val BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002.toUInt
++
++  // getentropy(3) fails with EIO beyond 256 bytes per call.
++  private final val MaxChunk = 256
++
++  private def fill(bytes: Array[Byte]): Unit = {
++    val len = bytes.length
++    if (len == 0) return
++    if (LinktimeInfo.isWindows) {
++      val status = bcrypt.BCryptGenRandom(
++        null,
++        bytes.at(0),
++        len.toUInt,
++        BCRYPT_USE_SYSTEM_PREFERRED_RNG
++      )
++      if (status != 0)
++        throw new ProviderException(s"BCryptGenRandom failed: NTSTATUS $status")
++    } else if (LinktimeInfo.is32BitPlatform) {
++      fillFromUrandom(bytes)
++    } else {
++      var off = 0
++      while (off < len) {
++        val n = Math.min(MaxChunk, len - off)
++        if (unistd.getentropy(bytes.at(off), n.toUSize) != 0) {
++          fillFromUrandom(bytes)
++          return
++        }
++        off += n
++      }
++    }
++  }
++
++  private def fillFromUrandom(bytes: Array[Byte]): Unit = {
++    val in = new java.io.FileInputStream("/dev/urandom")
++    try {
++      var off = 0
++      while (off < bytes.length) {
++        val n = in.read(bytes, off, bytes.length - off)
++        if (n < 0) throw new ProviderException("/dev/urandom: unexpected end of file")
++        off += n
++      }
++    } finally in.close()
++  }
++}
 diff --git a/javalib/src/main/scala/java/util/zip/Deflater.scala b/javalib/src/main/scala/java/util/zip/Deflater.scala
 index c6b06fc33..35ff97753 100644
 --- a/javalib/src/main/scala/java/util/zip/Deflater.scala

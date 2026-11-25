@@ -193,6 +193,7 @@ object ScalinoCli:
   /** `run -w`: the program keeps running while the sources are rebuilt, and is stopped and started again once
    *  a build has succeeded (scala-cli's `--restart`). A failed build leaves the running program alone. */
   private var managedApp: Option[Process] = None
+  private var managedWatcher: Option[Thread] = None
   private var managedShutdownHook = false
 
   private val RestartGraceSeconds = 10L
@@ -208,10 +209,12 @@ object ScalinoCli:
           p.destroyForcibly()
         p.waitFor()
     }
+    managedWatcher.foreach(_.join())
+    managedWatcher = None
     managedApp = None
 
   /** Starts `cmd` with inherited IO and returns at once, after stopping the previous run. */
-  def runManaged(cmd: List[String], env: Map[String, String] = Map.empty): Int =
+  def runManaged(cmd: List[String], env: Map[String, String] = Map.empty, onExit: Option[Int => Unit] = None): Int =
     if !managedShutdownHook then
       managedShutdownHook = true
       // normal exits of scalino; a signal goes through `shutdownOnSignal` instead
@@ -225,7 +228,16 @@ object ScalinoCli:
     val pb = new JProcessBuilder(cmd.asJava)
     pb.inheritIO()
     env.foreach { case (k, v) => pb.environment().put(k, v) }
-    managedApp = Some(pb.start())
+    val proc = pb.start()
+    managedApp = Some(proc)
+    // `run -w --coverage`: report when the program ends, however it ends. Whoever stops it waits for
+    // the report (`managedWatcher`) before going on.
+    managedWatcher = onExit.map { f =>
+      val t = new Thread(() => f(proc.waitFor()), "scalino-run-exit")
+      t.setDaemon(true)
+      t.start()
+      t
+    }
     0
 
   /** Called by the watch loop once a SIGINT/SIGTERM arrived: forwards it to the program, waits for it and
@@ -243,6 +255,7 @@ object ScalinoCli:
         while !p.waitFor(100, java.util.concurrent.TimeUnit.MILLISECONDS) do
           if Signals.pending == -1 then p.destroyForcibly()
         p.exitValue()
+    managedWatcher.foreach(_.join(30000))
     managedApp = None
     sys.exit(code)
 
@@ -684,7 +697,7 @@ object ScalinoCli:
       if line.startsWith("//>") then
         anyDirectiveKeyRe.findFirstMatchIn(line).foreach { m =>
           val key = m.group(1)
-          if !recognizedDirectiveKeys(key) && !Publish.isKnownDirective(key) && warnedKeys.add(key) then
+          if !recognizedDirectiveKeys(key) && !Publish.isKnownDirective(key) && !Coverage.isKnownDirective(key) && warnedKeys.add(key) then
             // scala-cli-style diagnostic (it hard-errors on these; we keep going).
             val keyIdx = rawLine.indexOf(key, rawLine.indexOf("using") + 5)
             val values = rawLine.substring(keyIdx + key.length).trim
@@ -1825,7 +1838,7 @@ object ScalinoCli:
 
   /** Translates a scala-cli-style glob (`*` within a path segment, `**` across segments, `?` one
    *  char) to an anchored regex; `getPathMatcher("glob:...")` is unverified in this javalib port. */
-  private def globToRegex(glob: String): scala.util.matching.Regex =
+  def globToRegex(glob: String): scala.util.matching.Regex =
     val sb = new StringBuilder("^")
     var i = 0
     while i < glob.length do
@@ -2495,7 +2508,7 @@ object ScalinoCli:
     incremental: Boolean = true,
     js: Boolean = false
   ): Path =
-    val classesDir = Paths.get(".scalino-build", "_scratch", if js then "classes-js" else "classes")
+    val classesDir = Paths.get(".scalino-build", "_scratch", Coverage.classesDirName(if js then "classes-js" else "classes"))
     val cc = if js then computeJsCompileClasspath(extraClasspath, extraCompileOnlyClasspath) else computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
     compileToClasses(sources, classesDir, cc, extraOptions, incremental, js)
     classesDir
@@ -2957,7 +2970,7 @@ object ScalinoCli:
           Some(resources.toAbsolutePath)
     finally jsPlatform = saved
 
-  def buildJsAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts, directives: Directives, moduleCp: List[String] = Nil): Int =
+  def buildJsAndMaybeRun(mode: String, expanded: List[Path], o: RunOpts, directives: Directives, moduleCp: List[String] = Nil, coverage: Option[Coverage.Config] = None): Int =
     if o.formats.nonEmpty then fail("--format is not supported for Scala.js")
     val allDeps = (jsBaseDeps ++ directives.deps ++ o.cliDeps).distinct
     val repos = (directives.repositories ++ o.cliRepositories).distinct
@@ -2972,8 +2985,14 @@ object ScalinoCli:
     mode match
       case "run" =>
         // Scala.js has no process arguments: they are linked into the program, so a `run` is a fresh link.
-        val (_, jsFile) = link(o.progArgs)
-        runProgram(jsRuntimeCommand() :+ jsFile.toString, o.watch, runEnvOf(directives, o))
+        val (_, jsFile) =
+          if coverage.isEmpty then link(o.progArgs)
+          else
+            // the coverage runtime for JavaScript (cli/Coverage.scala) is compiled with the program
+            val invoker = Coverage.jsRuntimeSource()
+            val covOptions = Coverage.optionsFor(expanded, expanded.filter(isCoverageTestSource) :+ invoker)
+            buildJs(expanded :+ invoker, o.progArgs, explicitMainClass, extraClasspath, options ++ covOptions, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts, o.watch)
+        runMeasured(jsRuntimeCommand() :+ jsFile.toString, coverage, o, runEnvOf(directives, o))
       case "package" =>
         if jsOpts.splitStyle != "fewest" then fail("package writes one file: a js module split style is not supported here (use a jsClient with --js-client-out)")
         val (mainClass, jsFile) = link(Nil)
@@ -3134,7 +3153,7 @@ object ScalinoCli:
        |    ))
        |""".stripMargin
 
-  def testJs(expanded: List[Path], o: RunOpts, directives: Directives, moduleCp: List[String] = Nil): Int =
+  def testJs(expanded: List[Path], o: RunOpts, directives: Directives, moduleCp: List[String] = Nil, coverage: Option[Coverage.Config] = None): Int =
     val repos = (directives.repositories ++ o.cliRepositories).distinct
     val depsCache = Paths.get(".scalino-build").resolve("deps-cache")
     // One resolution for main and test dependencies: resolved apart, a framework's own (older) Scala 3
@@ -3177,9 +3196,19 @@ object ScalinoCli:
     else
       val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
       Files.write(driverSrc, generateTestMainJs(matches).getBytes("UTF-8"))
+      // `--coverage`: pass 2 is the instrumented one (pass 1 above, scanned for suites, is not); the
+      // suites, the driver and the JavaScript coverage runtime are compiled without instrumentation.
+      val (sources, buildOptions) =
+        if coverage.isEmpty then (expanded :+ driverSrc, options)
+        else
+          val invoker = Coverage.jsRuntimeSource()
+          val suiteNames = discovered.map(m => m.className.substring(m.className.lastIndexOf('.') + 1)).toSet
+          val suites = expanded.filter(p => isCoverageTestSource(p) || extractDeclaredNames(readFile(p)).exists(suiteNames))
+          (expanded :+ driverSrc :+ invoker, options ++ Coverage.optionsFor(expanded, suites :+ driverSrc :+ invoker))
       // The framework's arguments (`--tests=...`) are the driver's `args`, linked in like any Scala.js program's.
-      val (_, jsFile) = buildJs(expanded :+ driverSrc, o.progArgs, Some("ScalinoCliTestMain"), testClasspath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts)
-      runInherited(jsRuntimeCommand() :+ jsFile.toString, extraEnv = runEnvOf(directives, o))
+      val (_, jsFile) = buildJs(sources, o.progArgs, Some("ScalinoCliTestMain"), testClasspath, buildOptions, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, jsOpts)
+      val exit = runInherited(jsRuntimeCommand() :+ jsFile.toString, extraEnv = runEnvOf(directives, o))
+      finishCoverage(coverage, exit, o)
 
   // CLI surface, scala-cli-shaped:
   //   scalino <sources...>                       run (default command, like
@@ -3290,6 +3319,48 @@ object ScalinoCli:
   private def oTestOnly: String =
     s"""|  --test-only <glob>         only run test classes whose fully-qualified name matches the glob
        |                             (test only); the rest are left out of the linked binary entirely
+       |""".stripMargin
+
+  private def oCoverage: String =
+    s"""|  --coverage                 build with coverage instrumentation, run, and print a coverage
+       |                             table (`run` and `test`; see "coverage" below)
+       |  --coverage-report <fmts>   also write reports, comma-separated: ${Coverage.Formats.mkString(", ")}
+       |  --coverage-dir <dir>       where reports go (default: coverage)
+       |  --coverage-fail-under <pct>            fail when statement coverage is lower
+       |  --coverage-fail-under-branches <pct>   fail when branch coverage is lower
+       |  --coverage-fail-under-file <pct>       fail when any file's statement coverage is lower
+       |""".stripMargin
+
+  private def coverageNote: String =
+    s"""|`--coverage` compiles the program with the Scala 3 compiler's own coverage
+       |instrumentation (`-coverage-out`, scoverage's data format), runs it, and
+       |prints statement and branch coverage per file. `test --coverage` measures
+       |the program, not the suites: sources under a `test` directory, `*.test.scala`
+       |files and files declaring a test class are not instrumented. `dependsOn`
+       |modules are measured with the root. Instrumented classes are kept apart
+       |from the normal build, so switching between the two stays incremental.
+       |
+       |  scalino test --coverage
+       |  scalino test --coverage-report html,lcov --coverage-fail-under 80
+       |  scalino coverage --coverage-report cobertura   (reports again from the last run's data)
+       |
+       |Formats: `html` (coverage/index.html), `lcov` (lcov.info), `cobertura`
+       |(cobertura.xml), `scoverage` (scoverage.xml, as sbt-scoverage writes it) and
+       |`json` (coverage.json); the table is always printed, also with -q. The raw
+       |data stays in .scalino-build/coverage-data for scoverage's own tools. Below a
+       |threshold the command exits with 1 (when the program itself succeeded).
+       |Code between `// $$COVERAGE-OFF$$` and `// $$COVERAGE-ON$$` is not measured.
+       |Directives (flags win):
+       |  //> using coverage.report html lcov
+       |  //> using coverage.dir target/coverage
+       |  //> using coverage.failUnder 80
+       |  //> using coverage.failUnderBranches 60
+       |  //> using coverage.failUnderFile 50
+       |  //> using coverage.exclude "src/generated/**"   (glob, relative to the current directory)
+       |  //> using coverage.excludeClass ".*Codec"        (regex on fully-qualified class names)
+       |Scala.js works on node, bun and deno. `run -w --coverage` prints the table
+       |each time the program ends: on its own, stopped for a rebuild, or by Ctrl+C.
+       |--interpret is not supported.
        |""".stripMargin
 
   private def oNoInc: String =
@@ -3677,6 +3748,7 @@ object ScalinoCli:
          |  scalino sysroot build <triple>...      set up the sysroot for cross-compiling to <triple> (see --native-target-triple)
          |  scalino clean                         delete the .scalino-build directory
          |  scalino daemon [status|stop]          list or stop the background compilers (see --no-daemon)
+         |  scalino coverage [options]             coverage reports from the last `test --coverage` / `run --coverage`
          |  scalino version                        print version info
          |  scalino --help                         this message
          |  scalino <command> --help               help for one command
@@ -3684,18 +3756,19 @@ object ScalinoCli:
          |$sourcesNote
          |$incrementalNote
          |${Color.bold("options:", out)}
-         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oInterpret$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oNoInc$oOffline$oProgArgs$oRepl
+         |$oMain$oDeps$oRepo$oScala$oScalac$oWatch$oInterpret$oArgsFile$oOut$oVerbose$oQuiet$oColor$oTestFw$oTestOnly$oCoverage$oNoInc$oOffline$oProgArgs$oRepl
          |$nativeHeader$nativeOpts
          |$directivesBlock
          |$lockNote
          |$testNote
+         |$coverageNote
          |$scriptsNote
          |$replNote
          |$setupIdeNote
          |$completionsNote""".stripMargin, out))
 
   val HelpCommands: Set[String] =
-    Set("run", "compile", "package", "test", "repl", "setup-ide", "lock", "publish", "publish-local", "completions", "clean", "sysroot", "daemon", "version")
+    Set("run", "compile", "package", "test", "repl", "setup-ide", "lock", "publish", "publish-local", "completions", "clean", "sysroot", "daemon", "coverage", "version")
 
   /** `scalino <command> --help`: usage plus only the options/notes that apply to
    *  that command. */
@@ -3709,8 +3782,8 @@ object ScalinoCli:
       case "run" =>
         head("scalino run <sources...> [options] [-- <program args>]", "Compile and run.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
-          opts(oMain + common + oWatch + oInterpret + oProgArgs) +
-          nativeHeader + nativeOpts + "\n" + jsHeader + "\n" + directivesBlock + "\n" + scriptsNote
+          opts(oMain + common + oWatch + oInterpret + oCoverage + oProgArgs) +
+          nativeHeader + nativeOpts + "\n" + jsHeader + "\n" + directivesBlock + "\n" + scriptsNote + "\n" + coverageNote
       case "compile" =>
         head("scalino compile [options]", "Compile only, no link (see build output), the current directory by default.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
@@ -3723,8 +3796,8 @@ object ScalinoCli:
       case "test" =>
         head("scalino test [options] [-- <framework args>]", "Compile and run tests in the current directory.") +
           sourcesNote + "\n" + incrementalNote + "\n" +
-          opts(common + oWatch + oTestFw + oTestOnly + oProgArgs) +
-          nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + testNote
+          opts(common + oWatch + oTestFw + oTestOnly + oCoverage + oProgArgs) +
+          nativeHeader + nativeOpts + "\n" + directivesBlock + "\n" + testNote + "\n" + coverageNote
       case "repl" =>
         head("scalino repl [sources...] [options]", "Start an interactive Scala REPL.") +
           opts(common + oRepl) + directivesBlock + "\n" + replNote
@@ -3774,6 +3847,9 @@ object ScalinoCli:
               |Linux targets are static musl binaries that run on any distro. Every
               |--native-target-triple uses these sysroots, on a Mac too, so builds match across machines.
               |""".stripMargin
+      case "coverage" =>
+        head("scalino coverage [report] [options]", "Print and write coverage reports from the last instrumented run, without building or running.") +
+          opts(oCoverage.linesIterator.drop(2).mkString("", "\n", "\n") + oQuiet) + coverageNote
       case "version" =>
         head("scalino version", "Print version info.")
     out.print(colorizeHelp(text, out))
@@ -3841,7 +3917,8 @@ object ScalinoCli:
     cliJsAllowBigInts: Boolean = false,
     cliJsRuntime: Option[String] = None,
     cliPostLink: List[String] = Nil,
-    cliRunEnv: List[String] = Nil
+    cliRunEnv: List[String] = Nil,
+    coverage: Coverage.Flags = Coverage.Flags()
   ):
     // scala-cli-style: -v shows the full build-tool debug trace (clang/linker invocations,
     // NativeConfig dumps), the default ("info") progress lines, -q only warnings/errors. -v wins.
@@ -3967,15 +4044,60 @@ object ScalinoCli:
           if (v != "true" && v != "false")
             die(s"--native-optimize=$v: expected true or false")
           o = o.copy(cliNativeOptimize = Some(v == "true"))
+        case f if Coverage.isFlag(f) =>
+          val (flags, used) = Coverage.parseFlag(args, i, o.coverage)
+          o = o.copy(coverage = flags); i += used
         case f if f.startsWith("-") => die(s"unknown option: $f")
         case f => o = o.copy(sources = o.sources :+ Paths.get(f))
       i += 1
     o
 
+  /** A test source as far as coverage goes: `isTestSource`, or scala-cli's `*.test.scala`. */
+  def isCoverageTestSource(p: Path): Boolean =
+    isTestSource(p) || p.getFileName.toString.endsWith(".test.scala")
+
+  /** `--coverage` (cli/Coverage.scala): checks it applies, then starts the instrumented build. */
+  def startCoverage(o: RunOpts, sources: List[Path], mode: String): Option[Coverage.Config] =
+    if !o.coverage.enabled then None
+    else
+      if mode != "run" && mode != "test" then fail(s"--coverage: only `run` and `test` measure coverage, not `$mode`")
+      if o.interpret then fail("--coverage: the interpreter (--interpret) isn't instrumented, drop one of the two")
+      // `run -w`: the running program records against the statement map this build is about to
+      // rewrite, so it is stopped (and reported) now rather than once the build has succeeded.
+      if mode == "run" && o.watch then stopManagedApp()
+      val cfg = Coverage.config(o.coverage, Coverage.parseDirectiveSettings(sources))
+      Coverage.begin(cfg)
+      Some(cfg)
+
+  /** The reports after the instrumented program exited with `exit`; a failed threshold fails a
+   *  command that would otherwise succeed. */
+  def finishCoverage(coverage: Option[Coverage.Config], exit: Int, o: RunOpts, only: Set[Path] = Coverage.instrumentedSources): Int =
+    coverage match
+      case None => exit
+      case Some(cfg) =>
+        if !o.quiet then println()
+        val ok = Coverage.report(cfg, Some(only), o.quiet)
+        if exit != 0 then exit else if ok then 0 else 1
+
+  /** Runs the program; with `--coverage`, reports once it has exited. Under `-w` the program runs in the
+   *  background, and the report comes whenever it ends: by itself, stopped for a rebuild, or by Ctrl+C. */
+  def runMeasured(cmd: List[String], coverage: Option[Coverage.Config], o: RunOpts, env: Map[String, String]): Int =
+    if coverage.isDefined && o.watch then
+      val only = Coverage.instrumentedSources
+      runManaged(cmd, env, onExit = Some { _ =>
+        try finishCoverage(coverage, 0, o, only)
+        catch case e: BuildFailed => System.err.println(Color.error(s"scalino: coverage: ${e.getMessage}"))
+        ()
+      })
+    else finishCoverage(coverage, runProgram(cmd, o.watch, env), o)
+
   /** Runs for every rebuild: re-parses directives (they may change under `-w`), resolves deps,
    *  detects the entry point, compiles and links, and for `run` executes the result. Throws
    *  BuildFailed on recoverable failures, never `die`/`sys.exit`, so watch mode keeps watching. */
   def buildAndMaybeRun(mode: String, expandedIn: List[Path], o: RunOpts): Int =
+    try buildAndMaybeRunOnce(mode, expandedIn, o) finally Coverage.end()
+
+  private def buildAndMaybeRunOnce(mode: String, expandedIn: List[Path], o: RunOpts): Int =
     val directives0 = parseDirectives(expandedIn)
     // `//> using target.platform` files drop out for the other platform (the platform itself comes from the rest)
     val expandedOrig = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
@@ -3990,9 +4112,10 @@ object ScalinoCli:
     }
     jsPlatform = resolvePlatform(ownDirectives, o) == "js"
     jsRuntime = o.cliJsRuntime.getOrElse("node")
+    val coverage = startCoverage(o, expandedOrig, mode)
     // `//> using dependsOn`: upstream modules are compiled first, their classes go first on the class path
     val (directives, moduleCp) = Modules.prepare(ownDirectives, expandedOrig, if jsPlatform then "js" else "native", o)
-    if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives, moduleCp)
+    if jsPlatform then return buildJsAndMaybeRun(mode, expanded, o, directives, moduleCp, coverage)
     if directives.jsClients.size > 1 then fail(s"only one jsClient is supported, found ${directives.jsClients.size}")
     // `compile` only type-checks the server: it doesn't need the bundle.
     val clientResources = if mode == "compile" then Nil else directives.jsClients.flatMap(buildJsClient(_, directives.shared, o, out = o.cliJsClientOut.orElse(directives.jsClientOut), serverNativeMode = o.cliNativeMode.orElse(directives.nativeMode)))
@@ -4026,8 +4149,9 @@ object ScalinoCli:
           interpretProgram(expanded, explicitMainClass, extraClasspath, options, extraCompileOnlyClasspath, o, runEnvOf(directives, o)) match
             case Some(exit) => return exit
             case None => if !o.quiet then System.err.println(Color.gray("Linking it instead"))
-        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
-        runProgram(binPathFor(mainClass).toString :: o.progArgs, o.watch, runEnvOf(directives, o))
+        val buildOptions = options ++ Coverage.optionsFor(expanded, expanded.filter(isCoverageTestSource))
+        val mainClass = buildBinary(expanded, explicitMainClass, extraClasspath, binPathFor, buildOptions, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, hostOpts, o.watch)
+        runMeasured(binPathFor(mainClass).toString :: o.progArgs, coverage, o, runEnvOf(directives, o))
       case "package" if o.formats.nonEmpty && o.formats != List("binary") =>
         def binPathFor(mc: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(hostBinName)
         def binPathForTriple(mc: String, t: String): Path = Paths.get(".scalino-build").resolve(mc).resolve(s"bin-$t")
@@ -4250,14 +4374,18 @@ object ScalinoCli:
     if expanded.isEmpty then die("no .scala files found")
 
     def attempt(expandedIn: List[Path]): Int =
+      try attemptOnce(expandedIn) finally Coverage.end()
+
+    def attemptOnce(expandedIn: List[Path]): Int =
       val directives0 = parseDirectives(expandedIn)
       val expanded = forPlatform(expandedIn, if resolvePlatform(directives0, o) == "js" then "js" else "native")
       val ownDirectives = if expanded.size == expandedIn.size then directives0 else parseDirectives(expanded)
       jsPlatform = resolvePlatform(ownDirectives, o) == "js"
       jsRuntime = o.cliJsRuntime.getOrElse("node")
+      val coverage = startCoverage(o, expanded, "test")
       // The root module's tests, with its upstream modules (main scope) on the class path.
       val (directives, moduleCp) = Modules.prepare(ownDirectives, expanded, if jsPlatform then "js" else "native", o)
-      if jsPlatform then return testJs(expanded, o, directives, moduleCp)
+      if jsPlatform then return testJs(expanded, o, directives, moduleCp, coverage)
       directives.scalaVersion.orElse(o.cliScala).foreach { v =>
         if !BuildInfo.scalaVersion.startsWith(v) then
           System.err.println(
@@ -4334,15 +4462,24 @@ object ScalinoCli:
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", hostBinName)
+        // --coverage: the program's sources are instrumented, not the suites (any file declaring a
+        // discovered test class counts as one, wherever it is) nor the generated driver.
+        val buildOptions =
+          if coverage.isEmpty then options
+          else
+            val suiteNames = discovered.map(m => m.className.substring(m.className.lastIndexOf('.') + 1)).toSet
+            val suites = expanded.filter(p => isCoverageTestSource(p) || extractDeclaredNames(readFile(p)).exists(suiteNames))
+            options ++ Coverage.optionsFor(expanded, suites :+ driverSrc)
         def build(exclude: Set[String]) =
-          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, options, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude)
+          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, buildOptions, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude)
         // A selected test could reference an excluded class other than by inheritance: if the
         // trimmed link fails, fall back to the full link.
         try build(excluded)
         catch case BuildFailed(_) if excluded.nonEmpty =>
           System.err.println("scalino: warning: link with --test-only exclusions failed (a selected test references an excluded test class?) -- retrying with every test class linked")
           build(Set.empty)
-        runInherited(binPath.toString :: o.progArgs, extraEnv = runEnvOf(directives, o))
+        val exit = runInherited(binPath.toString :: o.progArgs, extraEnv = runEnvOf(directives, o))
+        finishCoverage(coverage, exit, o)
 
     if o.watch then
       def resolve() =
@@ -4486,7 +4623,7 @@ object ScalinoCli:
   // `Sysroot.Supported`) and `sysroot`'s sub-arguments. Prints to stdout, like cargo/rustup
   // (e.g. `scalino completions bash > /etc/bash_completion.d/scalino`).
 
-  private val completionSubcommands = "run compile package test repl setup-ide lock publish publish-local clean sysroot daemon version completions"
+  private val completionSubcommands = "run compile package test repl setup-ide lock publish publish-local clean sysroot daemon coverage version completions"
   private val completionSysrootActions = "build list path"
   // Closed value sets of the Scala.js options (scala-cli's spellings, see resolveJsOpts/platformName)
   private val completionJsModuleKinds = "commonjs common esmodule es nomodule none"
@@ -4496,11 +4633,12 @@ object ScalinoCli:
   private val completionJsSplitStyles = "fewestmodules smallestmodules smallmodulesfor"
   private val completionJsEsVersions = "es5_1 es2015 es2016 es2017 es2018 es2019 es2020 es2021"
   private def completionTriples: String = Sysroot.Supported.mkString(" ")
+  private def completionCoverageFormats: String = Coverage.Formats.mkString(" ")
   private val completionOptions =
     "--main-class --dep --dependency --compile-dep --compile-only-dependency " +
     "-r --repo --repository -S --scala --scala-version -O --scalac-option --scalac-opt " +
     "-w --watch --watching --watching-path --args-file -o --output --format --pkg-name --pkg-version --release-url -v --verbose -q --quiet " +
-    "--color --test-framework --test-only --no-incremental --no-daemon --offline --interpret --repl-init-script --repl-quit-after-init --native-mode --native-gc --native-lto " +
+    "--color --test-framework --test-only --coverage --coverage-report --coverage-dir --coverage-fail-under --coverage-fail-under-branches --coverage-fail-under-file --no-incremental --no-daemon --offline --interpret --repl-init-script --repl-quit-after-init --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --post-link --run-env --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
     "--native-direct-codegen --native-compact-headers --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
@@ -4546,11 +4684,13 @@ object ScalinoCli:
        |    --js-module-split-style) COMPREPLY=($$(compgen -W "$completionJsSplitStyles" -- "$$cur")); return ;;
        |    --js-header) return ;;
        |    --format|--formats) COMPREPLY=($$(compgen -W "binary tar deb rpm docker brew" -- "$$cur")); return ;;
+       |    --coverage-report) COMPREPLY=($$(compgen -W "$completionCoverageFormats" -- "$$cur")); return ;;
+       |    --coverage-fail-under|--coverage-fail-under-branches|--coverage-fail-under-file) return ;;
        |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
        |    completions) COMPREPLY=($$(compgen -W "bash zsh fish" -- "$$cur")); return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository| \\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path| \\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking|--post-link|--run-env| \\
+       |    --args-file|-o|--output|--test-framework|--test-only|--coverage-dir|--native-sysroot|--native-clang|--native-clangpp|--native-linking|--post-link|--run-env| \\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      COMPREPLY=($$(compgen -f -- "$$cur")); return ;;
        |  esac
@@ -4603,11 +4743,13 @@ object ScalinoCli:
        |    --js-module-split-style) _values 'split style' $completionJsSplitStyles; return ;;
        |    --js-header) return ;;
        |    --format|--formats) _values 'format' binary tar deb rpm docker brew; return ;;
+       |    --coverage-report) _values -s , 'report format' $completionCoverageFormats; return ;;
+       |    --coverage-fail-under|--coverage-fail-under-branches|--coverage-fail-under-file) return ;;
        |    --pkg-name|--pkg-version|--package-name|--package-version|--release-url) return ;;
        |    completions) _values 'shell' bash zsh fish; return ;;
        |    --main-class|--dep|--dependency|--compile-dep|--compile-only-dependency|-r|--repo|--repository|\\
        |    -S|--scala|--scala-version|-O|--scalac-option|--scalac-opt|--watching|--watching-path|\\
-       |    --args-file|-o|--output|--test-framework|--test-only|--native-sysroot|--native-clang|--native-clangpp|--native-linking|--post-link|--run-env|\\
+       |    --args-file|-o|--output|--test-framework|--test-only|--coverage-dir|--native-sysroot|--native-clang|--native-clangpp|--native-linking|--post-link|--run-env|\\
        |    --native-compile|--native-c-compile|--native-cpp-compile|--native-prune)
        |      _files; return ;;
        |  esac
@@ -4654,6 +4796,10 @@ object ScalinoCli:
        |complete -c scalino -l js-header -x
        |complete -c scalino -l format -x -a "binary tar deb rpm docker brew"
        |complete -c scalino -l formats -x -a "binary tar deb rpm docker brew"
+       |complete -c scalino -l coverage-report -x -a "$completionCoverageFormats"
+       |complete -c scalino -l coverage-fail-under -x
+       |complete -c scalino -l coverage-fail-under-branches -x
+       |complete -c scalino -l coverage-fail-under-file -x
        |complete -c scalino -l post-link -x
        |complete -c scalino -l run-env -x
        |complete -c scalino -l pkg-name -x
@@ -4729,6 +4875,7 @@ object ScalinoCli:
       case "clean" => handleClean(args.drop(1))
       case "sysroot" => Sysroot.handle(args.drop(1))
       case "daemon" => DotcDaemon.handle(args.drop(1))
+      case "coverage" => Coverage.handle(args.drop(1))
       case "lock" => handleLock(args.drop(1))
       case "publish-local" => Publish.handle(args.drop(1), local = true)
       // scala-cli's spelling

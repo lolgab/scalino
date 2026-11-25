@@ -21,7 +21,7 @@ object Modules:
     def name: String = Option(dir.getFileName).map(_.toString).getOrElse("root")
     /** Keyed by the absolute directory: two modules may share a name (`a/core`, `b/core`). */
     def classesDir: Path =
-      Paths.get(".scalino-build", "modules", s"$name-${hashKey(dir.toString).take(8)}", if platform == "js" then "classes-js" else "classes")
+      Paths.get(".scalino-build", "modules", s"$name-${hashKey(dir.toString).take(8)}", Coverage.classesDirName(if platform == "js" then "classes-js" else "classes"))
     /** This module and everything it depends on, upstream first. */
     def closure: List[Module] = (dependsOn.flatMap(_.closure) :+ this).distinctBy(m => (m.dir, m.platform))
 
@@ -105,7 +105,9 @@ object Modules:
       val cp = classpathOf(m.closure, Some(m), o, depsCache)
       val compileOnlyCp = resolveDeps(m.directives.compileOnlyDeps.distinct, depsCache, (m.directives.repositories ++ o.cliRepositories).distinct)
       val cc = if js then computeJsCompileClasspath(cp, compileOnlyCp) else computeCompileClasspath(cp, compileOnlyCp)
-      compileToClasses(m.sources, m.classesDir, cc, m.directives.options ++ o.cliOptions, !o.noIncremental, js, what = s"module ${shown(m.dir)}")
+      // --coverage: modules are instrumented too, into their own classes-coverage (cli/Coverage.scala)
+      val coverageOptions = Coverage.optionsFor(m.sources)
+      compileToClasses(m.sources, m.classesDir, cc, m.directives.options ++ o.cliOptions ++ coverageOptions, !o.noIncremental, js, what = s"module ${shown(m.dir)}")
 
   /** The root's half of a multi-module build: resolves and compiles its upstream modules, and returns
    *  its directives with theirs folded in (`withUpstream`) plus their classes directories, which go

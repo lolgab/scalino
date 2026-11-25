@@ -140,6 +140,7 @@ scalino run examples/Hello.scala --interpret                                # no
 scalino run hello.sc -- some args                                           # a script
 scalino repl --dep com.lihaoyi::os-lib::0.11.3                              # REPL, no JVM
 scalino test                                                                # munit/utest/scalatest/zio-test
+scalino test --coverage --coverage-report html,lcov                         # statement and branch coverage
 scalino package examples/Hello.scala -o hello && ./hello
 scalino package . --main-class Server,Worker -o bin/                        # one binary per main, each with its own link cache
 ```
@@ -149,7 +150,8 @@ scalino package . --main-class Server,Worker -o bin/                        # on
 | `run` (default) | compile, link and run |
 | `compile` | compile only, no link |
 | `package` | link a native binary (or, with `--js`, a JavaScript bundle); `--format` also wraps it as a deb/rpm/tar/docker/brew package ([Packaging](#packaging)) |
-| `test` | compile main + test scope, run the tests |
+| `test` | compile main + test scope, run the tests; `--coverage` measures them ([Coverage](#coverage)) |
+| `coverage` | the coverage reports again from the last `--coverage` run |
 | `repl` | interactive Scala REPL, interpreted ([REPL and the interpreter](#repl-and-the-interpreter)) |
 | `setup-ide` | write the LSP config ([Editor support](#editor-support)) |
 | `lock` | write `scalino.lock.json` ([Hermetic builds](#hermetic--nix-builds)) |
@@ -208,6 +210,64 @@ scalino: 2 passed, 0 failed, 0 errored, 0 skipped
 
 `--test-only <glob>` leaves the other suites out of the link altogether, and
 anything after `--` goes to the framework.
+
+### Coverage
+
+`--coverage` builds the program with the Scala 3 compiler's coverage
+instrumentation (`-coverage-out`, the data format scoverage reads), runs it and
+prints what ran:
+
+```console
+$ scalino test --coverage
+...
+calc.CalcTest:
+  + abs 0.00s
+  + classify 0.00s
+scalino: 2 passed, 0 failed, 0 errored, 0 skipped
+
+File        Stmts  Miss  Branch  BrMiss  Cover  Missing
+-------------------------------------------------------
+Calc.scala     18     8       6       3  55.6%  9, 11-13
+Main.scala      3     3       0       0   0.0%  3
+-------------------------------------------------------
+TOTAL          21    11       6       3  47.6%
+Branches: 3/6 (50.0%), lines: 4/9 (44.4%)
+```
+
+The suites themselves are not measured: sources under a `test` directory,
+`*.test.scala` files and any file declaring a test class are compiled without
+instrumentation. `dependsOn` modules are measured along with the project, and
+`run --coverage` does the same for a plain program run. Instrumented classes
+live next to the normal ones, so going back and forth between `scalino test`
+and `scalino test --coverage` doesn't throw away either incremental build.
+
+`--coverage-report` writes files into `coverage/` (`--coverage-dir` to move
+it): `html`, `lcov` (`lcov.info`), `cobertura` (`cobertura.xml`), `scoverage`
+(`scoverage.xml`, the same report sbt-scoverage writes) and `json`. The first
+four are what Codecov, Codacy, Coveralls, GitLab and the editor coverage
+plugins read. `scalino coverage` prints the table and writes the reports again
+from the last run without rebuilding anything.
+
+`--coverage-fail-under 80` makes the command exit with 1 when statement
+coverage is below 80%, and so do `--coverage-fail-under-branches` (branches)
+and `--coverage-fail-under-file` (any single file). Each has a directive, so a
+project can carry its own policy:
+
+```scala
+//> using coverage.failUnder 80
+//> using coverage.report html lcov
+//> using coverage.exclude "generated/**"
+//> using coverage.excludeClass ".*BuildInfo"
+```
+
+Code between `// $COVERAGE-OFF$` and `// $COVERAGE-ON$` is left out. scala-cli
+has no coverage command of its own (it passes `-coverage-out` through), so the
+flags follow cargo-llvm-cov and coverage.py instead.
+
+Scala.js is measured too (`--js`, on node, bun or deno), with the same
+statements as on Scala Native. Under `run -w --coverage` the table is printed
+each time the program ends: on its own, when it is stopped for a rebuild, or on
+Ctrl+C, which suits a server you poke at by hand. `--interpret` isn't supported.
 
 ### Toolkits
 

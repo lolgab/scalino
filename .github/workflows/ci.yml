@@ -446,6 +446,13 @@ jobs:
           if [[ "$RUNNER_OS" == Linux ]]; then sudo apt-get install -y libcurl4-openssl-dev libidn2-dev; fi
           ./tests/toolkit/run.sh dist/scalino
 
+      - name: Smoke test -- coverage
+        if: matrix.test == 'js'
+        # `test --coverage` / `run --coverage`: what is measured, incremental statement maps, every
+        # report format, thresholds, dependsOn modules. See tests/coverage/run.sh.
+        shell: bash
+        run: ./tests/coverage/run.sh dist/scalino
+
       - name: Smoke test -- stack-allocated objects (escape analysis)
         if: matrix.test == 'escape'
         # Every release mode stack-allocates objects the escape analysis
@@ -722,6 +729,13 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: ./tests/js/run.sh "$(command -v scalino)"
+
+      - name: Smoke test -- coverage
+        if: ${{ !cancelled() }}
+        # Also the Windows side of java.security.SecureRandom (BCryptGenRandom) and the exclusion of test
+        # sources from instrumentation with backslash paths. The `run -w` section is skipped here.
+        shell: bash
+        run: ./tests/coverage/run.sh "$(command -v scalino)"
 
   # scalino-lsp's smoke test drives it through `dist/scalino setup-ide`, so it
   # can only run once both the lsp and dotc jobs are done.
