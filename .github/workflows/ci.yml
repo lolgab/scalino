@@ -356,6 +356,18 @@ jobs:
         shell: bash
         run: ./tests/zip-fd/run.sh dist/scalino
 
+      - name: Smoke test -- object monitors
+        # synchronized/wait/notify in every lock state, compact headers (lightweight locking) and
+        # the regular lock word, with evacuation too. See tests/object-locks/run.sh.
+        shell: bash
+        run: ./tests/object-locks/run.sh dist/scalino
+
+      - name: Smoke test -- jsoniter-scala byte arrays
+        # jsoniter-scala-core reads byte arrays through raw pointers: the compact header layout
+        # must keep their elements where it expects them. See tests/jsoniter/run.sh.
+        shell: bash
+        run: ./tests/jsoniter/run.sh dist/scalino
+
       - name: Smoke test -- real macro
         # Known-failing, not a regression: jsoniter-scala's derivation macro hits an open
         # interpreter gap (general quote-pattern matching; docs/findings.md "Remaining work" #1).

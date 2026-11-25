@@ -324,19 +324,61 @@ index f1c41dc89..fa2cd5b09 100644
  
  typedef void (*WeakReferencesCollectedCallback)();
  void scalanative_GC_set_weak_references_collected_callback(
+diff --git a/nativelib/src/main/resources/scala-native/lock_stack.c b/nativelib/src/main/resources/scala-native/lock_stack.c
+new file mode 100644
+index 000000000..e584eb509
+--- /dev/null
++++ b/nativelib/src/main/resources/scala-native/lock_stack.c
+@@ -0,0 +1,34 @@
++// Lock stack of lightweight locking, used with compact object headers, see
++// scala.scalanative.runtime.monitor.CompactMonitor.
++//
++// Kept in C on purpose: the lock path can run while a Scala module is being
++// initialized (waiting for it takes the lock of its class), so it can't depend
++// on loading any Scala module, nor on state kept in a Scala object.
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++// Must match LockStackRef.isFull
++#define LOCK_STACK_CAPACITY 8
++
++// The objects fast-locked by the current thread, the most recent last. They
++// are not GC roots: a thread holding a lock keeps its object on its own stack
++// until it exits the monitor, which also pins it for a moving collector.
++typedef struct LockStack {
++    intptr_t size;
++    void *objects[LOCK_STACK_CAPACITY];
++} LockStack;
++
++static _Thread_local LockStack lockStack;
++
++// Set while a virtual thread is mounted: the lock stack belongs to the carrier
++static _Thread_local bool virtualMounted = false;
++
++// The lock stack of the current thread, NULL for a virtual thread
++LockStack *scalanative_monitor_lock_stack(void) {
++    return virtualMounted ? NULL : &lockStack;
++}
++
++void scalanative_monitor_set_virtual_mounted(bool mounted) {
++    virtualMounted = mounted;
++}
 diff --git a/nativelib/src/main/resources/scala-native/module_load.c b/nativelib/src/main/resources/scala-native/module_load.c
-index 4bd022794..9f0d12b2d 100644
+index 4bd022794..24bf2abe7 100644
 --- a/nativelib/src/main/resources/scala-native/module_load.c
 +++ b/nativelib/src/main/resources/scala-native/module_load.c
-@@ -59,6 +59,15 @@ extern ModuleRef scalanative_initializeModule(ModuleCtor ctor,
+@@ -59,6 +59,17 @@ extern ModuleRef scalanative_initializeModule(ModuleCtor ctor,
  extern ModuleRef scalanative_awaitForInitialization(ModuleSlot slot,
                                                      void *classInfo);
  
 +#ifdef SCALANATIVE_COMPACT_HEADERS
-+// The first word of an object is [lock:16 | rtti:48], see ObjectHeader.h
++// The header of an object is the offset of its RTTI in the RTTI space, with
++// the lock state in its 2 lowest bits, see ObjectHeader.h
++extern char scalanative_rtti_space[] __attribute__((visibility("hidden")));
 +#define MODULE_IS_CLASS(module, classInfo)                                     \
-+    (((uintptr_t)*(module) & (uintptr_t)0x0000FFFFFFFFFFFFULL) ==              \
-+     (uintptr_t)(classInfo))
++    ((void *)(scalanative_rtti_space +                                         \
++              (*(const uint32_t *)(module) & ~(uint32_t)3)) == (classInfo))
 +#else
 +#define MODULE_IS_CLASS(module, classInfo) (*(module) == (classInfo))
 +#endif
@@ -344,7 +386,7 @@ index 4bd022794..9f0d12b2d 100644
  // The tag can be inspected without dereferencing the stack-local context.
  bool scalanative_isModuleInitializationContext(ModuleRef module) {
      return isInitializationContext(module);
-@@ -148,7 +157,7 @@ INLINE ModuleRef __scalanative_loadModule(ModuleSlot slot, void *classInfo,
+@@ -148,7 +159,7 @@ INLINE ModuleRef __scalanative_loadModule(ModuleSlot slot, void *classInfo,
          return __scalanative_startAndWaitForModuleInitialization(
              slot, classInfo, size, ctor);
  
@@ -420,6 +462,23 @@ index 3ea72e370..5b724cbc2 100644
    }
  #elif defined(_LIBUNWIND_HAVE_GETAUXVAL)
    static bool checkHasSME() {
+diff --git a/nativelib/src/main/resources/scala-native/rtti_space.c b/nativelib/src/main/resources/scala-native/rtti_space.c
+new file mode 100644
+index 000000000..b9f022dc9
+--- /dev/null
++++ b/nativelib/src/main/resources/scala-native/rtti_space.c
+@@ -0,0 +1,11 @@
++// Start of the RTTI space with compact object headers, see
++// codegen.RttiSpace. The header of an object is the offset of its RTTI there.
++#ifdef SCALANATIVE_COMPACT_HEADERS
++
++// An alias defined by codegen
++extern char scalanative_rtti_space[] __attribute__((visibility("hidden")));
++
++// For runtime.RttiSpace.base: Scala reads the address from a variable
++char *scalanative_rtti_space_base = scalanative_rtti_space;
++
++#endif
 diff --git a/nativelib/src/main/resources/scala-native/staticRoots.c b/nativelib/src/main/resources/scala-native/staticRoots.c
 index fa8bcbdd8..56694b188 100644
 --- a/nativelib/src/main/resources/scala-native/staticRoots.c
@@ -446,57 +505,6 @@ index fa8bcbdd8..56694b188 100644
  
  SN_SECTION_LOCAL void scalanative_register_static_roots(void) {
      registerSection(scalanative_static_globals_section());
-diff --git a/nativelib/src/main/resources/scala-native/thread_slots.c b/nativelib/src/main/resources/scala-native/thread_slots.c
-new file mode 100644
-index 000000000..a7334b47e
---- /dev/null
-+++ b/nativelib/src/main/resources/scala-native/thread_slots.c
-@@ -0,0 +1,45 @@
-+// Owner ids of the thin locks with compact object headers, see
-+// scala.scalanative.runtime.monitor.BasicMonitor.getThreadId.
-+//
-+// Kept in C on purpose: the lock path can run while a Scala module is being
-+// initialized (waiting for it takes the lock of its class), so it can't depend
-+// on loading any Scala module, nor on state kept in a Scala object.
-+#include <stdatomic.h>
-+
-+// The owner field of the compact lock word has 10 bits. The last id is never
-+// leased, it marks the threads without a slot (see LockWord.ThreadIdMax).
-+#define SLOTLESS 1023
-+
-+// Index 0 is unused
-+static atomic_int slots[SLOTLESS];
-+
-+// Slot of the current thread, 0 until its first lock
-+static _Thread_local int threadSlot = 0;
-+
-+static int acquire(void) {
-+    for (int i = 1; i < SLOTLESS; i++) {
-+        int expected = 0;
-+        if (atomic_compare_exchange_strong(&slots[i], &expected, 1))
-+            return i;
-+    }
-+    return SLOTLESS;
-+}
-+
-+// Slot of the current thread, leased on first use
-+int scalanative_monitor_thread_slot(void) {
-+    int slot = threadSlot;
-+    if (slot == 0) {
-+        slot = acquire();
-+        threadSlot = slot;
-+    }
-+    return slot;
-+}
-+
-+// Gives back the slot of the current thread when it terminates, if it still
-+// takes locks afterwards it does as a slotless thread
-+void scalanative_monitor_release_thread_slot(void) {
-+    int slot = threadSlot;
-+    threadSlot = SLOTLESS;
-+    if (slot > 0 && slot < SLOTLESS)
-+        atomic_store_explicit(&slots[slot], 0, memory_order_release);
-+}
 diff --git a/nativelib/src/main/resources/scala-native/zone/Zone.c b/nativelib/src/main/resources/scala-native/zone/Zone.c
 index 31fa0cf9f..d5fbf4a9e 100644
 --- a/nativelib/src/main/resources/scala-native/zone/Zone.c

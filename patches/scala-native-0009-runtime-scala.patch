@@ -161,6 +161,19 @@ index fe00e56ed..53cf5088b 100644
                if (new File(dSymPath).exists()) {
                  val dSYMBin: BinaryFile = new BinaryFile(
                    new File(dSymPath)
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Class.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Class.scala
+index 3373628b3..fe5d2ae8a 100644
+--- a/nativelib/src/main/scala/scala/scalanative/runtime/Class.scala
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/Class.scala
+@@ -103,7 +103,7 @@ private[runtime] final class _Class[A] {
+   // The class of an object is never an interface: no check on its side
+   @inline def isInstance(obj: Object): scala.Boolean =
+     obj != null && _Class.classIs(
+-      Intrinsics.loadRawPtr(Intrinsics.castObjectToRawPtr(obj)),
++      loadHeaderRtti(Intrinsics.castObjectToRawPtr(obj)),
+       this
+     )
+ 
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala b/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
 index cf4341c17..84a574751 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/GC.scala
@@ -179,7 +192,7 @@ index cf4341c17..84a574751 100644
    @name("scalanative_GC_set_weak_references_collected_callback")
    private[runtime] def setWeakReferencesCollectedCallback(
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
-index ef9d367a8..fa5666d4b 100644
+index ef9d367a8..99f68ba33 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/MemoryLayout.scala
 @@ -1,7 +1,10 @@
@@ -194,20 +207,25 @@ index ef9d367a8..fa5666d4b 100644
  import scala.scalanative.runtime.Intrinsics.{castRawSizeToInt, sizeOf}
  
  private[runtime] object MemoryLayout {
-@@ -15,17 +18,28 @@ private[runtime] object MemoryLayout {
+@@ -15,25 +18,44 @@ private[runtime] object MemoryLayout {
    @alwaysinline private def PtrSize = castRawSizeToInt(sizeOf[RawPtr])
    @alwaysinline private def IntSize = 4
  
-+  /** With compact headers the lock bits live in the upper 16 bits of the
-+   *  RTTI word, there is no separate lock word.
++  /** With compact headers the header is a 32 bit word: the offset of the
++   *  RTTI in the RTTI space, with the lock state in its 2 lowest bits (see
++   *  monitor.CompactMonitor). There is no separate lock word.
 +   */
 +  @alwaysinline private def usesLockWord =
 +    isMultithreadingEnabled && !isCompactHeaders
 +
-+  /** Mask of the RTTI pointer in the first word of an object with compact
++  /** Mask of the RTTI offset in the header of an object with compact
 +   *  headers, see codegen.Metadata.CompactHeaderRttiMask.
 +   */
-+  @alwaysinline def CompactHeaderRttiMask = 0x0000ffffffffffffL
++  @alwaysinline def CompactHeaderRttiMask = ~3
++
++  /** Size of the RTTI word of an object header */
++  @alwaysinline private def HeaderRttiSize =
++    if (isCompactHeaders) IntSize else PtrSize
 +
    private def requiresEnabledMulithreading = throw new IllegalStateException(
 -    "Field available only in multithreading mode"
@@ -222,11 +240,24 @@ index ef9d367a8..fa5666d4b 100644
        else requiresEnabledMulithreading
      @alwaysinline def FlagsOffset =
 -      if (isMultithreadingEnabled) LockWordOffset + PtrSize
+-      else PtrSize
 +      if (usesLockWord) LockWordOffset + PtrSize
-       else PtrSize
++      else HeaderRttiSize
      @deprecated("Class ids were replaced by flags", since = "0.5.13")
      @alwaysinline def IdOffset = FlagsOffset
-@@ -56,23 +70,28 @@ private[runtime] object MemoryLayout {
+ 
+     @deprecated("No longer used", since = "0.5.6") @alwaysinline
+     def TraitIdOffset = -1
+     @alwaysinline def InterfacesCountOffset = FlagsOffset + IntSize
+-    @alwaysinline def InterfacesOffset = InterfacesCountOffset + IntSize
++    // Pointer aligned, after a padding word with compact headers
++    @alwaysinline def InterfacesOffset =
++      if (isCompactHeaders) InterfacesCountOffset + 2 * IntSize
++      else InterfacesCountOffset + IntSize
+     @alwaysinline def NameOffset = InterfacesOffset + PtrSize
+ 
+     @deprecated("Not a part of Rtti layout", since = "0.5.6") @alwaysinline
+@@ -56,23 +78,31 @@ private[runtime] object MemoryLayout {
    object Object {
      @alwaysinline def RttiOffset = 0
      @alwaysinline def LockWordOffset =
@@ -235,8 +266,9 @@ index ef9d367a8..fa5666d4b 100644
        else requiresEnabledMulithreading
      @alwaysinline def FieldsOffset =
 -      if (isMultithreadingEnabled) LockWordOffset + PtrSize
+-      else PtrSize
 +      if (usesLockWord) LockWordOffset + PtrSize
-       else PtrSize
++      else HeaderRttiSize
    }
  
    object Array {
@@ -247,10 +279,15 @@ index ef9d367a8..fa5666d4b 100644
        else requiresEnabledMulithreading
      @alwaysinline def LengthOffset =
 -      if (isMultithreadingEnabled) LockWordOffset + PtrSize
+-      else PtrSize
 +      if (usesLockWord) LockWordOffset + PtrSize
-       else PtrSize
++      else HeaderRttiSize
      @alwaysinline def StrideOffset = LengthOffset + IntSize
-     @alwaysinline def ValuesOffset = StrideOffset + IntSize
+-    @alwaysinline def ValuesOffset = StrideOffset + IntSize
++    // The compact header is padded, the elements stay at the same offset
++    @alwaysinline def ValuesOffset =
++      if (isCompactHeaders) StrideOffset + 2 * IntSize
++      else StrideOffset + IntSize
 +    // ByteArray keeps its elements where they are with a lock word, also with
 +    // compact headers: third party code (jsoniter-scala) depends on it.
 +    @alwaysinline def ByteValuesOffset =
@@ -260,7 +297,7 @@ index ef9d367a8..fa5666d4b 100644
  
  }
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
-index a6322875d..b3bfa8dc9 100644
+index a6322875d..ed9066ba3 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/NativeThread.scala
 @@ -8,7 +8,11 @@ import scala.annotation.nowarn
@@ -276,17 +313,24 @@ index a6322875d..b3bfa8dc9 100644
  import scala.scalanative.runtime.GC.{ThreadRoutineArg, ThreadStartRoutine}
  import scala.scalanative.runtime.Intrinsics._
  import scala.scalanative.runtime.ffi.stdatomic.atomic_thread_fence
-@@ -341,6 +345,8 @@ object NativeThread {
-         nativeThread.state = NativeThread.State.Terminated
-         thread.notifyAll()
-       }
-+      // After the last lock of the thread, gives back its thin lock owner id
-+      if (isCompactHeaders) monitor.ThreadSlots.releaseCurrent()
-       StackOverflowGuards.close()
-     }
-     null
+@@ -206,7 +210,14 @@ object NativeThread {
+ 
+   @alwaysinline def currentThread: Thread = TLS.currentThread
+   @alwaysinline def setCurrentThread(thread: Thread): Unit = {
+-    TLS.assignCurrentThread(thread, currentNativeThread)
++    val native = currentNativeThread
++    TLS.assignCurrentThread(thread, native)
++    // Mounting a virtual thread: the lock stack of lightweight locking belongs
++    // to the carrier, see monitor.CompactMonitor
++    if (isCompactHeaders)
++      monitor.LockStack.setVirtualMounted(
++        native != null && (thread ne native.thread)
++      )
+   }
+   @alwaysinline def currentNativeThread: NativeThread = TLS.currentNativeThread
+ 
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
-index 227a04644..f2e8d8e19 100644
+index 227a04644..7eda31af7 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/Object.scala
 @@ -1,6 +1,9 @@
@@ -350,8 +394,8 @@ index 227a04644..f2e8d8e19 100644
        ffi.memcpy(clone, src, Intrinsics.castIntToRawSize(size))
 -      if (isMultithreadingEnabled) {
 +      if (isCompactHeaders) {
-+        // Reset object monitor, it is stored in the upper bits of the header
-+        storeLong(clone, loadLong(clone) & MemoryLayout.CompactHeaderRttiMask)
++        // Reset the lock state, stored in the lowest bits of the header
++        storeInt(clone, loadInt(clone) & MemoryLayout.CompactHeaderRttiMask)
 +      } else if (isMultithreadingEnabled) {
          // Reset object monitor
          storeRawSize(
@@ -529,7 +573,7 @@ index 62c59eb30..3248df1ce 100644
      private[runtime] def atomic_load_llong(
          ptr: RawPtr,
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
-index 2a3621286..2eec3e3ca 100644
+index 2a3621286..1d37f54ca 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/BasicMonitor.scala
 @@ -4,7 +4,10 @@ package monitor
@@ -544,259 +588,470 @@ index 2a3621286..2eec3e3ca 100644
  import scala.scalanative.runtime.Intrinsics._
  import scala.scalanative.runtime.VirtualThread
  import scala.scalanative.runtime.ffi._
-@@ -18,7 +21,9 @@ import LockWord._
+@@ -17,6 +20,9 @@ import LockWord._
+ /** Lightweight monitor used for single-threaded execution, upon detection of
   *  access from multiple threads is inflated in ObjectMonitor
   *
++ *  With compact object headers it delegates to CompactMonitor, then
++ *  `lockWordRef` is the object itself.
++ *
   *  @param lockWordRef
-- *    Pointer to LockWord, internal field of every object header
-+ *    Pointer to LockWord, internal field of every object header. With compact
-+ *    headers it is the pointer to the object header, which stores the lock in
-+ *    its upper 16 bits.
+  *    Pointer to LockWord, internal field of every object header
   */
- @inline
- private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-@@ -59,7 +64,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+@@ -26,7 +32,10 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+   import BasicMonitor._
+   type ThreadId = RawPtr
  
-     val threadId = getThreadId(thread)
- 
--    if (!tryLock(threadId))
-+    if (isSlotlessThread(threadId) || !tryLock(threadId))
-       enterMonitor(thread, threadId) // slow-path
++  @alwaysinline private def compact = new CompactMonitor(lockWordRef)
++
+   @alwaysinline def _notify(): Unit = {
++    if (isCompactHeaders) return compact._notify()
+     val current = lockWord
+     if (current.isInflated) current.getObjectMonitor._notify()
+     else {
+@@ -36,6 +45,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
    }
  
-@@ -69,11 +74,16 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-     val native = NativeThread.currentNativeThread
+   @alwaysinline def _notifyAll(): Unit = {
++    if (isCompactHeaders) return compact._notifyAll()
      val current = lockWord
-     if (current.isInflated) current.getObjectMonitor.enter(thread)
--    else {
-+    else if (isSlotlessThread(threadId)) {
-+      // Never owns a thin monitor, the lock of the object needs to be inflated
-+      if (!current.isUnlocked || !tryLock(threadId)) {
-+        waitingOnMonitorEnter(lockAndInflate(thread, threadId))
-+      } else inflate(thread)
-+    } else {
-       if (native != null && threadId == current.threadId) {
-         if (current.recursionCount < ThinMonitorMaxRecursion) {
-           // No need for atomic operation since we already obtain the lock
--          storeRawPtr(lockWordRef, current.withIncreasedRecursion)
-+          storeLockWord(current.withIncreasedRecursion)
-         } else {
-           // inflate counts the earlier entries; add this one
-           inflate(thread).enter(thread)
-@@ -88,12 +98,8 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
- 
-     val threadId = getThreadId(thread)
-     val current = lockWord
--    if (current == lockedWithThreadId(threadId))
--      atomic_store_intptr(
--        lockWordRef,
--        castIntToRawPtr(0),
--        memory_order_release
--      )
-+    if (!isSlotlessThread(threadId) && current == lockedWithThreadId(threadId))
-+      storeLockWord(castIntToRawPtr(0))
-     else exitSlowPath(thread, threadId, current)
+     if (current.isInflated) current.getObjectMonitor._notifyAll()
+     else {
+@@ -45,15 +55,19 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
    }
  
-@@ -114,14 +120,10 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-       try monitor = inflate(thread)
-       finally {
-         if (monitor == null && !lockWord.isInflated)
--          atomic_store_intptr(
--            lockWordRef,
--            castIntToRawPtr(0),
--            memory_order_release
--          )
-+          storeLockWord(castIntToRawPtr(0))
-       }
-       monitor.exit(thread)
--    } else storeRawPtr(lockWordRef, current.withDecresedRecursion)
-+    } else storeLockWord(current.withDecresedRecursion)
+   @alwaysinline def _wait(): Unit =
+-    getObjectMonitorForWait(Thread.currentThread())._wait()
++    if (isCompactHeaders) compact._wait()
++    else getObjectMonitorForWait(Thread.currentThread())._wait()
+ 
+   @alwaysinline def _wait(timeout: Long): Unit =
+-    getObjectMonitorForWait(Thread.currentThread())._wait(timeout)
++    if (isCompactHeaders) compact._wait(timeout)
++    else getObjectMonitorForWait(Thread.currentThread())._wait(timeout)
+ 
+   @alwaysinline def _wait(timeout: Long, nanos: Int): Unit =
+-    getObjectMonitorForWait(Thread.currentThread())._wait(timeout, nanos)
++    if (isCompactHeaders) compact._wait(timeout, nanos)
++    else getObjectMonitorForWait(Thread.currentThread())._wait(timeout, nanos)
+ 
+   @inline def enter(obj: Object): Unit = {
++    if (isCompactHeaders) return compact.enter()
+     val thread = Thread.currentThread()
+     if (thread == null) return // Not yet initialized
+ 
+@@ -83,6 +97,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+   }
+ 
+   @inline def exit(obj: Object): Unit = {
++    if (isCompactHeaders) return compact.exit()
+     val thread = Thread.currentThread()
+     if (thread == null) return // Not yet initialized
+ 
+@@ -124,6 +139,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+     } else storeRawPtr(lockWordRef, current.withDecresedRecursion)
  
    @alwaysinline def isLockedBy(thread: Thread): Boolean = {
++    if (isCompactHeaders) return compact.isLockedBy(thread)
      val current = lockWord
-@@ -130,7 +132,44 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
+     if (current.isInflated) current.getObjectMonitor.isLockedBy(thread)
+     else current.threadId == getThreadId(thread)
+@@ -281,7 +297,8 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
    }
  
-   @alwaysinline private def lockWord: LockWord =
--    atomic_load_intptr(lockWordRef, memory_order_acquire)
-+    if (isCompactHeaders) castLongToRawPtr(loadHeader() >>> CompactLockShift)
-+    else atomic_load_intptr(lockWordRef, memory_order_acquire)
+   def show: String =
+-    if (lockWord.isInflated)
++    if (isCompactHeaders) compact.show
++    else if (lockWord.isInflated)
+       lockWord.getObjectMonitor.toString
+     else {
+       val lock = lockWord
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/CompactMonitor.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/CompactMonitor.scala
+new file mode 100644
+index 000000000..e854247dc
+--- /dev/null
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/CompactMonitor.scala
+@@ -0,0 +1,275 @@
++package scala.scalanative.runtime
++package monitor
 +
-+  // With compact headers the lock word is stored in the upper 16 bits of the
-+  // header word, above the RTTI pointer.
-+  @alwaysinline private def CompactLockShift = 48
++import scala.annotation.tailrec
 +
-+  @alwaysinline private def loadHeader(): Long =
-+    castRawPtrToLong(atomic_load_intptr(lockWordRef, memory_order_acquire))
++import scala.scalanative.annotation.alwaysinline
++import scala.scalanative.runtime.Intrinsics._
++import scala.scalanative.runtime.VirtualThread
++import scala.scalanative.runtime.ffi.stdatomic._
++import scala.scalanative.runtime.ffi.stdatomic.memory_order._
++import scala.scalanative.unsafe.{stackalloc => _, _}
 +
-+  @alwaysinline private def withLockWord(header: Long, value: RawPtr): Long =
-+    (header & MemoryLayout.CompactHeaderRttiMask) |
-+      (castRawPtrToLong(value) << CompactLockShift)
++/** Lightweight locking, used with compact object headers.
++ *
++ *  The header has no room for a lock word: the lock state takes its 2 lowest
++ *  bits (the offset of an RTTI is always aligned):
++ *
++ *    - 00 unlocked
++ *    - 01 fast-locked, the owner has the object on its lock stack
++ *    - 11 fast-locked, another thread waits for it: the owner inflates the lock
++ *      when exiting it, the waiter then queues on the ObjectMonitor
++ *    - 10 inflated, the ObjectMonitor is found in the MonitorTable
++ *
++ *  As in HotSpot's lightweight locking, the owner of a fast lock isn't stored in
++ *  the object: a thread owns it iff the object is on its lock stack, which also
++ *  holds one entry per recursive entry. A full lock stack, wait/notify and
++ *  virtual threads (their carrier's lock stack isn't theirs) inflate the lock.
++ *
++ *  @param obj
++ *    the locked object, its header is the first word
++ */
++private[runtime] final class CompactMonitor(val obj: RawPtr) extends AnyVal {
++
++  // The header is a 32 bit word: the offset of the RTTI in the RTTI space,
++  // with the lock state in its 2 lowest bits
++  @alwaysinline private def Unlocked = 0
++  @alwaysinline private def FastLocked = 1
++  @alwaysinline private def Inflated = 2
++  @alwaysinline private def InflationRequested = 3
++  @alwaysinline private def StateMask = 3
++
++  @alwaysinline private def loadHeader(): Int =
++    atomic_load_int(obj, memory_order_acquire)
++
++  // Fast paths only: a stale value makes the CAS that follows fail
++  @alwaysinline private def peekHeader(): Int = loadInt(obj)
++
++  @alwaysinline private def state(header: Int): Int = header & StateMask
++
++  @alwaysinline private def isFastLocked(header: Int): Boolean =
++    (header & FastLocked) != 0
++
++  @alwaysinline private def withState(header: Int, state: Int): Int =
++    (header & ~StateMask) | state
 +
 +  @alwaysinline private def compareAndSetHeader(
-+      expected: Long,
-+      value: Long
++      expected: Int,
++      value: Int
 +  ): Boolean = {
-+    val expectedPtr = stackalloc[RawPtr]()
-+    storeRawPtr(expectedPtr, castLongToRawPtr(expected))
-+    atomic_compare_exchange_intptr(
-+      lockWordRef,
-+      expectedPtr,
-+      castLongToRawPtr(value)
-+    )
++    val expectedPtr = stackalloc[Int]()
++    storeInt(expectedPtr, expected)
++    atomic_compare_exchange_int(obj, expectedPtr, value)
 +  }
 +
-+  /** Stores the lock word, with compact headers keeping the RTTI bits. Needs to
-+   *  be used only by the owner of the lock.
-+   */
-+  @alwaysinline private def storeLockWord(value: RawPtr): Unit =
-+    if (isCompactHeaders)
-+      atomic_store_intptr(
-+        lockWordRef,
-+        castLongToRawPtr(withLockWord(loadHeader(), value)),
-+        memory_order_release
-+      )
-+    else atomic_store_intptr(lockWordRef, value, memory_order_release)
- 
-   @inline private def getObjectMonitor() = {
-     val current = lockWord
-@@ -155,7 +194,20 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-     if (is32bit) castIntToRawPtr(castRawPtrToInt(threadId) << ThreadIdOffset)
-     else castLongToRawPtr(castRawPtrToLong(threadId) << ThreadIdOffset)
- 
-+  /** Threads which don't fit in the owner field of the compact lock word, they
-+   *  use the biggest id only to inflate the lock, never to hold a thin one.
-+   */
-+  @alwaysinline private def isSlotlessThread(threadId: ThreadId): Boolean =
-+    isCompactHeaders && castRawPtrToLong(threadId) == LockWord.ThreadIdMax
++  // Not for virtual threads, see LockStack.current
++  @alwaysinline private def lockStack = new LockStackRef(LockStack.current())
 +
-   @alwaysinline private def getThreadId(thread: Thread): ThreadId = {
-+    if (isCompactHeaders) {
-+      // Owner ids are leased to live threads, see thread_slots.c. Virtual
-+      // threads share their carrier's native thread, they never get one.
-+      if (thread.isInstanceOf[VirtualThread])
-+        return castLongToRawPtr(LockWord.ThreadIdMax)
-+      return castLongToRawPtr(ThreadSlots.current().toLong)
++  @alwaysinline private def monitor: ObjectMonitor = MonitorTable.get(obj)
++
++  @alwaysinline private def isVirtual(thread: Thread): Boolean =
++    thread.isInstanceOf[VirtualThread]
++
++  /** Does the current platform thread hold the fast lock? */
++  @alwaysinline private def ownsFastLock(thread: Thread, header: Int) =
++    isFastLocked(header) && !isVirtual(thread) && lockStack.contains(obj)
++
++  @inline def enter(): Unit = {
++    val ptr = LockStack.current()
++    if (castRawPtrToLong(ptr) != 0L) {
++      val stack = new LockStackRef(ptr)
++      if (!stack.isFull) {
++        val header = peekHeader()
++        val s = state(header)
++        if (s == Unlocked) {
++          if (compareAndSetHeader(header, header | FastLocked)) {
++            stack.push(obj)
++            return
++          }
++        } else if (s != Inflated && stack.contains(obj)) {
++          // Recursive entry, nobody else can change the owner
++          stack.push(obj)
++          return
++        }
++      }
 +    }
-     val addr = castObjectToRawPtr(thread)
-     if (is32bit) castIntToRawPtr(castRawPtrToInt(addr) & LockWord32.ThreadIdMax)
-     else castLongToRawPtr(castRawPtrToLong(addr) & LockWord.ThreadIdMax)
-@@ -179,21 +231,36 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
- 
-   @inline
-   private def tryLock(threadId: ThreadId) = {
--    val expected = stackalloc[RawPtr]()
--    // ThreadId set to 0, recursion set to 0
--    storeRawSize(expected, castIntToRawSize(0))
--    atomic_compare_exchange_intptr(
--      lockWordRef,
--      expected,
--      lockedWithThreadId(threadId)
--    )
-+    if (isCompactHeaders) {
-+      val header = loadHeader()
-+      if ((header >>> CompactLockShift) != 0L) false
-+      else
-+        compareAndSetHeader(
-+          header,
-+          withLockWord(header, lockedWithThreadId(threadId))
-+        )
-+    } else {
-+      val expected = stackalloc[RawPtr]()
-+      // ThreadId set to 0, recursion set to 0
-+      storeRawSize(expected, castIntToRawSize(0))
-+      atomic_compare_exchange_intptr(
-+        lockWordRef,
-+        expected,
-+        lockedWithThreadId(threadId)
++    enterSlowPath()
++  }
++
++  @noinline private def enterSlowPath(): Unit = {
++    val thread = Thread.currentThread()
++    if (thread == null) return // Not yet initialized
++    val header = loadHeader()
++    if (state(header) == Inflated) monitor.enter(thread)
++    else if (ownsFastLock(thread, header))
++      // Recursive entry with a full lock stack
++      inflate(thread).enter(thread)
++    else waitingOnMonitorEnter(lockAndInflate(thread))
++  }
++
++  @inline def exit(): Unit = {
++    val ptr = LockStack.current()
++    if (castRawPtrToLong(ptr) != 0L) {
++      val stack = new LockStackRef(ptr)
++      if (stack.isTop(obj)) {
++        val header = peekHeader()
++        if (state(header) == FastLocked) {
++          stack.size = stack.size - 1
++          if (stack.contains(obj)) return // recursive exit
++          if (compareAndSetHeader(header, withState(header, Unlocked))) return
++          // A waiter asked to inflate meanwhile
++          stack.push(obj)
++        }
++      }
++    }
++    exitSlowPath()
++  }
++
++  // Kept out of line so every synchronized exit site only carries the fast path.
++  @noinline private def exitSlowPath(): Unit = {
++    val thread = Thread.currentThread()
++    if (thread == null) return // Not yet initialized
++    val header = loadHeader()
++    state(header) match {
++      case 2 /* Inflated */ => monitor.exit(thread)
++      case 0 /* Unlocked */ => () // can happen only on the main thread
++      case _ =>
++        if (!ownsFastLock(thread, header))
++          throw new IllegalMonitorStateException(
++            "Thread is not an owner of this object"
++          )
++        val stack = lockStack
++        if (stack.count(obj) > 1) stack.removeLast(obj)
++        else {
++          // The last entry with a waiter, or a lock not on top of the stack
++          val m = inflate(thread)
++          m.exit(thread)
++        }
++    }
++  }
++
++  @alwaysinline def isLockedBy(thread: Thread): Boolean = {
++    val header = loadHeader()
++    if (state(header) == Inflated) monitor.isLockedBy(thread)
++    else (thread eq Thread.currentThread()) && ownsFastLock(thread, header)
++  }
++
++  @alwaysinline def _notify(): Unit = {
++    val header = loadHeader()
++    if (state(header) == Inflated) monitor._notify()
++    else ensureOwnsFastLock(header)
++    // A fast lock has no wait queue, notify is a no-op once ownership is verified
++  }
++
++  @alwaysinline def _notifyAll(): Unit = {
++    val header = loadHeader()
++    if (state(header) == Inflated) monitor._notifyAll()
++    else ensureOwnsFastLock(header)
++  }
++
++  @alwaysinline def _wait(): Unit = monitorForWait()._wait()
++
++  @alwaysinline def _wait(timeout: Long): Unit =
++    monitorForWait()._wait(timeout)
++
++  @alwaysinline def _wait(timeout: Long, nanos: Int): Unit =
++    monitorForWait()._wait(timeout, nanos)
++
++  @noinline private def ensureOwnsFastLock(header: Int): Unit = {
++    val thread = Thread.currentThread()
++    if (thread != null && !ownsFastLock(thread, header))
++      throw new IllegalMonitorStateException(
++        "Thread is not an owner of this object"
 +      )
++  }
++
++  @noinline private def monitorForWait(): ObjectMonitor = {
++    val header = loadHeader()
++    if (state(header) == Inflated) monitor
++    else {
++      ensureOwnsFastLock(header)
++      inflate(Thread.currentThread())
 +    }
-   }
- 
-   // Ask the thin lock owner to inflate on exit; a racing plain store by the
-   // owner may drop the flag, so callers retry it on every poll.
-   @inline private def requestInflation(): Unit = {
-     val current = lockWord
--    if (!current.isUnlocked && !current.isInflated && !current.isContended) {
-+    if (isCompactHeaders) {
-+      val header = loadHeader()
-+      val word: LockWord = castLongToRawPtr(header >>> CompactLockShift)
-+      if (!word.isUnlocked && !word.isInflated && !word.isContended)
-+        compareAndSetHeader(header, withLockWord(header, word.withContended))
-+    } else if (!current.isUnlocked && !current.isInflated && !current.isContended) {
-       val expected = stackalloc[RawPtr]()
-       storeRawPtr(expected, current.value)
-       atomic_compare_exchange_intptr(
-@@ -210,6 +277,14 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-       thread: Thread,
-       threadId: ThreadId
-   ): Unit = {
-+    // Cached once per call, not re-read on every backoff iteration: this
-+    // thread's own native-thread pointer can't change mid-loop, but each
-+    // `NativeThread.currentNativeThread` read is a Darwin TLV lookup
-+    // (tlv_get_addr) -- under thin-lock contention (the common case, since
-+    // every synchronized/identity-hash access goes through here before a
-+    // monitor is ever inflated) re-fetching it every backoff was measured as
-+    // a double-digit-percent chunk of total runtime in profiling.
++  }
++
++  // Ask the owner of the fast lock to inflate it on exit
++  @alwaysinline private def requestInflation(): Unit = {
++    val header = loadHeader()
++    if (state(header) == FastLocked)
++      compareAndSetHeader(header, withState(header, InflationRequested))
++  }
++
++  /** Takes the lock of an object owned by another thread (or by nobody, for a
++   *  virtual thread) and inflates it, or enters its inflated monitor.
++   */
++  @inline private def lockAndInflate(thread: Thread): Unit = {
++    // Fetched once, see BasicMonitor.lockAndInflate
 +    lazy val nativeThread = NativeThread.currentNativeThread
-     @tailrec @alwaysinline def waitForOwnership(
-         yields: Int,
-         backoffNanos: Int
-@@ -225,7 +300,7 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-               Thread.`yield`()
-               waitForOwnership(yields, backoffNanos)
-             case _ =>
--              val native = NativeThread.currentNativeThread
-+              val native = nativeThread
-               if (native != null) native.sleepNanos(backoffNanos)
-               else Thread.`yield`()
-               waitForOwnership(
-@@ -249,8 +324,11 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
- 
-   @inline private def inflate(thread: Thread): ObjectMonitor = {
-     // Preserve the RawPtr value-class ABI used by existing getMonitor callers.
-+    // With compact headers the lock lives in the header word, so the lock
-+    // reference is the object itself (and LockWordOffset does not exist).
-     val obj = castRawPtrToObject(
--      elemRawPtr(lockWordRef, -MemoryLayout.Object.LockWordOffset)
-+      if (isCompactHeaders) lockWordRef
-+      else elemRawPtr(lockWordRef, -MemoryLayout.Object.LockWordOffset)
-     )
-     // A static object, such as a class, a string literal or its backing
-     // array, only reaches its monitor through its lock word: register it as
-@@ -265,7 +343,14 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-     // Since pointers are always aligned we can safely override N=sizeof(Word) right-most bits
-     val monitorAddress = castObjectToRawPtr(objectMonitor)
-     val inflated =
--      if (is32bit) {
-+      if (isCompactHeaders) {
-+        // The lock word has no room for the address, use the table index
-+        val index = MonitorTable.register(
-+          castRawPtrToObject(lockWordRef),
-+          objectMonitor
-+        )
-+        castIntToRawPtr((index << 1) | LockType.Inflated)
-+      } else if (is32bit) {
-         val lockMark = (LockType.Inflated: Int) << LockTypeOffset
-         val addr = castRawPtrToInt(monitorAddress)
-         castIntToRawPtr(lockMark | addr)
-@@ -274,7 +359,8 @@ private[runtime] final class BasicMonitor(val lockWordRef: RawPtr)
-         val addr = castRawPtrToLong(monitorAddress)
-         castLongToRawPtr(lockMark | addr)
-       }
--    atomic_store_intptr(lockWordRef, inflated, memory_order_release)
-+    if (isCompactHeaders) storeLockWord(inflated)
-+    else atomic_store_intptr(lockWordRef, inflated, memory_order_release)
-     atomic_thread_fence(memory_order_seq_cst)
- 
-     objectMonitor
++
++    // Takes the fast lock for inflating it, the object is never pushed on the
++    // lock stack. false once inflated by its owner.
++    @tailrec def acquire(yields: Int, backoffNanos: Int): Boolean = {
++      def MaxSleepNanos = 128000
++      val header = loadHeader()
++      val s = state(header)
++      if (s == Inflated) false
++      else if (s == Unlocked &&
++          compareAndSetHeader(header, withState(header, FastLocked))) true
++      else if (yields > 8) {
++        requestInflation()
++        thread match {
++          case _: VirtualThread =>
++            // Avoid pinning a carrier while contending on a fast lock
++            Thread.`yield`()
++            acquire(yields, backoffNanos)
++          case _ =>
++            val native = nativeThread
++            if (native != null) native.sleepNanos(backoffNanos)
++            else Thread.`yield`()
++            acquire(yields, (backoffNanos * 3 / 2).min(MaxSleepNanos))
++        }
++      } else {
++        NativeThread.onSpinWait()
++        acquire(yields + 1, backoffNanos)
++      }
++    }
++
++    if (acquire(yields = 0, backoffNanos = 1000)) inflate(thread)
++    else monitor.enter(thread)
++  }
++
++  /** Inflates the fast lock owned by `thread`: its entries move from the lock
++   *  stack to a new ObjectMonitor, owned by `thread`.
++   */
++  private def inflate(thread: Thread): ObjectMonitor = {
++    val entries =
++      if (isVirtual(thread)) 1
++      else {
++        val stack = lockStack
++        val n = stack.count(obj)
++        stack.removeAll(obj)
++        n.max(1)
++      }
++    val objectMonitor = new ObjectMonitor()
++    objectMonitor.enter(thread)
++    objectMonitor.recursion += entries - 1
++    MonitorTable.register(obj, objectMonitor)
++
++    // Only the state changes, a waiter may still turn 01 into 11 meanwhile
++    var done = false
++    while (!done) {
++      val header = loadHeader()
++      done = compareAndSetHeader(header, withState(header, Inflated))
++    }
++    atomic_thread_fence(memory_order_seq_cst)
++    objectMonitor
++  }
++
++  def show: String = {
++    val header = loadHeader()
++    state(header) match {
++      case 2 => monitor.toString
++      case s  => s"CompactMonitor(state=$s)"
++    }
++  }
++}
+diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/LockStack.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/LockStack.scala
+new file mode 100644
+index 000000000..8817080f0
+--- /dev/null
++++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/LockStack.scala
+@@ -0,0 +1,93 @@
++package scala.scalanative.runtime
++package monitor
++
++import scala.scalanative.annotation.alwaysinline
++import scala.scalanative.runtime.Intrinsics._
++import scala.scalanative.unsafe._
++
++/** The objects fast-locked by the current thread, see lock_stack.c. Extern, so
++ *  the lock path never needs a module to be loaded.
++ */
++@extern
++private[runtime] object LockStack {
++  /** null while a virtual thread is mounted, its carrier owns the stack */
++  @name("scalanative_monitor_lock_stack")
++  def current(): RawPtr = extern
++
++  @name("scalanative_monitor_set_virtual_mounted")
++  def setVirtualMounted(mounted: Boolean): Unit = extern
++}
++
++/** Operations on the lock stack of the current thread, layout:
++ *  `{ intptr_t size; void *objects[Capacity]; }`.
++ */
++private[monitor] final class LockStackRef(val ptr: RawPtr) extends AnyVal {
++  @alwaysinline def size: Int = loadLong(ptr).toInt
++  @alwaysinline def size_=(value: Int): Unit = storeLong(ptr, value.toLong)
++
++  @alwaysinline private def slot(index: Int): RawPtr =
++    elemRawPtr(ptr, castIntToRawSize((index + 1) * 8))
++
++  @alwaysinline def apply(index: Int): RawPtr = loadRawPtr(slot(index))
++
++  // Must match LOCK_STACK_CAPACITY in lock_stack.c
++  @alwaysinline def isFull: Boolean = size == 8
++
++  @alwaysinline private def same(a: RawPtr, b: RawPtr): Boolean =
++    castRawPtrToLong(a) == castRawPtrToLong(b)
++
++  /** Needs `!isFull` */
++  @alwaysinline def push(obj: RawPtr): Unit = {
++    val n = size
++    storeRawPtr(slot(n), obj)
++    size = n + 1
++  }
++
++  @alwaysinline def isTop(obj: RawPtr): Boolean = {
++    val n = size
++    n > 0 && same(apply(n - 1), obj)
++  }
++
++  /** Occurrences of `obj`, how many times the current thread entered it */
++  def count(obj: RawPtr): Int = {
++    var n = 0
++    var i = size - 1
++    while (i >= 0) {
++      if (same(apply(i), obj)) n += 1
++      i -= 1
++    }
++    n
++  }
++
++  @alwaysinline def contains(obj: RawPtr): Boolean = {
++    var i = size - 1
++    while (i >= 0 && !same(apply(i), obj)) i -= 1
++    i >= 0
++  }
++
++  /** Removes the most recent occurrence of `obj` */
++  def removeLast(obj: RawPtr): Unit = {
++    var i = size - 1
++    while (i >= 0 && !same(apply(i), obj)) i -= 1
++    if (i >= 0) removeAt(i)
++  }
++
++  /** Removes every occurrence of `obj` */
++  def removeAll(obj: RawPtr): Unit = {
++    var i = size - 1
++    while (i >= 0) {
++      if (same(apply(i), obj)) removeAt(i)
++      i -= 1
++    }
++  }
++
++  private def removeAt(index: Int): Unit = {
++    val n = size
++    var i = index
++    while (i < n - 1) {
++      storeRawPtr(slot(i), apply(i + 1))
++      i += 1
++    }
++    size = n - 1
++  }
++}
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
 new file mode 100644
-index 000000000..1a11d5ef6
+index 000000000..ba5bdfd54
 --- /dev/null
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/MonitorTable.scala
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,156 @@
 +package scala.scalanative.runtime
 +package monitor
 +
@@ -812,22 +1067,34 @@ index 000000000..1a11d5ef6
 +import scala.scalanative.runtime.ffi.stdatomic.memory_order._
 +import scala.scalanative.unsafe.{stackalloc => _, _}
 +
-+/** Table of inflated monitors, used only with compact object headers.
++/** Inflated monitors by object, used only with compact object headers.
 + *
-+ *  The header of an object has no room for a reference to its ObjectMonitor, so
-+ *  an inflated lock word stores an index in this table. The table keeps the
-+ *  monitors alive, objects are referenced only weakly: a slot of a collected
-+ *  object is reused by later inflations. The monitor itself never references
-+ *  its owner object, so it can't keep it alive.
++ *  The header of an object keeps only the state of its lock (see
++ *  CompactMonitor), so an inflated monitor is found by the address of its
++ *  object. The object's block is pinned when the monitor is registered, a
++ *  moving collector never changes that address. The table keeps the monitors
++ *  alive, objects are referenced only weakly: the entry of a collected object
++ *  is reused by a later object at the same address, or dropped when the table
++ *  is rebuilt. Monitors are never deflated.
++ *
++ *  Lookups don't lock: an object's entry is complete before its header says
++ *  that it is inflated, and lookups only happen after reading that header.
 + */
 +private[runtime] object MonitorTable {
-+  // Indexes need to fit in the 15 bits of the inflated lock word
-+  @alwaysinline def Capacity = 1 << 15
++  private final class Table(val capacity: Int) {
++    // Object addresses, 0 for an empty slot
++    val keys = new scala.Array[Long](capacity)
++    val owners = new scala.Array[WeakReference[AnyRef]](capacity)
++    val monitors = new scala.Array[ObjectMonitor](capacity)
++    var used = 0
++    // Bumped by every update, see register
++    var version = 0
++  }
 +
-+  private var monitors: scala.Array[ObjectMonitor] = _
-+  private var owners: scala.Array[WeakReference[AnyRef]] = _
-+  private var cursor = 0
-+  // Spin lock guarding the allocation of the slots, stored off-heap
++  @alwaysinline private def InitialCapacity = 1024
++
++  @volatile private var table: Table = _
++  // Spin lock guarding the updates, stored off-heap
 +  private var lockCell: RawPtr = _
 +
 +  /** Needs to be called before any monitor is inflated, from the single
@@ -835,18 +1102,98 @@ index 000000000..1a11d5ef6
 +   */
 +  private[runtime] def init(): Unit =
 +    if (isCompactHeaders && isMultithreadingEnabled) {
-+      if (monitors == null) {
++      if (table == null) {
 +        lockCell = ffi.malloc(castIntToRawSize(4))
 +        storeInt(lockCell, 0)
-+        owners = new scala.Array[WeakReference[AnyRef]](Capacity)
-+        monitors = new scala.Array[ObjectMonitor](Capacity)
-+        exhausted = new OutOfMemoryError(
-+          "Too many inflated monitors, limit with compact object headers is " + Capacity
-+        )
++        table = new Table(InitialCapacity)
 +      }
 +    }
 +
-+  @alwaysinline def get(index: Int): ObjectMonitor = monitors(index)
++  @alwaysinline private def indexOf(addr: Long, capacity: Int): Int = {
++    // Fibonacci hashing of the address without its always-zero low bits
++    val h = (addr >>> 3) * 0x9e3779b97f4a7c15L
++    (h >>> 32).toInt & (capacity - 1)
++  }
++
++  /** The monitor of an object whose header says it is inflated */
++  def get(obj: RawPtr): ObjectMonitor = {
++    val addr = castRawPtrToLong(obj)
++    val t = table
++    val mask = t.capacity - 1
++    var i = indexOf(addr, t.capacity)
++    while (true) {
++      val key = t.keys(i)
++      if (key == addr) return t.monitors(i)
++      if (key == 0L)
++        throw new IllegalStateException("Inflated monitor not found")
++      i = (i + 1) & mask
++    }
++    null
++  }
++
++  /** Registers the monitor of `obj`, before its header is marked inflated */
++  private[monitor] def register(obj: RawPtr, monitor: ObjectMonitor): Unit = {
++    // The address is the key, the object must never move
++    GC.noteIdentityHash(obj)
++    // Allocate outside of the lock, GC can't suspend threads waiting for it
++    val ref = new WeakReference[AnyRef](castRawPtrToObject(obj))
++    val addr = castRawPtrToLong(obj)
++    while (true) {
++      lock()
++      val t = table
++      val version = t.version
++      val fits = (t.used + 1) * 2 <= t.capacity
++      if (fits) {
++        val mask = t.capacity - 1
++        var i = indexOf(addr, t.capacity)
++        while (t.keys(i) != 0L && t.keys(i) != addr) i = (i + 1) & mask
++        // A used slot with this address belongs to a collected object
++        t.monitors(i) = monitor
++        t.owners(i) = ref
++        if (t.keys(i) == 0L) {
++          t.keys(i) = addr
++          t.used += 1
++        }
++        t.version += 1
++      }
++      unlock()
++      if (fits) return
++      // Built without the lock, it allocates: installed only if nothing
++      // changed meanwhile, else retried
++      val bigger = rebuild(t)
++      lock()
++      if ((table eq t) && t.version == version) table = bigger
++      unlock()
++    }
++  }
++
++  /** A table with the entries of live objects, twice as big as they need */
++  private def rebuild(old: Table): Table = {
++    var live = 0
++    var i = 0
++    while (i < old.capacity) {
++      if (old.keys(i) != 0L && old.owners(i).get() != null) live += 1
++      i += 1
++    }
++    var capacity = InitialCapacity
++    while (capacity < (live + 1) * 4) capacity *= 2
++    val t = new Table(capacity)
++    val mask = capacity - 1
++    i = 0
++    while (i < old.capacity) {
++      val addr = old.keys(i)
++      if (addr != 0L && old.owners(i).get() != null) {
++        var j = indexOf(addr, capacity)
++        while (t.keys(j) != 0L) j = (j + 1) & mask
++        t.monitors(j) = old.monitors(i)
++        t.owners(j) = old.owners(i)
++        t.keys(j) = addr
++        t.used += 1
++      }
++      i += 1
++    }
++    t
++  }
 +
 +  private def lock(): Unit = {
 +    val expected = stackalloc[Int]()
@@ -860,149 +1207,9 @@ index 000000000..1a11d5ef6
 +
 +  private def unlock(): Unit =
 +    atomic_store_int(lockCell, 0, memory_order_release)
-+
-+  /** Thrown when the table is full. Preallocated: building a new throwable
-+   *  synchronizes on it, which can inflate its lock and register in this very
-+   *  table, failing again until the stack overflows.
-+   */
-+  private var exhausted: OutOfMemoryError = _
-+
-+  /** Registers the monitor of `owner` and returns its index */
-+  private[monitor] def register(owner: AnyRef, monitor: ObjectMonitor): Int = {
-+    // Allocate outside of the lock, GC can't suspend threads waiting for it
-+    val ref = new WeakReference[AnyRef](owner)
-+    var idx = tryRegister(ref, monitor)
-+    if (idx < 0) {
-+      // Slots of collected objects are only reusable once their references are
-+      // cleared
-+      System.gc()
-+      idx = tryRegister(ref, monitor)
-+    }
-+    if (idx < 0) throw exhausted
-+    idx
-+  }
-+
-+  /** Index of the claimed slot, -1 if all of them belong to live objects */
-+  private def tryRegister(
-+      ref: WeakReference[AnyRef],
-+      monitor: ObjectMonitor
-+  ): Int = {
-+    lock()
-+    try {
-+      var tries = 0
-+      var idx = cursor
-+      while (tries < Capacity) {
-+        if (monitors(idx) == null || owners(idx).get() == null) {
-+          monitors(idx) = monitor
-+          owners(idx) = ref
-+          cursor = (idx + 1) & (Capacity - 1)
-+          return idx
-+        }
-+        idx = (idx + 1) & (Capacity - 1)
-+        tries += 1
-+      }
-+      -1
-+    } finally unlock()
-+  }
 +}
-diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
-new file mode 100644
-index 000000000..836d051dc
---- /dev/null
-+++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/ThreadSlots.scala
-@@ -0,0 +1,16 @@
-+package scala.scalanative.runtime
-+package monitor
-+
-+import scala.scalanative.unsafe._
-+
-+/** Leases of the owner ids of thin locks, see thread_slots.c. Extern, so the
-+ *  lock path never needs a module to be loaded.
-+ */
-+@extern
-+private[runtime] object ThreadSlots {
-+  @name("scalanative_monitor_thread_slot")
-+  def current(): CInt = extern
-+
-+  @name("scalanative_monitor_release_thread_slot")
-+  def releaseCurrent(): Unit = extern
-+}
-diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
-index fcb749aef..86b520a4d 100644
---- a/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
-+++ b/nativelib/src/main/scala/scala/scalanative/runtime/monitor/package.scala
-@@ -1,7 +1,10 @@
- package scala.scalanative.runtime
- 
- import scala.scalanative.annotation.alwaysinline
--import scala.scalanative.meta.LinktimeInfo.{is32BitPlatform => is32bit}
-+import scala.scalanative.meta.LinktimeInfo.{
-+  is32BitPlatform => is32bit,
-+  isCompactHeaders
-+}
- import scala.scalanative.runtime.Intrinsics._
- 
- package object monitor {
-@@ -38,18 +41,32 @@ package object monitor {
-    * |     ObjectMonitor ref        |   1    |
-    *
-    */
-+  /* With compact headers (64bit only) the header of every object is a single
-+   * 64bit word, [lock:16 | rtti:48]. The 16bit lock keeps the same shape,
-+   * but is limited to threads with a small id (see BasicMonitor.getThreadId)
-+   * and the inflated monitor is referenced by an index in the MonitorTable:
-+   *
-+   * Thin monitor
-+   * |------10bit-------|----1bit---|---4bit----|--1bit--|
-+   * | threadID (owner) | contended | recursion |   0    |
-+   *
-+   * Inflated monitor
-+   * |------15bit-------------------|--1bit--|
-+   * |     MonitorTable index       |   1    |
-+   */
-   private[runtime] object LockWord {
-     // For information why we use `def` instead of `val` see comments in the runtime/MemoryLayout
-     @alwaysinline def RecursionOffset = 1
--    @alwaysinline def RecursionBits = 6
-+    // With compact headers the lock word has 16 bits, see the layout above
-+    @alwaysinline def RecursionBits = if (isCompactHeaders) 4 else 6
-     @alwaysinline def ThinMonitorMaxRecursion = (1 << RecursionBits) - 1
-     @alwaysinline def RecursionMask = ThinMonitorMaxRecursion << RecursionOffset
- 
-     @alwaysinline def ContendedOffset = RecursionOffset + RecursionBits
-     @alwaysinline def ContendedMask = 1 << ContendedOffset
- 
--    @alwaysinline def ThreadIdOffset = 8
--    @alwaysinline def ThreadIdBits = 56
-+    @alwaysinline def ThreadIdOffset = if (isCompactHeaders) 6 else 8
-+    @alwaysinline def ThreadIdBits = if (isCompactHeaders) 10 else 56
-     @alwaysinline def ThreadIdMax = (1L << ThreadIdBits) - 1
-     @alwaysinline def ThreadIdMask = ThreadIdMax << ThreadIdOffset
- 
-@@ -147,11 +164,16 @@ package object monitor {
-     // Inflated monitor ops
-     @alwaysinline def getObjectMonitor: ObjectMonitor = {
-       // assert(isInflated, "LockWord was not inflated")
--      val addr =
--        if (is32bit) castIntToRawPtr((intValue & LockWord32.ObjectMonitorMask))
--        else castLongToRawPtr(longValue & LockWord.ObjectMonitorMask)
--
--      castRawPtrToObject(addr).asInstanceOf[ObjectMonitor]
-+      if (isCompactHeaders)
-+        MonitorTable.get(longValue.toInt >>> 1)
-+      else {
-+        val addr =
-+          if (is32bit)
-+            castIntToRawPtr((intValue & LockWord32.ObjectMonitorMask))
-+          else castLongToRawPtr(longValue & LockWord.ObjectMonitorMask)
-+
-+        castRawPtrToObject(addr).asInstanceOf[ObjectMonitor]
-+      }
-     }
-   }
- 
 diff --git a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
-index 18ae5b55d..c4fd75263 100644
+index 18ae5b55d..dbb092c5d 100644
 --- a/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
 +++ b/nativelib/src/main/scala/scala/scalanative/runtime/package.scala
 @@ -5,7 +5,10 @@ import java.{lang => jl}
@@ -1134,15 +1341,23 @@ index 18ae5b55d..c4fd75263 100644
          val ex = Intrinsics
            .castRawPtrToObject(moduleRef)
            .asInstanceOf[ExceptionInInitializerError]
-@@ -383,6 +431,12 @@ package object runtime {
+@@ -383,6 +431,20 @@ package object runtime {
      ???
    }
  
 +  /** Reads the class of a real (non-tagged, non-null) object, whatever its header encoding is */
 +  @alwaysinline private[runtime] def loadHeaderRtti(obj: RawPtr): RawPtr =
-+    if (meta.LinktimeInfo.isCompactHeaders)
-+      castLongToRawPtr(loadLong(obj) & MemoryLayout.CompactHeaderRttiMask)
-+    else loadRawPtr(obj)
++    if (meta.LinktimeInfo.isCompactHeaders) {
++      // The offset of the RTTI in the RTTI space, see codegen.RttiSpace
++      val offset = loadInt(obj) & MemoryLayout.CompactHeaderRttiMask
++      elemRawPtr(RttiSpace.base, castIntToRawSizeUnsigned(offset))
++    } else loadRawPtr(obj)
++
++  /** Start of the RTTI space with compact object headers, see rtti_space.c */
++  @extern private[runtime] object RttiSpace {
++    @name("scalanative_rtti_space_base")
++    var base: RawPtr = extern
++  }
 +
    @extern private[runtime] object StackOverflowGuards {
      @name("scalanative_StackOverflowGuards_size")

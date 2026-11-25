@@ -22,7 +22,7 @@ import tempfile
 
 # (patch name, path predicate). First match wins.
 BUCKETS = [
-    ("nscplugin-tagging-and-compact-headers", lambda p: p.startswith("nscplugin/")),
+    ("nscplugin-tagging", lambda p: p.startswith("nscplugin/")),
     ("javalib", lambda p: p.startswith("javalib/")),
     ("nir-util", lambda p: p.startswith(("nir/", "util/"))),
     ("interflow", lambda p: "/scalanative/interflow/" in p or "/scalanative/checker/" in p),

@@ -487,7 +487,6 @@ object ScalinoCli:
     nativeMultithreading: Option[Boolean],
     nativeDirectCodegen: Option[Boolean],
     nativeCompactHeaders: Option[Boolean],
-    nativeCompactByteArrays: Option[Boolean],
     nativeGcStwSweep: Option[Boolean],
     nativeHeapHistogram: Option[Boolean],
     nativeDebugInfo: Option[Boolean],
@@ -555,7 +554,7 @@ object ScalinoCli:
     "platform", "platforms", "target.platform", "jsModuleKind", "jsMode", "jsEmitSourceMaps", "jsClient", "jsClientOut", "shared",
     "jsNoOpt", "jsCheckIr", "jsHeader", "jsEsVersionStr", "jsModuleSplitStyleStr", "jsSmallModuleForPackage", "jsAvoidClasses", "jsAvoidLetsAndConsts", "jsAllowBigIntsForLongs",
     "postLink", "runEnv", "dependsOn",
-    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeCompactByteArrays", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
+    "nativeEmbedResources", "nativeMultithreading", "nativeDirectCodegen", "nativeCompactHeaders", "nativeGcStwSweep", "nativeHeapHistogram", "nativeDebugInfo", "nativeOptimize",
     // `scalino package --format ...` metadata -- see cli/Packaging.scala
     "packageName", "packageVersion", "packageDescription", "packageMaintainer", "packageLicense",
     "packageHomepage", "packageDep", "packageDeps", "packageFile", "packageFiles",
@@ -648,7 +647,6 @@ object ScalinoCli:
     var nativeMultithreading = Option.empty[Boolean]
     var nativeDirectCodegen = Option.empty[Boolean]
     var nativeCompactHeaders = Option.empty[Boolean]
-    var nativeCompactByteArrays = Option.empty[Boolean]
     var nativeGcStwSweep = Option.empty[Boolean]
     var nativeHeapHistogram = Option.empty[Boolean]
     var nativeDebugInfo = Option.empty[Boolean]
@@ -752,7 +750,6 @@ object ScalinoCli:
         directiveBool(line, "nativeMultithreading").foreach(v => nativeMultithreading = Some(v))
         directiveBool(line, "nativeDirectCodegen").foreach(v => nativeDirectCodegen = Some(v))
         directiveBool(line, "nativeCompactHeaders").foreach(v => nativeCompactHeaders = Some(v))
-        directiveBool(line, "nativeCompactByteArrays").foreach(v => nativeCompactByteArrays = Some(v))
         directiveBool(line, "nativeGcStwSweep").foreach(v => nativeGcStwSweep = Some(v))
         directiveBool(line, "nativeHeapHistogram").foreach(v => nativeHeapHistogram = Some(v))
         directiveBool(line, "nativeDebugInfo").foreach(v => nativeDebugInfo = Some(v))
@@ -763,7 +760,7 @@ object ScalinoCli:
       deps.distinct, compileOnlyDeps.distinct, testDeps.distinct, scalaVersion, mainClass, options, testFramework,
       nativeMode, nativeGc, nativeLto, nativeClang, nativeClangPP,
       nativeLinking, nativeCompile, nativeCCompile, nativeCppCompile, nativePrune,
-      nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeCompactByteArrays, nativeGcStwSweep, nativeHeapHistogram, nativeDebugInfo, nativeOptimize,
+      nativeTarget, nativeEmbedResources, nativeMultithreading, nativeDirectCodegen, nativeCompactHeaders, nativeGcStwSweep, nativeHeapHistogram, nativeDebugInfo, nativeOptimize,
       jars.distinct, testOptions, resourceDirs.distinct, repositories.distinct, pkg,
       nativeTargetTriples, nativeSysroots, nativePkgConfig,
       platform, jsModuleKind, jsMode, jsSourceMaps, jsClients.distinct, shared.distinct,
@@ -2407,9 +2404,6 @@ object ScalinoCli:
     multithreading: Boolean = true,
     directCodegen: Boolean = true,
     compactHeaders: Boolean = true,
-    // None: left to scalino-linkdriver, on unless a library reading byte
-    // arrays through raw pointers (jsoniter-scala-core) is on the classpath
-    compactByteArrays: Option[Boolean] = None,
     gcStwSweep: Boolean = false,
     heapHistogram: Boolean = false,
     debugInfo: Boolean = false,
@@ -2473,10 +2467,6 @@ object ScalinoCli:
       compactHeaders = o.cliNativeCompactHeaders
         .orElse(directives.nativeCompactHeaders)
         .getOrElse(!windowsTarget),
-      // Default-on, but scalino-linkdriver turns it off when the classpath has
-      // a library reading byte arrays through raw pointers (jsoniter-scala-core),
-      // unless given explicitly. See NativeConfig.compactByteArrays.
-      compactByteArrays = o.cliNativeCompactByteArrays.orElse(directives.nativeCompactByteArrays),
       // Opt-in, commix GC only: see NativeConfig.gcStwSweep.
       gcStwSweep = directives.nativeGcStwSweep.getOrElse(false) || o.cliNativeGcStwSweep,
       // Opt-in: gates SCALINO_HEAP_HISTOGRAM at C compile time (LinkDriver.scala's withCOptions);
@@ -2696,7 +2686,6 @@ object ScalinoCli:
       (if incremental then List("--incremental-compilation") else List("--no-incremental-compilation")) ++
       (if nativeOpts.directCodegen then List("--direct-codegen") else List("--no-direct-codegen")) ++
       (if nativeOpts.compactHeaders then List("--compact-headers") else List("--no-compact-headers")) ++
-      nativeOpts.compactByteArrays.map(v => if v then "--compact-byte-arrays" else "--no-compact-byte-arrays").toList ++
       (if nativeOpts.gcStwSweep then List("--gc-stw-sweep") else Nil) ++
       (if nativeOpts.heapHistogram then List("--heap-histogram") else Nil) ++
       (if nativeOpts.debugInfo then List("--debug-info") else Nil) ++
@@ -3445,16 +3434,12 @@ object ScalinoCli:
        |                                        toolchain itself running as compiled Scala Native
        |                                        code with a discoverable libLLVM, else it's a
        |                                        silent no-op; pass =false to opt out)
-       |  --native-compact-headers[=true|false]  4 byte object headers (class id and lock
-       |                                        bits) instead of 8-16 bytes: less memory for
-       |                                        every object and array (on by default, except
-       |                                        on Windows; only for 64-bit targets with the
-       |                                        immix GC; pass =false to opt out)
-       |  --native-compact-byte-arrays[=true|false]  also give Array[Byte] the compact header
-       |                                        (on by default, except when jsoniter-scala-core is
-       |                                        on the classpath: it reads byte arrays through raw
-       |                                        pointers, with the regular layout; needs compact
-       |                                        headers)
+       |  --native-compact-headers[=true|false]  4 byte object headers (where the class
+       |                                        info is, and lock bits) instead of 16 bytes:
+       |                                        less memory for every object and array (on
+       |                                        by default, except on Windows; only for
+       |                                        64-bit targets with the immix GC; pass =false
+       |                                        to opt out)
        |  --native-gc-stw-sweep      commix GC only: keep mutators paused through the
        |                             parallel sweep too, instead of resuming them once
        |                             marking finishes (off by default; throughput over
@@ -3531,7 +3516,6 @@ object ScalinoCli:
        |  //> using nativeMultithreading false   (on by default)
        |  //> using nativeDirectCodegen false   (on by default except on Windows)
        |  //> using nativeCompactHeaders false   (on by default except on Windows)
-       |  //> using nativeCompactByteArrays true   (on by default, see --native-compact-byte-arrays)
        |  //> using nativeGcStwSweep true   (commix GC only; off by default)
        |  //> using nativeHeapHistogram true   (live-heap histogram GC debug dump; off by default, adds ~7.5MB to binary)
        |  //> using nativeDebugInfo true   (source-level debug info; off by default)
@@ -3833,7 +3817,6 @@ object ScalinoCli:
     cliNativeMultithreading: Option[Boolean] = None,
     cliNativeDirectCodegen: Option[Boolean] = None,
     cliNativeCompactHeaders: Option[Boolean] = None,
-    cliNativeCompactByteArrays: Option[Boolean] = None,
     cliNativeGcStwSweep: Boolean = false,
     cliNativeHeapHistogram: Boolean = false,
     cliNativeDebugInfo: Option[Boolean] = None,
@@ -3970,12 +3953,6 @@ object ScalinoCli:
           if (v != "true" && v != "false")
             die(s"--native-compact-headers=$v: expected true or false")
           o = o.copy(cliNativeCompactHeaders = Some(v == "true"))
-        case "--native-compact-byte-arrays" => o = o.copy(cliNativeCompactByteArrays = Some(true))
-        case f if f.startsWith("--native-compact-byte-arrays=") =>
-          val v = f.drop("--native-compact-byte-arrays=".length)
-          if (v != "true" && v != "false")
-            die(s"--native-compact-byte-arrays=$v: expected true or false")
-          o = o.copy(cliNativeCompactByteArrays = Some(v == "true"))
         case "--native-gc-stw-sweep" => o = o.copy(cliNativeGcStwSweep = true)
         case "--native-heap-histogram" => o = o.copy(cliNativeHeapHistogram = true)
         case "--native-debug-info" => o = o.copy(cliNativeDebugInfo = Some(true))
@@ -4526,7 +4503,7 @@ object ScalinoCli:
     "--color --test-framework --test-only --no-incremental --no-daemon --offline --interpret --repl-init-script --repl-quit-after-init --native-mode --native-gc --native-lto " +
     "--native-target-triple --native-sysroot --native-clang --native-clangpp --native-linking --post-link --run-env --native-compile --native-c-compile " +
     "--native-cpp-compile --native-pkg-config --native-prune --native-target --embed-resources --native-multithreading " +
-    "--native-direct-codegen --native-compact-headers --native-compact-byte-arrays --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
+    "--native-direct-codegen --native-compact-headers --native-gc-stw-sweep --native-heap-histogram --native-debug-info --native-optimize " +
     "--js --native --platform --js-mode --js-client-out --js-module-kind --js-emit-source-maps --js-no-opt --js-check-ir --js-header --js-es-version --js-module-split-style --js-small-module-for-package " +
     "--js-avoid-classes --js-avoid-lets-and-consts --js-allow-big-ints-for-longs --js-runtime " +
     "--formats --package-name --package-version " +

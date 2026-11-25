@@ -1531,10 +1531,10 @@ index 6cc554ad2..d6713c321 100644
  
  #endif // IMMIX_LARGEALLOCATOR_H
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
-index 413018652..f3e7e21db 100644
+index 413018652..a6ec9c8b2 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
 +++ b/nativelib/src/main/resources/scala-native/gc/immix/Marker.c
-@@ -2,148 +2,2408 @@
+@@ -2,148 +2,2426 @@
  #include "immix_commix/ObjectTracer.h"
  #include <stdint.h>
  #include <stdio.h>
@@ -2216,18 +2216,36 @@ index 413018652..f3e7e21db 100644
 + * reference object (it is not in the reference map), since skipping it here
 + * would leave it silently pointing at stale memory.
 + */
++#ifdef SCALANATIVE_COMPACT_HEADERS
++// A header no object has: an RTTI offset past any RTTI space, unlocked. The
++// header can't hold the address of a sentinel outside the RTTI space.
++#define EVAC_FORWARDED_HEADER (~(uint32_t)3)
++
++static inline bool Evac_IsForwarded(Object *object) {
++    return *(uint32_t *)object == EVAC_FORWARDED_HEADER;
++}
++
++static inline void Evac_SetForwardedHeader(Object *object) {
++    *(uint32_t *)object = EVAC_FORWARDED_HEADER;
++}
++#else
 +static Rtti EvacForwardedRtti; // sentinel; address compared, never dereferenced
 +
 +static inline bool Evac_IsForwarded(Object *object) {
 +    return Object_Rtti(object) == &EvacForwardedRtti;
 +}
 +
++static inline void Evac_SetForwardedHeader(Object *object) {
++    Object_SetRtti(object, &EvacForwardedRtti);
++}
++#endif
++
 +static inline word_t *Evac_ForwardedAddress(Object *object) {
 +    return *(word_t **)((uint8_t *)object + EVAC_FORWARD_OFFSET);
 +}
 +
 +static inline void Evac_SetForwarded(Object *object, word_t *newAddr) {
-+    Object_SetRtti(object, &EvacForwardedRtti);
++    Evac_SetForwardedHeader(object);
 +    *(word_t **)((uint8_t *)object + EVAC_FORWARD_OFFSET) = newAddr;
 +}
 +
@@ -2656,8 +2674,7 @@ index 413018652..f3e7e21db 100644
 +    }
 +    memset(evacWorkersBase, 0, (size_t)count * EVAC_WORKER_STRIDE);
 +}
- 
--static inline void Marker_markLockWords(Heap *heap, Stack *stack,
++
 +typedef enum {
 +    evac_copy,
 +    evac_fixup_roots,
@@ -3486,7 +3503,8 @@ index 413018652..f3e7e21db 100644
 +    MarkPool_unlock();
 +    return chunk;
 +}
-+
+ 
+-static inline void Marker_markLockWords(Heap *heap, Stack *stack,
 +// The current chunk is full: the older full chunk (the spare) goes to the
 +// shared list and this one becomes the spare; a worker that has no spare
 +// still shares when the shared list is short, so idle workers get work soon.
@@ -3584,15 +3602,15 @@ index 413018652..f3e7e21db 100644
 +    if (!Evac_CanForward(size))
 +        EvacPin_record(heap, object);
 +}
- 
--    Marker_markLockWords(heap, stack, object);
++
 +static inline void Marker_markObject(MarkWorker *w, Heap *heap,
 +                                     Object *object, ObjectMeta *objectMeta) {
 +    // Another worker may have marked it since the caller looked
 +    assert(ObjectMeta_IsAllocated(objectMeta) ||
 +           ObjectMeta_IsMarked(objectMeta));
 +    assert(Object_Rtti(object) != NULL);
-+
+ 
+-    Marker_markLockWords(heap, stack, object);
 +    if (graphDumpFile != NULL) {
 +        // The lock-word scan below can itself discover further objects (a
 +        // monitor object) whose edges must be attributed to THIS object, not
@@ -3620,8 +3638,9 @@ index 413018652..f3e7e21db 100644
      Object_Mark(heap, object, objectMeta);
 -    Stack_Push(stack, object);
 +    MarkWorker_push(w, (word_t *)object);
-+}
-+
+ }
+ 
+-static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
 +// Mirrors nir.Type.Smi/PtrTag's bit layout (see their doc comments) - kept
 +// in sync by hand, same reasoning as SmiBox.scala/PtrBox's runtime mirror.
 +#define SMI_TAG_MASK (((word_t)1) << 63)
@@ -3642,9 +3661,8 @@ index 413018652..f3e7e21db 100644
 +    if (ObjectMeta_IsAllocated(fieldMeta)) {
 +        Marker_markObject(w, heap, (Object *)field, fieldMeta);
 +    }
- }
- 
--static inline void Marker_markField(Heap *heap, Stack *stack, Field_t field) {
++}
++
 +static inline void Marker_markField(MarkWorker *w, Heap *heap, Field_t field) {
 +    const word_t asWord = (word_t)field;
 +
@@ -3976,11 +3994,12 @@ index 413018652..f3e7e21db 100644
 +            if (trace != NULL) {
 +                ScanContext context = {w, heap};
 +                trace((void **)object->fields, Marker_scanRange, &context);
-+            }
-+        }
-+    }
-+}
-+
+             }
+         }
+     }
+ }
+ 
+-NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
 +// Marks until this worker has no entry left anywhere it can reach: its
 +// stack, then its edge queue, then the shared list
 +static void Marker_drain(MarkWorker *w, Heap *heap) {
@@ -3990,7 +4009,7 @@ index 413018652..f3e7e21db 100644
 +            if (w->edgeCount > 0) {
 +                Marker_flushEdges(w, heap);
 +                continue;
-             }
++            }
 +            if (MarkWorker_takeShared(w))
 +                continue;
 +            return;
@@ -4005,16 +4024,15 @@ index 413018652..f3e7e21db 100644
 +            else
 +                Marker_markRange(w, heap, window, window + MARK_RANGE_WORDS,
 +                                 sizeof(word_t));
-         }
-     }
- }
- 
--NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
++        }
++    }
++}
++
 +NO_SANITIZE static void Marker_markRange(MarkWorker *w, Heap *heap,
                                           word_t **from, word_t **to,
                                           const size_t stride) {
      assert(from != NULL);
-@@ -163,14 +2423,25 @@ NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
+@@ -163,14 +2441,25 @@ NO_SANITIZE static void Marker_markRange(Heap *heap, Stack *stack,
      for (ubyte_t *current = alignedFrom; current < alignedTo;
           current += stride) {
          word_t *addr = *(word_t **)current;
@@ -4043,7 +4061,7 @@ index 413018652..f3e7e21db 100644
      if (atomic_load_explicit(&thread->inHost, memory_order_acquire))
          return;
      word_t **stackBottom = thread->stackBottom;
-@@ -181,6 +2452,14 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+@@ -181,6 +2470,14 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
      } while (stackTop == NULL);
      stackBottom = (word_t **)threadStackScanBottom(thread->threadInfo, stackTop,
                                                     stackBottom);
@@ -4058,7 +4076,7 @@ index 413018652..f3e7e21db 100644
  #ifdef SCALANATIVE_THREAD_ALT_STACK
      // Keep the captured SP until stack bounds are known.
      if (thread->threadInfo != NULL && thread->threadInfo->stackTop != NULL &&
-@@ -197,7 +2476,7 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+@@ -197,7 +2494,7 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
              word_t **signalHandlerStack =
                  (word_t **)thread->threadInfo->signalHandlerStack;
              Marker_markRange(
@@ -4067,7 +4085,7 @@ index 413018652..f3e7e21db 100644
                  (word_t **)((char *)signalHandlerStack +
                              thread->threadInfo->signalHandlerStackSize),
                  sizeof(word_t));
-@@ -208,7 +2487,7 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+@@ -208,7 +2505,7 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
      int nRanges = threadStackScanableRanges(stackTop, stackBottom,
                                              thread->threadInfo, ranges);
      for (int i = 0; i < nRanges; i++)
@@ -4076,7 +4094,7 @@ index 413018652..f3e7e21db 100644
                           (word_t **)ranges[i].to, sizeof(word_t));
  
      // Mark registers buffer
-@@ -219,32 +2498,235 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
+@@ -219,32 +2516,235 @@ NO_SANITIZE void Marker_markProgramStack(MutatorThread *thread, Heap *heap,
  #else
          sizeof(word_t);
  #endif
@@ -4625,8 +4643,30 @@ index 8f2c57aac..8aa50baf7 100644
  #else
  #error "Unable to capture registers state"
  #endif // CaptureRegisters
+diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c b/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c
+index d2f792f51..e6fd76dc2 100644
+--- a/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c
++++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/ScalaNativeGC.c
+@@ -40,7 +40,7 @@ INLINE void *scalanative_GC_alloc(Rtti *info, size_t size) {
+     } else {
+         alloc = (Object *)Allocator_Alloc(&heap, size);
+     }
+-    alloc->rtti = info;
++    Object_SetRtti(alloc, info);
+     return (void *)alloc;
+ }
+ 
+@@ -48,7 +48,7 @@ INLINE void *scalanative_GC_alloc_large(Rtti *info, size_t size) {
+     size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
+ 
+     Object *alloc = (Object *)LargeAllocator_Alloc(&heap, size);
+-    alloc->rtti = info;
++    Object_SetRtti(alloc, info);
+     return (void *)alloc;
+ }
+ 
 diff --git a/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h b/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h
-index 304bf268b..53a25e542 100644
+index 304bf268b..4acba54a3 100644
 --- a/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h
 +++ b/nativelib/src/main/resources/scala-native/gc/immix_commix/headers/ObjectHeader.h
 @@ -45,7 +45,10 @@
@@ -4634,39 +4674,117 @@ index 304bf268b..53a25e542 100644
  #define SCALANATIVE_RTTI_LINEAGE_SIZE 8
  
 -#ifdef SCALANATIVE_MULTITHREADING_ENABLED
-+/* With compact headers the lock bits are stored in the upper 16 bits of the
-+ * RTTI word, [lock:16 | rtti:48], see Object_Rtti */
++/* With compact headers the lock state is stored in the 2 lowest bits of the
++ * RTTI word, see Object_Rtti */
 +#if defined(SCALANATIVE_MULTITHREADING_ENABLED) &&                              \
 +    !defined(SCALANATIVE_COMPACT_HEADERS)
  #define USES_LOCKWORD 1
  
  // Inflation mark and object monitor are complementary
-@@ -147,6 +150,24 @@ typedef struct {
+@@ -57,6 +60,19 @@
+ typedef struct StringObject StringObject;
+ 
+ struct BaseRtti;
++struct Rtti;
++
++#ifdef SCALANATIVE_COMPACT_HEADERS
++/* The header of an object is a 32 bit word: the offset of its RTTI in the RTTI
++ * space (see codegen.RttiSpace), with the lock state in its 2 lowest bits (see
++ * runtime.monitor.CompactMonitor). Read and written with Object_Rtti and
++ * Object_SetRtti. */
++typedef uint32_t HeaderRtti;
++// Start of the RTTI space, an alias defined by codegen
++extern char scalanative_rtti_space[] __attribute__((visibility("hidden")));
++#else
++typedef struct Rtti *HeaderRtti;
++#endif
+ 
+ /* Slot of an open-addressing table of implemented traits, see codegen.ITable.
+  * A NULL trait marks an empty slot. */
+@@ -68,7 +84,7 @@ typedef struct ITableEntry {
+ typedef struct Rtti {
+     // Fields shared by all classes
+     struct BaseRtti {
+-        word_t *cls;
++        HeaderRtti cls;
+ #ifdef USES_LOCKWORD
+         word_t *lockWord;
+ #endif
+@@ -101,7 +117,7 @@ typedef struct Rtti {
+ typedef word_t *Field_t;
+ 
+ typedef struct {
+-    Rtti *rtti;
++    HeaderRtti rtti;
+ #ifdef USES_LOCKWORD
+     word_t *lockWord;
+ #endif
+@@ -109,12 +125,16 @@ typedef struct {
+ } Object;
+ 
+ typedef struct {
+-    Rtti *rtti;
++    HeaderRtti rtti;
+ #ifdef USES_LOCKWORD
+     word_t *lockWord;
+ #endif
+     int32_t length;
+     int32_t stride;
++#ifdef SCALANATIVE_COMPACT_HEADERS
++    // Elements start at the same offset as with a pointer-sized header
++    int32_t padding;
++#endif
+ } ArrayHeader;
+ 
+ typedef struct {
+@@ -124,7 +144,7 @@ typedef struct {
+ 
+ typedef struct StringObject {
+     // ObjectHeader
+-    Rtti *rtti;
++    HeaderRtti rtti;
+ #ifdef USES_LOCKWORD
+     word_t *lockWord;
+ #endif
+@@ -140,13 +160,36 @@ typedef struct StringObject {
+  * the header in every reference object */
+ typedef struct {
+     // ObjectHeader
+-    Rtti *rtti;
++    HeaderRtti rtti;
+ #ifdef USES_LOCKWORD
+     word_t *lockWord;
+ #endif
      Object *referent;
  } ReferenceObject;
  
 +#ifdef SCALANATIVE_COMPACT_HEADERS
 +/* Keep in sync with codegen.Metadata.CompactHeaderRttiMask */
-+#define HEADER_RTTI_MASK ((word_t)0x0000FFFFFFFFFFFFULL)
++#define HEADER_RTTI_MASK (~(uint32_t)3)
 +
 +static inline Rtti *Object_Rtti(const void *object) {
-+    return (Rtti *)(*(const word_t *)object & HEADER_RTTI_MASK);
++    return (Rtti *)(scalanative_rtti_space +
++                    (*(const uint32_t *)object & HEADER_RTTI_MASK));
++}
++
++/* Also clears the lock state */
++static inline void Object_SetRtti(void *object, Rtti *rtti) {
++    *(uint32_t *)object = (uint32_t)((char *)rtti - scalanative_rtti_space);
 +}
 +#else
 +static inline Rtti *Object_Rtti(const void *object) {
 +    return *(Rtti *const *)object;
 +}
-+#endif
 +
-+/* Also clears the lock bits of compact headers */
 +static inline void Object_SetRtti(void *object, Rtti *rtti) {
 +    *(Rtti **)object = rtti;
 +}
++#endif
 +
  typedef struct Chunk Chunk;
  
  struct Chunk {
-@@ -160,7 +181,7 @@ static inline bool Rtti_HasFlag(const Rtti *rtti, int32_t flag) {
+@@ -160,7 +203,7 @@ static inline bool Rtti_HasFlag(const Rtti *rtti, int32_t flag) {
  }
  
  static inline bool Object_IsArray(const Object *object) {
@@ -4675,7 +4793,7 @@ index 304bf268b..53a25e542 100644
  }
  
  static inline int32_t Rtti_ArrayScan(const Rtti *rtti) {
-@@ -175,20 +196,35 @@ static inline size_t Array_Stride(const ArrayHeader *header) {
+@@ -175,20 +218,35 @@ static inline size_t Array_Stride(const ArrayHeader *header) {
  }
  
  static inline size_t BlobArray_ScannableLimit(const ArrayHeader *header) {
@@ -4714,7 +4832,7 @@ index 304bf268b..53a25e542 100644
                                               ALLOCATION_ALIGNMENT);
      }
  }
-@@ -199,7 +235,7 @@ static inline int32_t Rtti_ReferenceKind(const Rtti *rtti) {
+@@ -199,7 +257,7 @@ static inline int32_t Rtti_ReferenceKind(const Rtti *rtti) {
  
  /* RTTI_REFERENCE_KIND_*, 0 for objects other than references */
  static inline int32_t Object_ReferenceKind(const Object *object) {
@@ -4723,7 +4841,7 @@ index 304bf268b..53a25e542 100644
  }
  
  /* Not in the reference map, see immix_commix/References.h */
-@@ -226,7 +262,7 @@ static inline Field_t Field_allignedLockRef(const Field_t field) {
+@@ -226,7 +284,7 @@ static inline Field_t Field_allignedLockRef(const Field_t field) {
  static inline wchar_t *Object_nameWString(Object *object) {
      // Depending on platform wchar_t might be 2 or 4 bytes
      // Always convert Scala Char to wchar_t

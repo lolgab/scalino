@@ -754,7 +754,7 @@ index cc6bb2fd8..01363ce2f 100644
  
  }
 diff --git a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
-index 68880581d..b79a143f3 100644
+index 68880581d..a81aba9b0 100644
 --- a/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
 +++ b/tools/src/main/scala/scala/scalanative/build/NativeConfig.scala
 @@ -74,6 +74,23 @@ sealed trait NativeConfig {
@@ -781,13 +781,14 @@ index 68880581d..b79a143f3 100644
     // format: off
    /** Shall be compiled with multithreading support.
     *
-@@ -113,6 +130,39 @@ sealed trait NativeConfig {
+@@ -113,6 +130,40 @@ sealed trait NativeConfig {
    private[scalanative] def multithreadingSupport: Boolean =
      multithreading.getOrElse(true)
  
-+  /** Use compact object headers: with multithreading, the lock bits are kept
-+   *  in the upper 16 bits of the RTTI pointer word instead of a separate lock
-+   *  word, so every object header is 8 bytes instead of 16. On by default, but
++  /** Use compact object headers: the header is a 32 bit word, the offset of
++   *  the RTTI in the RTTI space with the lock state (lightweight locking) in
++   *  its 2 lowest bits, instead of an RTTI pointer and a lock word, so object
++   *  headers are 4 bytes instead of 16 (arrays keep 16). On by default, but
 +   *  only takes effect for multithreaded 64-bit targets using the Immix GC
 +   *  (single-threaded programs have no lock word anyway), see
 +   *  [[compactHeadersEnabled]].
@@ -821,7 +822,7 @@ index 68880581d..b79a143f3 100644
    /** Map of user defined properties resolved at linktime */
    def linktimeProperties: NativeConfig.LinktimeProperites
  
-@@ -279,12 +329,22 @@ sealed trait NativeConfig {
+@@ -279,12 +330,22 @@ sealed trait NativeConfig {
    /** Create a new config with given incrementalCompilation value */
    def withIncrementalCompilation(value: Boolean): NativeConfig
  
@@ -844,7 +845,7 @@ index 68880581d..b79a143f3 100644
    /** Create a new config with given linktime properites */
    final def withLinktimeProperties(
        value: NativeConfig.LinktimeProperites
-@@ -363,7 +423,10 @@ object NativeConfig {
+@@ -363,7 +424,10 @@ object NativeConfig {
        linkStubs = false,
        optimize = true,
        useIncrementalCompilation = true,
@@ -855,7 +856,7 @@ index 68880581d..b79a143f3 100644
        linktimeProperties = Map.empty,
        embedResources = false,
        resourceIncludePatterns = Seq("**"),
-@@ -396,7 +459,10 @@ object NativeConfig {
+@@ -396,7 +460,10 @@ object NativeConfig {
        linkStubs: Boolean,
        optimize: Boolean,
        useIncrementalCompilation: Boolean,
@@ -866,7 +867,7 @@ index 68880581d..b79a143f3 100644
        linktimeProperties: LinktimeProperites,
        embedResources: Boolean,
        resourceIncludePatterns: Seq[String],
-@@ -480,12 +546,22 @@ object NativeConfig {
+@@ -480,12 +547,22 @@ object NativeConfig {
      override def withIncrementalCompilation(value: Boolean): NativeConfig =
        copy(useIncrementalCompilation = value)
  
@@ -889,7 +890,7 @@ index 68880581d..b79a143f3 100644
      def withLinktimeProperties(
          update: Mapping[LinktimeProperites]
      ): NativeConfig = {
-@@ -574,7 +650,10 @@ object NativeConfig {
+@@ -574,7 +651,10 @@ object NativeConfig {
            | - linkStubs:               $linkStubs
            | - optimize                 $optimize
            | - incrementalCompilation:  $useIncrementalCompilation

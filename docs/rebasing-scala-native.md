@@ -13,12 +13,12 @@ The patches are split by area, with disjoint file sets, so they are independent 
 | patch | contents |
 | --- | --- |
 | `selfhost` | the few `nscplugin` hunks that only compile against scalino's self-hosted dotc; `01a` reverts it while sbt runs |
-| `nscplugin-tagging-and-compact-headers` | SMI / pointer tagging, compact headers, enum-with-explicit-nulls |
+| `nscplugin-tagging` | SMI / pointer tagging, enum-with-explicit-nulls |
 | `javalib` | zip file system provider, provider-generic `Files`, SMI boxes, ... |
 | `nir-util`, `interflow`, `codegen`, `linker`, `build-tools` | the `tools`/`nir`/`util` modules: escape analysis, direct LLVM codegen, incremental builds, link-time pruning, PGO |
 | `runtime-scala` | `nativelib` Scala code: monitors, `SmiBox`, thread slots |
 | `gc-immix-commix` | Immix/Commix: evacuation, compact headers, shared recycle pool, release to OS |
-| `gc-shared-and-runtime-c` | trampoline (aarch64 resume via sigreturn), stack overflow poll count, compact-header module init, thread slots |
+| `gc-shared-and-runtime-c` | trampoline (aarch64 resume via sigreturn), stack overflow poll count, compact headers (RTTI space, lock stack) |
 | `docs` | `gc-safepoint-trampoline.md` |
 
 ## Bumping `SCALA_NATIVE_REF`
@@ -42,9 +42,13 @@ Check each patched area against upstream before keeping it. Upstream has already
 `Files` probes, interior-pointer conservative marking, the shared yieldpoint trap page, the inline module-load
 fast path, the connect `SO_ERROR` check, the `\e` regex escape, ...).
 
-Compact headers follow upstream's RTTI: with multithreading the lock bits sit in the upper 16 bits of the RTTI
-pointer word (`[lock:16 | rtti:48]`, 8-byte header instead of 16), so no whole-program class ids are needed and
-RTTI depends only on a type and its ancestors, as upstream intends.
+Compact headers keep upstream's RTTI, which depends only on a type and its ancestors; no whole-program class ids.
+Codegen lays every RTTI out in one global, the RTTI space (`codegen/RttiSpace.scala`), and each RTTI symbol becomes
+an alias of its place there. The object header is then a 32-bit word, the RTTI's offset in that space, with the
+lock state in its 2 lowest bits (like HotSpot's compressed class pointers). Locking is lightweight locking as in
+HotSpot (`runtime/monitor/CompactMonitor.scala`): a per-thread lock stack in C (`lock_stack.c`) for fast locks,
+inflated monitors found by object address in `MonitorTable`. Arrays keep a 16-byte header (upstream's stride
+field, padded); byte arrays keep their elements at offset 24 for jsoniter-scala.
 
 ## Binary compatibility with libraries built for released Scala Native
 

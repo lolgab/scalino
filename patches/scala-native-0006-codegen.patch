@@ -50,10 +50,10 @@ index 000000000..f7f1cda7a
 +}
 diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
 new file mode 100644
-index 000000000..47120356a
+index 000000000..b4c591ae7
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/DirectCodeGen.scala
-@@ -0,0 +1,1526 @@
+@@ -0,0 +1,1586 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -222,6 +222,8 @@ index 000000000..47120356a
 +      // never break a build that the regular .ll + clang path would
 +      // otherwise have handled fine -- it should just fall back instead (we
 +      // can't trust objPath is valid if emitTo threw partway through).
++      // The text path would use the same wrong offsets
++      case e: RttiSpace.LayoutMismatch => throw e
 +      case scala.util.control.NonFatal(e) =>
 +        config.logger.debug(
 +          s"useLLVMDirectCodeGen: falling back to .ll+clang for this partition (${e.getMessage})"
@@ -363,6 +365,9 @@ index 000000000..47120356a
 +  private var constCounter = 0
 +  // Globals in a section marked `used` (kept under LTO), listed in @llvm.used.
 +  private val usedGlobals = mutable.ArrayBuffer.empty[LLVMValueRef]
++  // The RTTI space when this module defines it, checked against the target's
++  // data layout before emitting
++  private var rttiSpaceGlobal: LLVMValueRef = null
 +
 +  // Exception handling. Two personality/landingpad shapes, selected exactly
 +  // like UnixCompat (config.usingCppExceptions): the default ScalaNative
@@ -751,6 +756,9 @@ index 000000000..47120356a
 +    case nir.Val.Local(id, _) =>
 +      if (locals eq null) unsupported(v)
 +      else locals.getOrElse(id.id, unsupported(v))
++    case nir.Val.Global(name, nir.Type.Int) if rttiOffset(name).isDefined =>
++      // Compact object header, see Metadata.headerRtti
++      C.LLVMConstInt(C.LLVMIntTypeInContext(ctx, 32.toUInt), rttiOffset(name).get.toULong, 0)
 +    case nir.Val.Global(name: nir.Global.Member, _) =>
 +      globalValueFor(name)
 +    case nir.Val.Const(inner) =>
@@ -846,6 +854,11 @@ index 000000000..47120356a
 +  // ---- top-level definitions -------------------------------------------
 +
 +  private def emitTo(objPath: Path): Unit = {
++    // Before anything references an RTTI by name, see RttiSpace
++    defns.foreach {
++      case d: nir.Defn.Var if d.name == RttiSpace.Name => declareRttiSpace()
++      case _                                          => ()
++    }
 +    defns.foreach { case d: nir.Defn.Const => predeclare(d.name); case _ => () }
 +    defns.foreach { case d: nir.Defn.Var => predeclare(d.name); case _ => () }
 +    defns.foreach { case d: nir.Defn.Declare => predeclare(d.name); case _ => () }
@@ -896,6 +909,52 @@ index 000000000..47120356a
 +    C.LLVMDisposeModule(module)
 +    C.LLVMContextDispose(ctx)
 +  }
++
++  private def rttiOffset(n: nir.Global): Option[Long] =
++    sections.rttiSpace.flatMap(_.offsetOf(n))
++
++  /** Same as AbstractCodeGen.genRttiAliases: each RTTI symbol is an alias of
++   *  its place in the RTTI space.
++   */
++  private def declareRttiSpace(): Unit = sections.rttiSpace.foreach { layout =>
++    val space = globalValueFor(RttiSpace.Name)
++    rttiSpaceGlobal = space
++    val i8Ty = C.LLVMIntTypeInContext(ctx, 8.toUInt)
++    val i64Ty = C.LLVMIntTypeInContext(ctx, 64.toUInt)
++    Zone.acquire { implicit z =>
++      val start = C.LLVMAddAlias2(module, i8Ty, 0.toUInt, space, toCString(RttiSpace.CName))
++      C.LLVMSetVisibility(start, LLVMHiddenVisibility)
++    }
++    layout.entries.foreach {
++      case (name, offset) =>
++        Zone.acquire { implicit z =>
++          val index = alloc[LLVMValueRef](1)
++          index(0) = C.LLVMConstInt(i64Ty, offset.toULong, 0)
++          val addr = C.LLVMConstInBoundsGEP2(i8Ty, space, index, 1.toUInt)
++          val mangled = mangledName(name)
++          val alias = C.LLVMAddAlias2(module, i8Ty, 0.toUInt, addr, toCString(mangled))
++          C.LLVMSetVisibility(alias, LLVMHiddenVisibility)
++          globals(name) = alias
++          globalsByName(mangled) = alias
++        }
++    }
++  }
++
++  /** The offsets of the RTTI aliases need to be where LLVM puts the RTTI */
++  private def checkRttiSpace(dataLayout: LLVMTargetDataRef): Unit =
++    if (rttiSpaceGlobal != null) sections.rttiSpace.foreach { layout =>
++      val structTy = C.LLVMGlobalGetValueType(rttiSpaceGlobal)
++      var i = 0
++      layout.entries.foreach {
++        case (name, offset) =>
++          val actual = TM.LLVMOffsetOfElement(dataLayout, structTy, i.toUInt).toLong
++          if (actual != offset)
++            throw new RttiSpace.LayoutMismatch(
++              s"RTTI space layout: ${name.show} at $actual, expected $offset"
++            )
++          i += 1
++      }
++    }
 +
 +  private def predeclare(name: nir.Global): Unit = name match {
 +    case m: nir.Global.Member if !globals.contains(m) =>
@@ -1541,6 +1600,7 @@ index 000000000..47120356a
 +      )
 +      try {
 +        val dataLayout = TM.LLVMCreateTargetDataLayout(tm)
++        checkRttiSpace(dataLayout)
 +        val dataLayoutStr = TM.LLVMCopyStringRepOfTargetData(dataLayout)
 +        C.LLVMSetDataLayout(module, dataLayoutStr)
 +        C.LLVMDisposeMessage(dataLayoutStr)
@@ -1648,10 +1708,10 @@ index 000000000..666d68c38
 +}
 diff --git a/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
 new file mode 100644
-index 000000000..4d6bccb99
+index 000000000..616b8fe74
 --- /dev/null
 +++ b/tools/native/src/main/scala/scala/scalanative/codegen/llvm/direct/LLVMCApi.scala
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,620 @@
 +package scala.scalanative
 +package codegen
 +package llvm
@@ -1859,6 +1919,20 @@ index 000000000..4d6bccb99
 +    // Globals / functions
 +    def LLVMAddGlobal(m: LLVMModuleRef, ty: LLVMTypeRef, name: CString): LLVMValueRef =
 +      extern
++    def LLVMAddAlias2(
++        m: LLVMModuleRef,
++        valueTy: LLVMTypeRef,
++        addrSpace: CUnsignedInt,
++        aliasee: LLVMValueRef,
++        name: CString
++    ): LLVMValueRef = extern
++    def LLVMGlobalGetValueType(global: LLVMValueRef): LLVMTypeRef = extern
++    def LLVMConstInBoundsGEP2(
++        ty: LLVMTypeRef,
++        constantVal: LLVMValueRef,
++        constantIndices: Ptr[LLVMValueRef],
++        numIndices: CUnsignedInt
++    ): LLVMValueRef = extern
 +    def LLVMGetNamedGlobal(m: LLVMModuleRef, name: CString): LLVMValueRef = extern
 +    def LLVMSetInitializer(globalVar: LLVMValueRef, constantVal: LLVMValueRef): Unit =
 +      extern
@@ -2202,6 +2276,11 @@ index 000000000..4d6bccb99
 +    def LLVMDisposeTargetMachine(t: LLVMTargetMachineRef): Unit = extern
 +    def LLVMCreateTargetDataLayout(t: LLVMTargetMachineRef): LLVMTargetDataRef = extern
 +    def LLVMCopyStringRepOfTargetData(td: LLVMTargetDataRef): CString = extern
++    def LLVMOffsetOfElement(
++        td: LLVMTargetDataRef,
++        structTy: LLVMTypeRef,
++        element: CUnsignedInt
++    ): CUnsignedLongLong = extern
 +    @blocking def LLVMTargetMachineEmitToFile(
 +        t: LLVMTargetMachineRef,
 +        m: LLVMModuleRef,
@@ -2254,10 +2333,42 @@ index 000000000..4d6bccb99
 +  }
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala b/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
-index 6143aee88..a42dd9e35 100644
+index 6143aee88..9c659fa49 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/CommonMemoryLayouts.scala
-@@ -126,6 +126,15 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
+@@ -30,7 +30,7 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
+ 
+   object Rtti
+       extends Layout(
+-        nir.Type.Ptr :: // ClassRtti
++        meta.headerRttiType :: // ClassRtti
+           meta.lockWordType.toList ::: // optional, multithreading only
+           nir.Type.Int :: // Flags, see RuntimeTypeInformation.Flags
+           nir.Type.Int :: // InterfacesCount
+@@ -96,7 +96,7 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
+ 
+   object ObjectHeader
+       extends Layout(
+-        nir.Type.Ptr :: // RTTI
++        meta.headerRttiType :: // RTTI
+           meta.lockWordType.toList // optional, multithreading only
+       ) {
+     final val RttiIdx = Common.RttiIdx
+@@ -114,11 +114,11 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
+ 
+   object ArrayHeader
+       extends Layout(
+-        nir.Type.Ptr :: // RTTI
++        meta.headerRttiType :: // RTTI
+           meta.lockWordType.toList ::: // optional, multithreading only
+           nir.Type.Int :: // length
+           nir.Type.Int :: // stride (used only by GC)
+-          Nil
++          meta.arrayHeaderPadType // compact headers only
+       ) {
+     final val RttiIdx = Common.RttiIdx
+     final val LockWordIdx = Common.LockWordIdx
+@@ -126,6 +126,16 @@ private[codegen] class CommonMemoryLayouts(implicit meta: Metadata) {
        if (meta.usesLockWords) LockWordIdx + 1
        else RttiIdx + 1
      final val StrideIdx = LengthIdx + 1
@@ -2265,7 +2376,8 @@ index 6143aee88..a42dd9e35 100644
 +    /** Header of ByteArray. Compact headers drop the lock word, but the
 +     *  elements of byte arrays stay where they are with a lock word, 3 words
 +     *  from the object start: libraries such as jsoniter-scala-core access them
-+     *  through raw pointers with a copy of that offset.
++     *  through raw pointers with a copy of that offset. The compact header is
++     *  2 words, it gets one more.
 +     */
 +    val byteLayout: nir.Type.StructValue =
 +      if (!meta.useCompactHeaders) layout
@@ -2274,7 +2386,7 @@ index 6143aee88..a42dd9e35 100644
  
    object Array
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
-index f465b7bc4..8cde22a41 100644
+index f465b7bc4..940ddfb0f 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/FieldLayout.scala
 @@ -28,19 +28,41 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
@@ -2335,7 +2447,18 @@ index f465b7bc4..8cde22a41 100644
      nir.Val.Const(nir.Val.ArrayValue(nir.Type.Int, offsets.map(nir.Val.Int(_))))
    }
  
-@@ -76,4 +99,15 @@ private[codegen] object FieldLayout {
+@@ -58,7 +81,9 @@ private[codegen] class FieldLayout(cls: Class)(implicit meta: Metadata) {
+   private def referentOffset: Option[Int] =
+     entries.find(_.name == FieldLayout.Referent).map { fld =>
+       val offset = layout.tys(index(fld)).offset.toInt
+-      val expected = MemoryLayout.sizeOf(ObjectHeader.layout).toInt
++      val expected = MemoryLayout
++        .align(MemoryLayout.sizeOf(ObjectHeader.layout), platform.sizeOfPtr)
++        .toInt
+       if (offset != expected)
+         throw new build.BuildException(
+           s"The referent of ${cls.name.id} must follow the object header at offset $expected, found at $offset"
+@@ -76,4 +101,15 @@ private[codegen] object FieldLayout {
    // The first field of every reference object, see java.lang.ref.Reference
    val Referent: nir.Global.Member =
      Reference.member(nir.Sig.Field("_gc_modified_referent"))
@@ -2352,7 +2475,7 @@ index f465b7bc4..8cde22a41 100644
 +      })
  }
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Generate.scala b/tools/src/main/scala/scala/scalanative/codegen/Generate.scala
-index 68c01272c..c40409dc0 100644
+index 68c01272c..02432cec6 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Generate.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Generate.scala
 @@ -15,14 +15,14 @@ private[codegen] object Generate {
@@ -2381,7 +2504,17 @@ index 68c01272c..c40409dc0 100644
        defns.collect {
          case defn @ nir.Defn.Define(_, name: nir.Global.Member, _, _, _) if name.sig.isClinit =>
            nir.Inst.Let(
-@@ -367,6 +367,24 @@ private[codegen] object Generate {
+@@ -276,7 +276,8 @@ private[codegen] object Generate {
+             val moduleTyName = name.member(nir.Sig.Generated("type"))
+             val moduleTyVal = nir.Val.Global(moduleTyName, nir.Type.Ptr)
+             val instanceName = name.member(nir.Sig.Generated("instance"))
+-            val instanceVal = nir.Val.StructValue(moduleTyVal :: meta.lockWordVals)
++            val instanceVal =
++              nir.Val.StructValue(meta.headerRtti(moduleTyVal) :: meta.lockWordVals)
+             // Needs to be defined as var, const does not allow to modify lock-word field
+             val instanceDefn = nir.Defn.Var(
+               nir.Attrs.None,
+@@ -367,6 +368,31 @@ private[codegen] object Generate {
                val rttiOk = nir.Val.Local(fresh(), nir.Type.Bool)
                val loaded = nir.Val.Local(fresh(), clsTy)
  
@@ -2390,23 +2523,30 @@ index 68c01272c..c40409dc0 100644
 +                if (!meta.useCompactHeaders)
 +                  Seq(nir.Inst.Let(selfRtti.id, nir.Op.Load(nir.Type.Ptr, selfPtr), nir.Next.None))
 +                else {
-+                  val header = nir.Val.Local(fresh(), nir.Type.Long)
-+                  val masked = nir.Val.Local(fresh(), nir.Type.Long)
++                  // The header is the offset of the RTTI in the RTTI space
++                  val header = nir.Val.Local(fresh(), nir.Type.Int)
++                  val masked = nir.Val.Local(fresh(), nir.Type.Int)
++                  val wide = nir.Val.Local(fresh(), nir.Type.Long)
 +                  Seq(
-+                    nir.Inst.Let(header.id, nir.Op.Load(nir.Type.Long, selfPtr), nir.Next.None),
++                    nir.Inst.Let(header.id, nir.Op.Load(nir.Type.Int, selfPtr), nir.Next.None),
 +                    nir.Inst.Let(
 +                      masked.id,
-+                      nir.Op.Bin(nir.Bin.And, nir.Type.Long, header, nir.Val.Long(Metadata.CompactHeaderRttiMask)),
++                      nir.Op.Bin(nir.Bin.And, nir.Type.Int, header, nir.Val.Int(Metadata.CompactHeaderRttiMask)),
 +                      nir.Next.None
 +                    ),
-+                    nir.Inst.Let(selfRtti.id, nir.Op.Conv(nir.Conv.Inttoptr, nir.Type.Ptr, masked), nir.Next.None)
++                    nir.Inst.Let(wide.id, nir.Op.Conv(nir.Conv.Zext, nir.Type.Long, masked), nir.Next.None),
++                    nir.Inst.Let(
++                      selfRtti.id,
++                      nir.Op.Elem(nir.Type.Byte, nir.Val.Global(RttiSpace.Name, nir.Type.Ptr), Seq(wide)),
++                      nir.Next.None
++                    )
 +                  )
 +                }
 +
                Seq(
                  nir.Inst.Label(entry, Seq.empty),
                  nir.Inst.Let(slot.id, selectSlot, nir.Next.None),
-@@ -403,8 +421,8 @@ private[codegen] object Generate {
+@@ -403,8 +429,8 @@ private[codegen] object Generate {
                    selfPtr.id,
                    nir.Op.Conv(nir.Conv.Bitcast, nir.Type.Ptr, self),
                    nir.Next.None
@@ -2432,11 +2572,41 @@ index 0d9a0901b..0c1a85157 100644
    ): Seq[nir.Defn.Define] = {
  
      // filters methods with same name and args but different return type for each given type
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/GlobalSections.scala b/tools/src/main/scala/scala/scalanative/codegen/GlobalSections.scala
+index 93e1a8468..97d52a934 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/GlobalSections.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/GlobalSections.scala
+@@ -55,6 +55,9 @@ private[codegen] final class GlobalSections {
+   import GlobalSections.Section
+ 
+   private val globals = TrieMap.empty[nir.Global, Section]
++
++  /** Where each RTTI is in the RTTI space, when there is one */
++  @volatile var rttiSpace: Option[RttiSpace.Layout] = None
+   private val constants = TrieMap.empty[nir.Val, Section]
+ 
+   def define(section: Section, definition: nir.Defn.Var): nir.Defn.Var = {
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala b/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
+index 35a111089..ef01fc780 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/IncrementalCodeGenContext.scala
+@@ -35,8 +35,9 @@ private[codegen] class IncrementalCodeGenContext(config: build.Config) {
+     }
+   }
+ 
+-  def addEntry(packageName: String, defns: Seq[nir.Defn]): Unit = {
+-    val hash = defns.foldLeft(0L)(_ + _.hashCode())
++  /** `salt` covers what `defns` depend on outside their NIR (RTTI offsets) */
++  def addEntry(packageName: String, defns: Seq[nir.Defn], salt: Long): Unit = {
++    val hash = defns.foldLeft(salt)(_ + _.hashCode())
+     val prevHash = pack2hashPrev.get(packageName)
+     package2hash.put(packageName, hash)
+     if (prevHash.forall(_ != hash)) {
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
-index a896bdb1c..28f95d0ec 100644
+index a896bdb1c..b281822e8 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Lower.scala
-@@ -17,15 +17,43 @@ private[scalanative] object Lower {
+@@ -17,15 +17,46 @@ private[scalanative] object Lower {
    def apply(
        defns: Seq[nir.Defn]
    )(implicit meta: Metadata, logger: build.Logger): Seq[nir.Defn] =
@@ -2459,6 +2629,9 @@ index a896bdb1c..28f95d0ec 100644
 +      def lockWordType = metaRaw.lockWordType
 +      def usesLockWords = metaRaw.usesLockWords
 +      def useCompactHeaders = metaRaw.useCompactHeaders
++      def headerRttiType = metaRaw.headerRttiType
++      def headerRtti(rtti: nir.Val) = metaRaw.headerRtti(rtti)
++      def arrayHeaderPadVals = metaRaw.arrayHeaderPadVals
 +      def layout(cls: Class) = knowledge.layout(cls)
 +      def vtable(cls: Class) = knowledge.vtable(cls)
 +      val rtti = knowledge.rtti
@@ -2485,7 +2658,7 @@ index a896bdb1c..28f95d0ec 100644
  
      private val zero = nir.Val.Int(0)
      private val one = nir.Val.Int(1)
-@@ -37,7 +65,7 @@ private[scalanative] object Lower {
+@@ -37,7 +68,7 @@ private[scalanative] object Lower {
  
      // Type of the bare runtime type information struct.
      private val classRttiType =
@@ -2494,7 +2667,7 @@ index a896bdb1c..28f95d0ec 100644
  
      // Names of the fields of the java.lang.String in the memory layout order.
      private val stringFieldNames = {
-@@ -53,11 +81,15 @@ private[scalanative] object Lower {
+@@ -53,11 +84,15 @@ private[scalanative] object Lower {
      private val staticStackallocs = new util.ScopedVar[StaticStackallocs]
      private implicit val currentDefn: util.ScopedVar[nir.Defn.Define] = new util.ScopedVar()
      private implicit val intrinsicMethods: util.ScopedVar[mutable.Map[nir.Local, IntrinsicCall]] = new util.ScopedVar()
@@ -2512,7 +2685,7 @@ index a896bdb1c..28f95d0ec 100644
      }
      class BlockInfo(
          val nullGuardedVals: mutable.Set[nir.Val] = mutable.Set.empty
-@@ -66,7 +98,7 @@ private[scalanative] object Lower {
+@@ -66,7 +101,7 @@ private[scalanative] object Lower {
      // Whether `v` is checked on every path from the method's entry to this point of `currentBlock`.
      // An exception edge leaves its block in the middle, so its target is unchecked on entry.
      def isNullGuarded(currentBlock: Block, v: nir.Val): Boolean = {
@@ -2521,7 +2694,7 @@ index a896bdb1c..28f95d0ec 100644
        def uncheckedOnEntry(block: Block) =
          block.isEntry || block.inEdges.isEmpty || block.inEdges.exists(_.next.isInstanceOf[nir.Next.Unwind])
        // Walks back through the blocks that do not check `v`, looking for one entered unchecked
-@@ -104,7 +136,12 @@ private[scalanative] object Lower {
+@@ -104,7 +139,12 @@ private[scalanative] object Lower {
          nir.Next.Unwind(exc, nir.Next.Label(handler, Seq(exc)))
        }
  
@@ -2534,7 +2707,7 @@ index a896bdb1c..28f95d0ec 100644
        val buf = mutable.UnrolledBuffer.empty[nir.Defn]
  
        defns.foreach {
-@@ -114,6 +151,8 @@ private[scalanative] object Lower {
+@@ -114,6 +154,8 @@ private[scalanative] object Lower {
            ()
          case nir.Defn.Var(attrs, FieldRef(_: Class, _), _, _) if !attrs.isExtern =>
            ()
@@ -2543,7 +2716,7 @@ index a896bdb1c..28f95d0ec 100644
          case defn =>
            buf += onDefn(defn)
        }
-@@ -121,6 +160,40 @@ private[scalanative] object Lower {
+@@ -121,6 +163,40 @@ private[scalanative] object Lower {
        buf.toSeq
      }
  
@@ -2584,7 +2757,7 @@ index a896bdb1c..28f95d0ec 100644
      override def onDefn(defn: nir.Defn): nir.Defn = defn match {
        case defn: nir.Defn.Define =>
          val nir.Type.Function(_, ty) = defn.ty
-@@ -213,12 +286,27 @@ private[scalanative] object Lower {
+@@ -213,12 +289,27 @@ private[scalanative] object Lower {
          }
        )
  
@@ -2612,7 +2785,7 @@ index a896bdb1c..28f95d0ec 100644
          case _ => ()
        }
        // Zeroed at the original position, see genStackallocOp
-@@ -302,8 +390,8 @@ private[scalanative] object Lower {
+@@ -302,8 +393,8 @@ private[scalanative] object Lower {
            else
              currentDefn.get.name match {
                case nir.Global.Member(ClassRef(cls), sig) if sig.isCtor && {
@@ -2623,7 +2796,7 @@ index a896bdb1c..28f95d0ec 100644
                    } =>
                  // Release memory fence after initialization of constructor with final fields
                  buf.fence(nir.MemoryOrder.Release)
-@@ -312,6 +400,7 @@ private[scalanative] object Lower {
+@@ -312,6 +403,7 @@ private[scalanative] object Lower {
            val retVal =
              if (v.ty == nir.Type.Unit) optionallyBoxedUnit(v)
              else genVal(buf, v)
@@ -2631,7 +2804,7 @@ index a896bdb1c..28f95d0ec 100644
            leaveEntry()
            buf += nir.Inst.Ret(retVal)
  
-@@ -474,7 +563,7 @@ private[scalanative] object Lower {
+@@ -474,7 +566,7 @@ private[scalanative] object Lower {
              val toty = nir.Val.Local(fresh(), nir.Type.Ptr)
  
              buf.label(slowPath, Seq(obj, toty))
@@ -2640,7 +2813,7 @@ index a896bdb1c..28f95d0ec 100644
              buf.call(
                throwClassCastTy,
                throwClassCastVal,
-@@ -580,6 +669,7 @@ private[scalanative] object Lower {
+@@ -580,6 +672,7 @@ private[scalanative] object Lower {
            // Jump to the label and skip unwinding
            buf.jump(toLabel.id, Seq(exc))
          case _ =>
@@ -2648,7 +2821,7 @@ index a896bdb1c..28f95d0ec 100644
            // Invoke scalanative_throw and let exception handling find the handler
            genOp(buf, fresh(), nir.Op.Call(throwSig, throw_, Seq(exc)))
            buf.unreachable(nir.Next.None)
-@@ -671,6 +761,13 @@ private[scalanative] object Lower {
+@@ -671,6 +764,13 @@ private[scalanative] object Lower {
        }
      }
  
@@ -2662,7 +2835,7 @@ index a896bdb1c..28f95d0ec 100644
      def genGuardNotNull(
          buf: nir.InstructionBuilder,
          obj: nir.Val
-@@ -695,6 +792,179 @@ private[scalanative] object Lower {
+@@ -695,6 +795,181 @@ private[scalanative] object Lower {
          case _ => ()
        }
  
@@ -2701,7 +2874,8 @@ index a896bdb1c..28f95d0ec 100644
 +        .map(_.const)
 +
 +    /** Reads the rtti of a real (untagged, non-null) object from its header.
-+     *  With compact headers the upper bits of the header word hold the lock.
++     *  With compact headers the header word is the offset of the RTTI in the
++     *  RTTI space, with the lock state in its lowest bits.
 +     */
 +    private def loadHeaderRtti(
 +        buf: nir.InstructionBuilder,
@@ -2710,9 +2884,10 @@ index a896bdb1c..28f95d0ec 100644
 +      import buf._
 +      if (!meta.useCompactHeaders) let(nir.Op.Load(nir.Type.Ptr, obj), unwind)
 +      else {
-+        val header = let(nir.Op.Load(nir.Type.Long, obj), unwind)
-+        val rtti = bin(nir.Bin.And, nir.Type.Long, header, nir.Val.Long(Metadata.CompactHeaderRttiMask), unwind)
-+        conv(nir.Conv.Inttoptr, nir.Type.Ptr, rtti, unwind)
++        val header = let(nir.Op.Load(nir.Type.Int, obj), unwind)
++        val offset = bin(nir.Bin.And, nir.Type.Int, header, nir.Val.Int(Metadata.CompactHeaderRttiMask), unwind)
++        val wide = conv(nir.Conv.Zext, nir.Type.Long, offset, unwind)
++        elem(nir.Type.Byte, nir.Val.Global(RttiSpace.Name, nir.Type.Ptr), Seq(wide), unwind)
 +      }
 +    }
 +
@@ -2842,7 +3017,7 @@ index a896bdb1c..28f95d0ec 100644
      def genGuardInBounds(
          buf: nir.InstructionBuilder,
          idx: nir.Val,
-@@ -912,7 +1182,7 @@ private[scalanative] object Lower {
+@@ -912,7 +1187,7 @@ private[scalanative] object Lower {
                ownerName == "java.lang.AbstractStringBuilder" ||
                ownerName == "java.lang.System$"
              }
@@ -2851,7 +3026,7 @@ index a896bdb1c..28f95d0ec 100644
        }
      }
  
-@@ -985,7 +1255,7 @@ private[scalanative] object Lower {
+@@ -985,7 +1260,7 @@ private[scalanative] object Lower {
        branch(isFound, nir.Next.Label(found, Seq(itables, start)), nir.Next(nextL))
  
        label(nextL)
@@ -2860,7 +3035,7 @@ index a896bdb1c..28f95d0ec 100644
          val after = let(nir.Op.Bin(nir.Bin.Iadd, nir.Type.Int, start, one), unwind)
          val next = let(nir.Op.Bin(nir.Bin.And, nir.Type.Int, after, mask), unwind)
          if (implemented) jump(found, Seq(itables, next))
-@@ -1029,9 +1299,9 @@ private[scalanative] object Lower {
+@@ -1029,9 +1304,9 @@ private[scalanative] object Lower {
        val mask = let(nir.Op.Load(nir.Type.Int, maskPtr), unwind)
        val itablesPtr = let(nir.Op.Elem(ClassRtti.layout, rttiPtr, ClassRttiItablesPath), unwind)
        val itables = let(nir.Op.Load(nir.Type.Ptr, itablesPtr), unwind)
@@ -2872,7 +3047,7 @@ index a896bdb1c..28f95d0ec 100644
          else {
            val shiftPtr = let(nir.Op.Elem(ClassRtti.layout, rttiPtr, ClassRttiITableShiftPath), unwind)
            val shift = let(nir.Op.Load(nir.Type.Int, shiftPtr), unwind)
-@@ -1099,7 +1369,7 @@ private[scalanative] object Lower {
+@@ -1099,7 +1374,7 @@ private[scalanative] object Lower {
        }
      }
      def shouldSwitchThreadState(name: nir.Global.Member) =
@@ -2881,7 +3056,7 @@ index a896bdb1c..28f95d0ec 100644
          val attrs = info.attrs
          attrs.isExtern && {
            config.semanticsConfig.strictExternCallSemantics match {
-@@ -1111,13 +1381,14 @@ private[scalanative] object Lower {
+@@ -1111,13 +1386,14 @@ private[scalanative] object Lower {
  
      object shouldCarrierCompensateBlockingExtern {
        private val usesVirtualThreads = platform.isMultithreadingEnabled && {
@@ -2899,7 +3074,7 @@ index a896bdb1c..28f95d0ec 100644
            val attrs = info.attrs
            attrs.isExtern && attrs.isBlocking
          }
-@@ -1207,7 +1478,12 @@ private[scalanative] object Lower {
+@@ -1207,7 +1483,12 @@ private[scalanative] object Lower {
            s"The virtual table of ${cls.name} does not contain $sig"
          )
  
@@ -2913,7 +3088,7 @@ index a896bdb1c..28f95d0ec 100644
          val methptrptr = let(
            nir.Op.Elem(
              rtti(cls).struct,
-@@ -1226,7 +1502,7 @@ private[scalanative] object Lower {
+@@ -1226,7 +1507,7 @@ private[scalanative] object Lower {
              .indexOf(sig)
              .ensuring(_ >= 0, s"Not found ${sig.show} entry in ${trt.name.id} methods")
          )
@@ -2922,7 +3097,7 @@ index a896bdb1c..28f95d0ec 100644
  
          def genLoadMethod(itables: nir.Val, pos: nir.Val): nir.Val = {
            val methodsPtr = let(nir.Op.Elem(ITable.layout, itables, Seq(pos, nir.Val.Int(ITable.MethodsIdx))), unwind)
-@@ -1237,7 +1513,7 @@ private[scalanative] object Lower {
+@@ -1237,7 +1518,7 @@ private[scalanative] object Lower {
  
          // Every class of the program stores `trt` in the slot where its
          // lookup starts, a single probe finds it
@@ -2931,7 +3106,7 @@ index a896bdb1c..28f95d0ec 100644
            val (_, itables, pos) = genItableStart(buf, rttiPtr, trt)
            let(n, nir.Op.Copy(genLoadMethod(itables, pos)), unwind)
          } else {
-@@ -1258,7 +1534,7 @@ private[scalanative] object Lower {
+@@ -1258,7 +1539,7 @@ private[scalanative] object Lower {
        }
  
        def genMethodLookup(scope: ScopeInfo): Unit = {
@@ -2940,7 +3115,7 @@ index a896bdb1c..28f95d0ec 100644
            case Seq() =>
              // logger.warn(s"Unable to call ${sig.show} on instance of ${scope.name.id} in ${srcPosition.show}. It would result in NullPointerException at runtime")
              let(n, nir.Op.Copy(nir.Val.Null), unwind)
-@@ -1268,7 +1544,7 @@ private[scalanative] object Lower {
+@@ -1268,7 +1549,7 @@ private[scalanative] object Lower {
              obj.ty match {
                case ClassRef(cls) =>
                  genClassVirtualLookup(cls)
@@ -2949,7 +3124,7 @@ index a896bdb1c..28f95d0ec 100644
                  genClassVirtualLookup(Object)
                case TraitRef(trt) =>
                  genTraitVirtualLookup(trt)
-@@ -1278,8 +1554,8 @@ private[scalanative] object Lower {
+@@ -1278,8 +1559,8 @@ private[scalanative] object Lower {
        }
  
        def genStaticMethod(cls: Class): Unit = {
@@ -2960,7 +3135,7 @@ index a896bdb1c..28f95d0ec 100644
            .getOrElse {
              unsupported(
                s"Did not find the signature of method $sig in ${cls.name}"
-@@ -1289,7 +1565,7 @@ private[scalanative] object Lower {
+@@ -1289,7 +1570,7 @@ private[scalanative] object Lower {
        }
  
        def staticMethodIn(cls: Class): Boolean =
@@ -2969,7 +3144,7 @@ index a896bdb1c..28f95d0ec 100644
  
        // We check type of original value, because it may change inside `genVal` transformation
        // Eg. nir.Val.String is transformed to Const(StructValue) which changes type from Ref to Ptr
-@@ -1343,7 +1619,7 @@ private[scalanative] object Lower {
+@@ -1343,7 +1624,7 @@ private[scalanative] object Lower {
  
        def genReflectiveLookup(): nir.Val = {
          // The program's reflective proxy table, see ReflectiveProxyTable
@@ -2978,7 +3153,7 @@ index a896bdb1c..28f95d0ec 100644
          val proxy = call(
            dyndispatchSig,
            dyndispatch,
-@@ -1404,17 +1680,27 @@ private[scalanative] object Lower {
+@@ -1404,17 +1685,27 @@ private[scalanative] object Lower {
          scopeId: nir.ScopeId
      ): nir.Val = {
        import buf._
@@ -3010,7 +3185,7 @@ index a896bdb1c..28f95d0ec 100644
            if (superclassCount < CommonMemoryLayouts.LineageSize) {
              val ancestorPtr = let(
                nir.Op.Elem(ClassRtti.layout, typeptr, Seq(zero, nir.Val.Int(ClassRtti.LineageIdx), nir.Val.Int(superclassCount))),
-@@ -1454,16 +1740,16 @@ private[scalanative] object Lower {
+@@ -1454,16 +1745,16 @@ private[scalanative] object Lower {
              result
            }
  
@@ -3030,7 +3205,7 @@ index a896bdb1c..28f95d0ec 100644
            val foundL, missingL, resultL = fresh()
            genItableProbe(buf, rttiPtr, trt, implemented = false)(found = foundL, missing = missingL)
  
-@@ -1503,7 +1789,7 @@ private[scalanative] object Lower {
+@@ -1503,7 +1794,7 @@ private[scalanative] object Lower {
  
            label(checkIfIsInstanceOfL)
            val isInstanceOf = genIsOp(buf, ty, v)
@@ -3039,7 +3214,7 @@ index a896bdb1c..28f95d0ec 100644
            branch(
              isInstanceOf,
              nir.Next(castL),
-@@ -1528,7 +1814,7 @@ private[scalanative] object Lower {
+@@ -1528,7 +1819,7 @@ private[scalanative] object Lower {
      )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
        val size = op.ty match {
          case ClassRef(cls) if op.ty != nir.Type.Unit =>
@@ -3048,7 +3223,7 @@ index a896bdb1c..28f95d0ec 100644
              val nir.Global.Top(clsName) = cls.name
              logger.warn(
                s"Referencing size of non allocated type ${clsName} in ${srcPosition.show}"
-@@ -1553,6 +1839,96 @@ private[scalanative] object Lower {
+@@ -1553,6 +1844,96 @@ private[scalanative] object Lower {
          buf: nir.InstructionBuilder,
          n: nir.Local,
          op: nir.Op.Classalloc
@@ -3064,7 +3239,7 @@ index a896bdb1c..28f95d0ec 100644
 +          Seq(slot, nir.Val.Int(0), nir.Val.Size(size)),
 +          unwind
 +        )
-+        buf.store(nir.Type.Ptr, slot, rtti(cls).const, unwind)
++        buf.store(meta.headerRttiType, slot, meta.headerRtti(rtti(cls).const), unwind)
 +        buf.let(n, nir.Op.Conv(nir.Conv.Bitcast, op.resty, slot), unwind)
 +      } else genHeapClassallocOp(buf, n, op)
 +    }
@@ -3122,7 +3297,7 @@ index a896bdb1c..28f95d0ec 100644
 +        val p = buf.elem(ArrayHeader.layout, slot, Seq(zero, nir.Val.Int(idx)), unwind)
 +        buf.store(ty, p, v, unwind)
 +      }
-+      hdr(ArrayHeader.RttiIdx, nir.Type.Ptr, rtti(arrCls).const)
++      hdr(ArrayHeader.RttiIdx, meta.headerRttiType, meta.headerRtti(rtti(arrCls).const))
 +      hdr(ArrayHeader.LengthIdx, nir.Type.Int, nir.Val.Int(len))
 +      hdr(ArrayHeader.StrideIdx, nir.Type.Int, nir.Val.Int(MemoryLayout.sizeOf(ty).toInt))
 +      op.init match {
@@ -3145,7 +3320,7 @@ index a896bdb1c..28f95d0ec 100644
      )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
        val nir.Op.Classalloc(ClassRef(cls), v) = op: @unchecked
        val zone = v.map(genVal(buf, _))
-@@ -1850,6 +2226,33 @@ private[scalanative] object Lower {
+@@ -1850,6 +2231,33 @@ private[scalanative] object Lower {
        val nir.Op.Box(ty, v) = op
        val from = genVal(buf, v)
  
@@ -3179,7 +3354,7 @@ index a896bdb1c..28f95d0ec 100644
        val methodName = BoxTo(ty)
        val moduleName = methodName.top
  
-@@ -1867,6 +2270,161 @@ private[scalanative] object Lower {
+@@ -1867,6 +2275,161 @@ private[scalanative] object Lower {
        )
      }
  
@@ -3341,7 +3516,7 @@ index a896bdb1c..28f95d0ec 100644
      def genUnboxOp(
          buf: nir.InstructionBuilder,
          n: nir.Local,
-@@ -1875,19 +2433,159 @@ private[scalanative] object Lower {
+@@ -1875,19 +2438,159 @@ private[scalanative] object Lower {
        val nir.Op.Unbox(ty, v) = op
        val from = genVal(buf, v)
  
@@ -3511,7 +3686,7 @@ index a896bdb1c..28f95d0ec 100644
          unwind
        )
      }
-@@ -1899,8 +2597,8 @@ private[scalanative] object Lower {
+@@ -1899,8 +2602,8 @@ private[scalanative] object Lower {
      )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId) = {
        val nir.Op.Module(name) = op
  
@@ -3522,7 +3697,7 @@ index a896bdb1c..28f95d0ec 100644
            val instance = name.member(nir.Sig.Generated("instance"))
            buf.let(
              n,
-@@ -1923,6 +2621,10 @@ private[scalanative] object Lower {
+@@ -1923,6 +2626,10 @@ private[scalanative] object Lower {
          op: nir.Op.Arrayalloc
      )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
        val nir.Op.Arrayalloc(ty, v1, v2) = op
@@ -3533,7 +3708,7 @@ index a896bdb1c..28f95d0ec 100644
        val init = genVal(buf, v1)
        val zone = v2.map(genVal(buf, _))
        init match {
-@@ -1983,10 +2685,15 @@ private[scalanative] object Lower {
+@@ -1983,10 +2690,15 @@ private[scalanative] object Lower {
      }
  
      private def arrayMemoryLayout(
@@ -3550,7 +3725,7 @@ index a896bdb1c..28f95d0ec 100644
      )
      private def arrayValuePath(idx: nir.Val) = Seq(zero, one, idx)
  
-@@ -2003,7 +2710,7 @@ private[scalanative] object Lower {
+@@ -2003,7 +2715,7 @@ private[scalanative] object Lower {
        genArraylengthOp(buf, len, nir.Op.Arraylength(arr))
        genGuardInBounds(buf, idx, nir.Val.Local(len, nir.Type.Int))
  
@@ -3559,7 +3734,7 @@ index a896bdb1c..28f95d0ec 100644
        val elemPtr = buf.elem(arrTy, arr, arrayValuePath(idx), unwind)
        genLoadOp(buf, n, nir.Op.Load(ty, elemPtr, Some(nir.MemoryOrder.Unordered)))
      }
-@@ -2020,7 +2727,7 @@ private[scalanative] object Lower {
+@@ -2020,7 +2732,7 @@ private[scalanative] object Lower {
        genArraylengthOp(buf, len, nir.Op.Arraylength(arr))
        genGuardInBounds(buf, idx, nir.Val.Local(len, nir.Type.Int))
  
@@ -3568,7 +3743,7 @@ index a896bdb1c..28f95d0ec 100644
        val elemPtr = buf.elem(arrTy, arr, arrayValuePath(idx), unwind)
        genStoreOp(buf, n, nir.Op.Store(ty, elemPtr, value, Some(nir.MemoryOrder.Unordered)))
      }
-@@ -2100,13 +2807,13 @@ private[scalanative] object Lower {
+@@ -2100,13 +2812,14 @@ private[scalanative] object Lower {
  
        val chars = value.toCharArray
        val charsLength = nir.Val.Int(chars.length)
@@ -3576,15 +3751,17 @@ index a896bdb1c..28f95d0ec 100644
 +      val charsConst = registerConstant(
          GlobalSections.Strings,
          nir.Val.StructValue(
-           rtti(CharArrayCls).const ::
+-          rtti(CharArrayCls).const ::
++          meta.headerRtti(rtti(CharArrayCls).const) ::
              meta.lockWordVals :::
              charsLength ::
 -            nir.Val.Int(2) :: // stride is used only by GC
 +            nir.Val.Int(2) :: // stride, used only by GC
++            meta.arrayHeaderPadVals :::
              nir.Val.ArrayValue(
                nir.Type.Char,
                chars.toSeq.map(nir.Val.Char(_))
-@@ -2127,7 +2834,7 @@ private[scalanative] object Lower {
+@@ -2127,10 +2840,10 @@ private[scalanative] object Lower {
            util.unreachable
        }
  
@@ -3592,8 +3769,12 @@ index a896bdb1c..28f95d0ec 100644
 +      registerConstant(
          GlobalSections.Strings,
          nir.Val.StructValue(
-           rtti(StringCls).const ::
-@@ -2190,7 +2897,7 @@ private[scalanative] object Lower {
+-          rtti(StringCls).const ::
++          meta.headerRtti(rtti(StringCls).const) ::
+             meta.lockWordVals ++
+             fieldValues
+         )
+@@ -2190,7 +2903,7 @@ private[scalanative] object Lower {
      object UnsignedMultiplyHigh extends IntrinsicCall
  
      private def resolveIntrinsicCall(owner: nir.Global.Top, sig: nir.Sig)(implicit
@@ -3602,7 +3783,7 @@ index a896bdb1c..28f95d0ec 100644
          logger: build.Logger,
          srcPos: nir.SourcePosition,
          currentDefn: util.ScopedVar[nir.Defn.Define]
-@@ -2202,7 +2909,7 @@ private[scalanative] object Lower {
+@@ -2202,7 +2915,7 @@ private[scalanative] object Lower {
          case (_, nir.Sig.Method("intrinsic", _, _)) if owner == nir.Rt.Runtime.name =>
            val symbol @ nir.Global.Member(owner, sig) = currentDefn.get.name
            // Reflective proxies might make the intrinsic method reachable, but they're unlikely to be called
@@ -3611,7 +3792,7 @@ index a896bdb1c..28f95d0ec 100644
            // Ingore intrinsic call form intrinsic methods. It was already handled
            if (!isMaybeReflectiveProxy && resolveIntrinsicCall(owner, sig).isEmpty) {
              logger.warn(s"Instrinsic method was not resolved by Scala Native, it would lead to runtime exception. Defined at ${srcPos.show}")
-@@ -2213,7 +2920,7 @@ private[scalanative] object Lower {
+@@ -2213,7 +2926,7 @@ private[scalanative] object Lower {
      }
  
      def unapply(op: nir.Op.Call)(implicit
@@ -3620,7 +3801,7 @@ index a896bdb1c..28f95d0ec 100644
          logger: build.Logger,
          srcPos: nir.SourcePosition,
          intrinsicMethods: util.ScopedVar[mutable.Map[nir.Local, IntrinsicCall]],
-@@ -2227,7 +2934,7 @@ private[scalanative] object Lower {
+@@ -2227,7 +2940,7 @@ private[scalanative] object Lower {
      // Required only in non-optimized builds
      def unapply(
          op: nir.Op.Method
@@ -3629,7 +3810,7 @@ index a896bdb1c..28f95d0ec 100644
        op.obj.ty match {
          case owner: nir.Type.RefKind => resolveIntrinsicCall(owner.className, op.sig)
          case _                       => None
-@@ -2605,6 +3312,18 @@ private[scalanative] object Lower {
+@@ -2605,6 +3318,18 @@ private[scalanative] object Lower {
      buf += CharArrayName
      buf += BoxesRunTime
      buf += RuntimeBoxes
@@ -4349,16 +4530,17 @@ index 000000000..308265623
 +  }
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala b/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
-index 8828f8662..f9e4aae7f 100644
+index 8828f8662..d3e44f100 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/Metadata.scala
-@@ -13,7 +13,13 @@ private[scalanative] class Metadata(
+@@ -13,10 +13,39 @@ private[scalanative] class Metadata(
    def config: build.NativeConfig = buildConfig.compilerConfig
    private implicit def self: Metadata = this
  
 -  final val usesLockWords = platform.isMultithreadingEnabled
-+  /** Compact headers: the lock bits live in the upper 16 bits of the RTTI
-+   *  word of the object header instead of a separate lock word, see
++  /** Compact headers: the header is a single 32 bit word, the offset of the
++   *  RTTI in the RTTI space (see RttiSpace) with the lock state in its 2
++   *  lowest bits instead of a separate lock word, see
 +   *  Metadata.CompactHeaderRttiMask.
 +   */
 +  final val useCompactHeaders = platform.useCompactHeaders
@@ -4367,18 +4549,44 @@ index 8828f8662..f9e4aae7f 100644
    val lockWordType = if (usesLockWords) Some(nir.Type.Ptr) else None
    private[codegen] val lockWordVals = lockWordType.map(_ => nir.Val.Null).toList
  
-@@ -158,3 +164,12 @@ private[scalanative] class Metadata(
++  /** Type of the RTTI word of an object header */
++  val headerRttiType: nir.Type =
++    if (useCompactHeaders) nir.Type.Int else nir.Type.Ptr
++
++  /** The RTTI word of the header of an object of type `rtti`. With compact
++   *  headers a global of type Int: codegen gives it the offset of the RTTI in
++   *  the RTTI space, known only once the whole program is laid out.
++   */
++  def headerRtti(rtti: nir.Val): nir.Val = rtti match {
++    case nir.Val.Global(name, _) if useCompactHeaders =>
++      nir.Val.Global(name, nir.Type.Int)
++    case _ => rtti
++  }
++
++  /** Pads the compact array header to 16 bytes, the elements of every array
++   *  start at the same offset as with a pointer-sized RTTI word.
++   */
++  private[codegen] val arrayHeaderPadType: List[nir.Type] =
++    if (useCompactHeaders) List(nir.Type.Int) else Nil
++  private[codegen] val arrayHeaderPadVals: List[nir.Val] =
++    arrayHeaderPadType.map(_ => nir.Val.Int(0))
++
+   val layouts = new CommonMemoryLayouts()
+   val globalSections = new GlobalSections
+   val rtti = mutable.Map.empty[linker.Info, RuntimeTypeInformation]
+@@ -158,3 +187,13 @@ private[scalanative] class Metadata(
      }
    }
  }
 +
 +private[scalanative] object Metadata {
 +
-+  /** With compact headers the first word of an object holds the lock bits in
-+   *  its upper 16 bits and the RTTI pointer in the lower 48. Keep in sync with
++  /** With compact headers the header of an object is a 32 bit word, the
++   *  offset of its RTTI in the RTTI space with the lock state in its 2 lowest
++   *  bits (runtime.monitor.CompactMonitor). Keep in sync with
 +   *  HEADER_RTTI_MASK in ObjectHeader.h and runtime.MemoryLayout.
 +   */
-+  final val CompactHeaderRttiMask = 0x0000ffffffffffffL
++  final val CompactHeaderRttiMask = ~3
 +}
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala b/tools/src/main/scala/scala/scalanative/codegen/PlatformInfo.scala
 index 8e0e2b960..ee43f2ee1 100644
@@ -4400,6 +4608,125 @@ index 8e0e2b960..ee43f2ee1 100644
      useOpaquePointers =
        Discover.features.opaquePointers(config.compilerConfig).isAvailable,
      useGCYieldPointTraps = config.useTrapBasedGCYieldPoints,
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/RttiSpace.scala b/tools/src/main/scala/scala/scalanative/codegen/RttiSpace.scala
+new file mode 100644
+index 000000000..48c50a05d
+--- /dev/null
++++ b/tools/src/main/scala/scala/scalanative/codegen/RttiSpace.scala
+@@ -0,0 +1,100 @@
++package scala.scalanative.codegen
++
++import scala.scalanative.nir
++
++/** With compact object headers every RTTI is placed in one global, the RTTI
++ *  space, at an offset known to codegen: an object header can then hold the
++ *  offset of its RTTI (a narrow pointer, like HotSpot's compressed class
++ *  pointers) instead of its address.
++ *
++ *  The RTTI itself is unchanged, it still depends only on its type and its
++ *  ancestors: only where it is stored is decided for the whole program. Each
++ *  RTTI keeps its symbol, an alias of its place in the space, so it is
++ *  referenced by name as before (NIR, other object files, the C runtime).
++ */
++private[codegen] object RttiSpace {
++
++  /** Name of the global holding every RTTI */
++  val Name: nir.Global.Member =
++    nir.Global.Top("scala.scalanative.runtime.RttiSpace")
++      .member(nir.Sig.Generated("space"))
++
++  /** Symbol of the start of the space for the C runtime, see rtti_space.c */
++  final val CName = "scalanative_rtti_space"
++
++  /** The offsets computed here aren't where LLVM puts the RTTI */
++  final class LayoutMismatch(msg: String) extends RuntimeException(msg)
++
++  /** Offsets of the RTTI in the space, by name */
++  final class Layout(val entries: Seq[(nir.Global.Member, Long)]) {
++    private val offsets = entries.toMap
++    def offsetOf(rtti: nir.Global): Option[Long] = rtti match {
++      case m: nir.Global.Member => offsets.get(m)
++      case _                    => None
++    }
++    def size: Long = entries.size
++
++    /** Hash of the offsets `defns` refer to (`Metadata.headerRtti` values).
++     *
++     *  Incremental codegen reuses the object file of a group of definitions
++     *  whose NIR hasn't changed, but an offset isn't part of the NIR: adding
++     *  or removing a class moves the RTTI after it. Mixing this into the
++     *  group's key recompiles only the groups that use a moved offset.
++     */
++    def offsetsKey(defns: Seq[nir.Defn]): Long = {
++      object traverse extends nir.Traverse {
++        var key = 0L
++        override def onVal(value: nir.Val): Unit = value match {
++          case nir.Val.Global(name, nir.Type.Int) =>
++            offsetOf(name).foreach { offset =>
++              key = key + name.hashCode().toLong * 31 + offset
++            }
++          case _ => super.onVal(value)
++        }
++      }
++      traverse.onDefns(defns)
++      traverse.key
++    }
++  }
++
++  def isEnabled(implicit meta: Metadata): Boolean = meta.useCompactHeaders
++
++  /** Replaces the RTTI definitions of `assembly` by the RTTI space */
++  def apply(
++      assembly: Seq[nir.Defn]
++  )(implicit meta: Metadata): (Seq[nir.Defn], Option[Layout]) =
++    if (!isEnabled) (assembly, None)
++    else if (!meta.platform.useOpaquePointers)
++      throw new scala.scalanative.build.BuildException(
++        "Compact object headers need LLVM 15 or newer, disable them with compactHeaders = false"
++      )
++    else {
++      def isRtti(defn: nir.Defn): Boolean = defn match {
++        case v: nir.Defn.Var =>
++          !v.attrs.isExtern &&
++            meta.globalSections.forGlobal(v.name).contains(GlobalSections.ClassInfo)
++        case _ => false
++      }
++      val (rttis, rest) = assembly.partition(isRtti)
++      if (rttis.isEmpty) (assembly, None)
++      else {
++        // Sorted by name: the same program always gets the same offsets
++        val sorted = rttis.sortBy(_.name).map(_.asInstanceOf[nir.Defn.Var])
++        val values = sorted.map(_.rhs)
++        val value = nir.Val.StructValue(values)
++        // Same layout as LLVM gives the struct
++        val layout = MemoryLayout(values.map(_.ty))(meta.platform)
++        val entries = sorted.zip(layout.tys).map {
++          case (defn, positioned) =>
++            defn.name.asInstanceOf[nir.Global.Member] -> positioned.offset
++        }
++        val space = meta.globalSections.define(
++          GlobalSections.ClassInfo,
++          nir.Defn.Var(nir.Attrs.None, Name, value.ty, value)(
++            nir.SourcePosition.NoPosition
++          )
++        )
++        (rest :+ space, Some(new Layout(entries)))
++      }
++    }
++}
+diff --git a/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala b/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala
+index 433f2a774..913c4b001 100644
+--- a/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala
++++ b/tools/src/main/scala/scala/scalanative/codegen/RuntimeTypeInformation.scala
+@@ -79,7 +79,7 @@ private[codegen] class RuntimeTypeInformation(info: ScopeInfo)(implicit
+     )
+ 
+     val base = nir.Val.StructValue(
+-      classConst :: meta.lockWordVals :::
++      meta.headerRtti(classConst) :: meta.lockWordVals :::
+         flags ::
+         interfacesCount ::
+         interfaces ::
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala b/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala
 index e157b2bd1..a8c209846 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/SourceCodeCache.scala
@@ -4454,21 +4781,57 @@ index 38143c6d9..e2ca6f408 100644
    val value: nir.Val =
      nir.Val.ArrayValue(nir.Type.Ptr, slots.map(impls).toSeq)
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
-index cea5a829b..d9677d834 100644
+index cea5a829b..9b58d2af3 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/AbstractCodeGen.scala
-@@ -293,6 +293,10 @@ private[codegen] abstract class AbstractCodeGen(
-       str("""], section "llvm.metadata"""")
+@@ -12,7 +12,7 @@ import scala.scalanative.build.{BuildTarget, Discover}
+ import scala.scalanative.codegen.llvm.Metadata.conversions._
+ import scala.scalanative.codegen.llvm.compat.os.OsCompat
+ import scala.scalanative.codegen.{
+-  GlobalSections, Lower, Metadata => CodeGenMetadata
++  GlobalSections, Lower, Metadata => CodeGenMetadata, RttiSpace
+ }
+ import scala.scalanative.io.VirtualDirectory
+ import scala.scalanative.nir.ControlFlow.{Block, Graph => CFG}
+@@ -157,6 +157,7 @@ private[codegen] abstract class AbstractCodeGen(
+         newline()
+         genDefn(defn)
+         generated += mn
++        if (defn.name == RttiSpace.Name) genRttiAliases()
+       }
      }
  
-+  /** Compact headers start with a 32 bit word, so a static object is only 4
-+   *  byte aligned by default. Keep them aligned like the heap objects, both the
-+   *  GC and tagged pointers rely on it.
-+   */
-   private[codegen] def genFunctionDefn(
-       defn: nir.Defn,
-       insts: Seq[nir.Inst],
-@@ -396,12 +400,43 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -173,6 +174,29 @@ private[codegen] abstract class AbstractCodeGen(
+ 
+   }
+ 
++  private def rttiOffset(n: nir.Global): Option[Long] =
++    meta.globalSections.rttiSpace.flatMap(_.offsetOf(n))
++
++  /** Each RTTI symbol is an alias of its place in the RTTI space */
++  private def genRttiAliases()(implicit sb: ShowBuilder): Unit = {
++    import sb._
++    meta.globalSections.rttiSpace.foreach { layout =>
++      newline()
++      str(s"@${RttiSpace.CName} = hidden alias i8, ptr @")
++      genGlobal(RttiSpace.Name)
++      layout.entries.foreach {
++        case (name, offset) =>
++          newline()
++          str("@")
++          genGlobal(name)
++          str(" = hidden alias i8, ptr getelementptr inbounds (i8, ptr @")
++          genGlobal(RttiSpace.Name)
++          str(s", i64 $offset)")
++          generated += mangled(name)
++      }
++    }
++  }
++
+   protected final def touch(n: nir.Global.Member): Unit =
+     deps += n
+ 
+@@ -396,12 +420,43 @@ private[codegen] abstract class AbstractCodeGen(
      if (nonnull) {
        str("nonnull ")
      }
@@ -4516,7 +4879,7 @@ index cea5a829b..d9677d834 100644
    private[codegen] def toDereferenceable(
        refty: nir.Type.RefKind
    ): (Boolean, String, Long) = {
-@@ -414,10 +449,12 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -414,10 +469,12 @@ private[codegen] abstract class AbstractCodeGen(
          unreachable
      }
  
@@ -4531,7 +4894,17 @@ index cea5a829b..d9677d834 100644
      }
    }
  
-@@ -920,11 +957,13 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -648,6 +705,9 @@ private[codegen] abstract class AbstractCodeGen(
+       case nir.Val.Local(n, ty) =>
+         str("%")
+         genLocal(n)
++      case nir.Val.Global(n, nir.Type.Int) if rttiOffset(n).isDefined =>
++        // Compact object header, see Metadata.headerRtti
++        str(rttiOffset(n).get.toString)
+       case nir.Val.Global(n: nir.Global.Member, ty) =>
+         if (useOpaquePointers) {
+           lookup(n)
+@@ -920,11 +980,13 @@ private[codegen] abstract class AbstractCodeGen(
                if (nonnull) {
                  str(", !nonnull !{}")
                }
@@ -4550,7 +4923,7 @@ index cea5a829b..d9677d834 100644
              case _ =>
                ()
            }
-@@ -1221,11 +1260,13 @@ private[codegen] abstract class AbstractCodeGen(
+@@ -1221,11 +1283,13 @@ private[codegen] abstract class AbstractCodeGen(
          if (nonnull) {
            str(" nonnull")
          }
@@ -4570,7 +4943,7 @@ index cea5a829b..d9677d834 100644
          genJustVal(v)
        case _ =>
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
-index a477edfce..00b299768 100644
+index a477edfce..abbd33287 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
 @@ -13,6 +13,7 @@ import scala.scalanative.build
@@ -4597,7 +4970,19 @@ index a477edfce..00b299768 100644
    }
  
    private final val EmptyPath = "__empty"
-@@ -81,15 +84,65 @@ object CodeGen {
+@@ -69,7 +72,10 @@ object CodeGen {
+       ec: ExecutionContext
+   ): IRGenerators =
+     Scope { implicit in =>
+-      val env = assembly.map(defn => defn.name -> defn).toMap
++      // The RTTI definitions stay in env: other object files declare them
++      val (spaced, rttiSpace) = RttiSpace(assembly)
++      meta.globalSections.rttiSpace = rttiSpace
++      val env = (assembly ++ spaced).map(defn => defn.name -> defn).toMap
+       val outputDirPath = config.workDir.resolve("generated")
+       if (Build.userConfigHasChanged(config))
+         IO.deleteRecursive(outputDirPath)
+@@ -81,15 +87,65 @@ object CodeGen {
          defn.pos.source.directory
            .getOrElse(EmptyPath)
  
@@ -4632,7 +5017,7 @@ index a477edfce..00b299768 100644
        // across IR module boundary unless LTO is turned on.
        def separate(): IRGenerators =
 -        partitionBy(assembly, procs)(outputFileId).toSeq.map {
-+        partitionBy(assembly, procs)(outputFileId).toSeq.flatMap {
++        partitionBy(spaced, procs)(outputFileId).toSeq.flatMap {
            case (id, defns) =>
 -            Future {
 -              val sorted = defns.sortBy(_.name)
@@ -4667,10 +5052,13 @@ index a477edfce..00b299768 100644
              }
          }
  
-@@ -98,6 +151,30 @@ object CodeGen {
+@@ -97,6 +153,32 @@ object CodeGen {
+       def separateIncrementally(): IRGenerators = {
          val ctx = new IncrementalCodeGenContext(config)
          ctx.collectFromPreviousState()
- 
++        def salt(defns: Seq[nir.Defn]): Long =
++          rttiSpace.fold(0L)(_.offsetsKey(defns))
++
 +        // Cache-key helper for the plain `.ll`-per-directory artifact
 +        // (used both for a directPlan-Unavailable directory and for the
 +        // `.ll` fallback half of a Split directory -- distinct `key`s so
@@ -4680,7 +5068,7 @@ index a477edfce..00b299768 100644
 +            val outFile = outputDirPath.resolve(s"$key.ll")
 +            val ownerDirectory = outFile.getParent()
 +
-+            ctx.addEntry(key, defns)
++            ctx.addEntry(key, defns, salt(defns))
 +            if (ctx.shouldCompile(key) || !Files.exists(outFile)) {
 +              val sorted = defns.sortBy(_.name)
 +              if (!Files.exists(ownerDirectory))
@@ -4694,11 +5082,10 @@ index a477edfce..00b299768 100644
 +              outFile
 +            }
 +          }
-+
+ 
          // Partition into multiple LLVM IR files per Scala source file originated from.
          // We previously partitioned LLVM IR files by package.
-         // However, this caused issues with the Darwin linker when generating N_OSO symbols,
-@@ -114,26 +191,49 @@ object CodeGen {
+@@ -114,26 +196,49 @@ object CodeGen {
          // To address this issue, we partition into multiple LLVM IR files per Scala source file originated from.
          // This will ensure that each LLVM IR file only references a single Scala source file,
          // which will prevent the Darwin linker failing to generate N_OSO symbols.
@@ -4713,7 +5100,7 @@ index a477edfce..00b299768 100644
 +        // entry point a mode at an artifact the other mode produced --
 +        // worst case is one extra recompile of that directory right after a
 +        // toggle, never a stale/missing-file reuse.
-+        val llvmIRGenerators = assembly.groupBy(outputFileId).toSeq.flatMap {
++        val llvmIRGenerators = spaced.groupBy(outputFileId).toSeq.flatMap {
            case (dir, defns) =>
 -            Future {
 -              val hash = dir.hashCode().toHexString
@@ -4742,7 +5129,7 @@ index a477edfce..00b299768 100644
 +                val directKey = s"$hash-direct"
 +                val objPath = outputDirPath.resolve(s"$hash.o")
 +                val directFuture = Future {
-+                  ctx.addEntry(directKey, capable)
++                  ctx.addEntry(directKey, capable, salt(capable))
 +                  if (ctx.shouldCompile(directKey) || !Files.exists(objPath)) {
 +                    if (DirectCodeGenDispatch.emit(config, env, meta.globalSections, capable, objPath)(meta.platform))
 +                      objPath
@@ -4767,7 +5154,7 @@ index a477edfce..00b299768 100644
              }
          }
          Future.sequence(llvmIRGenerators).andThen {
-@@ -150,6 +250,12 @@ object CodeGen {
+@@ -150,6 +255,12 @@ object CodeGen {
          .map(Future.successful)
  
        val llvmIRGenerators =
@@ -4780,7 +5167,7 @@ index a477edfce..00b299768 100644
          if (config.compilerConfig.useIncrementalCompilation)
            separateIncrementally()
          else separate()
-@@ -201,7 +307,8 @@ object CodeGen {
+@@ -201,7 +312,8 @@ object CodeGen {
            dir: VirtualDirectory,
            config: build.Config
        ): Option[Path] =
