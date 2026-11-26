@@ -1,8 +1,12 @@
 name: VS Code extension
 
-# Published by release.yml on every scalino release (v* tag), with the
-# extension version set to the scalino version. Run by hand to build a
-# .vsix, or to republish a version.
+# Called by release.yml on every scalino release (v* tag), with the extension
+# version set to the scalino version. It publishes only when vscode-extension/
+# changed since the version on the Marketplace (itself a scalino tag), so users
+# don't get an identical update every release; the extension is a thin client
+# that finds scalino-lsp on PATH and doesn't depend on its version. A failed
+# publish is retried by the next release, since the Marketplace still has the
+# older version. Run by hand to build a .vsix, or to (re)publish regardless.
 on:
   workflow_call:
     inputs:
@@ -11,6 +15,9 @@ on:
         type: string
         required: true
       publish:
+        type: boolean
+        default: true
+      skip-unchanged:
         type: boolean
         default: true
   workflow_dispatch:
@@ -28,7 +35,45 @@ permissions:
   contents: read
 
 jobs:
+  check:
+    name: Changed since the published version?
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the tags, to diff against the published version's
+
+      - id: check
+        shell: bash
+        env:
+          # unset on workflow_dispatch: a manual run always builds and publishes
+          SKIP_UNCHANGED: ${{ inputs.skip-unchanged }}
+        run: |
+          if [[ "$SKIP_UNCHANGED" != true ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          id="$(jq -r '.publisher + "." + .name' vscode-extension/package.json)"
+          # `vsce show` prints "undefined" and exits 0 for an extension that was never published
+          published="$(npx --yes @vscode/vsce show "$id" --json 2>/dev/null \
+            | jq -r '.versions[0].version // empty' 2>/dev/null || true)"
+          if [[ -z "$published" ]]; then
+            changed=true; reason="$id: nothing on the Marketplace yet (or the query failed)"
+          elif ! git rev-parse -q --verify "refs/tags/v$published" > /dev/null; then
+            changed=true; reason="$id $published is published, but there is no tag v$published to diff against"
+          elif git diff --quiet "v$published" HEAD -- vscode-extension/; then
+            changed=false; reason="$id: vscode-extension/ unchanged since v$published, not publishing"
+          else
+            changed=true; reason="$id: vscode-extension/ changed since v$published"
+          fi
+          echo "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     env:
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
