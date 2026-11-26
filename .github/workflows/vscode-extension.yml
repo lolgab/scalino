@@ -1,11 +1,24 @@
 name: VS Code extension
 
+# Published by release.yml on every scalino release (v* tag), with the
+# extension version set to the scalino version. Run by hand to build a
+# .vsix, or to republish a version.
 on:
-  push:
-    tags:
-      - 'vscode-v*'
+  workflow_call:
+    inputs:
+      version:
+        description: 'Extension version, e.g. 0.0.35 (a leading v is stripped)'
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Extension version, e.g. 0.0.35 (defaults to package.json)'
+        type: string
+        required: false
       publish:
         description: 'Publish to the Marketplace (otherwise just build the .vsix)'
         type: boolean
@@ -33,29 +46,26 @@ jobs:
 
       - run: npm ci
 
-      - name: Check tag matches package.json version
-        if: startsWith(github.ref, 'refs/tags/vscode-v')
-        run: |
-          v=$(node -p "require('./package.json').version")
-          if [ "vscode-v$v" != "${GITHUB_REF_NAME}" ]; then
-            echo "tag ${GITHUB_REF_NAME} != package.json version $v" >&2
-            exit 1
-          fi
+      - name: Set version
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: npm version --no-git-tag-version --allow-same-version "${VERSION#v}"
 
       - name: Package
-        run: npx --yes @vscode/vsce package -o scalino-lsp.vsix
+        run: npx --yes @vscode/vsce package -o scalino.vsix
 
       - uses: actions/upload-artifact@v4
         with:
-          name: scalino-lsp-vsix
-          path: vscode-extension/scalino-lsp.vsix
+          name: scalino-vsix
+          path: vscode-extension/scalino.vsix
 
       - name: Publish to VS Code Marketplace
-        if: startsWith(github.ref, 'refs/tags/vscode-v') || inputs.publish
+        if: inputs.publish
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: npx --yes @vscode/vsce publish --packagePath scalino-lsp.vsix
+        run: npx --yes @vscode/vsce publish --packagePath scalino.vsix
 
       - name: Publish to Open VSX
-        if: (startsWith(github.ref, 'refs/tags/vscode-v') || inputs.publish) && env.OVSX_PAT != ''
-        run: npx --yes ovsx publish scalino-lsp.vsix -p "$OVSX_PAT"
+        if: inputs.publish && env.OVSX_PAT != ''
+        run: npx --yes ovsx publish scalino.vsix -p "$OVSX_PAT"

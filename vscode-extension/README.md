@@ -13,14 +13,20 @@ a workspace you get every diagnostic and hover twice. Turn one of them off with
 
 ## Install
 
-The extension is not on the Marketplace. Package it and install the `.vsix`:
+Install "Scalino" from the Marketplace, or from the command line:
+
+```
+code --install-extension lolgab.scalino
+```
+
+A new version is published with every scalino release. To try local changes,
+package it and install the `.vsix`:
 
 ```
 cd vscode-extension
 npm install
-npm run compile
 npx vsce package
-code --install-extension scalino-lsp-0.0.7.vsix
+code --install-extension scalino-*.vsix
 ```
 
 It does not download the server, so:
@@ -31,7 +37,7 @@ It does not download the server, so:
    `.vscode/settings.json`:
    ```json
    {
-     "scalino-lsp.path": "/absolute/path/to/dist/scalino-lsp"
+     "scalino.path": "/absolute/path/to/dist/scalino-lsp"
    }
    ```
 2. Open your project. The server reads `.scalino-build/scalino-lsp.json`, and
@@ -45,7 +51,7 @@ It does not download the server, so:
 ## When something is missing
 
 Look at the "Scalino" output channel (`View` -> `Output`). Setting
-`scalino-lsp.trace.server` to `"verbose"` traces every request and
+`scalino.trace.server` to `"verbose"` traces every request and
 notification. The server keeps its own log too, in
 `.scalino-build/scalino-lsp.log` in the project root.
 
@@ -55,7 +61,7 @@ Each kind of hint has its own switch, and all are on by default:
 `inferredTypes`, `typeParameters`, `implicitArguments`, `implicitConversions`,
 `byNameParameters`, `namedParameters`, `hintsInPatternMatch`.
 
-In VS Code they are the `scalino-lsp.inlayHints.<kind>.enable` settings. Search
+In VS Code they are the `scalino.inlayHints.<kind>.enable` settings. Search
 for "scalino inlay" in the Settings UI. Changes apply without a restart.
 
 ## What it doesn't do

@@ -1,8 +1,8 @@
 {
-  "name": "scalino-lsp",
+  "name": "scalino",
   "displayName": "Scalino",
   "description": "JVM-free Scala language server (scalino-lsp, from scalino) -- diagnostics and hover without Metals' JVM dependency.",
-  "version": "0.0.7",
+  "version": "0.0.34",
   "publisher": "lolgab",
   "license": "Apache-2.0",
   "repository": {
@@ -25,7 +25,7 @@
     ],
     "commands": [
       {
-        "command": "scalino-lsp.setupIde",
+        "command": "scalino.setupIde",
         "title": "Scalino: Run setup-ide"
       }
     ],
@@ -33,64 +33,64 @@
       "type": "object",
       "title": "Scalino",
       "properties": {
-        "scalino-lsp.path": {
+        "scalino.path": {
           "type": "string",
           "default": "",
           "description": "Absolute path to the scalino-lsp binary (dist/scalino-lsp). Falls back to PATH lookup if unset."
         },
-        "scalino-lsp.args": {
+        "scalino.args": {
           "type": "array",
           "items": { "type": "string" },
           "default": ["-stdio"],
           "description": "Arguments passed to scalino-lsp."
         },
-        "scalino-lsp.env": {
+        "scalino.env": {
           "type": "object",
           "default": {},
           "description": "Extra environment variables for the scalino-lsp process."
         },
-        "scalino-lsp.initializationOptions": {
+        "scalino.initializationOptions": {
           "type": "object",
           "default": {},
           "description": "Extra LSP initializationOptions passed to scalino-lsp on initialize."
         },
-        "scalino-lsp.trace.server": {
+        "scalino.trace.server": {
           "type": "string",
           "enum": ["off", "messages", "verbose"],
           "default": "off",
           "description": "Trace LSP communication between VS Code and scalino-lsp."
         },
-        "scalino-lsp.inlayHints.inferredTypes.enable": {
+        "scalino.inlayHints.inferredTypes.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show inferred types (`val x/*: Int*/ = 1`)."
         },
-        "scalino-lsp.inlayHints.typeParameters.enable": {
+        "scalino.inlayHints.typeParameters.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show inferred type arguments of method calls."
         },
-        "scalino-lsp.inlayHints.implicitArguments.enable": {
+        "scalino.inlayHints.implicitArguments.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show implicit/given arguments passed to method calls."
         },
-        "scalino-lsp.inlayHints.implicitConversions.enable": {
+        "scalino.inlayHints.implicitConversions.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show implicit conversions applied to expressions."
         },
-        "scalino-lsp.inlayHints.byNameParameters.enable": {
+        "scalino.inlayHints.byNameParameters.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show by-name parameter markers (`=>`) on call arguments."
         },
-        "scalino-lsp.inlayHints.namedParameters.enable": {
+        "scalino.inlayHints.namedParameters.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show parameter names on call arguments."
         },
-        "scalino-lsp.inlayHints.hintsInPatternMatch.enable": {
+        "scalino.inlayHints.hintsInPatternMatch.enable": {
           "type": "boolean",
           "default": true,
           "description": "Show inferred types in pattern matches."

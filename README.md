@@ -470,7 +470,8 @@ actions and diagnostics.
    entries, not a new format.
 2. Install the client for your editor (each directory's README has the steps):
    - Zed: [`zed-extension/`](zed-extension/), in Zed's gallery as "Scalino".
-   - VS Code: [`vscode-extension/`](vscode-extension/), installed locally (it is not on the Marketplace).
+   - VS Code: [`vscode-extension/`](vscode-extension/), on the Marketplace as "Scalino"
+     (`lolgab.scalino`).
    - Neovim: [`neovim-extension/`](neovim-extension/), a `vim.lsp` config. No plugin needed.
 
 ## Packaging

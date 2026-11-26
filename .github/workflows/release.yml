@@ -300,6 +300,14 @@ jobs:
           git commit -m "scalino ${{ inputs.tag || github.ref_name }}"
           git push origin HEAD:main
 
+  vscode-extension:
+    name: Publish VS Code extension
+    needs: publish
+    uses: ./.github/workflows/vscode-extension.yml
+    with:
+      version: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit
+
   publish-repo:
     name: Publish apt/dnf repo
     needs: publish

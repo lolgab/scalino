@@ -7,7 +7,7 @@
 //
 // No DAP support and no auto-download of `scalino-lsp`, same as the Zed extension: it is this
 // repo's dist/ build output (build/08-build-scalino-lsp.sh, or a release tarball). Resolved via
-// the `scalino-lsp.path` setting, falling back to a PATH lookup.
+// the `scalino.path` setting, falling back to a PATH lookup.
 
 import * as cp from "child_process";
 import * as fs from "fs";
@@ -20,7 +20,10 @@ import {
   ServerOptions,
 } from "vscode-languageclient/node";
 
-const SERVER_ID = "scalino-lsp";
+// Extension id, settings section (`scalino.*`) and LanguageClient id (trace setting
+// `scalino.trace.server`). The server binary keeps its own name.
+const SECTION = "scalino";
+const SERVER_BIN = "scalino-lsp";
 
 let client: LanguageClient | undefined;
 
@@ -50,13 +53,13 @@ function resolveServerPath(config: vscode.WorkspaceConfiguration): string {
   const configured = config.get<string>("path", "").trim();
   if (configured) return configured;
 
-  const onPath = findOnPath(SERVER_ID);
+  const onPath = findOnPath(SERVER_BIN);
   if (onPath) return onPath;
 
   throw new Error(
-    `${SERVER_ID} not found on PATH -- build it (build/08-build-scalino-lsp.sh, ` +
-      `or use a release tarball's dist/${SERVER_ID}) and either add dist/ to PATH ` +
-      `or set "scalino-lsp.path" in settings.json`,
+    `${SERVER_BIN} not found on PATH -- build it (build/08-build-scalino-lsp.sh, ` +
+      `or use a release tarball's dist/${SERVER_BIN}) and either add dist/ to PATH ` +
+      `or set "scalino.path" in settings.json`,
   );
 }
 
@@ -186,7 +189,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider("jar", new JarContentProvider()),
   );
-  const config = vscode.workspace.getConfiguration(SERVER_ID);
+  const config = vscode.workspace.getConfiguration(SECTION);
 
   let command: string;
   try {
@@ -214,17 +217,17 @@ export function activate(context: vscode.ExtensionContext): void {
     ],
     initializationOptions: config.get("initializationOptions"),
     synchronize: {
-      // Pushes `scalino-lsp.*` settings (inlay hint toggles) to the server
+      // Pushes `scalino.*` settings (inlay hint toggles) to the server
       // on startup and whenever they change.
-      configurationSection: SERVER_ID,
+      configurationSection: SECTION,
       fileEvents: vscode.workspace.createFileSystemWatcher("**/*.scala"),
     },
   };
 
-  client = new LanguageClient(SERVER_ID, "Scalino", serverOptions, clientOptions);
+  client = new LanguageClient(SECTION, "Scalino", serverOptions, clientOptions);
   client.start();
   context.subscriptions.push(
-    vscode.commands.registerCommand("scalino-lsp.setupIde", () => offerSetupIde(command)),
+    vscode.commands.registerCommand("scalino.setupIde", () => offerSetupIde(command)),
   );
   void offerSetupIde(command);
 }
