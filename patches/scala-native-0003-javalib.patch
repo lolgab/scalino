@@ -914,6 +914,29 @@ index d715b487f..0075792f7 100644
  
    override protected def finalize(): Unit =
      close()
+diff --git a/javalib/src/main/scala/scala/scalanative/ffi/zlib.scala b/javalib/src/main/scala/scala/scalanative/ffi/zlib.scala
+index f9e704fb1..7fea9996c 100644
+--- a/javalib/src/main/scala/scala/scalanative/ffi/zlib.scala
++++ b/javalib/src/main/scala/scala/scalanative/ffi/zlib.scala
+@@ -6,14 +6,16 @@ import scala.scalanative.runtime.{Intrinsics, fromRawUSize}
+ import scala.scalanative.unsafe._
+ 
+ private[ffi] object zlibPlatformCompat {
+-  @extern
++  // scalino: link "zlib" on Windows (the MSVC library's name) as before upstream dropped the
++  // annotation; scalino's Windows sysroots install MSYS2's static libz.a as libzlib.a for it.
++  @extern @link("zlib")
+   private object zlibWindows extends zlib
+ 
+   @extern @link("z")
+   private object zlibDefault extends zlib
+ 
+   // Link-time branch keeps @link("z") off Windows, where the zlib library name
+-  // varies by build and users pass the matching -l<name> themselves.
++  // varies by build.
+   val instance: zlib =
+     if (isWindows) zlibWindows
+     else zlibDefault
 diff --git a/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala b/javalib/src/main/scala/scala/scalanative/nio/fs/zip/ZipFileSystem.scala
 new file mode 100644
 index 000000000..1587013dd
