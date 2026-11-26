@@ -63,8 +63,19 @@ trap restore EXIT
 # release CI: it asserts the pushed tag equals its own version) and CI (stamps "<base>-<date>-<hash>-
 # SNAPSHOT"). Our CI sets all of them, which would trip the assertion or change the version that
 # versions.env pins, so unset them for this subprocess only.
+#
+# --server runs sbt in this process instead of handing the commands to a background sbt server
+# through sbtn (sbt 2's default). A reused server keeps its own environment (the `env -u` above
+# would not reach it), its session settings from earlier runs (a `++` from a previous call
+# sticks), and its JVM even after the JDK under it was upgraded in place.
+#
+# `++ $SCALA_VERSION` builds the Scala 3 modules with our Scala instead of the newest one Scala
+# Native supports (ScalaVersions.scala3): at the v0.5.13 tag that is 3.10.1, which publishes
+# nscplugin_3.10.1 and scala3lib 3.10.1+..., neither of which a 3.10.0 toolchain resolves.
+# No `!`: that would also force it onto the Scala 2 projects (scalalib2_13, whose jar scalalib3
+# copies specialized classes from), which then fail to compile.
 env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME -u GITHUB_REF -u CI \
-  sbt -batch "$(printf '%s/publishLocal; ' "${PROJECTS[@]}")"
+  sbt --server -batch "++ $SCALA_VERSION; $(printf '%s/publishLocal; ' "${PROJECTS[@]}")"
 
 _TASTY_CLASSES="$(ls -d javalib/.3/target/scala-*/classes javalib/target/out/native*/scala-*/javalib/classes 2>/dev/null | head -1 || true)"
 if [[ -z "$_TASTY_CLASSES" ]]; then
