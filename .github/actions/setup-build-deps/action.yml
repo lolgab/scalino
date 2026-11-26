@@ -6,9 +6,11 @@ runs:
   using: composite
   steps:
     - name: Set up OpenJDK
+      # Also the JDK API scalino compiles user code against: build/02-build-java-base.sh extracts
+      # dist/java.base.jar from this JDK. 21 has virtual threads, which Scala Native's javalib implements.
       uses: actions/setup-java@v6
       with:
-        java-version: '17'
+        java-version: '21'
         distribution: 'temurin'
 
     - name: Set up coursier
