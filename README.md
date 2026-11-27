@@ -469,7 +469,8 @@ actions and diagnostics.
    dependencyClasspath}`, so further targets (say a js frontend) are more
    entries, not a new format.
 2. Install the client for your editor (each directory's README has the steps):
-   - Zed: [`zed-extension/`](zed-extension/), in Zed's gallery as "Scalino".
+   - Zed: [`zed-extension/`](zed-extension/), installed as a dev extension (not in
+     Zed's gallery yet).
    - VS Code: [`vscode-extension/`](vscode-extension/), on the Marketplace as "Scalino"
      (`lolgab.scalino`).
    - Neovim: [`neovim-extension/`](neovim-extension/), a `vim.lsp` config. No plugin needed.

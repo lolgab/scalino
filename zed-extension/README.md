@@ -21,8 +21,11 @@ never attaches to those files.
 
 ## Install
 
-The extension is in Zed's gallery as **Scalino**: `cmd-shift-p`, "zed:
-extensions", search for "Scalino", install.
+The extension is submitted to Zed's gallery
+([zed-industries/extensions#8480](https://github.com/zed-industries/extensions/pull/8480)).
+Until it is merged, install it as a dev extension from a clone of this repo:
+`cmd-shift-p`, "zed: install dev extension", pick the `zed-extension/`
+directory. Zed builds it with Rust, so `rustup` must be installed.
 
 That gets you the grammar and the wiring. It does not download the server, so:
 
