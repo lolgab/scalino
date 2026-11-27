@@ -328,6 +328,16 @@ jobs:
       version: ${{ inputs.tag || github.ref_name }}
     secrets: inherit
 
+  zed-extension:
+    name: Submit Zed extension
+    # after update-package-metadata, which also pushes to main
+    needs: [publish, update-package-metadata]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/zed-extension.yml
+    with:
+      version: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit
+
   publish-repo:
     name: Publish apt/dnf repo
     needs: publish

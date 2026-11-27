@@ -1,0 +1,122 @@
+name: Zed extension
+
+# Called by release.yml on every scalino release (v* tag), like vscode-extension.yml: when
+# zed-extension/ changed since the version in Zed's registry, it sets extension.toml's version to
+# the scalino version, commits that to main, and opens a PR on zed-industries/extensions that
+# points the extensions/scalino-lsp submodule at the commit. Zed publishes once the PR is merged.
+# Otherwise it does nothing, so users don't get an identical update every release. A missed update
+# is retried by the next release, since the registry still has the older commit. Run by hand to
+# submit regardless.
+#
+# Needs the ZED_EXTENSIONS_TOKEN secret: a classic personal access token with the `public_repo`
+# and `workflow` scopes, of the account owning the zed-industries/extensions fork (pushing a branch
+# based on upstream's main can touch workflow files). Without it the job only reports.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Extension version, e.g. 0.0.35 (a leading v is stripped)'
+        type: string
+        required: true
+      skip-unchanged:
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Extension version, e.g. 0.0.35'
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    name: Submit to Zed's registry
+    runs-on: ubuntu-24.04
+    env:
+      ID: scalino-lsp
+      VERSION: ${{ inputs.version }}
+      # unset on workflow_dispatch: a manual run always submits
+      SKIP_UNCHANGED: ${{ inputs.skip-unchanged }}
+      ZED_EXTENSIONS_TOKEN: ${{ secrets.ZED_EXTENSIONS_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main  # the version bump is committed on top of main
+          fetch-depth: 0
+
+      - name: Changed since the version in Zed's registry?
+        id: check
+        run: |
+          version="${VERSION#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          published="$(curl -fsSL https://raw.githubusercontent.com/zed-industries/extensions/main/extensions.toml \
+            | awk -v id="[$ID]" '$0 == id { f = 1; next } /^\[/ { f = 0 } f && $1 == "version" { gsub(/"/, "", $3); print $3 }')"
+          commit="$(gh api "repos/zed-industries/extensions/contents/extensions/$ID" --jq .sha 2>/dev/null || true)"
+          if [[ -z "$published" || -z "$commit" ]]; then
+            changed=false; reason="$ID is not in Zed's registry yet: the first submission is a manual PR"
+          elif [[ "$SKIP_UNCHANGED" != true ]]; then
+            changed=true; reason="$ID $published ($commit): submitting $version regardless"
+          elif ! git cat-file -e "$commit^{commit}" 2>/dev/null; then
+            changed=true; reason="$ID $published: registry commit $commit not found here, submitting $version"
+          elif git diff --quiet "$commit" HEAD -- zed-extension/; then
+            changed=false; reason="$ID: zed-extension/ unchanged since $published ($commit), not submitting"
+          else
+            changed=true; reason="$ID: zed-extension/ changed since $published ($commit), submitting $version"
+          fi
+          if [[ "$changed" == true && -z "$ZED_EXTENSIONS_TOKEN" ]]; then
+            changed=false; reason="$reason, but ZED_EXTENSIONS_TOKEN is not set"
+            echo "::warning::$reason"
+          fi
+          echo "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Set the version and commit it to main
+        id: bump
+        if: steps.check.outputs.changed == 'true'
+        env:
+          V: ${{ steps.check.outputs.version }}
+        run: |
+          sed -i -E "s/^version = \".*\"/version = \"$V\"/" zed-extension/extension.toml
+          grep -qx "version = \"$V\"" zed-extension/extension.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git commit -am "zed-extension: version $V"
+            # release.yml's packaging job pushes to main too
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Open the PR on zed-industries/extensions
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ZED_EXTENSIONS_TOKEN }}
+          V: ${{ steps.check.outputs.version }}
+          COMMIT: ${{ steps.bump.outputs.commit }}
+        run: |
+          owner="$(gh api user --jq .login)"
+          gh repo sync "$owner/extensions"
+          git clone --depth 1 "https://x-access-token:$GH_TOKEN@github.com/$owner/extensions.git" zext
+          cd zext
+          branch="$ID-$V"
+          git checkout -b "$branch"
+          # point the submodule at the new commit without cloning it
+          git update-index --cacheinfo "160000,$COMMIT,extensions/$ID"
+          awk -v id="[$ID]" -v v="$V" '
+            $0 == id { f = 1 } /^\[/ && $0 != id { f = 0 }
+            f && $1 == "version" { $0 = "version = \"" v "\"" } { print }' extensions.toml > extensions.toml.new
+          mv extensions.toml.new extensions.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add extensions.toml
+          git commit -m "Update $ID to $V"
+          git push -f origin "$branch"
+          gh pr create -R zed-industries/extensions --head "$owner:$branch" --base main \
+            --title "Update $ID to $V" \
+            --body "Updates $ID to $V ([changes](https://github.com/lolgab/scalino/commits/$COMMIT/zed-extension))." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

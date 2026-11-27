@@ -30,6 +30,8 @@ Code now compiles against the JDK 21 API instead of JDK 17's, so virtual threads
 
 The extension is on the VS Code Marketplace as `lolgab.scalino`, so you no longer need to install a `.vsix` by hand. Its settings and commands moved from `scalino-lsp.*` to `scalino.*`. Rename them in your settings if you set any. Future releases update the extension only when it changes.
 
+The Zed extension is submitted to Zed's gallery as **Scalino** ([zed-industries/extensions#8480](https://github.com/zed-industries/extensions/pull/8480)), and releases update it the same way.
+
 ### Fixes
 
 - macOS Intel: multithreaded programs could crash with SIGILL when the GC stopped a thread. The safepoint signal handler overwrote part of the kernel's signal frame.
