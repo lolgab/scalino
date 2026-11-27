@@ -3,7 +3,7 @@ name: Zed extension
 # Called by release.yml on every scalino release (v* tag), like vscode-extension.yml: when
 # zed-extension/ changed since the version in Zed's registry, it sets extension.toml's version to
 # the scalino version, commits that to main, and opens a PR on zed-industries/extensions that
-# points the extensions/scalino-lsp submodule at the commit. Zed publishes once the PR is merged.
+# points the extensions/scalino submodule at the commit. Zed publishes once the PR is merged.
 # Otherwise it does nothing, so users don't get an identical update every release. A missed update
 # is retried by the next release, since the registry still has the older commit. Run by hand to
 # submit regardless.
@@ -36,7 +36,7 @@ jobs:
     name: Submit to Zed's registry
     runs-on: ubuntu-24.04
     env:
-      ID: scalino-lsp
+      ID: scalino
       VERSION: ${{ inputs.version }}
       # unset on workflow_dispatch: a manual run always submits
       SKIP_UNCHANGED: ${{ inputs.skip-unchanged }}

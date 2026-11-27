@@ -1,4 +1,4 @@
-id = "scalino-lsp"
+id = "scalino"
 name = "Scalino"
 description = "JVM-free Scala language server (scalino-lsp, from scalino) -- diagnostics and hover without Metals' JVM dependency."
 version = "0.0.1"
