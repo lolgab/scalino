@@ -226,9 +226,29 @@ jobs:
       - name: List assets that actually built
         run: ls -la assets || echo "no assets produced -- every platform failed"
 
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+          path: src
+
+      - name: Release notes from CHANGELOG.md
+        # The tag's section ("## v0.0.35 (2026-11-27)"), one heading level up. GitHub's generated
+        # list of PRs goes below it. A missing section leaves just that list, with a warning.
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          awk -v tag="$TAG" '/^## / { if (found) exit; found = ($2 == tag); next } found' src/CHANGELOG.md \
+            | sed -E 's/^#(#+ )/\1/' > release-notes.md
+          if [[ -z "$(tr -d '[:space:]' < release-notes.md)" ]]; then
+            echo "::warning::CHANGELOG.md has no section for $TAG"
+          fi
+          cat release-notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          body_path: release-notes.md
           generate_release_notes: true
           fail_on_unmatched_files: false
           files: |
