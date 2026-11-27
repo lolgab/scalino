@@ -2398,6 +2398,18 @@ The constant length is the proof. In the shipped v0.0.17 linkdriver, `String.com
 - Reproduced the CI failure itself: 5 of 53 clean-directory builds of a snunit hello-world with the unmodified v0.0.17 linkdriver (`--cpus 3`, 3 GB, amd64 container), all with this signature.
 - Real linkdriver with the 0069 trampoline (an `LD_PRELOAD` shim swapping it into the unmodified v0.0.17 binary, same container and project): 0 crashes in the first 50 builds, versus 5 in 53 without it. The linkdriver itself still has to be rebuilt on x86_64 to ship the fix.
 
+## SIGILL on macOS x86_64: the safepoint handler overwrote the signal frame's `uc_mcontext` pointer (2026-11-27)
+
+**Symptom.** The `smoke trampoline (macos-x86_64)` CI job failed intermittently since at least 355cb6b (2 of the last 3 runs that reached it): `examples/safepoint-trampoline` in release-fast died with exit 132 (SIGILL) before printing anything. Linux x86_64 and both arm64 targets passed.
+
+**Root cause.** Patch 0069's `prepare_redirect` emulated a `call` from inside the signal handler: it stored the interrupted `%rip` at `%rsp - 128 - 8` and pointed `%rsp` there. That word is right below the red zone, and unless the handler runs on an alternate signal stack, the kernel's signal frame starts there. On xnu, `sendsig` puts the 56-byte `user_ucontext64` directly below the red zone, so its last field, `uc_mcontext64`, sits at exactly `%rsp - 136`. The handler's own writes still went through the old pointer (clang keeps it in a register: `movq 0x30(%rdi),%rcx`, then the store to `-0x88(%rsi)`), but `sigreturn` reads the user ucontext again and copies the machine context in through `uc_mcontext64`, which now pointed at the interrupted code. Every register was loaded from code bytes and the thread resumed at a garbage `%rip`. On Linux the word below the red zone is the end of the 64-byte-aligned xsave area, usually padding, so it went unnoticed there.
+
+Rosetta does not reproduce it: it builds signal frames in its own memory, not on the thread's stack.
+
+**Fix (patch 0011).** `prepare_redirect` only lowers `%rsp` by 128 and writes nothing to the stack. The trampoline reserves the return address slot at the top of its own frame and fills it from `safepointResumePc` (`scalanative_gc_safepoint_load_resume_pc`) after `sigreturn`, then `ret $128`s as before.
+
+**Test.** `tests/safepoint-trampoline` now also runs on macOS x86_64 and checks that `prepare_redirect` leaves the 64 bytes below the red zone untouched. Before the fix: 1-2 qwords written, FAIL (also under Rosetta). After: PASS.
+
 ## Scala.js support, phase 0 spike (2026-10-31)
 
 Goal: confirm the version set and the riskiest assumptions before patching anything. Everything below ran on a plain JVM with published artifacts; nothing in scalino changed.

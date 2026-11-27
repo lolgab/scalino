@@ -16,9 +16,9 @@ dir="${1:-$root/vendor/scala-native/nativelib/src/main/resources/scala-native/gc
 cc="${CLANG:-clang}"
 arch=x86_64
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) ;;
+  Linux-x86_64|Darwin-x86_64) ;;
   Linux-aarch64|Linux-arm64|Darwin-arm64) arch=aarch64 ;;
-  *) echo "skipped: the trampoline test only runs on Linux x86_64 and Linux/macOS arm64"; exit 0 ;;
+  *) echo "skipped: the trampoline test only runs on x86_64 and arm64 Linux/macOS"; exit 0 ;;
 esac
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 flags=(-O1 -g -DSCALANATIVE_MULTITHREADING_ENABLED -DSCALANATIVE_GC_USE_YIELDPOINT_TRAPS -DSCALANATIVE_GC_IMMIX -I"$here/stubs" -I"$dir")

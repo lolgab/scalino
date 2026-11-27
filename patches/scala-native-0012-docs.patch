@@ -1,5 +1,5 @@
 diff --git a/docs/contrib/gc-safepoint-trampoline.md b/docs/contrib/gc-safepoint-trampoline.md
-index 96c73eddb..85764653a 100644
+index 96c73eddb..c8cdc40e4 100644
 --- a/docs/contrib/gc-safepoint-trampoline.md
 +++ b/docs/contrib/gc-safepoint-trampoline.md
 @@ -24,13 +24,19 @@ Scala Native follows the same *idea* on POSIX (with its own `ucontext` + assembl
@@ -12,7 +12,7 @@ index 96c73eddb..85764653a 100644
 -- `prepare_redirect` emulates a `call` that **skips the red zone**: it lowers `%rsp` by `128 + 8`, stores the interrupted `%rip` in the new top slot, and then points `%rip` at the trampoline.
 -- The trampoline returns with **`ret $128`**: it pops the interrupted `%rip` and drops the red-zone skip in one instruction, so resuming needs **no scratch register**. `rflags` are saved and restored with `pushfq`/`popfq`.
 -- Before calling C, the trampoline aligns `%rsp` to 16 bytes; `%rbp` carries the unaligned value across the call.
-+- `prepare_redirect` emulates a `call` that **skips the red zone**: it lowers `%rsp` by `128 + 8`, stores the interrupted `%rip` in the new top slot, and only then points `%rip` at the trampoline. The trampoline frame therefore never overlaps the red zone.
++- `prepare_redirect` **skips the red zone**: it lowers `%rsp` by 128 and points `%rip` at the trampoline. The trampoline frame therefore never overlaps the red zone. The trampoline, not the handler, stores the interrupted `%rip` (`safepointResumePc`) in the top slot of its frame as a return address: unless the handler runs on an alternate signal stack, the kernel's signal frame sits right below the red zone, and on Darwin the word there is the ucontext's `uc_mcontext` pointer, which `sigreturn` loads every register through.
 +- The trampoline returns with **`ret $128`**: it pops the interrupted `%rip` and drops the red-zone skip in one instruction, so resuming needs **no scratch register** (a `jmp *%reg` exit clobbers whichever register it uses) and leaves `rflags` untouched (they are saved and restored with `pushfq`/`popfq`).
 +- Before calling C, the trampoline aligns `%rsp` to 16 bytes (the poll can interrupt code at any alignment); `%rbp` carries the unaligned value across the call.
  

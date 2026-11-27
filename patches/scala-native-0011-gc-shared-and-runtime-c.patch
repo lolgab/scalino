@@ -190,8 +190,57 @@ index 0ebeed76b..910bd41d8 100644
  
  #endif
  
+diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S
+index 053406228..ec8901665 100644
+--- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S
++++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline-x86_64.S
+@@ -1,8 +1,11 @@
+ /* clang-format off */
+ /*
+  * POSIX x86_64: normal-context stub after a yield-point page fault.
+- * Saves XMM0-15, GPRs and rflags, calls scalanative_gc_safepoint_poll_run_yield
+- * (C), then returns to the interrupted PC with `ret $128`.
++ * Entered with %rsp 128 bytes below the interrupted one (past the red zone).
++ * Saves XMM0-15, GPRs and rflags, stores the interrupted PC
++ * (scalanative_gc_safepoint_load_resume_pc) as the return address in the slot
++ * at the top of the frame, calls scalanative_gc_safepoint_poll_run_yield (C),
++ * then returns to that PC with `ret $128`, which also restores %rsp.
+  * See SafepointPollTrampoline.c and docs/contrib/gc-safepoint-trampoline.md.
+  */
+ #if defined(SCALANATIVE_MULTITHREADING_ENABLED) &&                              \
+@@ -16,17 +19,20 @@
+ 
+ #if defined(__APPLE__)
+ #    define RUN_YIELD _scalanative_gc_safepoint_poll_run_yield
++#    define LOAD_RESUME_PC _scalanative_gc_safepoint_load_resume_pc
+ .globl scalanative_gc_safepoint_poll_trampoline
+ .globl _scalanative_gc_safepoint_poll_trampoline
+ scalanative_gc_safepoint_poll_trampoline:
+ _scalanative_gc_safepoint_poll_trampoline:
+ #else
+ #    define RUN_YIELD scalanative_gc_safepoint_poll_run_yield
++#    define LOAD_RESUME_PC scalanative_gc_safepoint_load_resume_pc
+ .globl scalanative_gc_safepoint_poll_trampoline
+ .type scalanative_gc_safepoint_poll_trampoline, @function
+ scalanative_gc_safepoint_poll_trampoline:
+ #endif
+-    leaq -SFPT_FRAME(%rsp), %rsp
++    /* the frame, plus the return address slot at SFPT_FRAME(%rsp) */
++    leaq -(SFPT_FRAME + 8)(%rsp), %rsp
+     pushfq
+     popq 392(%rsp)
+ 
+@@ -65,6 +71,8 @@ scalanative_gc_safepoint_poll_trampoline:
+ 
+     movq %rsp, %rbp
+     andq $-16, %rsp
++    call LOAD_RESUME_PC
++    movq %rax, SFPT_FRAME(%rbp)
+     call RUN_YIELD
+     movq %rbp, %rsp
+ 
 diff --git a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
-index fed5e70de..71ef16717 100644
+index fed5e70de..db28e70e0 100644
 --- a/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
 +++ b/nativelib/src/main/resources/scala-native/gc/shared/SafepointPollTrampoline.c
 @@ -81,12 +81,6 @@ void scalanative_gc_safepoint_poll_trampoline(void);
@@ -277,11 +326,16 @@ index fed5e70de..71ef16717 100644
  bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
  #ifndef SN_UC_UNSUPPORTED
      MutatorThread *self = (MutatorThread *)mutatorThread;
-@@ -118,12 +175,29 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
+@@ -118,12 +175,33 @@ bool scalanative_gc_safepoint_prepare_redirect(void *uap, void *mutatorThread) {
      ucontext_t *uc = (ucontext_t *)uap;
      uintptr_t pc = SN_UC_GET_PC(uc);
      self->safepointResumePc = pc;
 -#if defined(__x86_64__)
+-    uintptr_t sp = SN_UC_GET_SP(uc) - 128 - sizeof(uintptr_t);
+-    *(uintptr_t *)sp = pc;
+-    SN_UC_SET_SP(uc, sp);
+-#elif defined(__aarch64__) && defined(SN_RED_ZONE)
+-    SN_UC_SET_SP(uc, SN_UC_GET_SP(uc) - SN_RED_ZONE);
 +#if defined(__aarch64__)
 +    /* Save the whole context below the red zone and run the trampoline below
 +     * the copy; see sn_resumeTrapHandler. The kernel built the signal frame
@@ -297,16 +351,18 @@ index fed5e70de..71ef16717 100644
 +    memcpy((void *)copy, SN_UC_MCTX(uc), SN_MCTX_SIZE);
 +    SN_UC_SET_SP(uc, copy);
 +#elif defined(__x86_64__)
-+    /* Emulate a `call` that steps over the 128 B SysV red zone: leaf code
-+     * compiled by LLVM keeps live spills below %rsp, and the trampoline's own
-+     * frame must not overwrite them. The interrupted PC becomes the return
-+     * address the trampoline `ret $128`s to, so it needs no register to resume
-+     * (a `jmp *%reg` would clobber one of the interrupted code's registers). */
-     uintptr_t sp = SN_UC_GET_SP(uc) - 128 - sizeof(uintptr_t);
-     *(uintptr_t *)sp = pc;
-     SN_UC_SET_SP(uc, sp);
--#elif defined(__aarch64__) && defined(SN_RED_ZONE)
--    SN_UC_SET_SP(uc, SN_UC_GET_SP(uc) - SN_RED_ZONE);
++    /* Start the trampoline below the 128 B SysV red zone: leaf code compiled
++     * by LLVM keeps live spills below %rsp, and the trampoline's own frame
++     * must not overwrite them. The trampoline stores the interrupted PC
++     * (safepointResumePc) as its return address and `ret $128`s to it, so it
++     * needs no register to resume (a `jmp *%reg` would clobber one of the
++     * interrupted code's registers).
++     *
++     * Nothing may be written below the red zone from here: unless the handler
++     * runs on an alternate stack, that is where the kernel put the signal
++     * frame. On Darwin the word right below the red zone is the ucontext's
++     * uc_mcontext pointer, which sigreturn loads every register through. */
++    SN_UC_SET_SP(uc, SN_UC_GET_SP(uc) - 128);
  #endif
      SN_UC_SET_PC(uc, (void *)scalanative_gc_safepoint_poll_trampoline);
      return true;

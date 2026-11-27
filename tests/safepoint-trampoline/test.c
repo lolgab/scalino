@@ -5,17 +5,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <emmintrin.h>
-#include <ucontext.h>
 #include "SafepointPollTrampoline.h"
 #include "immix/MutatorThread.h"
 
 MutatorThread *currentMutatorThread;
 static MutatorThread mt;
 static void *page;
-static volatile int yields, misaligned;
+static volatile int yields, misaligned, below_redzone_writes;
 
 extern int64_t sn_test_poll(void *page, int misalign);
+extern uint64_t sn_poll_rsp;
 extern uint64_t sn_res_regs[15], sn_res_xmm[3], sn_res_flags, sn_res_redzone_bad, sn_res_rsp_delta;
 
 void Synchronizer_yield(void) {
@@ -35,7 +36,13 @@ void Synchronizer_yield(void) {
 }
 
 static void handler(int sig, siginfo_t *si, void *uap) {
+    /* Below the red zone is the kernel's signal frame, unless the handler runs on an alternate
+     * stack. prepare_redirect must not write there: on Darwin the word right below the red zone
+     * is the ucontext's uc_mcontext pointer, and sigreturn loads every register through it. */
+    uint64_t *below = (uint64_t *)(uintptr_t)(sn_poll_rsp - 128 - 64), before[8];
+    memcpy(before, below, sizeof before);
     if (!scalanative_gc_safepoint_prepare_redirect(uap, &mt)) { fprintf(stderr, "redirect unsupported\n"); _exit(2); }
+    for (int i = 0; i < 8; i++) if (below[i] != before[i]) below_redzone_writes++;
 }
 
 #define CHECK(c, ...) do { if (!(c)) { printf("  FAIL: " __VA_ARGS__); printf("\n"); bad++; } } while (0)
@@ -46,6 +53,7 @@ int main(void) {
     struct sigaction sa = {0};
     sa.sa_sigaction = handler; sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL); /* Darwin reports PROT_NONE faults as SIGBUS */
     int total_bad = 0;
     for (int mis = 0; mis < 2; mis++) {
         int bad = 0;
@@ -67,6 +75,7 @@ int main(void) {
             }
         }
         CHECK(yields == (mis + 1) * 200, "yield count %d", yields);
+        CHECK(below_redzone_writes == 0, "prepare_redirect wrote %d qwords below the red zone", below_redzone_writes);
         printf("misalign=%d: %s (yields=%d)\n", mis, bad ? "BAD" : "ok", yields);
         total_bad += bad;
     }

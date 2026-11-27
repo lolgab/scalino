@@ -1,8 +1,13 @@
 /* int64 sn_test_poll(void *trapPage, int misalign): runs a poll against the armed trap page with
  * known register/flags/red-zone contents and records what it sees afterwards in `sn_res`. */
+#if defined(__APPLE__)
+#    define SYM(x) _##x
+#else
+#    define SYM(x) x
+#endif
 .text
-.globl sn_test_poll
-sn_test_poll:
+.globl SYM(sn_test_poll)
+SYM(sn_test_poll):
     pushq %rbp
     pushq %rbx
     pushq %r12
@@ -16,7 +21,7 @@ sn_test_poll:
     jz 1f
     subq $8, %rsp
 1:
-    movq %rsp, saved_rsp2(%rip)
+    movq %rsp, SYM(sn_poll_rsp)(%rip)
     /* fill red zone [rsp-128, rsp) with a pattern */
     xorl %ecx, %ecx
 2:  movq $0x5a5a000000000000, %rax
@@ -53,27 +58,27 @@ sn_test_poll:
     movl (%rdi), %eax
     /* ---- after resume ---- */
     lahf
-    movb %ah, sn_res_flags(%rip)
-    movq %rbx, sn_res_regs+0(%rip)
-    movq %rcx, sn_res_regs+8(%rip)
-    movq %rdx, sn_res_regs+16(%rip)
-    movq %rsi, sn_res_regs+24(%rip)
-    movq %rdi, sn_res_regs+32(%rip)
-    movq %r8,  sn_res_regs+40(%rip)
-    movq %r9,  sn_res_regs+48(%rip)
-    movq %r10, sn_res_regs+56(%rip)
-    movq %r11, sn_res_regs+64(%rip)
-    movq %r12, sn_res_regs+72(%rip)
-    movq %r13, sn_res_regs+80(%rip)
-    movq %r14, sn_res_regs+88(%rip)
-    movq %r15, sn_res_regs+96(%rip)
-    movq %rbp, sn_res_regs+104(%rip)
+    movb %ah, SYM(sn_res_flags)(%rip)
+    movq %rbx, SYM(sn_res_regs)+0(%rip)
+    movq %rcx, SYM(sn_res_regs)+8(%rip)
+    movq %rdx, SYM(sn_res_regs)+16(%rip)
+    movq %rsi, SYM(sn_res_regs)+24(%rip)
+    movq %rdi, SYM(sn_res_regs)+32(%rip)
+    movq %r8,  SYM(sn_res_regs)+40(%rip)
+    movq %r9,  SYM(sn_res_regs)+48(%rip)
+    movq %r10, SYM(sn_res_regs)+56(%rip)
+    movq %r11, SYM(sn_res_regs)+64(%rip)
+    movq %r12, SYM(sn_res_regs)+72(%rip)
+    movq %r13, SYM(sn_res_regs)+80(%rip)
+    movq %r14, SYM(sn_res_regs)+88(%rip)
+    movq %r15, SYM(sn_res_regs)+96(%rip)
+    movq %rbp, SYM(sn_res_regs)+104(%rip)
     movq %xmm0, %rax
-    movq %rax, sn_res_xmm+0(%rip)
+    movq %rax, SYM(sn_res_xmm)+0(%rip)
     movq %xmm7, %rax
-    movq %rax, sn_res_xmm+8(%rip)
+    movq %rax, SYM(sn_res_xmm)+8(%rip)
     movq %xmm15, %rax
-    movq %rax, sn_res_xmm+16(%rip)
+    movq %rax, SYM(sn_res_xmm)+16(%rip)
     /* red zone: count mismatches */
     xorl %ecx, %ecx
     xorl %edx, %edx
@@ -85,12 +90,12 @@ sn_test_poll:
 4:  incq %rcx
     cmpq $16, %rcx
     jne 3b
-    movq %rdx, sn_res_redzone_bad(%rip)
+    movq %rdx, SYM(sn_res_redzone_bad)(%rip)
     /* rsp must be unchanged */
     movq %rsp, %rax
-    movq saved_rsp2(%rip), %rcx
+    movq SYM(sn_poll_rsp)(%rip), %rcx
     subq %rax, %rcx
-    movq %rcx, sn_res_rsp_delta(%rip)
+    movq %rcx, SYM(sn_res_rsp_delta)(%rip)
     movq saved_rsp(%rip), %rsp
     popq %r15
     popq %r14
@@ -101,11 +106,14 @@ sn_test_poll:
     ret
 .data
 saved_rsp: .quad 0
-saved_rsp2: .quad 0
-.globl sn_res_regs, sn_res_xmm, sn_res_flags, sn_res_redzone_bad, sn_res_rsp_delta
-sn_res_regs: .space 120
-sn_res_xmm: .space 24
-sn_res_flags: .quad 0
-sn_res_redzone_bad: .quad 0
-sn_res_rsp_delta: .quad 0
+.globl SYM(sn_poll_rsp)
+SYM(sn_poll_rsp): .quad 0  /* %rsp at the poll */
+.globl SYM(sn_res_regs), SYM(sn_res_xmm), SYM(sn_res_flags), SYM(sn_res_redzone_bad), SYM(sn_res_rsp_delta)
+SYM(sn_res_regs): .space 120
+SYM(sn_res_xmm): .space 24
+SYM(sn_res_flags): .quad 0
+SYM(sn_res_redzone_bad): .quad 0
+SYM(sn_res_rsp_delta): .quad 0
+#if defined(__linux__) && defined(__ELF__)
 .section .note.GNU-stack,"",@progbits
+#endif
