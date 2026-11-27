@@ -2,7 +2,7 @@
 
 What changed in each scalino release. The section for a version is the body of its GitHub release.
 
-## v0.0.35 (unreleased)
+## v0.0.35 (2026-11-27)
 
 ### Code coverage
 
