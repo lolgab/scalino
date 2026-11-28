@@ -423,8 +423,12 @@ object LinkDriver:
           // both Mac architectures.
           else if osOf(t) != osOf(hostTriple) || osOf(t) == "linux" then "-fuse-ld=lld" :: opts.ldPath.map(p => s"--ld-path=$p").toList
           else Nil
+        // The same deployment target for the object files LLVM writes directly: an unversioned darwin
+        // triple leaves out their platform load command (LC_BUILD_VERSION), and Apple's ld then warns
+        // "no platform load command found ... assuming: macOS" once per object file.
+        val llvmTriple = if macosVersion.nonEmpty then t.stripSuffix("darwin") + "macosx11.0.0" else t
         withDir.withCompilerConfig(
-          _.withTargetTriple(Some(t))
+          _.withTargetTriple(Some(llvmTriple))
             .withLinkingOptions(linkFlags ++ lld ++ opts.linking)
             .withCompileOptions(compileFlags ++ opts.compile)
             .withCppOptions(cDefines ++ cppFlags ++ genericInclude ++ opts.cppCompile)

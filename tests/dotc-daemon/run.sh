@@ -95,7 +95,16 @@ start=$(date +%s)
 x="$(SCALINO_DOTC_DAEMON=1 "$SCALINO" compile . 2>&1)"
 [[ $(( $(date +%s) - start )) -lt 30 ]] || fail "command substitution waited for the daemon"
 
-echo "== daemon stop"
+echo "== the daemon's request log"
+grep -q 'compile of .* for ' daemons/*.log || fail "no compile line in the daemon log"
+grep -q 'done in .*SCALINO_COMPILE_DONE 0' daemons/*.log || fail "no done line in the daemon log"
+[[ -z "$(ls daemons/*.busy 2>/dev/null)" ]] || fail "busy marker left behind"
+
+echo "== daemon stop: only this directory's"
+mkdir -p "$WORK/elsewhere"
+out="$(cd "$WORK/elsewhere" && "$SCALINO" daemon stop)"
+[[ "$out" == *"stopped 0 "*"1 scalino-dotc daemon of other directories left running"* ]] || fail "daemon stop from another directory: $out"
+"$SCALINO" daemon status | grep -q 'pid=' || fail "daemon stop from another directory stopped this one"
 "$SCALINO" daemon stop | grep -q 'stopped 1' || fail "daemon stop"
 [[ -z "$(ls daemons/*.state 2>/dev/null)" ]] || fail "state file left behind"
 echo "OK"

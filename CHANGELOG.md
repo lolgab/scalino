@@ -2,7 +2,7 @@
 
 What changed in each scalino release. The section for a version is the body of its GitHub release.
 
-## v0.0.35 (2026-11-27)
+## v0.0.35 (2026-11-28)
 
 ### Code coverage
 
@@ -32,8 +32,30 @@ The extension is on the VS Code Marketplace as `lolgab.scalino`, so you no longe
 
 The Zed extension is submitted to Zed's gallery as **Scalino** ([zed-industries/extensions#8480](https://github.com/zed-industries/extensions/pull/8480)), and releases update it the same way.
 
+### Cross-compilation
+
+- `scalino sysroot build` no longer breaks when a distribution deletes a package. v0.0.34 failed on a clean machine with a 404 for Alpine's `openssl-libs-static`, which Alpine had replaced with a newer build. Every pinned file is now downloaded from a copy scalino keeps (the [`sysroot-sources`](https://github.com/lolgab/scalino/releases/tag/sysroot-sources) release), then from upstream, and checked against the same sha256. `SCALINO_SYSROOT_MIRROR=off` uses upstream only.
+- New static library: `utf8proc`, installed when the classpath has scala-java-locales. skunk needs it to log in with a SCRAM password, and the link used to fail with `unable to find library -lutf8proc`.
+- `scalino test --native-target-triple <host triple>` links the tests against the sysroot and runs that binary. It used to fail with `Cannot run program ".scalino-build/ScalinoCliTestMain/bin"`, or run a stale one.
+- A triple with a sysroot is always linked against it, also when it is the host's own. `package` and `test` used to pick up Homebrew's libraries on a Mac.
+- macOS targets: no more `ld: warning: no platform load command found` for every object file.
+
+### Release builds
+
+- `--native-mode release-fast` and `release-full` were many times slower than in v0.0.34 on anything large: 13 minutes in "Generating intermediate code" for an http4s server, and hours for the compiler itself. The 4-byte headers keep every class descriptor in one global, and LLVM walked all of it again for each `match` it turned into a table. That global now has an object file of its own.
+
+### Build directory and daemon
+
+- `.scalino-build` remembers which scalino made it. After an upgrade the next build empties it and starts over. Before, object files of the old version could be linked with new ones, and the program ran with wrong field values until `scalino clean`.
+- `scalino daemon stop` stops the daemons of the current directory only, and `scalino daemon stop all` every one. A daemon that does not answer is killed.
+- `scalino daemon status` no longer waits for a daemon that is compiling: it says what it is busy with and for how long.
+- Each daemon logs its requests and how long they took (`~/.cache/scalino/dotc-daemon/<id>.log`). A compile still running after 5 minutes prints the daemon's pid and how to stop it, and on macOS saves a stack sample for a bug report.
+
 ### Fixes
 
+- skunk's `sql"..."` with two or more interpolated values failed to compile with a `MatchError` in the macro interpreter.
+- `//> using exclude data` drops the whole directory, and patterns are relative to the file with the directive.
+- `scalino test` passes `nativePkgConfig` and `nativeLinking` to the link that finds the test frameworks too.
 - macOS Intel: multithreaded programs could crash with SIGILL when the GC stopped a thread. The safepoint signal handler overwrote part of the kernel's signal frame.
 - `scalino-lsp` no longer fails every request with "Could not find package scala" after `brew upgrade`. It reruns `setup-ide` when its config points at a deleted install, and picks up a new config without a window reload.
 

@@ -150,4 +150,37 @@ set +e; wait "$WATCH_PID"; code=$?; set -e; WATCH_PID=
 [[ $code -ne 0 ]] || fail "expected the program's non-zero exit after SIGINT, got $code"
 ! kill -0 "$pid" 2>/dev/null || fail "the program outlived scalino after SIGINT"
 
+echo "== a build directory made by another scalino is emptied, not reused"
+cd "$WORK/hello"; rm -rf .scalino-build
+"$SCALINO" run . -q >/dev/null 2>&1
+[[ -s .scalino-build/toolchain ]] || fail "no toolchain stamp in .scalino-build"
+out="$("$SCALINO" run . -q 2>&1)"
+[[ "$out" != *"another scalino"* ]] || fail "the same scalino reset its own build directory: $out"
+# what an upgrade looks like: the stamp of some other build, and that build's caches
+echo other-build > .scalino-build/toolchain
+touch .scalino-build/stale-cache .scalino-build/scalino-lsp.json
+out="$("$SCALINO" run . -q 2>&1)"
+expect "$out" "made by another scalino build"
+expect "$out" "hello FOO="
+[[ ! -e .scalino-build/stale-cache ]] || fail "the other build's cache survived"
+[[ -e .scalino-build/scalino-lsp.json ]] || fail "the IDE's project file was deleted"
+# and a directory from before the stamp existed
+rm .scalino-build/toolchain; touch .scalino-build/stale-cache
+"$SCALINO" run . -q >/dev/null 2>&1
+[[ ! -e .scalino-build/stale-cache ]] || fail "an unstamped build directory was reused"
+
+echo "== release build: the RTTI space is in a module with no function"
+# LLVM re-walks the whole space for every switch of a function defined next to it (patches/
+# scala-native-0006, CodeGen.emit): with a function in that module, large release builds take hours.
+mkdir "$WORK/rtti" && cd "$WORK/rtti"
+cat > R.scala <<'SCALA'
+//> using nativeDirectCodegen false
+@main def r() = println(List(1, 2, 3).map(_ + 1).mkString(","))
+SCALA
+"$SCALINO" package . -q --native-mode release-fast -o r >/dev/null 2>&1 || fail "release build failed"
+[[ "$(./r)" == "2,3,4" ]] || fail "release binary output"
+space="$(grep -l 'RttiSpaceG5space" = hidden global' .scalino-build/*/link/native/generated/*.ll || true)"
+[[ -n "$space" && "$(echo "$space" | wc -l | tr -d ' ')" == 1 ]] || fail "expected one module defining the RTTI space, got: $space"
+[[ "$(grep -c '^define' "$space")" == 0 ]] || fail "$(grep -c '^define' "$space") function(s) in the RTTI space's module $space"
+
 echo "OK"

@@ -318,9 +318,14 @@ Builds compile through a background `scalino-dotc` that keeps the compiler and
 the loaded dependencies in memory. It serves `-w` rebuilds and separate
 commands alike, so a small edit recompiles in a fraction of the cold time.
 There is one per build directory, each exits after 15 idle minutes, and at most
-3 run at once. `scalino daemon status` lists them and `scalino daemon stop`
-stops them. `--no-daemon` or `SCALINO_DOTC_DAEMON=0` turns the daemon off, and
-it is off by default when `$CI` is set.
+3 run at once. `scalino daemon status` lists them, `scalino daemon stop` stops
+the ones building the current directory and `scalino daemon stop all` every
+one. `--no-daemon` or `SCALINO_DOTC_DAEMON=0` turns the daemon off, and it is
+off by default when `$CI` is set.
+
+`.scalino-build/` belongs to the scalino that made it. After an upgrade the
+next build empties it and starts over, since classes and object files from two
+versions do not mix.
 
 ### Debug info
 
@@ -623,6 +628,13 @@ scalino, or by an edited recipe, is rebuilt on next use.
 cached in `<sysroots>/.sources`, or in `$SCALINO_SYSROOT_SOURCES`, and you can
 fill that directory in advance to build offline.
 
+Distributions delete a package version when the next one comes out, so every
+file is downloaded from a copy scalino keeps (the assets of its
+[`sysroot-sources`](https://github.com/lolgab/scalino/releases/tag/sysroot-sources)
+release), and from the upstream URL when the copy has no such file. Both are
+checked against the same pinned sha256. `SCALINO_SYSROOT_MIRROR=off` uses only
+the upstream URLs, and `SCALINO_SYSROOT_MIRROR=<url>` another copy.
+
 ### Host builds and target builds
 
 `--native-target-triple` always links against scalino's sysroot, even when the
@@ -648,7 +660,7 @@ build keeps using the system's OpenSSL. The packages are prebuilt and
 checksum-verified: Alpine (musl), Debian 12 (gnu), MSYS2 (Windows, which needs
 a `tar` that reads zstd) and Homebrew's `openssl@3` bottle (macOS).
 
-Three more libraries work the same way. They are installed when a classpath
+Four more libraries work the same way. They are installed when a classpath
 dependency links them, transitively or not, and
 `scalino sysroot build <triple> --with <lib>` installs them ahead of time:
 
@@ -658,10 +670,12 @@ dependency links them, transitively or not, and
 - `s2n`, for fs2-io, and so for skunk and http4s-ember. Not on Windows, where
   s2n-tls has no port.
 - `curl`, for sttp's curl backend.
+- `utf8proc`, for scala-java-locales (`java.text.Normalizer`), which skunk
+  reaches when it logs in with a SCRAM password.
 
-s2n-tls and libcurl have no static packages, so they are compiled on your
-machine with the `clang` and `llvm-ar` on your `PATH`. That takes about a
-minute per target, once. Both need the OpenSSL addon, which is installed with
+s2n-tls, libcurl and utf8proc have no static packages, so they are compiled on
+your machine with the `clang` and `llvm-ar` on your `PATH`. That takes about a
+minute per target, once (utf8proc is one file). Both need the OpenSSL addon, which is installed with
 them, and both set `SSL_CERT_FILE` to the system's CA bundle at startup unless
 you already set it. libcurl is built with HTTP(S) over OpenSSL and zlib only
 (on Windows it is MSYS2's full build).

@@ -344,6 +344,12 @@ jobs:
         shell: bash
         run: ./tests/dotc-daemon/run.sh dist/scalino
 
+      - name: Smoke test -- run hooks, build directory stamp, RTTI space module
+        # --post-link, --run-env and `run -w` signals; a .scalino-build made by another scalino is
+        # emptied; a release build keeps the RTTI space in a module of its own. See tests/native/run.sh.
+        shell: bash
+        run: ./tests/native/run.sh dist/scalino
+
       - name: Smoke test -- libraries built with Scala Native 0.5.12
         # snunit 0.13.0 from Maven Central references posixlib externs by their 0.5.12 link names.
         # See tests/native-compat/run.sh.
@@ -588,6 +594,14 @@ jobs:
             echo "test with a foreign triple should fail"; exit 1
           fi
           grep -q "can't run tests built for" cross-out/test-foreign.log || { cat cross-out/test-foreign.log; exit 1; }
+
+      # Every file this commit's `sysroot build` is pinned to must be in scalino's mirror (the sysroot-sources
+      # release): builds each sysroot and addon from scratch from the mirror alone, outside the cache above.
+      # A failure means a pin changed: run build/14-mirror-sysroot-sources.sh.
+      - name: Sysroot sources -- every pinned file is in the mirror
+        if: matrix.test == 'cross'
+        shell: bash
+        run: tests/sysroot-sources/run.sh mirror dist/scalino
 
   # scalino-lsp for Windows: needs the LSP's NIR (lsp job) and the scalino CLI that builds the mingw sysroots (dotc job).
   windows-lsp:
