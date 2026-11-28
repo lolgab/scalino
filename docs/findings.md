@@ -427,7 +427,9 @@ each verified with a real end-to-end build:
 - `//> using file "./Other.scala"` / `files` (extra source, resolved relative
   to the declaring file's directory, not cwd) and `//> using exclude "glob"`
   (drops matching sources; glob matched against each source's path relative
-  to cwd), implemented in `expandSources` (`ScalinoCli.scala`) so its three
+  to cwd -- since 2026-11-28 relative to the declaring file instead, a plain
+  path drops a whole directory, and a file named on the command line is never
+  dropped: `excludes` in `ScalinoCli.scala`), implemented in `expandSources` (`ScalinoCli.scala`) so its three
   call sites (`run`/`compile`, `test`, `setup-ide`) get both. One level deep:
   a `file`-referenced source's own `file`/`exclude` directives are not
   expanded, as in scala-cli. The glob matcher is a hand-rolled

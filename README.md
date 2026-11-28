@@ -168,6 +168,20 @@ Pass files or directories, in any order. scalino finds the entry point by
 itself, whether it is an `@main`, an `extends App` or a `def main`. Files under
 `test/` or `src/test/scala/` are test scope, as in scala-cli.
 
+A directory brings in every `.scala` file below it. To leave some out, put
+`exclude` in a source, usually `project.scala`:
+
+```scala
+//> using exclude data
+//> using exclude "**/fixtures"
+```
+
+A plain path drops a file or a whole directory. A glob (`*`, `**`, `?`) drops
+every file whose path, or one of whose directories, matches it. Both are
+relative to the file holding the directive, so they work from any directory.
+A file you name on the command line is built even if excluded, so
+`scalino run data/build-data.scala` still runs that script on its own.
+
 ### Directives
 
 The `//> using` directives include `dep`, `test.dep`, `scala`, `mainClass`,

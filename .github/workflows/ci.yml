@@ -452,6 +452,13 @@ jobs:
         shell: bash
         run: ./tests/macros/run.sh dist/scalino
 
+      - name: Smoke test -- exclude and nativePkgConfig directives
+        if: matrix.test == 'js'
+        # Sources left out with `exclude`; `nativePkgConfig` in `scalino test`, probe included. See
+        # tests/directives/run.sh. Builds its own C library, so no system package is needed.
+        shell: bash
+        run: ./tests/directives/run.sh dist/scalino
+
       - name: Smoke test -- coverage
         if: matrix.test == 'js'
         # `test --coverage` / `run --coverage`: what is measured, incremental statement maps, every

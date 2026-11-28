@@ -1685,8 +1685,11 @@ object ScalinoCli:
   /** Compiles, links and runs the probe binary described above and parses its output into
    *  fingerprint specs, cached on disk by framework classes + resolved test classpath.
    *  `userClassesDir` (pass 1's output) is also on the probe's classpath so a project-local
-   *  `sbt.testing.Framework` (picked with `--test-framework`; auto-detection only scans jars) resolves. */
-  def probeFingerprints(frameworkFqcns: List[String], testClasspath: String, cc: CompileClasspath, userClassesDir: Path, cacheDir: Path, logLevel: String): List[SubclassSpec] =
+   *  `sbt.testing.Framework` (picked with `--test-framework`; auto-detection only scans jars) resolves.
+   *  That also links the project's reflectively instantiable classes (every munit suite), and with
+   *  them whatever C library they call: the probe gets the test binary's C and linker flags
+   *  (`nativeOpts`: `nativeLinking`, `nativePkgConfig`, ...) and clang, not its mode or GC. */
+  def probeFingerprints(frameworkFqcns: List[String], testClasspath: String, cc: CompileClasspath, userClassesDir: Path, cacheDir: Path, logLevel: String, nativeOpts: => NativeOpts): List[SubclassSpec] =
     Files.createDirectories(cacheDir)
     val key = sanitizeKey(frameworkFqcns.sorted.mkString(",")) + "-" + hashKey(testClasspath)
     val cacheFile = cacheDir.resolve(s"probe-$key.tsv")
@@ -1701,8 +1704,15 @@ object ScalinoCli:
       compileToClasses(List(probeSrc), probeClasses, ccWithUserClasses, daemon = false)
       val linkDir = scratch.resolve("link")
       val linkCp = s"$probeClasses$CP_SEP$userClassesDir$CP_SEP${cc.nativelibsCp}$CP_SEP$testClasspath"
-      val (clang, clangpp) = hostClangs(NativeOpts())
-      val (probeTriple, probeFlags) = windowsHostLink(NativeOpts(), linkCp)
+      val n = nativeOpts
+      val probeOpts = NativeOpts(clang = n.clang, clangpp = n.clangpp)
+      val (clang, clangpp) = hostClangs(probeOpts)
+      val (probeTriple, hostFlags) = windowsHostLink(probeOpts, linkCp)
+      val probeFlags = hostFlags ++
+        n.linking.flatMap(v => List("--linking", v)) ++
+        n.compile.flatMap(v => List("--compile", v)) ++
+        n.cCompile.flatMap(v => List("--c-compile", v)) ++
+        n.cppCompile.flatMap(v => List("--cpp-compile", v))
       val linkExit = runInherited(List(tool("scalino-linkdriver"), linkCp, linkDir.toString, "ScalinoCliProbeMain", clang, clangpp, logLevel) ++ probeFlags)
       if linkExit != 0 then fail("linking the test-framework probe failed")
       val producedDir = probeTriple.fold(linkDir)(linkDir.resolve(_))
@@ -1853,15 +1863,38 @@ object ScalinoCli:
     sb.append("$")
     sb.toString.r
 
+  /** `//> using exclude <pattern>`: does `pattern`, written in a source in directory `root`, drop
+   *  `file`? Relative to `root` (scala-cli's project root, where its `project.scala` holds the
+   *  directive), or absolute. A plain path names a file or a whole directory (`data`, `gen/old`); a
+   *  glob (`*`, `**`, `?`) matches the file's path or any directory it is in (`gen*`, `**\/fixtures`). */
+  def excludes(root: Path, pattern: String, file: Path): Boolean =
+    val abs = file.toAbsolutePath.normalize()
+    val isGlob = pattern.exists(c => c == '*' || c == '?')
+    if !isGlob then
+      val target = root.resolve(pattern).normalize()
+      abs.startsWith(target)
+    else
+      val absolutePattern = pattern.startsWith("/") || (pattern.length > 2 && pattern(1) == ':')
+      val re = globToRegex(pattern.replace('\\', '/'))
+      def shown(p: Path): Option[String] =
+        val s = if absolutePattern then Some(p.toString)
+          else try Some(root.relativize(p).toString) catch case _: IllegalArgumentException => None // another drive
+        s.map(_.replace(java.io.File.separatorChar, '/'))
+      // the file itself, then each directory it is in
+      // (for a relative pattern, only below `root`: it would show as "" and its parents as "..")
+      Iterator.iterate(abs)(_.getParent)
+        .takeWhile(p => p != null && (absolutePattern || (p.startsWith(root) && p != root)))
+        .flatMap(shown).exists(re.matches)
+
   /** Applies `//> using file`/`files` (extra sources, relative to the declaring source's directory)
-   *  and `//> using exclude` (glob against each source's path relative to the cwd) over the
-   *  directory-expanded set. Only directives of sources already in `base` count; as in scala-cli,
-   *  a `file`-referenced source's own directives are not expanded again. */
+   *  and `//> using exclude` (see `excludes`) over the directory-expanded set. Only directives of
+   *  sources already in `base` count; as in scala-cli, a `file`-referenced source's own directives
+   *  are not expanded again. A file named in `roots` (the command line) is never excluded. */
   private def applyFileAndExcludeDirectives(base: List[Path], roots: List[Path] = Nil): List[Path] =
     val extraFiles = base.flatMap { src =>
       directiveValuesOf(src, "file", "files").map(f => src.toAbsolutePath.getParent.resolve(f).normalize())
     }
-    val excludeGlobs = base.flatMap(src => directiveValuesOf(src, "exclude"))
+    val excludePatterns = base.flatMap(src => directiveValuesOf(src, "exclude").map(v => (src.toAbsolutePath.normalize().getParent, v)))
     // A `jsClient` directory is a project of its own (Scala.js), not part of the project declaring it.
     val clientDirs = base.flatMap(src => directiveValuesOf(src, "jsClient").map(directivePath(src, _)))
     // `shared`: sources the project and its jsClient have in common, files or directories
@@ -1875,13 +1908,11 @@ object ScalinoCli:
     // `./shared/A.scala` (from a directory scan) and the absolute path a directive gives are the same file
     val combined = (base ++ extraFiles ++ sharedFiles).distinctBy(_.toAbsolutePath.normalize)
       .filterNot(p => (clientDirs ++ moduleDirs).exists(d => p.toAbsolutePath.normalize.startsWith(d)))
-    if excludeGlobs.isEmpty then combined
+    if excludePatterns.isEmpty then combined
     else
-      val cwd = Paths.get("").toAbsolutePath.normalize()
-      val patterns = excludeGlobs.map(globToRegex)
+      val named = roots.filterNot(Files.isDirectory(_)).map(_.toAbsolutePath.normalize()).toSet
       combined.filterNot { p =>
-        val rel = cwd.relativize(p.toAbsolutePath.normalize()).toString.replace(java.io.File.separatorChar, '/')
-        patterns.exists(_.matches(rel))
+        !named(p.toAbsolutePath.normalize()) && excludePatterns.exists((root, pattern) => excludes(root, pattern, p))
       }
 
   // `.sc` scripts (given as a file argument, not picked up from directories: a stray `build.sc` is
@@ -4427,8 +4458,12 @@ object ScalinoCli:
         fail("no test framework found on the classpath -- add a `//> using test.dep \"org::name::version\"` for " +
           "a framework with a scala-native port (e.g. munit, utest, scalatest, zio-test-sbt), or pass --test-framework <class>")
 
+      // lazy: runs pkg-config, needed only by a probe that isn't cached or by a link
+      lazy val testNativeOpts =
+        val n = resolveNativeOpts(directives, o)
+        if clientResources.nonEmpty then n.copy(embedResources = true) else n
       val probeCacheDir = Paths.get(".scalino-build").resolve("test-probe-cache")
-      val specs = probeFingerprints(frameworkFqcns, testClasspath, cc, classesDir, probeCacheDir, o.logLevel)
+      val specs = probeFingerprints(frameworkFqcns, testClasspath, cc, classesDir, probeCacheDir, o.logLevel, testNativeOpts)
       if specs.isEmpty then
         fail(s"${frameworkFqcns.mkString(", ")}: no SubclassFingerprint reported -- annotation-based " +
           "(JUnit4-style) test discovery isn't supported")
@@ -4456,9 +4491,6 @@ object ScalinoCli:
           println(Color.action(s"scalino: $why", System.out))
         if discovered.isEmpty || o.testOnly.isEmpty then 0 else 1
       else
-        val testNativeOpts =
-          val n = resolveNativeOpts(directives, o)
-          if clientResources.nonEmpty then n.copy(embedResources = true) else n
         val driverSrc = Paths.get(".scalino-build", "_scratch", "ScalinoCliTestMain.scala")
         Files.write(driverSrc, generateTestMain(matches).getBytes("UTF-8"))
         val binPath = Paths.get(".scalino-build", "ScalinoCliTestMain", hostBinName)
