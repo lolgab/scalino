@@ -1,0 +1,20 @@
+diff --git a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+--- a/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
++++ b/compiler/src/dotty/tools/dotc/quoted/Interpreter.scala
+@@ -2080,7 +2080,15 @@
+         // seed) type only needs to CONFORM to it, not equal it exactly --
+         // `=:=` rejected every literal/singleton-typed scrutinee outright
+         // (breaking even the already-working `case '{ $acc: String } =>`).
+-        if scrutType <:< patType then Some(Map.empty) else None
++        //
++        // Anything else that still mentions a binding symbol (skunk's
++        // `'{ $acc: Encoder[t & Tuple] }`: the argument is an `AndType`, not a
++        // bare `TypeRef`) is not ground: `t` has to be solved by the subtype
++        // check itself, as a GADT constraint.
++        val holes = bindingSyms.filter(sym => patType.existsPart { case tr: TypeRef => tr.symbol == sym; case _ => false })
++        if holes.isEmpty then
++          if scrutType <:< patType then Some(Map.empty) else None
++        else matchStructuralTypePattern(holes.toList, patType, scrutType)
+     if debugMatchEnabled then
+       Console.err.println(s"[unifyPatternType] patType=${patType.show} scrutType=${scrutType.show} bindingSyms=${bindingSyms.mkString(",")} result=$result")
+     result

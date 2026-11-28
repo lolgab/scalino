@@ -446,6 +446,12 @@ jobs:
           if [[ "$RUNNER_OS" == Linux ]]; then sudo apt-get install -y libcurl4-openssl-dev libidn2-dev; fi
           ./tests/toolkit/run.sh dist/scalino
 
+      - name: Smoke test -- macros on the interpreter
+        if: matrix.test == 'js'
+        # Same-project macros whose shape once broke the macro interpreter. See tests/macros/run.sh.
+        shell: bash
+        run: ./tests/macros/run.sh dist/scalino
+
       - name: Smoke test -- coverage
         if: matrix.test == 'js'
         # `test --coverage` / `run --coverage`: what is measured, incremental statement maps, every
