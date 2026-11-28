@@ -2665,7 +2665,7 @@ object ScalinoCli:
     nativeOpts: NativeOpts = NativeOpts(),
     longRunning: Boolean = false,
     excludeFromLink: Set[String] = Set.empty,
-    outForTriple: (String, String) => Path = (_, _) => Paths.get("unused")
+    outForTriple: (String, String) => Path = (_, t) => fail(s"internal error: no output path for target $t")
   ): String =
     if splitMainClasses(explicitMainClass).size > 1 then
       fail(s"several main classes given (${explicitMainClass.get}): only `scalino package` builds more than one binary")
@@ -2690,7 +2690,7 @@ object ScalinoCli:
     excludeFromLink: Set[String] = Set.empty,
     // Where each cross target's binary goes; required when
     // `nativeOpts.targetTriples` is non-empty (`outFor` serves the host build).
-    outForTriple: (String, String) => Path = (_, _) => Paths.get("unused")
+    outForTriple: (String, String) => Path = (_, t) => fail(s"internal error: no output path for target $t")
   ): List[String] =
     val compiledDir = compileOnly(sources, extraClasspath, extraOptions, extraCompileOnlyClasspath, incremental)
     val cc = computeCompileClasspath(extraClasspath, extraCompileOnlyClasspath)
@@ -4460,8 +4460,18 @@ object ScalinoCli:
 
       // lazy: runs pkg-config, needed only by a probe that isn't cached or by a link
       lazy val testNativeOpts =
-        val n = resolveNativeOpts(directives, o)
-        if clientResources.nonEmpty then n.copy(embedResources = true) else n
+        val n0 = resolveNativeOpts(directives, o)
+        val n = if clientResources.nonEmpty then n0.copy(embedResources = true) else n0
+        if n.targetTriples.isEmpty then n
+        else
+          // The tests run here: only the host's own triple, built like `package` builds it (the
+          // sysroot, its static C-library addons, lld), e.g. to test against the sysroot's OpenSSL.
+          if n.targetTriples.size > 1 || n.targetTriples.exists(t => Packaging.hostFromTriple(t) != Packaging.detectHost()) then
+            fail(s"test: can't run tests built for ${n.targetTriples.mkString(", ")} on this machine -- only the host's own triple works")
+          n.copy(
+            sysroots = Sysroot.resolve(n.targetTriples, n.sysroots),
+            libAddons = Sysroot.resolveAddons(n.targetTriples, testClasspath),
+            ldPath = Sysroot.ensureLld(n.targetTriples))
       val probeCacheDir = Paths.get(".scalino-build").resolve("test-probe-cache")
       val specs = probeFingerprints(frameworkFqcns, testClasspath, cc, classesDir, probeCacheDir, o.logLevel, testNativeOpts)
       if specs.isEmpty then
@@ -4503,7 +4513,8 @@ object ScalinoCli:
             val suites = expanded.filter(p => isCoverageTestSource(p) || extractDeclaredNames(readFile(p)).exists(suiteNames))
             options ++ Coverage.optionsFor(expanded, suites :+ driverSrc)
         def build(exclude: Set[String]) =
-          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, buildOptions, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude)
+          buildBinary(expanded :+ driverSrc, Some("ScalinoCliTestMain"), testClasspath, _ => binPath, buildOptions, extraCompileOnlyClasspath, o.logLevel, !o.noIncremental, testNativeOpts, o.watch, exclude,
+            outForTriple = (_, _) => binPath)
         // A selected test could reference an excluded class other than by inheritance: if the
         // trimmed link fails, fall back to the full link.
         try build(excluded)

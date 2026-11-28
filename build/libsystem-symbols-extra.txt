@@ -96,3 +96,8 @@ _syslog
 _dispatch_assert_queue
 _dispatch_assert_queue_not
 _dispatch_queue_create_with_target
+# <ucontext.h> declares these only under _XOPEN_SOURCE (deprecated): OpenSSL's async code calls them
+_getcontext
+_makecontext
+_setcontext
+_swapcontext

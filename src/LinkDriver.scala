@@ -291,12 +291,14 @@ object LinkDriver:
       sys.env.getOrElse("PATH", "").split(java.io.File.pathSeparator).exists { d =>
         d.nonEmpty && List("ld.lld", "ld.lld.exe").exists(n => java.nio.file.Files.isExecutable(Paths.get(d, n)))
       }
-    // Windows: the host clang's own target is MSVC or MinGW, ours is always the mingw sysroot's
-    // (`scalino` picks the host's windows-gnu triple and gives it a sysroot), so a given sysroot makes it a cross target.
+    // A given sysroot always makes it a cross target, the host's own triple included: an explicit
+    // `--native-target-triple` links against scalino's sysroot and its static addons (OpenSSL...), not
+    // /opt/homebrew/lib, so the build is the same on every machine (cli/Sysroot.scala `resolve`).
+    // On Windows the host clang's own target is MSVC or MinGW anyway, ours is the mingw sysroot's.
     def isHostTarget(t: String): Boolean =
       normArch(t.takeWhile(_ != '-')) == normArch(hostTriple.takeWhile(_ != '-')) &&
         osOf(t) == osOf(hostTriple) && (osOf(t) != "linux" || t.endsWith("musl") == hostTriple.endsWith("musl")) &&
-        (osOf(t) != "windows" || !opts.sysroots.contains(t))
+        !opts.sysroots.contains(t)
     /** `link` as a view of the directory `target`: a symlink, or a copy where those need a privilege (Windows). */
     def linkDir(target: Path, link: Path): Unit =
       import java.nio.file.{Files, LinkOption}

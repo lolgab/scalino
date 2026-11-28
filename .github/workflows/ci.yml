@@ -579,6 +579,15 @@ jobs:
             [[ "$(cross-out/time-x86_64-unknown-linux-$t)" == *"time ok"* ]] || { echo "time $t failed"; exit 1; }
             [[ "$(cross-out/connect-x86_64-unknown-linux-$t)" == *"connect ok"* ]] || { echo "connect $t failed"; exit 1; }
           done
+          # `test` with the host's own triple: linked against the sysroot like `package`, then run from
+          # where it was linked (it used to land in ./unused and run a stale host binary, or none)
+          ./dist/scalino test tests/cross/suite --native-target-triple x86_64-unknown-linux-gnu | tee cross-out/test.log
+          grep -q "1 passed, 0 failed" cross-out/test.log || { echo "test with the host triple failed"; exit 1; }
+          [[ ! -e unused ]] || { echo "test left its binary in ./unused"; exit 1; }
+          if ./dist/scalino test tests/cross/suite --native-target-triple aarch64-unknown-linux-gnu 2> cross-out/test-foreign.log; then
+            echo "test with a foreign triple should fail"; exit 1
+          fi
+          grep -q "can't run tests built for" cross-out/test-foreign.log || { cat cross-out/test-foreign.log; exit 1; }
 
   # scalino-lsp for Windows: needs the LSP's NIR (lsp job) and the scalino CLI that builds the mingw sysroots (dotc job).
   windows-lsp:
