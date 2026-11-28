@@ -36,7 +36,7 @@ The Zed extension is submitted to Zed's gallery as **Scalino** ([zed-industries/
 
 - `scalino sysroot build` no longer breaks when a distribution deletes a package. v0.0.34 failed on a clean machine with a 404 for Alpine's `openssl-libs-static`, which Alpine had replaced with a newer build. Every pinned file is now downloaded from a copy scalino keeps (the [`sysroot-sources`](https://github.com/lolgab/scalino/releases/tag/sysroot-sources) release), then from upstream, and checked against the same sha256. `SCALINO_SYSROOT_MIRROR=off` uses upstream only.
 - New static library: `utf8proc`, installed when the classpath has scala-java-locales. skunk needs it to log in with a SCRAM password, and the link used to fail with `unable to find library -lutf8proc`.
-- `scalino test --native-target-triple <host triple>` links the tests against the sysroot and runs that binary. It used to fail with `Cannot run program ".scalino-build/ScalinoCliTestMain/bin"`, or run a stale one.
+- `scalino test --native-target-triple <host triple>` links the tests against the sysroot and runs that binary. It used to fail with `Cannot run program ".scalino-build/ScalinoCliTestMain/bin"`, or run a stale one. On Linux a musl triple of the machine's architecture works too, since the binary is static: `scalino test . --native-target-triple x86_64-unknown-linux-musl` tests what you deploy.
 - A triple with a sysroot is always linked against it, also when it is the host's own. `package` and `test` used to pick up Homebrew's libraries on a Mac.
 - macOS targets: no more `ld: warning: no platform load command found` for every object file.
 

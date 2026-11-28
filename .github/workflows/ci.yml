@@ -590,6 +590,10 @@ jobs:
           ./dist/scalino test tests/cross/suite --native-target-triple x86_64-unknown-linux-gnu | tee cross-out/test.log
           grep -q "1 passed, 0 failed" cross-out/test.log || { echo "test with the host triple failed"; exit 1; }
           [[ ! -e unused ]] || { echo "test left its binary in ./unused"; exit 1; }
+          # a musl binary is static and runs on this glibc runner: what a CI job that deploys a musl binary tests
+          ./dist/scalino test tests/cross/suite --native-target-triple x86_64-unknown-linux-musl | tee cross-out/test-musl.log
+          grep -q "1 passed, 0 failed" cross-out/test-musl.log || { echo "test with the musl triple failed"; exit 1; }
+          file .scalino-build/ScalinoCliTestMain/bin | grep -q "statically linked" || { echo "the musl test binary is not static"; exit 1; }
           if ./dist/scalino test tests/cross/suite --native-target-triple aarch64-unknown-linux-gnu 2> cross-out/test-foreign.log; then
             echo "test with a foreign triple should fail"; exit 1
           fi

@@ -4470,10 +4470,16 @@ object ScalinoCli:
         val n = if clientResources.nonEmpty then n0.copy(embedResources = true) else n0
         if n.targetTriples.isEmpty then n
         else
-          // The tests run here: only the host's own triple, built like `package` builds it (the
+          // The tests run here: only a triple this machine runs, built like `package` builds it (the
           // sysroot, its static C-library addons, lld), e.g. to test against the sysroot's OpenSSL.
-          if n.targetTriples.size > 1 || n.targetTriples.exists(t => Packaging.hostFromTriple(t) != Packaging.detectHost()) then
-            fail(s"test: can't run tests built for ${n.targetTriples.mkString(", ")} on this machine -- only the host's own triple works")
+          // A musl binary is static: it also runs on a glibc machine of the same architecture, which is
+          // how a CI runner tests what it deploys.
+          val host = Packaging.detectHost()
+          def runsHere(t: String): Boolean =
+            val target = Packaging.hostFromTriple(t)
+            target == host || (target.os == "linux" && host.os == "linux" && target.arch == host.arch && target.libc == "musl")
+          if n.targetTriples.size > 1 || !n.targetTriples.forall(runsHere) then
+            fail(s"test: can't run tests built for ${n.targetTriples.mkString(", ")} on this machine (${host.triple}) -- only a triple it can run works")
           n.copy(
             sysroots = Sysroot.resolve(n.targetTriples, n.sysroots),
             libAddons = Sysroot.resolveAddons(n.targetTriples, testClasspath),
