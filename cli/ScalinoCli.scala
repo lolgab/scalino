@@ -2742,7 +2742,7 @@ object ScalinoCli:
 
     val linkCmd = List(tool("scalino-linkdriver"), linkCp, linkDirArg, mainClasses.mkString(","), clang, clangpp, logLevel) ++ nativeFlags
     val linkExit = if longRunning then linkIncremental(linkCmd) else runInherited(linkCmd)
-    if linkExit != 0 then fail("linking failed")
+    if linkExit != 0 then fail(linkFailure(linkExit))
 
     def collect(mainClass: String, dir: Path, out: Path): Unit =
       val candidates = List(mainClass, mainClass.toLowerCase).flatMap(n => List(n, n + ".exe")).map(dir.resolve)
@@ -4869,6 +4869,13 @@ object ScalinoCli:
       case "zsh" => print(zshCompletion)
       case "fish" => print(fishCompletion)
       case other => die(s"completions: unsupported shell '$other' -- expected bash, zsh, or fish")
+
+  /** A link that ends without an error of its own was killed: say by what. 137 is SIGKILL, which is what
+   *  the kernel's out-of-memory killer sends (a release link of a large program takes several GB). */
+  def linkFailure(exit: Int): String =
+    if exit == 137 then "linking failed: scalino-linkdriver was killed (SIGKILL), most likely for running out of memory"
+    else if exit > 128 && exit < 160 then s"linking failed: scalino-linkdriver died with signal ${exit - 128}"
+    else "linking failed"
 
   def handleClean(args: Array[String]): Unit =
     if args.nonEmpty then die(s"clean: unexpected argument '${args(0)}'")
