@@ -4943,7 +4943,7 @@ index cea5a829b..9b58d2af3 100644
          genJustVal(v)
        case _ =>
 diff --git a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
-index a477edfce..abbd33287 100644
+index a477edfce..4f6addfa4 100644
 --- a/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
 +++ b/tools/src/main/scala/scala/scalanative/codegen/llvm/CodeGen.scala
 @@ -13,6 +13,7 @@ import scala.scalanative.build
@@ -4982,10 +4982,31 @@ index a477edfce..abbd33287 100644
        val outputDirPath = config.workDir.resolve("generated")
        if (Build.userConfigHasChanged(config))
          IO.deleteRecursive(outputDirPath)
-@@ -81,15 +87,65 @@ object CodeGen {
-         defn.pos.source.directory
-           .getOrElse(EmptyPath)
+@@ -77,19 +83,89 @@ object CodeGen {
+       val outputDir = VirtualDirectory.real(outputDirPath)
+       val sourceCodeCache = new SourceCodeCache(config)
  
++      // The RTTI space gets an object file of its own, with no function in
++      // it. A function in the module that defines the space sees every RTTI
++      // (an alias into the space) as a constant LLVM can look through, and
++      // SimplifyCFG, when it turns a switch into a lookup table, walks the
++      // operands of each case result (Constant::isThreadDependent,
++      // isDLLImportDependent): through the alias that is the initializer of
++      // the whole space, every RTTI and vtable of the program, once per case.
++      // Release builds have few, large modules: the one that got the space
++      // took 45 minutes instead of 40 seconds for scalino-linkdriver's own
++      // link. In every other module an RTTI is an external symbol.
++      val RttiSpaceFileId = "rtti-space"
++      def isRttiSpace(defn: nir.Defn): Boolean = defn.name == RttiSpace.Name
++
+       def outputFileId(defn: nir.Defn): String =
+-        defn.pos.source.directory
+-          .getOrElse(EmptyPath)
++        if (isRttiSpace(defn)) RttiSpaceFileId
++        else
++          defn.pos.source.directory
++            .getOrElse(EmptyPath)
++
 +      // EXPERIMENTAL (NativeConfig.useLLVMDirectCodeGen): try compiling as
 +      // much of this partition as possible straight to an object file via
 +      // libLLVM's C API (no `.ll` text, no clang subprocess for that
@@ -5011,13 +5032,18 @@ index a477edfce..abbd33287 100644
 +      def directPlan(defns: Seq[nir.Defn]): DirectCodeGenPlan =
 +        if (!config.compilerConfig.useLLVMDirectCodeGen) DirectCodeGenPlan.Unavailable
 +        else DirectCodeGenDispatch.plan(config, defns)(meta.platform)
-+
+ 
        // Partition into multiple LLVM IR files proportional to number
        // of available processors. This prevents LLVM from optimizing
        // across IR module boundary unless LTO is turned on.
        def separate(): IRGenerators =
 -        partitionBy(assembly, procs)(outputFileId).toSeq.map {
-+        partitionBy(spaced, procs)(outputFileId).toSeq.flatMap {
++        val (spaceDefns, otherDefns) = spaced.partition(isRttiSpace)
++        val partitions: Seq[(String, Seq[nir.Defn])] =
++          partitionBy(otherDefns, procs)(outputFileId).toSeq.map {
++            case (id, defns) => (id.toString, defns)
++          } ++ (if (spaceDefns.isEmpty) Nil else Seq((RttiSpaceFileId, spaceDefns)))
++        partitions.flatMap {
            case (id, defns) =>
 -            Future {
 -              val sorted = defns.sortBy(_.name)
@@ -5052,7 +5078,7 @@ index a477edfce..abbd33287 100644
              }
          }
  
-@@ -97,6 +153,32 @@ object CodeGen {
+@@ -97,6 +173,32 @@ object CodeGen {
        def separateIncrementally(): IRGenerators = {
          val ctx = new IncrementalCodeGenContext(config)
          ctx.collectFromPreviousState()
@@ -5085,7 +5111,7 @@ index a477edfce..abbd33287 100644
  
          // Partition into multiple LLVM IR files per Scala source file originated from.
          // We previously partitioned LLVM IR files by package.
-@@ -114,26 +196,49 @@ object CodeGen {
+@@ -114,26 +216,49 @@ object CodeGen {
          // To address this issue, we partition into multiple LLVM IR files per Scala source file originated from.
          // This will ensure that each LLVM IR file only references a single Scala source file,
          // which will prevent the Darwin linker failing to generate N_OSO symbols.
@@ -5154,7 +5180,7 @@ index a477edfce..abbd33287 100644
              }
          }
          Future.sequence(llvmIRGenerators).andThen {
-@@ -150,6 +255,12 @@ object CodeGen {
+@@ -150,6 +275,12 @@ object CodeGen {
          .map(Future.successful)
  
        val llvmIRGenerators =
@@ -5167,7 +5193,7 @@ index a477edfce..abbd33287 100644
          if (config.compilerConfig.useIncrementalCompilation)
            separateIncrementally()
          else separate()
-@@ -201,7 +312,8 @@ object CodeGen {
+@@ -201,7 +332,8 @@ object CodeGen {
            dir: VirtualDirectory,
            config: build.Config
        ): Option[Path] =
