@@ -1,0 +1,38 @@
+name: Sysroot sources
+
+# `scalino sysroot build` downloads pinned files (versions.env). This builds every sysroot and static
+# library addon from scratch each day with the latest released scalino, so a file that went away is
+# noticed here and not in a user's CI. See tests/sysroot-sources/run.sh.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.source }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # mirror: must have every file. upstream: only reports (warnings and the job summary).
+        source: [mirror, upstream]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install scalino (latest release)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang lld llvm zstd
+          bash install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build every sysroot and addon from the ${{ matrix.source }}
+        run: |
+          scalino version
+          tests/sysroot-sources/run.sh "${{ matrix.source }}" "$(command -v scalino)"

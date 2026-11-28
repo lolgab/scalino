@@ -159,7 +159,7 @@
           # Every addon `scalino sysroot build --with` knows. The sources
           # derivation fetches all of them (the hash must not depend on the
           # app); mkScalinoSysroot only installs the ones an app asks for.
-          allSysrootAddons = [ "openssl" "idn2" "s2n" "curl" ];
+          allSysrootAddons = [ "openssl" "idn2" "s2n" "curl" "utf8proc" ];
 
           # clang + llvm-ar compile the s2n/curl addons for the *target*. The
           # usual wrapped clang injects the builder's glibc headers, and

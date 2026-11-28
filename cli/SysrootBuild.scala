@@ -1,5 +1,5 @@
 // `scalino sysroot build <triple>`: assembles a cross-compilation sysroot on the
-// user's machine from upstream packages (scalino publishes none): musl (Debian
+// user's machine from upstream packages: musl (Debian
 // 13's musl-dev) and gnu (Debian 11's glibc), both with Debian 12's prebuilt
 // compiler-rt (and zlib: Alpine's for musl, Debian 11's for gnu), from .debs and .apks; apple (Darwin headers from Zig's source tarball +
 // a generated libSystem stub) and windows (llvm-mingw's data dirs). Nothing is
@@ -9,7 +9,9 @@
 // Also the addons: static C libraries (OpenSSL's libcrypto) a classpath dependency
 // links through `@link`, installed next to the sysroots (see `buildAddon`).
 //
-// Needs only `curl` and `tar` (with xz support) on PATH. Downloads are kept in
+// Needs only `curl` and `tar` (with xz support) on PATH. Every file is fetched from
+// scalino's mirror of the upstream files (a GitHub release, see `download`), then from
+// upstream, and checked against the same sha256. Downloads are kept in
 // <sysroots>/.sources, or $SCALINO_SYSROOT_SOURCES, so a directory pre-seeded
 // with the upstream files works offline.
 
@@ -30,7 +32,27 @@ object SysrootBuild:
     Option(System.getenv("SCALINO_SYSROOT_SOURCES")).filter(_.nonEmpty).map(Paths.get(_))
       .getOrElse(Sysroot.cacheRoot.resolve(".sources"))
 
-  /** `name` from `url`, checked against `sha256`; cached in `sources`. */
+  /** scalino's copy of every file `download` fetches: the assets of one GitHub release, uploaded by
+   *  build/14-mirror-sysroot-sources.sh. Distributions drop a package version when the next one lands
+   *  (Alpine keeps one per branch, MSYS2 a few), so a pinned upstream URL stops working sooner or later.
+   *  $SCALINO_SYSROOT_MIRROR is another base URL, or `off`. */
+  private val DefaultMirror = "https://github.com/lolgab/scalino/releases/download/sysroot-sources"
+
+  private def mirror: Option[String] =
+    Option(System.getenv("SCALINO_SYSROOT_MIRROR")).map(_.trim).filter(_.nonEmpty) match
+      case Some("off") => None
+      case Some(base) => Some(base.stripSuffix("/"))
+      case None => Some(DefaultMirror)
+
+  /** $SCALINO_SYSROOT_UPSTREAM=off: only the mirror (what the CI check of the mirror runs with). */
+  private def upstreamOn: Boolean = System.getenv("SCALINO_SYSROOT_UPSTREAM") != "off"
+
+  /** The asset name of `name` in the mirror: GitHub rewrites characters like `~` and `+` in asset names. */
+  def mirrorName(name: String): String =
+    name.map(c => if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' then c else '-')
+
+  /** `name`, checked against `sha256`; cached in `sources`. Fetched from the mirror, else from `url`
+   *  (upstream): the checksum is the same for both. */
   private def download(url: String, name: String, sha256: String, headers: List[String] = Nil): Path =
     Files.createDirectories(sources)
     val f = sources.resolve(name)
@@ -38,14 +60,22 @@ object SysrootBuild:
       if sha256Hex(Files.readAllBytes(f)) == sha256 then return f
       Files.delete(f)
     val part = sources.resolve(name + ".part")
-    println(s"downloading $url")
-    if runInherited(List("curl", "-fsSL") ++ headers.flatMap(h => List("-H", h)) ++ List("-o", part.toString, url)) != 0 then
-      die(s"sysroot build: download failed: $url (or put $name in $sources)")
-    val actual = sha256Hex(Files.readAllBytes(part))
-    if actual != sha256 then
-      Files.delete(part)
-      die(s"sysroot build: checksum mismatch for $url (expected $sha256, got $actual)")
-    Files.move(part, f, StandardCopyOption.REPLACE_EXISTING)
+    // (url, headers, quiet): a file the mirror lacks is not worth a curl error when upstream is tried next
+    val attempts =
+      mirror.toList.map(m => (s"$m/${mirrorName(name)}", Nil, upstreamOn)) ++
+        (if upstreamOn then List((url, headers, false)) else Nil)
+    if attempts.isEmpty then die("sysroot build: SCALINO_SYSROOT_MIRROR and SCALINO_SYSROOT_UPSTREAM are both off")
+    var problems = List.empty[String]
+    for (u, hs, quiet) <- attempts if !Files.exists(f) do
+      println(s"downloading $u")
+      val curl = List("curl", if quiet then "-fsL" else "-fsSL", "--retry", "3") ++ hs.flatMap(h => List("-H", h)) ++ List("-o", part.toString, u)
+      if runInherited(curl) != 0 then problems = problems :+ s"download failed: $u"
+      else
+        val actual = sha256Hex(Files.readAllBytes(part))
+        if actual == sha256 then Files.move(part, f, StandardCopyOption.REPLACE_EXISTING)
+        else problems = problems :+ s"checksum mismatch for $u (expected $sha256, got $actual)"
+      Files.deleteIfExists(part)
+    if !Files.exists(f) then die(s"sysroot build: ${problems.mkString("; ")} (or put $name in $sources)")
     f
 
   /** Windows' own bsdtar reads zip, xz and zstd; a `tar` further down PATH (Git's GNU tar) may not. */
@@ -509,6 +539,7 @@ object SysrootBuild:
         case "idn2" => installIdn2(triple, arch, work, out)
         case "s2n" => installS2n(triple, work, out)
         case "curl" => installCurl(triple, work, out)
+        case "utf8proc" => installUtf8proc(triple, work, out)
       rm(dest)
       Files.createDirectories(dest.getParent)
       Files.move(out, dest)
@@ -707,12 +738,17 @@ object SysrootBuild:
       .getOrElse(ScalinoCli.findOnPath("llvm-ar"))
     (clang, ar)
 
-  /** clang flags for compiling C for `triple` against its sysroot (the link driver's compile flags) and
-   *  the OpenSSL addon's headers. */
-  private def targetFlags(triple: String, sysroot: Path, ssl: Path): List[String] =
+  /** clang flags for compiling C for `triple` against its sysroot (the link driver's compile flags). */
+  private def targetFlags(triple: String, sysroot: Path): List[String] =
     List(s"--target=$triple") ++
-      (if triple.contains("apple") then List("-isysroot", sysroot.toString, "-mmacos-version-min=11.0") else List(s"--sysroot=$sysroot")) ++
-      List("-I" + ssl.resolve("include"))
+      (if triple.contains("apple") then List("-isysroot", sysroot.toString, "-mmacos-version-min=11.0")
+       // the headers every mingw arch shares, see LinkDriver
+       else if triple.contains("windows") then List(s"--sysroot=$sysroot", "-idirafter", sysroot.resolve("generic-w64-mingw32/include").toString)
+       else List(s"--sysroot=$sysroot"))
+
+  /** `targetFlags` plus the OpenSSL addon's headers. */
+  private def targetFlags(triple: String, sysroot: Path, ssl: Path): List[String] =
+    targetFlags(triple, sysroot) ++ List("-I" + ssl.resolve("include"))
 
   /** Compiles every file of `sources` with `clang flags` (in parallel) into `objs`; dies with the first errors. */
   private def compileAll(clang: String, flags: List[String], sources: List[Path], objs: Path, what: String): List[Path] =
@@ -855,6 +891,28 @@ object SysrootBuild:
          |  brotli, zstd, HTTP/2, libssh, libpsl or IDN; zlib $zver is compiled into libcurl.a (Z_PREFIX'd), see zlib-LICENSE. Additions: a constructor in lib/easy.c that sets
          |  SSL_CERT_FILE to the system's CA bundle when neither it nor SSL_CERT_DIR is set${if apple then "; curl_setup.h's macOS IPv6 literal workaround (SystemConfiguration) is switched off" else ""}.
          |Source: https://curl.se""".stripMargin, what = "static libcurl")
+
+  /** utf8proc (scala-java-locales' `@link("utf8proc")`, which skunk's SCRAM login reaches through saslprep):
+   *  one C file, compiled for every target. */
+  private def installUtf8proc(triple: String, work: Path, out: Path): Unit =
+    val sysroot = Sysroot.find(triple).getOrElse(build(triple, force = false))
+    val ver = pin("UTF8PROC_VERSION")
+    val tarball = download(s"https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v$ver.tar.gz", s"utf8proc-$ver.tar.gz", pin("UTF8PROC_SHA256"))
+    val src = Files.createDirectories(work.resolve("utf8proc"))
+    tar("-xzf", tarball.toString, "-C", src.toString, "--strip-components=1")
+    val (clang, ar) = clangAndAr()
+    println(s"utf8proc $ver: compiling for $triple")
+    // UTF8PROC_STATIC: no dllexport/dllimport on Windows. PE code is position independent as it is.
+    val flags = targetFlags(triple, sysroot) ++ List("-O2", "-w", "-DUTF8PROC_STATIC") ++ (if triple.contains("windows") then Nil else List("-fPIC"))
+    archive(ar, out.resolve("lib/libutf8proc.a"),
+      compileAll(clang, flags, List(src.resolve("utf8proc.c")), Files.createDirectories(work.resolve("utf8proc-obj")), s"utf8proc for $triple"))
+    copy(src.resolve("utf8proc.h"), out.resolve("include/utf8proc.h"))
+    addLicense(out, src.resolve("LICENSE.md"), "utf8proc-LICENSE.md")
+    writeReadme(out, triple,
+      s"""Components:
+         |  utf8proc $ver  libutf8proc.a compiled by scalino from the source (clang, -O2, UTF8PROC_STATIC) for $triple, and
+         |  utf8proc.h: MIT, with Unicode data under the Unicode licence, see utf8proc-LICENSE.md.
+         |Source: https://github.com/JuliaStrings/utf8proc""".stripMargin, what = "static utf8proc")
 
   /** libcurl on Windows: curl's own Windows configuration only supports MSVC, so MSYS2's static build, with
    *  everything it was built with (HTTP/2, HTTP/3, SSH, brotli, zstd, zlib, PSL). OpenSSL and libidn2 are the

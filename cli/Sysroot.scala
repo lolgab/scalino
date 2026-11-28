@@ -115,7 +115,9 @@ object Sysroot:
       "fs2-io"), // fs2.io.net.tls, so also skunk and http4s-ember; not on Windows (upstream has no port)
     "curl" -> List(
       "sttp/client3/core_native", "sttp/client4/core_native", // sttp's curl backend
-      "scala-native-loop", "libcurl"))
+      "scala-native-loop", "libcurl"),
+    "utf8proc" -> List(
+      "scala-java-locales")) // java.text.Normalizer; behind skunk-core (saslprep, SCRAM passwords)
 
   /** Addons a library needs installed and linked with it. */
   def addonDeps(lib: String, triple: String): List[String] = lib match

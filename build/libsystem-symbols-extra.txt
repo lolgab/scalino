@@ -101,3 +101,9 @@ _getcontext
 _makecontext
 _setcontext
 _swapcontext
+# <arpa/inet.h> defines these as macros (the header scan misses them); libSystem exports the functions
+# too, which is what a Scala Native `@extern` binding links (fs2-io)
+_htonl
+_htons
+_ntohl
+_ntohs

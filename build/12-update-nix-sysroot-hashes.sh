@@ -8,7 +8,7 @@
 # The archive set is fixed by the pins in the scalino release's versions.env,
 # so run this after a release, with that release's scalino (like
 # 10-update-package-metadata.sh). Needs `nix`, curl, tar (xz, zstd), clang
-# and llvm-ar (the s2n/curl addons are compiled) and ld.lld on PATH: with an ld.lld around,
+# and llvm-ar (the s2n/curl/utf8proc addons are compiled) and ld.lld on PATH: with an ld.lld around,
 # scalino doesn't also download one, which is the situation inside the Nix derivation.
 # The clang must not inject its own libc's headers (a plain distro clang is fine; in
 # Nix use llvmPackages.clangNoLibc, not pkgs.clang).
@@ -59,7 +59,7 @@ out=packaging/nix/sysroot-sources.json
     # finished downloads are cached in $src, so a retry only repeats the rest
     for attempt in 1 2 3 4; do
       SCALINO_SYSROOT_DIR="$work/root-$t" SCALINO_SYSROOT_SOURCES="$src" \
-        "$scalino" sysroot build "$t" --with openssl --with idn2 --with s2n --with curl >&2 && break
+        "$scalino" sysroot build "$t" --with openssl --with idn2 --with s2n --with curl --with utf8proc >&2 && break
       [ "$attempt" = 4 ] && { echo "sysroot build for $t failed" >&2; exit 1; }
       echo "retrying ($attempt)" >&2; sleep 20
     done
